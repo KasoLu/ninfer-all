@@ -1,6 +1,8 @@
 #include "core/weight.h"
 #include "ops/gdn_input_proj/q8/q8_gdn_input_kernels.h"
 
+#include "ops/gdn_input_proj/q8/q8_gdn_input_kernels_unified.h"
+#include "ops/linear/common/route_table.h"
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/linear/q8/q8_rowsplit_gemm_mma.cuh"
@@ -30,6 +32,10 @@ void launch_variant(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& 
 
 void q8_gdn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                       cudaStream_t stream) {
+    if (fused_route_table("unified/q8_gdn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_gdn_input_mma_r64_c128_launch(x, weight, qkv, z, stream);
+        return;
+    }
     if ((x.ne[1] % Schedule::BN) == 0) {
         launch_variant<true>(x, weight, qkv, z, stream);
     } else {

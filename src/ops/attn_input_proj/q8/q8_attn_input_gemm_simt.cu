@@ -1,6 +1,8 @@
 #include "core/weight.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_kernels.h"
 
+#include "ops/attn_input_proj/q8/q8_attn_input_kernels_unified.h"
+#include "ops/linear/common/route_table.h"
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/linear/q8/q8_rowsplit_gemm_simt.cuh"
@@ -41,6 +43,10 @@ void launch_route(const Tensor& x, const Weight& weight, Output output, cudaStre
 
 void q8_attn_input_simt_r8_c4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (fused_route_table("unified/q8_attn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_attn_input_simt_r8_c4_launch(x, weight, q, gate, k, v, stream);
+        return;
+    }
     static_assert((4096 % kRowsPerCta) == 0 && (512 % kRowsPerCta) == 0);
     const TargetOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
@@ -50,6 +56,10 @@ void q8_attn_input_simt_r8_c4_launch(const Tensor& x, const Weight& weight, Tens
 
 void q8_attn_input_simt_r8_c4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
                                      Tensor& v, cudaStream_t stream) {
+    if (fused_route_table("unified/q8_attn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_attn_input_simt_r8_c4_launch(x, weight, q, k, v, stream);
+        return;
+    }
     static_assert((4096 % kRowsPerCta) == 0 && (1024 % kRowsPerCta) == 0);
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),

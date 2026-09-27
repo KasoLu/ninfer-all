@@ -1,18 +1,18 @@
+#include "ops/linear/q8/q8_geometry.h"
+#include "ops/linear/q8/q8_instances.cuh"
 #include "core/weight.h"
-#include "ops/attn_input_proj/q8/q8_attn_input_kernels.h"
-
 #include "ops/attn_input_proj/q8/q8_attn_input_kernels_unified.h"
-#include "ops/linear/common/route_table.h"
+
 #include "core/device.h"
-#include "ops/linear/q8/q8_ksplit_mma.cuh"
-#include "ops/linear/q8/q8_ksplit_grouped_mma.cuh"
+#include "ops/linear/q8/q8_sliced_k_launch.cuh"
+#include "ops/linear/q8/q8_grouped_sliced_k_launch.cuh"
 
 #include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <utility>
 
-namespace ninfer::ops::detail {
+namespace ninfer::ops::detail::unified {
 namespace {
 
 constexpr int kTargetRows             = 9216;
@@ -22,10 +22,10 @@ constexpr int kRowsPerCta             = 16;
 constexpr int kFirstExactCols         = 2;
 constexpr int kLastTargetExactCols    = 48;
 constexpr int kLastCompanionExactCols = 32;
-using TargetOutput                    = Q8SplitOutput4<4096, 512, 4096, 512>;
-using CompanionOutput                 = Q8SplitOutput3<4096, 1024, 1024>;
+using TargetOutput                    = LinearBf16SegmentedOutput<4096, 512, 4096, 512>;
+using CompanionOutput                 = LinearBf16SegmentedOutput<4096, 1024, 1024>;
 using TargetLauncher    = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
-                                cudaStream_t);
+                                   cudaStream_t);
 using CompanionLauncher = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&,
                                    cudaStream_t);
 
@@ -38,12 +38,10 @@ void launch_output(const Tensor& x, const Weight& weight, Output output, cudaStr
                              : ActiveCols <= 40 ? 40
                                                 : 48;
     using Geometry         = Q8LinearGeometry<Rows, kHidden>;
-    using Schedule         = Q8KSplitDefaultSchedule<TileCols, ActiveCols>;
-    q8_ksplit_mma_kernel<Geometry, ActiveCols, Schedule>
-        <<<Rows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output);
+    using Schedule         = Q8SlicedKDefault<TileCols, ActiveCols>;
+    launch_q8_a16_sliced_k_mma<
+        typename Schedule::template with_problem<Geometry::kInputRows, ActiveCols, true>>(
+        q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
 }
 
 template <int ActiveCols>
@@ -90,11 +88,9 @@ void launch_target_medium_cols(const Tensor& x, const Weight& weight, Tensor& q,
     const TargetOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
         static_cast<__nv_bfloat16*>(gate.data), static_cast<__nv_bfloat16*>(v.data)};
-    q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks>
-        <<<kTargetRows / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
+    launch_q8_a16_grouped_sliced_k_mma<Q8A16GroupedSlicedKMmaSchedule<
+        TileCols, KSplits, NGroups, 1, MinBlocks, kHidden, Cache::cg, Cache::cg, false>>(
+        q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
 }
 
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
@@ -104,21 +100,15 @@ void launch_companion_medium_cols(const Tensor& x, const Weight& weight, Tensor&
     const CompanionOutput output{static_cast<__nv_bfloat16*>(q.data),
                                  static_cast<__nv_bfloat16*>(k.data),
                                  static_cast<__nv_bfloat16*>(v.data)};
-    q8_ksplit_grouped_mma_kernel<kHidden, TileCols, KSplits, NGroups, MinBlocks>
-        <<<kCompanionRows / kRowsPerCta, KSplits * NGroups * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(weight.qdata),
-            static_cast<const std::uint8_t*>(weight.scales), output, x.ne[1]);
+    launch_q8_a16_grouped_sliced_k_mma<Q8A16GroupedSlicedKMmaSchedule<
+        TileCols, KSplits, NGroups, 1, MinBlocks, kHidden, Cache::cg, Cache::cg, false>>(
+        q8_linear_operands(x, weight), output, LinearIdentityEpilogue{}, stream);
 }
 
 } // namespace
 
 void q8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream) {
-    if (fused_route_table("unified/q8_attn_input", x.ne[1]) == LinearRouteTable::Unified) {
-        unified::q8_attn_input_splitk_mma_launch(x, weight, q, gate, k, v, stream);
-        return;
-    }
     if (x.ne[1] < kFirstExactCols || x.ne[1] > 64) {
         throw std::invalid_argument("Q8 attention input split-K MMA requires T=2..64");
     }
@@ -132,10 +122,6 @@ void q8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
 
 void q8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k,
                                      Tensor& v, cudaStream_t stream) {
-    if (fused_route_table("unified/q8_attn_input", x.ne[1]) == LinearRouteTable::Unified) {
-        unified::q8_attn_input_splitk_mma_launch(x, weight, q, k, v, stream);
-        return;
-    }
     if (x.ne[1] < kFirstExactCols || x.ne[1] > 96) {
         throw std::invalid_argument("Q8 companion attention input split-K MMA requires T=2..96");
     }
@@ -151,4 +137,4 @@ void q8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
     CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace ninfer::ops::detail
+} // namespace ninfer::ops::detail::unified

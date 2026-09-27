@@ -60,10 +60,13 @@ survives a second interleaved measurement, and its output matches the compiled r
 | `attn_pv_f16` | FP16 accumulation of the probability-times-value product per key tile | a 1024-token prompt chunk at 32K and a decode step at 131K |
 | `attn_pack_gqa` | the standard INT8 prompt kernel with each KV head's query heads packed into its tiles (PackGQA) | a 1024-token prompt chunk at 32K and 131K |
 | `attn_prompt_fast` | the fast prompt-attention kernel (rows kept in registers, FP16 PV per tile) | a wave-aligned prompt chunk at 32K and 131K |
+| `unified/q4_q5_attn_input`, `unified/q4_q5_gdn_input`, `unified/q4_linear_swiglu`, `unified/q4_linear_add`, `unified/q5_linear_add/5120x<k>` | upstream's routes for the fused groupwise projections over the unified Linear templates (`unified`) instead of this line's own | the model shapes, widths 1 to 64 (the small-T launches only where those are all the switch covers) |
+| `unified/q4_linear_topk`, `unified/q8_*`, `unified/context_kv_materialize` | the same switch for the Q4 top-k head and the Q8 fused projections (attention and GDN inputs, LinearAdd, pair, SwiGLU, top-k, grouped convolution, context-KV materialization) | not calibrated; a profile or `NINFER_LINEAR_ROUTES` sets them |
 | `gdn_two_stage/h<value heads>` | the two-stage GDN prefill (fused Q/K normalization and control preparation, then one FP32-state recurrence that also writes the output) instead of the WY/state-passing/output pipeline | prompts of 16 to 8192 tokens, 48 and 32 value heads |
 
 `NINFER_SMALLT_PV_F16`, `NINFER_PROMPT_PV_F16`, `NINFER_PROMPT_PACK_GQA`, `NINFER_PROMPT_FAST` and
-`NINFER_GDN_TWO_STAGE` (`0` or `1`) override the profile for their route. `--fast-prefill-kernel` turns the fast prompt kernel on regardless.
+`NINFER_GDN_TWO_STAGE` (`0` or `1`) override the profile for their route; `NINFER_LINEAR_ROUTES`
+(`legacy` or `unified`) takes one table for every Linear shape and every `unified/*` switch. `--fast-prefill-kernel` turns the fast prompt kernel on regardless.
 
 ## Batch composition
 

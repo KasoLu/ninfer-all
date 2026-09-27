@@ -1,6 +1,8 @@
 #include "core/weight.h"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_kernels.h"
 
+#include "ops/linear_swiglu/q8/q8_linear_swiglu_kernels_unified.h"
+#include "ops/linear/common/route_table.h"
 #include "core/device.h"
 #include "ops/linear/q8/q8_ksplit_mma.cuh"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_output.cuh"
@@ -58,6 +60,10 @@ constexpr auto kLaunchers =
 
 void q8_linear_swiglu_splitk_exact_t_launch(const Tensor& x, const Weight& w, Tensor& out,
                                             cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_swiglu_splitk_exact_t_launch(x, w, out, stream);
+        return;
+    }
     if (x.ne[1] < kFirstExactT || x.ne[1] > kLastExactT) {
         throw std::invalid_argument("Q8 LinearSwiGLU exact split-K requires T=2..48");
     }

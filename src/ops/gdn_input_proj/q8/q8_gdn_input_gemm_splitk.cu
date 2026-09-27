@@ -1,6 +1,8 @@
 #include "core/weight.h"
 #include "ops/gdn_input_proj/q8/q8_gdn_input_kernels.h"
 
+#include "ops/gdn_input_proj/q8/q8_gdn_input_kernels_unified.h"
+#include "ops/linear/common/route_table.h"
 #include "core/device.h"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
@@ -402,6 +404,10 @@ constexpr auto kRecordLaunchers =
 
 void q8_gdn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                                     cudaStream_t stream) {
+    if (fused_route_table("unified/q8_gdn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_gdn_input_splitk_mma_launch(x, weight, qkv, z, stream);
+        return;
+    }
     const std::int32_t cols = x.ne[1];
     if (cols < kFirstExactCols || cols > 96) {
         throw std::invalid_argument("Q8 GDN split-K MMA requires T=2..96");
@@ -422,6 +428,12 @@ void q8_gdn_input_splitk_conv_snapshot_launch(
     const Tensor& x, const Weight& weight, const Tensor& conv_weight, Tensor& conv_states,
     const Tensor& valid_columns, const Tensor& initial_slot, const Tensor& snapshot_base_slot,
     Tensor& query, Tensor& key, Tensor& value, Tensor& z, cudaStream_t stream) {
+    if (fused_route_table("unified/q8_gdn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_gdn_input_splitk_conv_snapshot_launch(
+            x, weight, conv_weight, conv_states, valid_columns, initial_slot, snapshot_base_slot,
+            query, key, value, z, stream);
+        return;
+    }
     const std::int32_t cols = x.ne[1];
     if (cols < kFirstExactCols || cols > kLastSnapshotExactCols) {
         throw std::invalid_argument("Q8 fused GDN input snapshot requires T=2..16");
@@ -437,6 +449,12 @@ void q8_gdn_input_splitk_conv_record_launch(const Tensor& x, const Weight& weigh
                                             const Tensor& valid_columns, const Tensor& initial_slot,
                                             Tensor& conv_record, Tensor& query, Tensor& key,
                                             Tensor& value, Tensor& z, cudaStream_t stream) {
+    if (fused_route_table("unified/q8_gdn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_gdn_input_splitk_conv_record_launch(x, weight, conv_weight, conv_states,
+                                                        valid_columns, initial_slot, conv_record,
+                                                        query, key, value, z, stream);
+        return;
+    }
     const std::int32_t cols = x.ne[1];
     if (cols < kFirstExactCols || cols > kLastSnapshotExactCols) {
         throw std::invalid_argument("Q8 fused GDN input record requires T=2..16");

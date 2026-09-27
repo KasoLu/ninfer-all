@@ -16,8 +16,11 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_swiglu_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_linear_swiglu_decode.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_dflash2_linear_swiglu.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/q8/q8_dflash2_linear_swiglu_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_linear_swiglu_gemm_mma.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/q8/q8_linear_swiglu_gemm_mma_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_linear_swiglu_gemm_splitk.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/q8/q8_linear_swiglu_gemm_splitk_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8/q8_linear_swiglu_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/../wrapper/linear_swiglu.cpp"
 )

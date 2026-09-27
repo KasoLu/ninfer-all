@@ -2,16 +2,14 @@
 #include "ops/linear_pair/q8/q8_pair_gemm_mma.cuh"
 
 #include "ops/common/math.h"
-#include "ops/linear_pair/q8/q8_pair_kernels.h"
 #include "ops/linear_pair/q8/q8_pair_kernels_unified.h"
-#include "ops/linear/common/route_table.h"
 #include "core/device.h"
 #include "core/tensor.h"
-#include "ops/linear/q8/q8_rowsplit_gemm_simt.cuh"
+#include "ops/linear/q8/q8_simt_launch.cuh"
 
 #include <cstdint>
 
-namespace ninfer::ops::detail {
+namespace ninfer::ops::detail::unified {
 
 namespace {
 
@@ -51,69 +49,38 @@ void launch_tile(bool full, const Tensor& x, const Weight& first_weight,
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int TileCols, bool Full>
-void launch_simt_single(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    constexpr int RowsPerCta      = 8;
-    constexpr int Stages          = 2;
-    const std::int32_t full_slabs = x.ne[0] / 1024;
-    const dim3 grid(static_cast<unsigned>(div_up(out.ne[0], RowsPerCta)),
-                    static_cast<unsigned>(div_up(x.ne[1], TileCols)), 1u);
-    const Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), out.ne[0]};
-    q8_rowsplit_gemm_simt_kernel<Q8RowSplitSimtSchedule, TileCols, RowsPerCta, Stages, Full>
-        <<<grid, RowsPerCta * 32, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                                               static_cast<const std::uint8_t*>(weight.qdata),
-                                               static_cast<const std::uint8_t*>(weight.scales),
-                                               output, out.ne[0], x.ne[0], x.ne[1],
-                                               weight.padded_shape[1], full_slabs);
-}
-
 template <int TileCols>
-void launch_two_simt(bool full, const Tensor& x, const Weight& first_weight,
-                     const Weight& second_weight, Tensor& first_out, Tensor& second_out,
-                     cudaStream_t stream) {
-    if (full) {
-        launch_simt_single<TileCols, true>(x, first_weight, first_out, stream);
-        launch_simt_single<TileCols, true>(x, second_weight, second_out, stream);
-    } else {
-        launch_simt_single<TileCols, false>(x, first_weight, first_out, stream);
-        launch_simt_single<TileCols, false>(x, second_weight, second_out, stream);
-    }
-    CUDA_CHECK(cudaGetLastError());
+void launch_two_simt(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
+                     Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
+    using Schedule = Q8A16SimtSchedule<8, TileCols, 1, 32, 2, Cache::cg, 1>;
+    launch_q8_a16_simt<Schedule>(
+        q8_linear_operands(x, first_weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(first_out.data), first_out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
+    launch_q8_a16_simt<Schedule>(
+        q8_linear_operands(x, second_weight),
+        LinearBf16Output{static_cast<__nv_bfloat16*>(second_out.data), second_out.ne[0]},
+        LinearIdentityEpilogue{}, stream);
 }
 
 } // namespace
 
-void q8_pair_simt_r8_c4_launch(bool full, const Tensor& x, const Weight& first_weight,
+void q8_pair_simt_r8_c4_launch(const Tensor& x, const Weight& first_weight,
                                const Weight& second_weight, Tensor& first_out, Tensor& second_out,
                                cudaStream_t stream) {
-    if (fused_route_table("unified/q8_linear_pair", x.ne[1]) == LinearRouteTable::Unified) {
-        unified::q8_pair_simt_r8_c4_launch(x, first_weight, second_weight, first_out, second_out,
-                                           stream);
-        return;
-    }
-    launch_two_simt<4>(full, x, first_weight, second_weight, first_out, second_out, stream);
+    launch_two_simt<4>(x, first_weight, second_weight, first_out, second_out, stream);
 }
 
 void q8_pair_gemm_mma_r32_c64_launch(bool full, const Tensor& x, const Weight& first_weight,
                                      const Weight& second_weight, Tensor& first_out,
                                      Tensor& second_out, cudaStream_t stream) {
-    if (fused_route_table("unified/q8_linear_pair", x.ne[1]) == LinearRouteTable::Unified) {
-        unified::q8_pair_gemm_mma_r32_c64_launch(full, x, first_weight, second_weight, first_out,
-                                                 second_out, stream);
-        return;
-    }
     launch_tile<64>(full, x, first_weight, second_weight, first_out, second_out, stream);
 }
 
 void q8_pair_gemm_mma_r32_c128_launch(bool full, const Tensor& x, const Weight& first_weight,
                                       const Weight& second_weight, Tensor& first_out,
                                       Tensor& second_out, cudaStream_t stream) {
-    if (fused_route_table("unified/q8_linear_pair", x.ne[1]) == LinearRouteTable::Unified) {
-        unified::q8_pair_gemm_mma_r32_c128_launch(full, x, first_weight, second_weight, first_out,
-                                                  second_out, stream);
-        return;
-    }
     launch_tile<128>(full, x, first_weight, second_weight, first_out, second_out, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace ninfer::ops::detail::unified

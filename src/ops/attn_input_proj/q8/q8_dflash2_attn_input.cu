@@ -1,6 +1,8 @@
 #include "core/weight.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_kernels.h"
 
+#include "ops/attn_input_proj/q8/q8_attn_input_kernels_unified.h"
+#include "ops/linear/common/route_table.h"
 #include "core/device.h"
 #include "core/pdl.cuh"
 #include "ops/common/math.h"
@@ -105,6 +107,10 @@ void launch_mma(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Ten
 
 void q8_dflash2_attn_input_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                           Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (fused_route_table("unified/q8_attn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_dflash2_attn_input_small_t_launch(x, weight, q, k, v, stream);
+        return;
+    }
     if (x.ne[1] < 1 || x.ne[1] > kLastSmallTokens) {
         throw std::invalid_argument("Q8 DFlash2 attention input small-T: unsupported T");
     }
@@ -116,18 +122,30 @@ void q8_dflash2_attn_input_small_t_launch(const Tensor& x, const Weight& weight,
 
 void q8_dflash2_attn_input_mma_r32_c64_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                               Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (fused_route_table("unified/q8_attn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_dflash2_attn_input_mma_r32_c64_launch(x, weight, q, k, v, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<32, 64, 32, 16, 3>;
     launch_mma<Schedule>(x, weight, q, k, v, stream);
 }
 
 void q8_dflash2_attn_input_mma_r64_c128_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                                Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (fused_route_table("unified/q8_attn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_dflash2_attn_input_mma_r64_c128_launch(x, weight, q, k, v, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2, 2>;
     launch_mma<Schedule>(x, weight, q, k, v, stream);
 }
 
 void q8_dflash2_attn_input_mma_r16_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& q,
                                                    Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (fused_route_table("unified/q8_attn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_dflash2_attn_input_mma_r16_c64_k128_launch(x, w, q, k, v, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<16, 64, 16, 16, 1, 2, 128, 1>;
     // This route owns only the partial 49..63-column tile.
     launch_mma<Schedule, false>(x, w, q, k, v, stream);
@@ -135,12 +153,20 @@ void q8_dflash2_attn_input_mma_r16_c64_k128_launch(const Tensor& x, const Weight
 
 void q8_dflash2_attn_input_mma_r32_c32_k128_launch(const Tensor& x, const Weight& w, Tensor& q,
                                                    Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (fused_route_table("unified/q8_attn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_dflash2_attn_input_mma_r32_c32_k128_launch(x, w, q, k, v, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<32, 32, 16, 16, 1, 2, 128, 1>;
     launch_mma<Schedule>(x, w, q, k, v, stream);
 }
 
 void q8_dflash2_attn_input_mma_r32_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& q,
                                                    Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (fused_route_table("unified/q8_attn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_dflash2_attn_input_mma_r32_c64_k128_launch(x, w, q, k, v, stream);
+        return;
+    }
     // Three-block launch bounds reduce register usage and keep all 384 decode CTAs in one wave.
     using Schedule = Q8RowSplitMmaGemmSchedule<32, 64, 16, 16, 3, 2, 128, 1>;
     launch_mma<Schedule>(x, w, q, k, v, stream);

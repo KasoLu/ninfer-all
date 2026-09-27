@@ -2,6 +2,8 @@
 #include "ops/linear_pair/q8/q8_pair_kernels.h"
 #include "ops/linear_pair/q8/q8_pair_plan.h"
 
+#include "ops/linear_pair/q8/q8_pair_kernels_unified.h"
+#include "ops/linear/common/route_table.h"
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/linear/q8/q8_rowsplit_gemm_mma.cuh"
@@ -87,6 +89,11 @@ void require_adjacent(const Weight& first_weight, const Weight& second_weight) {
 void q8_pair_concat_mma_launch(Q8PairScheduleId schedule, bool full, const Tensor& x,
                                const Weight& first_weight, const Weight& second_weight,
                                Tensor& first_out, Tensor& second_out, cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_pair", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_pair_concat_mma_launch(schedule, x, first_weight, second_weight, first_out,
+                                           second_out, stream);
+        return;
+    }
     require_adjacent(first_weight, second_weight);
     switch (schedule) {
     case Q8PairScheduleId::ConcatMmaR32C64:

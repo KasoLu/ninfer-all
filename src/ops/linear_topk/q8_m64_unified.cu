@@ -1,13 +1,11 @@
 #include "core/weight.h"
-#include "ops/linear_topk/linear_topk_launch.h"
-
 #include "ops/linear_topk/linear_topk_launch_unified.h"
-#include "ops/linear/common/route_table.h"
+
 #include "core/device.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/score_id_order.cuh"
-#include "ops/linear/q8/q8_ksplit_mma.cuh"
+#include "ops/linear/q8/q8_sliced_k_launch.cuh"
 #include "ops/linear_topk/linear_topk_workspace.h"
 
 #include <cub/warp/warp_merge_sort.cuh>
@@ -15,7 +13,7 @@
 #include <cstdint>
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace ninfer::ops::detail::unified {
 namespace {
 
 constexpr int kGroupsPerRow = kLinearTopKHidden / 32;
@@ -93,7 +91,7 @@ __launch_bounds__(M64Schedule<TileColumns, kBlockK, kRowsPerProducer>::kThreads,
     extern __shared__ __align__(16) unsigned char shared_bytes[];
     auto& reusable = *reinterpret_cast<M64ReusableStorage<TileColumns, kBlockK, kRowsPerProducer>*>(
         shared_bytes);
-    auto* top_keys = reinterpret_cast<std::uint64_t(*)[kLinearTopK]>(
+    auto* top_keys = reinterpret_cast<std::uint64_t (*)[kLinearTopK]>(
         shared_bytes + sizeof(M64ReusableStorage<TileColumns, kBlockK, kRowsPerProducer>));
     const int column_begin = static_cast<int>(blockIdx.y) * TileColumns;
     const int live_columns = min(TileColumns, columns - column_begin);
@@ -207,8 +205,8 @@ __launch_bounds__(M64Schedule<TileColumns, kBlockK, kRowsPerProducer>::kThreads,
                     cp_commit();
                 }
 
-                const auto load_fragments = [&](int k_step, unsigned(&a)[4],
-                                                unsigned(&b)[kTokenMmas][2]) {
+                const auto load_fragments = [&](int k_step, unsigned (&a)[4],
+                                                unsigned (&b)[kTokenMmas][2]) {
                     const int weight_row = warp_row * 16 + a_rowoff;
                     const int weight_col = k_step * 16 + a_coloff;
                     ldmatrix_x4(
@@ -350,10 +348,6 @@ void launch_tile(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
 
 void linear_topk_q8_m64_launch(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
                                const LinearTopKWorkspace& workspace, cudaStream_t stream) {
-    if (fused_route_table("unified/q8_linear_topk", hidden.ne[1]) == LinearRouteTable::Unified) {
-        unified::linear_topk_q8_m64_launch(hidden, head, valid_rows, workspace, stream);
-        return;
-    }
     switch (workspace.tile_columns) {
     case 32:
         return launch_tile<32, 128, 128>(hidden, head, valid_rows, workspace, stream);
@@ -376,4 +370,4 @@ void linear_topk_q8_m64_launch(const Tensor& hidden, const Weight& head, std::in
     }
     throw std::invalid_argument("invalid linear_topk MMA tile");
 }
-} // namespace ninfer::ops::detail
+} // namespace ninfer::ops::detail::unified

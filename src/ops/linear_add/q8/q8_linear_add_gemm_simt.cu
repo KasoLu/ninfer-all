@@ -1,6 +1,8 @@
 #include "core/weight.h"
 #include "ops/linear_add/q8/q8_linear_add_kernels.h"
 
+#include "ops/linear_add/q8/q8_linear_add_kernels_unified.h"
+#include "ops/linear/common/route_table.h"
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/linear/q8/q8_rowsplit_gemm_simt.cuh"
@@ -128,26 +130,46 @@ void launch_variant(bool full, const Tensor& x, const Weight& w, Tensor& residua
 
 void q8_linear_add_decode_r4_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                     cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_add", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_add_decode_r4_launch(x, w, residual_out, stream);
+        return;
+    }
     launch_decode<4>(x, w, residual_out, stream);
 }
 
 void q8_linear_add_decode_r8_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                     cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_add", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_add_decode_r8_launch(x, w, residual_out, stream);
+        return;
+    }
     launch_decode<8>(x, w, residual_out, stream);
 }
 
 void q8_linear_add_decode_r16_launch(const Tensor& x, const Weight& w, Tensor& residual_out,
                                      cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_add", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_add_decode_r16_launch(x, w, residual_out, stream);
+        return;
+    }
     launch_decode<16>(x, w, residual_out, stream);
 }
 
 void q8_linear_add_simt_r8_c4_launch(bool full, const Tensor& x, const Weight& w,
                                      Tensor& residual_out, cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_add", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_add_simt_r8_c4_launch(x, w, residual_out, stream);
+        return;
+    }
     launch_variant<4>(full, x, w, residual_out, stream);
 }
 
 void q8_linear_add_simt_r8_c8_launch(bool full, const Tensor& x, const Weight& w,
                                      Tensor& residual_out, cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_add", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_add_simt_r8_c8_launch(x, w, residual_out, stream);
+        return;
+    }
     launch_variant<8>(full, x, w, residual_out, stream);
 }
 

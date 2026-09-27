@@ -1,5 +1,7 @@
 #include "ops/linear_add/q8/q8_linear_add_kernels.h"
 
+#include "ops/linear_add/q8/q8_linear_add_kernels_unified.h"
+#include "ops/linear/common/route_table.h"
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/linear/q8/q8_ksplit_grouped_mma.cuh"
@@ -25,6 +27,10 @@ void launch(const Tensor& x, const Weight& w, Tensor& residual, cudaStream_t str
 
 void q8_linear_add_grouped_launch(const Tensor& x, const Weight& w, Tensor& residual,
                                   cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_add", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_add_grouped_launch(x, w, residual, stream);
+        return;
+    }
     if (w.k == 6144) {
         launch<6144>(x, w, residual, stream);
     } else {

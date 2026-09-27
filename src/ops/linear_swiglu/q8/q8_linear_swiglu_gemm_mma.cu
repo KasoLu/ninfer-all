@@ -1,6 +1,8 @@
 #include "core/weight.h"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_kernels.h"
 
+#include "ops/linear_swiglu/q8/q8_linear_swiglu_kernels_unified.h"
+#include "ops/linear/common/route_table.h"
 #include "core/device.h"
 #include "ops/common/math.h"
 #include "ops/linear/q8/q8_rowsplit_gemm_mma.cuh"
@@ -34,90 +36,150 @@ void launch_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
 
 void q8_linear_swiglu_mma_r32_c32_launch(const Tensor& x, const Weight& w, Tensor& out,
                                          cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_swiglu_mma_r32_c32_launch(x, w, out, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<32, 32, 32, 16, 4>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
 void q8_linear_swiglu_mma_r32_c48_launch(const Tensor& x, const Weight& w, Tensor& out,
                                          cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_swiglu_mma_r32_c48_launch(x, w, out, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<32, 48, 32, 16, 4>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
 void q8_linear_swiglu_mma_r32_c64_launch(const Tensor& x, const Weight& w, Tensor& out,
                                          cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_swiglu_mma_r32_c64_launch(x, w, out, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<32, 64, 32, 16, 3>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
 void q8_linear_swiglu_mma_r32_c80_launch(const Tensor& x, const Weight& w, Tensor& out,
                                          cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_swiglu_mma_r32_c80_launch(x, w, out, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<32, 80, 32, 16, 3>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
 void q8_linear_swiglu_mma_r32_c96_launch(const Tensor& x, const Weight& w, Tensor& out,
                                          cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_swiglu_mma_r32_c96_launch(x, w, out, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<32, 96, 32, 16, 2>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
 void q8_linear_swiglu_mma_r32_c128_launch(const Tensor& x, const Weight& w, Tensor& out,
                                           cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_swiglu_mma_r32_c128_launch(x, w, out, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<32, 128, 32, 16, 2>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
 void q8_linear_swiglu_mma_r64_c64_launch(const Tensor& x, const Weight& w, Tensor& out,
                                          cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_swiglu_mma_r64_c64_launch(x, w, out, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<64, 64, 64, 16, 2>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
 void q8_linear_swiglu_mma_r64_c96_launch(const Tensor& x, const Weight& w, Tensor& out,
                                          cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_swiglu_mma_r64_c96_launch(x, w, out, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<64, 96, 64, 16, 2>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
 void q8_linear_swiglu_mma_r64_c128_launch(const Tensor& x, const Weight& w, Tensor& out,
                                           cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_swiglu_mma_r64_c128_launch(x, w, out, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<64, 128, 64, 16, 2>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
 void q8_linear_swiglu_mma_r128_c64_launch(const Tensor& x, const Weight& w, Tensor& out,
                                           cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_swiglu_mma_r128_c64_launch(x, w, out, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<128, 64, 64, 16, 2>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
 void q8_linear_swiglu_mma_r128_c80_launch(const Tensor& x, const Weight& w, Tensor& out,
                                           cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_linear_swiglu_mma_r128_c80_launch(x, w, out, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<128, 80, 64, 16, 2>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
 void q8_dflash2_linear_swiglu_mma_r32_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& out,
                                                       cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_dflash2_linear_swiglu_mma_r32_c64_k128_launch(x, w, out, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<32, 64, 16, 16, 3, 2, 128, 1>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
 void q8_dflash2_linear_swiglu_mma_r64_c64_k128_launch(const Tensor& x, const Weight& w, Tensor& out,
                                                       cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_dflash2_linear_swiglu_mma_r64_c64_k128_launch(x, w, out, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<64, 64, 32, 16, 2, 2, 128, 1>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
 void q8_dflash2_linear_swiglu_mma_r64_c80_k128_launch(const Tensor& x, const Weight& w, Tensor& out,
                                                       cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_dflash2_linear_swiglu_mma_r64_c80_k128_launch(x, w, out, stream);
+        return;
+    }
     using Schedule = Q8RowSplitMmaGemmSchedule<64, 80, 64, 8, 2, 2, 128, 1>;
     launch_route<Schedule>(x, w, out, stream);
 }
 
 void q8_dflash2_linear_swiglu_mma_r64_c96_k128_launch(const Tensor& x, const Weight& w, Tensor& out,
                                                       cudaStream_t stream) {
+    if (fused_route_table("unified/q8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::q8_dflash2_linear_swiglu_mma_r64_c96_k128_launch(x, w, out, stream);
+        return;
+    }
 #if defined(NINFER_SM8X_COMPAT)
     // BK=128 costs 64*128*2 + 96*128*2 + 64*128 + 64*16 = 50176 B of static shared memory,
     // over sm_86's 49152 B cap (the linker rejects it at 0xc400). Halving the K tile costs
