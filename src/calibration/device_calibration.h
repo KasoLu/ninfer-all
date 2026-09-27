@@ -20,6 +20,7 @@ struct CalibrationOptions {
     bool ternary   = true; // T2G128 projections (Ternary Bonsai 2)
     bool groupwise = true; // Q4/Q5 fused projections (Qwen3.6/3.8-27B groupwise-int)
     bool attention = true; // INT8-family small-T attention launch tiers
+    bool linear_attention = true; // GDN prefill algorithm per prompt width
     int warmup     = 2;
     int repeat     = 11;
     double margin  = 0.03;

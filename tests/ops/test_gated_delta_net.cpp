@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -222,8 +223,8 @@ int inplace_case(const Case& test_case, std::uint32_t seed) {
     failures += out.verify_guards((label + " out").c_str());
     failures += verify_common_inputs_unchanged(label, in, device.q, device.k, device.v, device.g,
                                                device.beta);
-    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
-        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+    if (workspace.used() != 0 || workspace.peak_used() > workspace_bytes) {
+        std::cerr << label << ": workspace was not released or exceeded its capacity query\n";
         ++failures;
     }
     return failures;
@@ -275,8 +276,8 @@ int distinct_state_case(const Case& test_case, std::uint32_t seed) {
     failures += out.verify_guards((label + " out").c_str());
     failures += verify_common_inputs_unchanged(label, in, device.q, device.k, device.v, device.g,
                                                device.beta);
-    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
-        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+    if (workspace.used() != 0 || workspace.peak_used() > workspace_bytes) {
+        std::cerr << label << ": workspace was not released or exceeded its capacity query\n";
         ++failures;
     }
     return failures;
@@ -455,6 +456,13 @@ int main() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
+    // This suite qualifies the WY/state-passing prefill whatever the device profile routes;
+    // ninfer_gated_delta_net_two_stage_test qualifies the two-stage one. Read once, at first use.
+#ifdef _WIN32
+    _putenv_s("NINFER_GDN_TWO_STAGE", "0");
+#else
+    setenv("NINFER_GDN_TWO_STAGE", "0", 1);
+#endif
 
     int failures = 0;
 

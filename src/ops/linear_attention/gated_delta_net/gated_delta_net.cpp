@@ -4,13 +4,17 @@
 
 #include "core/device.h"
 #include "core/layout.h"
+#include "ops/common/device_route.h"
 #include "ops/common/math.h"
 #include "ops/linear_attention/gated_delta_net/common.h"
 #include "ops/linear_attention/gated_delta_net/launch.h"
+#include "ops/linear_attention/gated_delta_net/two_stage/launch.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -204,6 +208,86 @@ ChunkedWorkspace allocate_chunked_workspace(Allocator& allocator, std::int32_t q
     return out;
 }
 
+// The two-stage prefill against the WY/state-passing/output pipeline, per prompt width: the device
+// profile's "gdn_two_stage/h<value heads>" entry, or NINFER_GDN_TWO_STAGE=0/1 for every width.
+bool two_stage_route(std::int32_t value_heads, std::int32_t tokens) {
+    if (tokens < detail::gated_delta_net::two_stage::kMinTokens) { return false; }
+    static const int forced = [] {
+        const char* value = std::getenv("NINFER_GDN_TWO_STAGE");
+        return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
+    }();
+    if (forced >= 0) { return forced == 1; }
+    return device_route_schedule("gdn_two_stage/h" + std::to_string(value_heads), tokens) == "on";
+}
+
+struct TwoStageWorkspace {
+    DeviceSpan packets;
+    // FP32 running state for the two-stage kernels when either stored state is FP16.
+    Tensor state_fp32;
+};
+
+template <class Allocator>
+TwoStageWorkspace allocate_two_stage_workspace(Allocator& allocator, std::int32_t qk_heads,
+                                               std::int32_t value_heads, std::int32_t tokens) {
+    TwoStageWorkspace out;
+    if (tokens < detail::gated_delta_net::two_stage::kMinTokens) { return out; }
+    out.packets = allocator.alloc_bytes(
+        detail::gated_delta_net::two_stage::workspace_layout(qk_heads, value_heads, tokens)
+            .total_bytes);
+    out.state_fp32 =
+        allocator.alloc(DType::FP32, {detail::gated_delta_net::kStateDim,
+                                      detail::gated_delta_net::kStateDim, value_heads});
+    return out;
+}
+
+void run_two_stage(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
+                   const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
+                   const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
+                   cudaStream_t stream) {
+    namespace two_stage       = detail::gated_delta_net::two_stage;
+    auto scratch_scope        = ws.scope();
+    TwoStageWorkspace scratch = allocate_two_stage_workspace(ws, q.ne[1], v.ne[1], q.ne[2]);
+    const auto layout         = two_stage::workspace_layout(q.ne[1], v.ne[1], q.ne[2]);
+    auto* qk = static_cast<two_stage::QkChunk*>(layout.qk.bind(scratch.packets).data);
+    auto* control =
+        static_cast<two_stage::ControlChunk*>(layout.control.bind(scratch.packets).data);
+
+    const bool staged = ssm_state_in.dtype == DType::FP16 || ssm_state_out.dtype == DType::FP16;
+    if (staged) {
+        if (ssm_state_in.dtype == DType::FP16) {
+            detail::gated_delta_net::widen_state_fp16_to_fp32(ssm_state_in, scratch.state_fp32,
+                                                              stream);
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(scratch.state_fp32.data, ssm_state_in.data,
+                                       ssm_state_in.bytes(), cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+    const two_stage::Arguments args{
+        static_cast<const __nv_bfloat16*>(q.data),
+        static_cast<const __nv_bfloat16*>(k.data),
+        static_cast<const __nv_bfloat16*>(v.data),
+        static_cast<const float*>(g.data),
+        static_cast<const float*>(beta.data),
+        static_cast<const float*>(staged ? scratch.state_fp32.data : ssm_state_in.data),
+        static_cast<float*>(staged ? scratch.state_fp32.data : ssm_state_out.data),
+        static_cast<__nv_bfloat16*>(out.data),
+        q.ne[1],
+        v.ne[1],
+        q.ne[2],
+        scale};
+    two_stage::launch_prepare(args, qk, control, normalize_qk, stream);
+    two_stage::launch_recurrence(args, qk, control, stream);
+    if (staged) {
+        if (ssm_state_out.dtype == DType::FP16) {
+            detail::gated_delta_net::narrow_state_fp32_to_fp16(scratch.state_fp32, ssm_state_out,
+                                                               stream);
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(ssm_state_out.data, scratch.state_fp32.data,
+                                       ssm_state_out.bytes(), cudaMemcpyDeviceToDevice, stream));
+        }
+    }
+}
+
 } // namespace
 
 std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t qk_heads,
@@ -214,9 +298,12 @@ std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t qk_heads,
         max_tokens < min_tokens) {
         throw std::invalid_argument("gated_delta_net workspace: invalid profile or interval");
     }
-    WorkspaceLayoutBuilder layout;
-    (void)allocate_chunked_workspace(layout, qk_heads, value_heads, max_tokens, normalize_qk);
-    return layout.peak_bytes(1);
+    // Either prefill algorithm may serve any width the route admits it for.
+    WorkspaceLayoutBuilder chunked;
+    (void)allocate_chunked_workspace(chunked, qk_heads, value_heads, max_tokens, normalize_qk);
+    WorkspaceLayoutBuilder two_stage;
+    (void)allocate_two_stage_workspace(two_stage, qk_heads, value_heads, max_tokens);
+    return std::max(chunked.peak_bytes(1), two_stage.peak_bytes(1));
 }
 
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
@@ -253,6 +340,11 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                      const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
                      cudaStream_t stream) {
     validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
+    if (two_stage_route(v.ne[1], q.ne[2])) {
+        run_two_stage(q, k, v, g, beta, scale, normalize_qk, ws, ssm_state_in, ssm_state_out, out,
+                      stream);
+        return;
+    }
 
     auto scratch_scope   = ws.scope();
     const std::int32_t T = q.ne[2];

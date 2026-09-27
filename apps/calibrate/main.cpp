@@ -21,14 +21,15 @@
 namespace {
 
 [[noreturn]] void usage(const char* program, int code) {
-    std::fprintf(code == 0 ? stdout : stderr,
-                 "usage: %s [--device N] [--out PATH] [--print] [--repeat N] [--margin F]\n"
-                 "          [--no-ternary] [--no-groupwise] [--no-attention] [--only PREFIX]\n"
-                 "          [--detail] [--quiet]\n"
-                 "  Times every route a device profile can steer on this GPU and stores the profile\n"
-                 "  at PATH (default: $NINFER_DEVICE_PROFILES, else the user cache). --only limits\n"
-                 "  it to the route keys starting with PREFIX; --detail logs every candidate.\n",
-                 program);
+    std::fprintf(
+        code == 0 ? stdout : stderr,
+        "usage: %s [--device N] [--out PATH] [--print] [--repeat N] [--margin F]\n"
+        "          [--no-ternary] [--no-groupwise] [--no-attention]\n"
+        "          [--no-linear-attention] [--only PREFIX] [--detail] [--quiet]\n"
+        "  Times every route a device profile can steer on this GPU and stores the profile\n"
+        "  at PATH (default: $NINFER_DEVICE_PROFILES, else the user cache). --only limits\n"
+        "  it to the route keys starting with PREFIX; --detail logs every candidate.\n",
+        program);
     std::exit(code);
 }
 
@@ -62,6 +63,8 @@ int main(int argc, char** argv) {
             options.groupwise = false;
         } else if (arg == "--no-attention") {
             options.attention = false;
+        } else if (arg == "--no-linear-attention") {
+            options.linear_attention = false;
         } else if (arg == "--only") {
             options.only = value();
         } else if (arg == "--detail") {

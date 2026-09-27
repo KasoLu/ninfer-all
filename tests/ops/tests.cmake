@@ -10,6 +10,7 @@ set(ninfer_op_tests
   gated_rmsnorm
   l2norm
   gated_delta_net
+  gated_delta_net_two_stage
   causal_conv1d_silu
   layer_norm
   embedding
@@ -225,6 +226,11 @@ foreach(mode IN ITEMS ngram-only onehot-distribution mtp-onehot mtp-distribution
 endforeach()
 set_tests_properties(ninfer_speculative_wide_accept_test PROPERTIES TIMEOUT 600)
 set_tests_properties(ninfer_speculative_wide_distribution_test PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
+
+add_test(NAME ninfer_gdn_state_fp16_two_stage_test
+  COMMAND ninfer_tests ninfer_gdn_state_fp16_test 64 --two-stage)
+set_tests_properties(ninfer_gdn_state_fp16_two_stage_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 
 add_test(NAME ninfer_gdn_replay_fold_wide_test
   COMMAND ninfer_tests ninfer_gdn_replay_fold_test --wide-only)

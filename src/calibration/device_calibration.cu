@@ -7,6 +7,7 @@
 #include "core/paged_kv_storage.h"
 #include "core/tensor.h"
 #include "core/weight.h"
+#include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
@@ -37,6 +38,14 @@ __global__ void fill_u16_kernel(std::uint16_t* values, std::uint64_t count, std:
     for (std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          index < count; index += stride) {
         values[index] = bits;
+    }
+}
+
+__global__ void fill_f32_kernel(float* values, std::uint64_t count, float value) {
+    const std::uint64_t stride = static_cast<std::uint64_t>(gridDim.x) * blockDim.x;
+    for (std::uint64_t index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < count; index += stride) {
+        values[index] = value;
     }
 }
 
@@ -554,6 +563,75 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
 // The INT8-family small-T partial kernel's tiers. A serving process captures its graphs over an
 // envelope as wide as the KV capacity, so the tier is chosen per envelope and has to serve every
 // depth below it: each envelope is timed at its full depth and at a sixteenth of it.
+// The two-stage GDN prefill against the WY/state-passing pipeline at the prompt widths prefill
+// takes, for the 27B's 48 value heads and the 35B-A3B's 32 (16 query/key heads each).
+void calibrate_linear_attention(ops::DeviceRouteProfile& profile, Timer& timer,
+                                const CalibrationOptions& options) {
+    constexpr std::int32_t state_dim       = 128;
+    constexpr std::int32_t qk_heads        = 16;
+    const std::vector<std::int32_t> widths = {16,  32,  48,   64,   96,   128,
+                                              256, 512, 1024, 2048, 4096, 8192};
+    const std::int32_t max_tokens          = widths.back();
+    const float scale                      = 1.0f / std::sqrt(static_cast<float>(state_dim));
+    for (const std::int32_t value_heads : {48, 32}) {
+        const auto f32_buffer = [](std::size_t elements, float value) {
+            DeviceBuffer buffer(std::max<std::size_t>(elements * 4, 256));
+            fill_f32_kernel<<<fill_grid(elements), 256>>>(static_cast<float*>(buffer.p), elements,
+                                                          value);
+            CUDA_CHECK(cudaGetLastError());
+            return buffer;
+        };
+        const std::size_t qk_elements = static_cast<std::size_t>(state_dim) * qk_heads * max_tokens;
+        const std::size_t value_elements =
+            static_cast<std::size_t>(state_dim) * value_heads * max_tokens;
+        const std::size_t gate_elements = static_cast<std::size_t>(value_heads) * max_tokens;
+        const std::size_t state_elements =
+            static_cast<std::size_t>(state_dim) * state_dim * value_heads;
+        DeviceBuffer q         = bf16_buffer(qk_elements);
+        DeviceBuffer k         = bf16_buffer(qk_elements);
+        DeviceBuffer v         = bf16_buffer(value_elements);
+        DeviceBuffer out       = bf16_buffer(value_elements);
+        DeviceBuffer g         = f32_buffer(gate_elements, -0.05f);
+        DeviceBuffer beta      = f32_buffer(gate_elements, 0.5f);
+        DeviceBuffer state_in  = f32_buffer(state_elements, 0.0f);
+        DeviceBuffer state_out = f32_buffer(state_elements, 0.0f);
+        WorkspaceArena workspace(
+            std::max<std::size_t>(ops::gated_delta_net_workspace_capacity_bytes(
+                                      qk_heads, value_heads, true, 1, max_tokens),
+                                  256));
+        const auto run = [&](std::int32_t tokens, cudaStream_t stream) {
+            const Tensor qt(q.p, DType::BF16, {state_dim, qk_heads, tokens});
+            const Tensor kt(k.p, DType::BF16, {state_dim, qk_heads, tokens});
+            const Tensor vt(v.p, DType::BF16, {state_dim, value_heads, tokens});
+            const Tensor gt(g.p, DType::FP32, {value_heads, tokens});
+            const Tensor bt(beta.p, DType::FP32, {value_heads, tokens});
+            const Tensor st_in(state_in.p, DType::FP32, {state_dim, state_dim, value_heads});
+            Tensor st_out(state_out.p, DType::FP32, {state_dim, state_dim, value_heads});
+            Tensor ot(out.p, DType::BF16, {state_dim, value_heads, tokens});
+            ops::gated_delta_net(qt, kt, vt, gt, bt, scale, true, workspace, st_in, st_out, ot,
+                                 stream);
+        };
+        const Family family{"gdn_two_stage/h" + std::to_string(value_heads),
+                            {"on"},
+                            widths,
+                            run,
+                            [&](std::int32_t tokens) {
+                                return std::pair<const void*, std::size_t>{
+                                    out.p,
+                                    static_cast<std::size_t>(state_dim) * value_heads * tokens};
+                            },
+                            {}};
+        auto bands = sweep(family, timer, options);
+        if (!bands.empty()) {
+            // Past the widest measured prompt both algorithms scale linearly in its chunks.
+            bands.back().last          = std::numeric_limits<std::int32_t>::max();
+            profile.routes[family.key] = std::move(bands);
+            ops::install_device_route_profile(
+                std::make_shared<const ops::DeviceRouteProfile>(profile));
+        }
+    }
+}
+
 void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
                          const CalibrationOptions& options, KvCacheStorage storage,
                          const char* coding) {
@@ -773,6 +851,7 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
     Timer timer(options);
     if (options.ternary) { calibrate_ternary(profile, timer, options); }
     if (options.groupwise) { calibrate_groupwise(profile, timer, options); }
+    if (options.linear_attention) { calibrate_linear_attention(profile, timer, options); }
     if (options.attention) {
         calibrate_attention(profile, timer, options, KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,
                             "rk8v4");

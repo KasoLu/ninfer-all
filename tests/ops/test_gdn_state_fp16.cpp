@@ -19,9 +19,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <random>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -39,6 +41,14 @@ constexpr int kSteps = 4096;
 
 int main(int argc, char** argv) {
     const int width = argc > 1 ? std::atoi(argv[1]) : 1; // tokens per call: 1 = decode, 4 = MTP3
+    if (argc > 2 && std::string_view(argv[2]) == "--two-stage") {
+        // Prefill widths through the two-stage kernels, which stage an FP16 state through FP32.
+#ifdef _WIN32
+        _putenv_s("NINFER_GDN_TWO_STAGE", "1");
+#else
+        setenv("NINFER_GDN_TWO_STAGE", "1", 1);
+#endif
+    }
     try {
         std::mt19937 rng(0x5eed);
         std::normal_distribution<float> normal(0.0F, 1.0F);
