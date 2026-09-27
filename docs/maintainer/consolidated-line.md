@@ -136,6 +136,10 @@ requests and `master`), each change re-applied on this tree and opt-in where it 
 | Ian Ranson (Wallawalla47) | ModelOpt NVFP4/FP8 and Quasar NVFP4 conversion, the `grouped_mse` scale search | `tools/convert/` |
 | MGS Creativa, IMGillusion, Alexey Dubkov, Duncan Betts, giveen | a Vision loan takes only pages no reservation needs; LRU disk-tier eviction and positioned I/O; a quoted parameter closer stays inside its value; the fused RMSNorm and NVFP4 attention input at every width; the shared catalog default | `runtime/engine/context_cache/`, `core/disk_kv_*`, `models/qwen3_5/frontend/tool_call_parser.cpp`, `ops/attn_input_proj/nvfp4/` |
 | [Neroued/ninfer](https://github.com/Neroued/ninfer) `master` | the unified Q4, Q5, Q6 and Q8 A16 Linear templates with sliced-K schedules, beside this line's routes and kernels; each card class takes them only in the width bands where two sweeps on an RTX 3090, 4090 and 5090 measured them faster, and `NINFER_LINEAR_ROUTES=legacy\|unified` forces one table | `ops/linear/common/route_table.{h,cpp}`, `ops/linear/q{4,5,6,8}/` |
+| [Neroued/ninfer](https://github.com/Neroued/ninfer) `master` | the unified FP8, NVFP4 and BF16 Linear templates, and upstream's moves of the Q4, Q5, Q8, FP8, NVFP4 and BF16 fused projections onto them (attention and GDN inputs with their conv forms, LinearAdd, SwiGLU, the Q8 pair, the top-k heads, the Q8 grouped convolution and context-KV materialization), compiled beside this line's routes in `ops::detail::unified`; the FP8, NVFP4 and BF16 Linear shapes take them per width through `LinearRouteFamily` bands and each fused Op through its `unified/<op>` device-profile key, only where measured faster on the card | `ops/linear/common/route_table.{h,cpp}`, `ops/linear/{fp8,nvfp4,bf16}/`, `ops/{attn_input_proj,gdn_input_proj,linear_add,linear_swiglu,linear_pair,linear_topk,context_kv_materialize,dynamic_grouped_conv}/` |
+| [Neroued/ninfer](https://github.com/Neroued/ninfer) `master` | the two-stage GDN prefill: one pass normalizes Q and K and prepares the gates, then one FP32-state recurrence also writes the output, in place of the WY, state-passing and output kernels, from 16 tokens where the profile's `gdn_two_stage/h<value heads>` says so or `NINFER_GDN_TWO_STAGE=1` | `ops/linear_attention/gated_delta_net/two_stage/` |
+| Gideon Zenz | PackGQA: each KV head's query heads packed into the INT8 prompt kernel's tiles, where the profile's `attn_pack_gqa` says so or `NINFER_PROMPT_PACK_GQA=1` | `ops/softmax_attention/dense/causal_cache/prompt.cu` |
+| this line, found in the port | kernels set their dynamic shared memory once per device rather than once per process, so a second GPU no longer launches without it; a forwarded call stays inside upstream's domain (the FP8 GDN record through 16 columns, the NVFP4 snapshot's A16 schedules through 16) and reads the integer-A8 policies as A16, as this line's plans do; the NVFP4 record's small-T launch follows its snapshot's table; a workspace query sizes each width for the table that serves it; on sm_8x the BF16 TMA route falls back to the cp.async MMA of the same tile | `core/device.h`, `ops/linear/common/route_table.h`, `ops/*/fp8/`, `ops/*/nvfp4/`, `ops/linear/bf16/bf16_a16_tma_mma.cuh` |
 | this line, found in the sweep | the FP8 small-T attention reduces its partials through the shared reducer (its own copy faulted on sm_120a, also on `master`); the GDN record kernel runs window by window past 16 columns; the stale private reclaim follows `--recency-eviction`'s order and counts the checkpoints it drops; the issue #251 reclaim spares the shared prefix a capture extends | `ops/softmax_attention/dense/causal_cache/small_t_fp8.cu`, `ops/linear_attention/gated_delta_net/recurrent.cuh`, `runtime/engine/context_cache/resource_manager.h` |
 
 Assessed in this sweep and not taken: the per-search planning window restart, whose search the
@@ -144,9 +148,7 @@ leases, which this line's Host and disk tiers and eviction options cover; moving
 checkpoint to the last stripped turn, which the next request can no longer reuse byte for byte;
 an edit of the froggeric template's instructions; the QUASAR binding overrides and the weights
 profile switch, which v3 artifacts make unnecessary; the small-T page-ID enlargement, covered by
-the block-table fallback. The PackGQA prefill kernel waits for measurements, as do the rest of
-Neroued's wave (the FP8, NVFP4 and BF16 template ports, the two-stage GDN kernels); Kimi Delta
-Attention has no model here.
+the block-table fallback; Kimi Delta Attention, which has no model here.
 
 The disk tier differs from IMGillusion's in one place: its abandon path released borrowed memory
 while write tickets were still pending, which could store a page whose bytes changed under a valid
@@ -258,6 +260,18 @@ and have not been run.
   the RTX 5090, 9 to 67% on the 3090 and 4090); the `NINFER_PDL` build answered as the default
   build at the same speed on the RTX 5090. The Linear route bands come from two sweeps per card of
   every shape with both tables, and a third sweep of the default routes.
+- The rest of Neroued's wave and PackGQA, on the final code: the full `ctest` (257 tests) on an RTX
+  3090, 4090 and 5090 with the Qwen3.8 artifact, where again only the MoE and DFlash v1 real-model
+  tests fail, for want of their artifacts; before the bands, the suites the ports touch under both
+  tables on each card, which is where the domain, policy, workspace and record issues above showed;
+  every fused Op benchmark and every FP8, NVFP4 and BF16 shape under both tables in two rounds of
+  opposite order per card (the 4090's host held it at 300 to 450 W, the 5090's at 450 W); the
+  calibration of the unified Q4/Q5 switches, the two-stage GDN prefill and PackGQA; and Engine
+  prefill of the Qwen3.8 artifact on the 3090 with the two-stage GDN off and on, 1,604 and 1,607
+  tok/s at 4K and 1,556 and 1,576 at 16K, with MTP decode unchanged at 35.4 tok/s. Greedy answers
+  with each card's built-in routes against the same build forced onto the legacy tables with the
+  two-stage prefill off matched byte for byte in 5, 3 and 4 of 8 cases on the 3090, 4090 and 5090
+  (the repeated file on every card) and elsewhere parted at a near tie into equally coherent text.
 - sm_120a: on an RTX 5090 both the default compatibility build and the native build
   (`NINFER_SM120_NATIVE`) pass `ctest` (169 tests), and the native build converts and serves the
   RedHatAI Qwen3.6-35B-A3B NVFP4 checkpoint.

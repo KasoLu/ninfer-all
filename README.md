@@ -295,6 +295,28 @@ From other forks:
   3090), 128 (4090) or 1,024 (5090), 1.5 to 1.7 times as fast over the shapes; Q6 from 4 to 32
   columns; Q4 from 25 columns; Q8 at widths that differ per card. Q4 decode and verification widths
   keep this line's kernels. `NINFER_LINEAR_ROUTES=legacy|unified` forces one table.
+- **FP8, NVFP4 and BF16 templates and the fused projections** (Neroued). Upstream's unified FP8,
+  NVFP4 and BF16 Linear templates, and its moves of the fused projections of every format onto
+  them (attention and GDN inputs with their conv forms, LinearAdd, SwiGLU, the Q8 pair, the top-k
+  heads, the Q8 grouped convolution and context-KV materialization), sit beside this line's routes
+  by the same rule: a card takes them at the widths where two rounds of every shape and Op
+  benchmark measured them faster. Where this line's FP8 and NVFP4 A16 routes loop a small-T kernel
+  over wide inputs, the unified ones run 1.7 to 7 (FP8) and 2.5 to 44 (NVFP4) times as fast at
+  verification and prefill widths on an RTX 3090, and similarly on a 4090; on an RTX 5090 the FP8,
+  NVFP4 and BF16 routes gain 1.1 to 3 times at most widths under A16, A8 and A4. The Q8
+  projections keep this line's routes at most widths. The unified SwiGLU keeps its gate and up
+  projections in FP32 through the activation.
+- **Two-stage GDN prefill** (Neroued). A prompt chunk of 16 tokens or more can run the gated delta
+  rule as one preparation pass (Q/K normalization, the gate factors and each chunk's solve) and one
+  FP32-state recurrence that also writes the output, in place of the WY, state-passing and output
+  kernels. The GDN op ran 1.4 to 4.3 times as fast at every width from 16 to 8,192 tokens on an
+  RTX 3090, 4090 and 5090, so their built-in profiles take it; Engine prefill of the Qwen3.8 27B
+  artifact on the 3090 moved by about 1 %, the recurrence being a small part of a prefill step.
+  `NINFER_GDN_TWO_STAGE=0|1` forces either.
+- **PackGQA** (Gideon Zenz). The INT8 prompt kernel can pack each KV head's query heads into its
+  tiles (`NINFER_PROMPT_PACK_GQA=1`, or a profile's `attn_pack_gqa`). A 1024-token chunk at 32K
+  and 131K of context ran 2.7 % faster on an RTX 3090 and 0.5 % and 3.9 % slower on a 4090 and
+  5090, so no built-in profile turns it on.
 - **Engine and serving fixes**: out-of-memory recovery of the worker (David Oelfke's, ported by
   Ian Ranson), `--kv-headroom-mib`, `--cuda-graph-allowance-mib`, `--thinking-budget-message` (Ian
   Ranson); the WebUI's MCP traffic relayed behind `--webui-mcp-proxy`, E8 root codes decoded from
