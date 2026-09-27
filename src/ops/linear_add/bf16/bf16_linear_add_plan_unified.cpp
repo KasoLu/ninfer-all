@@ -1,11 +1,9 @@
-#include "ops/linear/common/route_table.h"
-#include "ops/linear_add/bf16/bf16_linear_add_plan_unified.h"
 #include "core/weight.h"
-#include "ops/linear_add/bf16/bf16_linear_add_plan.h"
+#include "ops/linear_add/bf16/bf16_linear_add_plan_unified.h"
 
 #include <stdexcept>
 
-namespace ninfer::ops::detail {
+namespace ninfer::ops::detail::unified {
 
 bool bf16_linear_add_admits(std::int32_t output_rows, std::int32_t input_rows,
                             std::int32_t tokens) noexcept {
@@ -39,10 +37,6 @@ const char* bf16_linear_add_schedule_name(Bf16LinearAddScheduleId schedule) noex
 
 void bf16_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                               cudaStream_t stream) {
-    if (fused_route_table("unified/bf16_linear_add", x.ne[1]) == LinearRouteTable::Unified) {
-        unified::bf16_linear_add_dispatch(x, weight, residual, stream);
-        return;
-    }
     switch (bf16_linear_add_select(weight.n, weight.k, x.ne[1])) {
     case Bf16LinearAddScheduleId::Decode:
         bf16_linear_add_decode_launch(x, weight, residual, stream);
@@ -60,4 +54,4 @@ void bf16_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& res
     throw std::logic_error("bf16 linear_add: unknown schedule");
 }
 
-} // namespace ninfer::ops::detail
+} // namespace ninfer::ops::detail::unified

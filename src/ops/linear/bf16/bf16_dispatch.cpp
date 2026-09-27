@@ -1,5 +1,7 @@
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/bf16/bf16_shapes.h"
+#include "ops/linear/bf16/bf16_shapes_unified.h"
+#include "ops/linear/common/route_table.h"
 #include <array>
 #include <stdexcept>
 
@@ -15,11 +17,18 @@ constexpr std::array kShapes{
     ShapeEntry{5120, 6144, select_bf16_n5120_k6144},
     ShapeEntry{256, 5120, select_bf16_n256_k5120},
 };
+constexpr std::array kUnifiedShapes{
+    ShapeEntry{14336, 5120, unified::select_bf16_n14336_k5120},
+    ShapeEntry{5120, 6144, unified::select_bf16_n5120_k6144},
+    ShapeEntry{256, 5120, unified::select_bf16_n256_k5120},
+};
 } // namespace
 
 Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
     if (t <= 0) throw std::invalid_argument("bf16 linear: T must be positive");
-    for (const auto& entry : kShapes) {
+    const bool unified =
+        linear_route_table(LinearRouteFamily::Bf16, t) == LinearRouteTable::Unified;
+    for (const auto& entry : unified ? kUnifiedShapes : kShapes) {
         if (entry.n == n && entry.k == k) return entry.select(t);
     }
     // Shapes without a specialised kernel (for example a full-precision vocab head) fall back to the

@@ -1,16 +1,10 @@
-#include "ops/linear/common/route_table.h"
-#include "ops/attn_input_proj/bf16/bf16_attn_input_plan_unified.h"
 #include "core/weight.h"
-#include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
+#include "ops/attn_input_proj/bf16/bf16_attn_input_plan_unified.h"
 
-namespace ninfer::ops::detail {
+namespace ninfer::ops::detail::unified {
 
 void bf16_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& k, Tensor& v, cudaStream_t stream) {
-    if (fused_route_table("unified/bf16_attn_input", x.ne[1]) == LinearRouteTable::Unified) {
-        unified::bf16_attn_input_dispatch(x, weight, q, gate, k, v, stream);
-        return;
-    }
     if (x.ne[1] == 1) {
         bf16_attn_input_decode_launch(x, weight, q, gate, k, v, stream);
         return;
@@ -22,4 +16,4 @@ void bf16_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, 
     bf16_attn_input_mma_launch(x, weight, q, gate, k, v, stream);
 }
 
-} // namespace ninfer::ops::detail
+} // namespace ninfer::ops::detail::unified

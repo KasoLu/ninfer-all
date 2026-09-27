@@ -1,8 +1,12 @@
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_linear_add_decode.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_linear_add_decode_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_linear_add_gemm_mma.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_linear_add_gemm_mma_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_linear_add_small_t.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_linear_add_small_t_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_linear_add_plan.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/bf16/bf16_linear_add_plan_unified.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_decode.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_decode_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_small_t.cu"

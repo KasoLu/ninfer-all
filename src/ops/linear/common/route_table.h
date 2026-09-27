@@ -25,6 +25,7 @@ enum class LinearRouteFamily : std::uint8_t {
     Q8,
     Fp8,
     Nvfp4,
+    Bf16,
 };
 
 // The table for one call: by default the unified table only inside the width bands where it was
