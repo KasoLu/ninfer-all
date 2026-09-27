@@ -1,3 +1,5 @@
+#include "ops/linear/common/route_table.h"
+#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan_unified.h"
 #include "core/weight.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.h"
 
@@ -24,6 +26,15 @@ Nvfp4GdnProjectedWorkspace allocate_workspace(Allocator& allocator, std::int32_t
         nvfp4_gdn_input_workspace_capacity_bytes(policy, tokens, tokens);
     if (projection_bytes != 0) { out.projection = allocator.alloc_bytes(projection_bytes, 256); }
     return out;
+}
+
+// Upstream registers the A16 schedules only through T=16, where this line's materialized route
+// reaches T=64 for a single-row copy verification; wider A16 calls stay on this line's routes.
+constexpr std::int32_t kUnifiedA16MaxTokens = 16;
+
+bool unified_route(LinearPolicy policy, std::int32_t tokens) {
+    return (allows_a4(policy) || tokens <= kUnifiedA16MaxTokens) &&
+           fused_route_table("unified/nvfp4_gdn_input", tokens) == LinearRouteTable::Unified;
 }
 
 } // namespace
@@ -55,9 +66,9 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
     return {Nvfp4GdnConvScheduleId::Materialized};
 }
 
-std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
-                                                        std::int32_t min_tokens,
-                                                        std::int32_t max_tokens) {
+static std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes_own(LinearPolicy policy,
+                                                                   std::int32_t min_tokens,
+                                                                   std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("nvfp4 gdn snapshot workspace: invalid token interval");
     }
@@ -70,12 +81,34 @@ std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
     return layout.peak_bytes(1);
 }
 
+std::size_t nvfp4_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy,
+                                                        std::int32_t min_tokens,
+                                                        std::int32_t max_tokens) {
+    return capacity_by_table(
+        min_tokens, max_tokens,
+        [&](std::int32_t width) {
+            return unified_route(policy, width) ? LinearRouteTable::Unified
+                                                : LinearRouteTable::Legacy;
+        },
+        [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
+            return table == LinearRouteTable::Unified
+                       ? unified::nvfp4_gdn_snapshot_workspace_capacity_bytes(policy, first, last)
+                       : nvfp4_gdn_snapshot_workspace_capacity_bytes_own(policy, first, last);
+        });
+}
+
 void nvfp4_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tensor& conv_weight,
                                  Tensor& conv_states, const Tensor& valid_columns,
                                  const Tensor& initial_slot, const Tensor& snapshot_base_slot,
                                  Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                  LinearPolicy policy, WorkspaceArena& workspace,
                                  cudaStream_t stream) {
+    if (unified_route(policy, x.ne[1])) {
+        unified::nvfp4_gdn_snapshot_dispatch(x, weight, conv_weight, conv_states, valid_columns,
+                                             initial_slot, snapshot_base_slot, query, key, value, z,
+                                             policy, workspace, stream);
+        return;
+    }
     switch (nvfp4_gdn_conv_resolve_plan(policy, x.ne[1], 1).schedule) {
     case Nvfp4GdnConvScheduleId::DecodeFusedA16:
         nvfp4_gdn_snapshot_decode_launch(x, weight, conv_weight, conv_states, valid_columns,

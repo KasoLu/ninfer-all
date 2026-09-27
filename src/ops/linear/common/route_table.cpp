@@ -27,6 +27,7 @@ struct FamilyBands {
     std::span<const WidthBand> q6;
     std::span<const WidthBand> q8;
     std::span<const WidthBand> fp8;
+    std::span<const WidthBand> nvfp4;
 };
 
 // Widths where the unified table beat the legacy one on the named card, from two
@@ -83,6 +84,8 @@ std::span<const WidthBand> family_bands(const FamilyBands& bands, LinearRouteFam
         return bands.q8;
     case LinearRouteFamily::Fp8:
         return bands.fp8;
+    case LinearRouteFamily::Nvfp4:
+        return bands.nvfp4;
     }
     return {};
 }

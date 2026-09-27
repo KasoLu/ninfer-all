@@ -7,9 +7,13 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q4a8/q5a8_linear_add.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q4cublas/w4_cublas_prefill.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_decode.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_decode_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_small_t.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_small_t_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_w4a4.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_plan.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_plan_unified.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_swiglu_decode.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_swiglu_decode_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/fp8/fp8_linear_swiglu_small_t.cu"
@@ -31,6 +35,7 @@ target_sources(ninfer_ops PRIVATE
 
 if(TARGET ninfer_nvfp4_non_rdc)
   target_sources(ninfer_nvfp4_non_rdc PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_a4_tma.cu"
     "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_swiglu_w4a4_tma.cu"
   )
 endif()

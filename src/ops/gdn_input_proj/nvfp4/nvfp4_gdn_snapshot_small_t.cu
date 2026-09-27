@@ -3,6 +3,8 @@
 
 #include "core/device.h"
 #include "ops/gdn_input_proj/gdn_conv_output.cuh"
+#include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan_unified.h"
+#include "ops/linear/common/route_table.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_simt.cuh"
 
@@ -105,6 +107,13 @@ void nvfp4_gdn_record_small_t_launch(const Tensor& x, const Weight& weight,
                                      const Tensor& valid_columns, const Tensor& initial_slot,
                                      Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                      Tensor& z, cudaStream_t stream) {
+    // A block records what its snapshot computes, so the record follows the snapshot's table.
+    if (fused_route_table("unified/nvfp4_gdn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::nvfp4_gdn_record_small_t_launch(x, weight, conv_weight, conv_states, valid_columns,
+                                                 initial_slot, conv_record, query, key, value, z,
+                                                 stream);
+        return;
+    }
     const std::size_t index = static_cast<std::size_t>(x.ne[1] - 2);
     kRecordLaunchers[index](x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                             conv_record, query, key, value, z, stream);

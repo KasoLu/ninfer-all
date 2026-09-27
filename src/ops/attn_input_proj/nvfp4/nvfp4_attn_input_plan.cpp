@@ -1,3 +1,5 @@
+#include "ops/linear/common/route_table.h"
+#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan_unified.h"
 #include "core/weight.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 
@@ -61,8 +63,9 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate, 
 
 } // namespace
 
-std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
-                                                      std::int32_t max_tokens) {
+static std::size_t nvfp4_attn_input_workspace_capacity_bytes_own(LinearPolicy policy,
+                                                                 std::int32_t min_tokens,
+                                                                 std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("nvfp4 attn_input_proj workspace: invalid token interval");
     }
@@ -72,9 +75,25 @@ std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::
                : 0;
 }
 
+std::size_t nvfp4_attn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
+                                                      std::int32_t max_tokens) {
+    return capacity_by_table(
+        min_tokens, max_tokens,
+        [](std::int32_t width) { return fused_route_table("unified/nvfp4_attn_input", width); },
+        [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
+            return table == LinearRouteTable::Unified
+                       ? unified::nvfp4_attn_input_workspace_capacity_bytes(policy, first, last)
+                       : nvfp4_attn_input_workspace_capacity_bytes_own(policy, first, last);
+        });
+}
+
 void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                                cudaStream_t stream) {
+    if (fused_route_table("unified/nvfp4_attn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::nvfp4_attn_input_dispatch(x, weight, q, gate, k, v, policy, workspace, stream);
+        return;
+    }
     if (resolve_route(policy, x.ne[1]) == Nvfp4AttnInputRoute::A16) {
         launch_a16(x, weight, q, gate, k, v, stream);
         return;
