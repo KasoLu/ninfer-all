@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "core/pdl.cuh"
 #include "ops/common/score_id_order.cuh"
+#include "ops/linear/common/route_table.h"
 #include "ops/linear/q4/q4_ksplit_mma.cuh"
 
 #include <cstdint>
@@ -72,6 +73,11 @@ void linear_topk_q4_launch(const Tensor& hidden, const Weight& head,
                            const Tensor& row_to_global_ids, const LinearTopKWorkspace& workspace,
                            cudaStream_t stream) {
     if (workspace.rows_per_producer == kLinearTopKDirectRows) {
+        if (fused_route_table("unified/q4_linear_topk", hidden.ne[1]) ==
+            LinearRouteTable::Unified) {
+            linear_topk_q4_unified_launch(hidden, head, row_to_global_ids, workspace, stream);
+            return;
+        }
         launchers[(hidden.ne[1] - 1) / 8](hidden, head, row_to_global_ids, workspace, stream);
     } else {
         linear_topk_q4_m64_launch(hidden, head, row_to_global_ids, workspace, stream);

@@ -3,6 +3,7 @@
 
 #include "core/device.h"
 #include "ops/common/math.h"
+#include "ops/linear/common/route_table.h"
 #include "ops/linear/q4/q4_ksplit_mma.cuh"
 #include "ops/linear/q4/q4_ksplit_strided_store.cuh"
 #include "ops/linear/q4/q4_rowsplit_gemm_simt.cuh"
@@ -303,6 +304,11 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
 void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_weight,
                                      const Weight& gate_value_weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream) {
+    if (fused_route_table("unified/q4_q5_attn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        q4_q5_attn_input_small_t_unified_launch(x, query_key_weight, gate_value_weight, q, gate, k,
+                                                v, stream);
+        return;
+    }
     launch_q4(x, query_key_weight, q, k, stream);
     launch_q5(x, gate_value_weight, gate, v, stream);
 }

@@ -1,5 +1,7 @@
 #include "ops/linear/common/route_table.h"
 
+#include "ops/common/device_route.h"
+
 #include <cuda_runtime.h>
 
 #include <array>
@@ -129,18 +131,28 @@ DeviceClass current_device_class() {
     return static_cast<DeviceClass>(value - 1);
 }
 
-} // namespace
-
-LinearRouteTable linear_route_table(LinearRouteFamily family, std::int32_t t) {
+std::optional<LinearRouteTable> forced_route_table() {
     if (const int value = forced_for_tests().load(std::memory_order_relaxed); value >= 0) {
         return static_cast<LinearRouteTable>(value);
     }
     static const std::optional<LinearRouteTable> forced = forced_table();
-    if (forced) return *forced;
+    return forced;
+}
+
+} // namespace
+
+LinearRouteTable linear_route_table(LinearRouteFamily family, std::int32_t t) {
+    if (const auto forced = forced_route_table()) return *forced;
     for (const WidthBand band : family_bands(bands_for(current_device_class()), family)) {
         if (t >= band.first && t <= band.last) return LinearRouteTable::Unified;
     }
     return LinearRouteTable::Legacy;
+}
+
+LinearRouteTable fused_route_table(std::string_view key, std::int32_t width) {
+    if (const auto forced = forced_route_table()) return *forced;
+    return device_route_schedule(key, width) == "unified" ? LinearRouteTable::Unified
+                                                          : LinearRouteTable::Legacy;
 }
 
 void force_linear_route_table(std::optional<LinearRouteTable> table) {

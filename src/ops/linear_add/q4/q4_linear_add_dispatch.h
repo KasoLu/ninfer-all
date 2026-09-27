@@ -11,6 +11,10 @@ using Q4LinearAddLaunch = void (*)(const Tensor&, const Weight&, Tensor&, cudaSt
 
 Q4LinearAddLaunch select_q4_linear_add(std::int32_t rows, std::int32_t k, std::int32_t tokens);
 
+// Upstream's routes over the unified templates (gemv, sliced-K MMA to 32 columns, MMA tiles), taken
+// where fused_route_table("unified/q4_linear_add") says so.
+Q4LinearAddLaunch select_q4_linear_add_unified(std::int32_t tokens);
+
 // The individual routes, named so a route-boundary sweep can time the ones the table does not
 // currently select (bench/ops/dense_linear_add_schedule_bench.cu).
 void q4_linear_add_gemv_launch(const Tensor&, const Weight&, Tensor&, cudaStream_t);

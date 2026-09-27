@@ -3,6 +3,7 @@
 #include "ops/linear/q4/q4_gemv_launch.cuh"
 #include "ops/linear/q4/q4_ksplit_mma.cuh"
 #include "ops/linear/q4/q4_mma_launch.cuh"
+#include "ops/linear/common/route_table.h"
 
 #include <stdexcept>
 
@@ -131,6 +132,9 @@ void q4_linear_add_mma_r64_c128_launch(const Tensor& x, const Weight& w, Tensor&
 Q4LinearAddLaunch select_q4_linear_add(std::int32_t rows, std::int32_t k, std::int32_t tokens) {
     if (rows != 5120 || k != 6144 || tokens <= 0) {
         throw std::invalid_argument("q4 linear_add: unsupported shape or token extent");
+    }
+    if (fused_route_table("unified/q4_linear_add", tokens) == LinearRouteTable::Unified) {
+        return select_q4_linear_add_unified(tokens);
     }
     // Re-measured on sm_86 2026-09-17 with bench/ops/dense_linear_add_schedule_bench.cu (--q4),
     // cold, median of 11. The narrow end and 33..64 are upstream's and hold here; the 65..192 band

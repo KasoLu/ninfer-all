@@ -21,6 +21,21 @@ enum class Q5LinearAddScheduleId {
     MmaResidualR64C128,
     SmallTMmaResidual,
     MmaResidualR64C128Tail,
+    // Upstream's routes over the unified templates (fused_route_table
+    // "unified/q5_linear_add/<rows>x<k>").
+    UnifiedSplit2Exact,
+    UnifiedSlicedR16T8W4S2,
+    UnifiedSlicedR16T16W4S2,
+    UnifiedSlicedR16T24W4S2,
+    UnifiedSlicedR32T32W4S2,
+    UnifiedSlicedR32T24W4S2Pairwise,
+    UnifiedSlicedR32T32W4S1,
+    UnifiedSlicedR32T32W2S2,
+    UnifiedSlicedR32T64W2S1,
+    UnifiedMmaR32T32K128,
+    UnifiedMmaR32T128,
+    UnifiedMmaR64T128,
+    UnifiedMmaR64T128Tail,
 };
 
 struct Q5LinearAddProblem {

@@ -21,6 +21,7 @@
 
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_plan.h"
+#include "ops/linear/common/route_table.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_pair/q8/q8_pair_plan.h"
 #include "ops/linear_swiglu/q8/q8_linear_swiglu_plan.h"
@@ -38,6 +39,16 @@
 namespace {
 
 constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
+
+// Resolves as the fused Ops do where the device profile sends a width to upstream's routes over
+// the unified templates.
+template <class Resolve>
+auto under_unified_table(Resolve&& resolve) {
+    ninfer::ops::detail::force_linear_route_table(ninfer::ops::detail::LinearRouteTable::Unified);
+    const auto schedule = resolve();
+    ninfer::ops::detail::force_linear_route_table(std::nullopt);
+    return schedule;
+}
 
 // Column counts to resolve at. Every width to 2304 covers each table's dense low end and its
 // narrow exact-tail bands, and the tail values reach the unbounded final route. Resolution is pure
@@ -189,12 +200,22 @@ int main() {
     reports.push_back(
         survey<detail::Q5LinearAddScheduleId, decltype(detail::q5_linear_add_schedule_name), AddFn>(
             "q5_linear_add", detail::q5_linear_add_schedule_name, "linear_add.q5.unknown",
-            {"k=6144", "k=17408"},
+            {"k=6144", "k=17408", "k=6144 unified", "k=17408 unified"},
             {AddFn([](std::int32_t cols) {
                  return detail::q5_linear_add_resolve_plan({5120, 6144, 6144, cols}).schedule;
              }),
              AddFn([](std::int32_t cols) {
                  return detail::q5_linear_add_resolve_plan({5120, 17408, 17408, cols}).schedule;
+             }),
+             AddFn([](std::int32_t cols) {
+                 return under_unified_table([&] {
+                     return detail::q5_linear_add_resolve_plan({5120, 6144, 6144, cols}).schedule;
+                 });
+             }),
+             AddFn([](std::int32_t cols) {
+                 return under_unified_table([&] {
+                     return detail::q5_linear_add_resolve_plan({5120, 17408, 17408, cols}).schedule;
+                 });
              })},
             {"linear_add.q5.mma.r64.c16.cta_collective_residual",
              "linear_add.q5.mma.r64.c24.cta_collective_residual",

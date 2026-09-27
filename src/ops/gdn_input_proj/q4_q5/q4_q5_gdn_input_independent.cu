@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "core/pdl.cuh"
 #include "ops/common/math.h"
+#include "ops/linear/common/route_table.h"
 #include "ops/linear/q4/q4_ksplit_mma.cuh"
 #include "ops/linear/q4/q4_ksplit_strided_store.cuh"
 #include "ops/linear/q4/q4_rowsplit_gemm_simt.cuh"
@@ -341,6 +342,11 @@ void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value
 void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                         Tensor& z, cudaStream_t stream) {
+    if (fused_route_table("unified/q4_q5_gdn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        q4_q5_gdn_input_independent_unified_launch(x, qk_weight, value_z_weight, qk, value, z,
+                                                   stream);
+        return;
+    }
     if (x.ne[1] == 4) {
         launch_t4_pdl(x, qk_weight, value_z_weight, qk, value, z, stream);
         return;

@@ -4,6 +4,7 @@
 #include "ops/linear_add/q5/q5_linear_add_kernels.h"
 
 #include "ops/common/device_route.h"
+#include "ops/linear/common/route_table.h"
 
 #include <array>
 #include <string>
@@ -156,6 +157,39 @@ constexpr std::array<RouteSpec, 7> kK17408Routes{{
     {{513, kAnyCols}, Q5LinearAddScheduleId::MmaResidualR64C128Tail},
 }};
 
+// Upstream's tables for the unified templates, measured on an RTX 5090.
+constexpr std::array<RouteSpec, 13> kK6144UnifiedRoutes{{
+    {{1, 4}, Q5LinearAddScheduleId::UnifiedSplit2Exact},
+    {{5, 8}, Q5LinearAddScheduleId::UnifiedSlicedR16T8W4S2},
+    {{9, 16}, Q5LinearAddScheduleId::UnifiedSlicedR16T16W4S2},
+    {{17, 24}, Q5LinearAddScheduleId::UnifiedSlicedR16T24W4S2},
+    {{25, 32}, Q5LinearAddScheduleId::UnifiedSlicedR32T32W4S2},
+    {{33, 48}, Q5LinearAddScheduleId::UnifiedSlicedR32T24W4S2Pairwise},
+    {{49, 64}, Q5LinearAddScheduleId::UnifiedSlicedR32T32W4S2},
+    {{65, 96}, Q5LinearAddScheduleId::UnifiedMmaR32T32K128},
+    {{97, 128}, Q5LinearAddScheduleId::UnifiedSlicedR32T32W2S2},
+    {{129, 160}, Q5LinearAddScheduleId::UnifiedSlicedR32T64W2S1},
+    {{161, 256}, Q5LinearAddScheduleId::UnifiedMmaR32T128},
+    {{257, 512}, Q5LinearAddScheduleId::UnifiedMmaR64T128},
+    {{513, kAnyCols}, Q5LinearAddScheduleId::UnifiedMmaR64T128Tail},
+}};
+
+constexpr std::array<RouteSpec, 13> kK17408UnifiedRoutes{{
+    {{1, 4}, Q5LinearAddScheduleId::UnifiedSplit2Exact},
+    {{5, 8}, Q5LinearAddScheduleId::UnifiedSlicedR16T8W4S2},
+    {{9, 16}, Q5LinearAddScheduleId::UnifiedSlicedR16T16W4S2},
+    {{17, 24}, Q5LinearAddScheduleId::UnifiedSlicedR16T24W4S2},
+    {{25, 32}, Q5LinearAddScheduleId::UnifiedSlicedR32T32W4S2},
+    {{33, 48}, Q5LinearAddScheduleId::UnifiedSlicedR32T24W4S2Pairwise},
+    {{49, 64}, Q5LinearAddScheduleId::UnifiedSlicedR32T32W4S1},
+    {{65, 96}, Q5LinearAddScheduleId::UnifiedSlicedR32T32W4S1},
+    {{97, 128}, Q5LinearAddScheduleId::UnifiedSlicedR32T32W2S2},
+    {{129, 160}, Q5LinearAddScheduleId::UnifiedSlicedR32T64W2S1},
+    {{161, 256}, Q5LinearAddScheduleId::UnifiedMmaR32T128},
+    {{257, 512}, Q5LinearAddScheduleId::UnifiedMmaR64T128},
+    {{513, kAnyCols}, Q5LinearAddScheduleId::UnifiedMmaR64T128Tail},
+}};
+
 template <std::size_t N>
 constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcept {
     std::int64_t expected = 1;
@@ -167,7 +201,8 @@ constexpr bool catalog_is_closed(const std::array<RouteSpec, N>& routes) noexcep
            expected == static_cast<std::int64_t>(kAnyCols) + 1;
 }
 
-static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes),
+static_assert(catalog_is_closed(kK6144Routes) && catalog_is_closed(kK17408Routes) &&
+                  catalog_is_closed(kK6144UnifiedRoutes) && catalog_is_closed(kK17408UnifiedRoutes),
               "Q5 LinearAdd routes must be exact, contiguous, and closed");
 
 bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
@@ -190,19 +225,21 @@ bool supported_shape(const Q5LinearAddProblem& problem) noexcept {
 constexpr std::int32_t kWaveCols       = 512;
 constexpr std::int32_t kNarrowTailCols = 192;
 
-void launch_wide_with_narrow_tail(const Tensor& x, const Weight& w, Tensor& residual_out,
-                                  WorkspaceArena& ws, cudaStream_t stream) {
+using Q5LinearAddLaunch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+
+void launch_wide_with_narrow_tail(Q5LinearAddLaunch wide_launch, const Tensor& x, const Weight& w,
+                                  Tensor& residual_out, WorkspaceArena& ws, cudaStream_t stream) {
     const std::int32_t cols = x.ne[1];
     const std::int32_t wide = (cols / kWaveCols) * kWaveCols;
     const std::int32_t tail = cols - wide;
     if (wide == 0 || tail == 0 || tail > kNarrowTailCols) {
-        q5_linear_add_mma_r64_c128_launch(x, w, residual_out, stream);
+        wide_launch(x, w, residual_out, stream);
         return;
     }
 
     const Tensor x_wide = x.slice(1, 0, wide);
     Tensor out_wide     = residual_out.slice(1, 0, wide);
-    q5_linear_add_mma_r64_c128_launch(x_wide, w, out_wide, stream);
+    wide_launch(x_wide, w, out_wide, stream);
 
     const Tensor x_tail = x.slice(1, wide, tail);
     Tensor out_tail     = residual_out.slice(1, wide, tail);
@@ -235,6 +272,32 @@ const char* q5_linear_add_schedule_name(Q5LinearAddScheduleId schedule) noexcept
         return "linear_add.q5.mma.small_t.residual";
     case Q5LinearAddScheduleId::MmaResidualR64C128Tail:
         return "linear_add.q5.mma.r64.c128.cta_collective_residual.narrow_tail";
+    case Q5LinearAddScheduleId::UnifiedSplit2Exact:
+        return "linear_add.q5.unified.direct_simt.split2.exact.residual";
+    case Q5LinearAddScheduleId::UnifiedSlicedR16T8W4S2:
+        return "linear_add.q5.unified.sliced.r16.t8.w4.s2.residual";
+    case Q5LinearAddScheduleId::UnifiedSlicedR16T16W4S2:
+        return "linear_add.q5.unified.sliced.r16.t16.w4.s2.residual";
+    case Q5LinearAddScheduleId::UnifiedSlicedR16T24W4S2:
+        return "linear_add.q5.unified.sliced.r16.t24.w4.s2.residual";
+    case Q5LinearAddScheduleId::UnifiedSlicedR32T32W4S2:
+        return "linear_add.q5.unified.sliced.r32.t32.w4.s2.residual";
+    case Q5LinearAddScheduleId::UnifiedSlicedR32T24W4S2Pairwise:
+        return "linear_add.q5.unified.sliced.r32.t24.w4.s2.pairwise.residual";
+    case Q5LinearAddScheduleId::UnifiedSlicedR32T32W4S1:
+        return "linear_add.q5.unified.sliced.r32.t32.w4.s1.residual";
+    case Q5LinearAddScheduleId::UnifiedSlicedR32T32W2S2:
+        return "linear_add.q5.unified.sliced.r32.t32.w2.s2.residual";
+    case Q5LinearAddScheduleId::UnifiedSlicedR32T64W2S1:
+        return "linear_add.q5.unified.sliced.r32.t64.w2.s1.residual";
+    case Q5LinearAddScheduleId::UnifiedMmaR32T32K128:
+        return "linear_add.q5.unified.mma.r32.t32.k128.residual";
+    case Q5LinearAddScheduleId::UnifiedMmaR32T128:
+        return "linear_add.q5.unified.mma.r32.t128.residual";
+    case Q5LinearAddScheduleId::UnifiedMmaR64T128:
+        return "linear_add.q5.unified.mma.r64.t128.cta_collective_residual";
+    case Q5LinearAddScheduleId::UnifiedMmaR64T128Tail:
+        return "linear_add.q5.unified.mma.r64.t128.cta_collective_residual.narrow_tail";
     }
     return "linear_add.q5.unknown";
 }
@@ -246,6 +309,18 @@ bool q5_linear_add_admits(const Q5LinearAddProblem& problem) noexcept {
 Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
     if (!q5_linear_add_admits(problem)) {
         throw std::invalid_argument("q5 linear_add: exact problem or column count is not admitted");
+    }
+    const auto resolve_from = [&](const auto& routes) -> Q5LinearAddPlan {
+        for (const RouteSpec& route : routes) {
+            if (route.cols.contains(problem.cols)) { return {route.schedule, 0}; }
+        }
+        throw std::logic_error("q5 linear_add: admitted problem has no covering route");
+    };
+    const std::string shape = std::to_string(problem.rows) + "x" + std::to_string(problem.k);
+    if (fused_route_table("unified/q5_linear_add/" + shape, problem.cols) ==
+        LinearRouteTable::Unified) {
+        return problem.k == 6144 ? resolve_from(kK6144UnifiedRoutes)
+                                 : resolve_from(kK17408UnifiedRoutes);
     }
     using Id = Q5LinearAddScheduleId;
     static constexpr std::array<DeviceRouteCandidate<Id>, 9> kCandidates{{
@@ -259,18 +334,10 @@ Q5LinearAddPlan q5_linear_add_resolve_plan(const Q5LinearAddProblem& problem) {
         {"mma_r64_c32_s4", Id::MmaResidualR64C32S4, 0},
         {"mma_r64_c128", Id::MmaResidualR64C128, 0},
     }};
-    const std::string key = "q5_linear_add/" + std::to_string(problem.rows) + "x" +
-                            std::to_string(problem.k);
+    const std::string key = "q5_linear_add/" + shape;
     if (const auto* routed = routed_candidate<Id>(key, problem.cols, kCandidates)) {
         return {routed->id, 0};
     }
-
-    const auto resolve_from = [&](const auto& routes) -> Q5LinearAddPlan {
-        for (const RouteSpec& route : routes) {
-            if (route.cols.contains(problem.cols)) { return {route.schedule, 0}; }
-        }
-        throw std::logic_error("q5 linear_add: admitted problem has no covering route");
-    };
     return problem.k == 6144 ? resolve_from(kK6144Routes) : resolve_from(kK17408Routes);
 }
 
@@ -324,7 +391,48 @@ void q5_linear_add_execute_plan(const Q5LinearAddPlan& plan, const Tensor& x, co
         q5_linear_add_small_t_mma_launch(x, w, residual_out, stream);
         return;
     case Q5LinearAddScheduleId::MmaResidualR64C128Tail:
-        launch_wide_with_narrow_tail(x, w, residual_out, ws, stream);
+        launch_wide_with_narrow_tail(q5_linear_add_mma_r64_c128_launch, x, w, residual_out, ws,
+                                     stream);
+        return;
+    case Q5LinearAddScheduleId::UnifiedSplit2Exact:
+        q5_linear_add_unified_split2_exact_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::UnifiedSlicedR16T8W4S2:
+        q5_linear_add_unified_sliced_r16_t8_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::UnifiedSlicedR16T16W4S2:
+        q5_linear_add_unified_sliced_r16_t16_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::UnifiedSlicedR16T24W4S2:
+        q5_linear_add_unified_sliced_r16_t24_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::UnifiedSlicedR32T32W4S2:
+        q5_linear_add_unified_sliced_r32_t32_w4_s2_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::UnifiedSlicedR32T24W4S2Pairwise:
+        q5_linear_add_unified_sliced_r32_t24_pairwise_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::UnifiedSlicedR32T32W4S1:
+        q5_linear_add_unified_sliced_r32_t32_w4_s1_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::UnifiedSlicedR32T32W2S2:
+        q5_linear_add_unified_sliced_r32_t32_w2_s2_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::UnifiedSlicedR32T64W2S1:
+        q5_linear_add_unified_sliced_r32_t64_w2_s1_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::UnifiedMmaR32T32K128:
+        q5_linear_add_unified_mma_r32_t32_k128_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::UnifiedMmaR32T128:
+        q5_linear_add_unified_mma_r32_t128_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::UnifiedMmaR64T128:
+        q5_linear_add_unified_mma_r64_t128_launch(x, w, residual_out, stream);
+        return;
+    case Q5LinearAddScheduleId::UnifiedMmaR64T128Tail:
+        launch_wide_with_narrow_tail(q5_linear_add_unified_mma_r64_t128_launch, x, w, residual_out,
+                                     ws, stream);
         return;
     }
     throw std::logic_error("q5 linear_add: unknown schedule");

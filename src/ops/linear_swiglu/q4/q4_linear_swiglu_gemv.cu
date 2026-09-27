@@ -5,6 +5,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "ops/linear/common/route_table.h"
 #include "ops/linear/q4/q4_ksplit_mma.cuh"
 #include "ops/linear/q4/q4_small_t_mma_i8.cuh"
 
@@ -350,6 +351,10 @@ void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Ten
                                            cudaStream_t stream) {
     if (x.ne[1] < 2 || x.ne[1] > 32) {
         throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
+    }
+    if (fused_route_table("unified/q4_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        q4_linear_swiglu_small_t_unified_launch(x, w, out, stream);
+        return;
     }
     // A width that fills its tile needs no runtime column count, and dropping it is worth 2-4% at
     // sixteen and twenty-four columns (bench/ops/q4_linear_swiglu_schedule_bench.cu prices it

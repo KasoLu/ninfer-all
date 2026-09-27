@@ -12,6 +12,7 @@
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
 #include "ops/linear/t2/t2_a8.h"
+#include "ops/linear_add/q4/q4_linear_add_dispatch.h"
 #include "ops/linear_add/q5/q5_linear_add_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
 
@@ -468,6 +469,7 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
     SyntheticWeight out     = row_split_weight(QType::Q5_G64_FP16, hidden, 6144);
     SyntheticWeight down    = row_split_weight(QType::Q5_G64_FP16, hidden, 17408);
     SyntheticWeight gate_up = row_split_weight(QType::Q4_G64_FP16, 34816, hidden);
+    SyntheticWeight out_q4            = row_split_weight(QType::Q4_G64_FP16, hidden, 6144);
     DeviceBuffer x_hidden       = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
     DeviceBuffer x_mixer        = bf16_buffer(static_cast<std::size_t>(6144) * max_tokens);
     DeviceBuffer x_intermediate = bf16_buffer(static_cast<std::size_t>(17408) * max_tokens);
@@ -551,11 +553,64 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
          view(swiglu_out, 17408),
          {}},
     };
-    for (const Family& family : families) {
-        auto bands = sweep(family, timer, options);
-        if (!bands.empty()) {
-            profile.routes[family.key] = std::move(bands);
-            ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
+    // Upstream's move of these projections onto the unified templates, against the routes the
+    // families above left: one switch per Op, measured over the widths its fused launches serve.
+    const auto widths_to = [&](std::int32_t last) {
+        std::vector<std::int32_t> out;
+        for (const std::int32_t width : widths) {
+            if (width <= last) { out.push_back(width); }
+        }
+        return out;
+    };
+    const std::vector<Family> unified_families = {
+        {"unified/q4_q5_attn_input",
+         {"unified"},
+         widths_to(12),
+         families[0].run,
+         families[0].output,
+         {}},
+        {"unified/q4_q5_gdn_input",
+         {"unified"},
+         widths_to(15),
+         families[1].run,
+         families[1].output,
+         {}},
+        {"unified/q5_linear_add/5120x6144",
+         {"unified"},
+         widths,
+         families[2].run,
+         families[2].output,
+         families[2].reset},
+        {"unified/q5_linear_add/5120x17408",
+         {"unified"},
+         widths,
+         families[3].run,
+         families[3].output,
+         families[3].reset},
+        {"unified/q4_linear_swiglu",
+         {"unified"},
+         widths_to(32),
+         families[4].run,
+         families[4].output,
+         {}},
+        {"unified/q4_linear_add",
+         {"unified"},
+         widths,
+         [&](std::int32_t cols, cudaStream_t stream) {
+             Tensor x = tensor(x_mixer, 6144, cols), res = tensor(residual, hidden, cols);
+             ops::detail::select_q4_linear_add(hidden, 6144, cols)(x, out_q4.weight, res, stream);
+         },
+         view(residual, hidden),
+         reset_residual},
+    };
+    for (const auto* set : {&families, &unified_families}) {
+        for (const Family& family : *set) {
+            auto bands = sweep(family, timer, options);
+            if (!bands.empty()) {
+                profile.routes[family.key] = std::move(bands);
+                ops::install_device_route_profile(
+                    std::make_shared<const ops::DeviceRouteProfile>(profile));
+            }
         }
     }
 }

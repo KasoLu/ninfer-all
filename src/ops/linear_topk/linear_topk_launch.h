@@ -19,6 +19,11 @@ void linear_topk_fp8_m64_launch(const Tensor& hidden, const Weight& head, std::i
 void linear_topk_q4_launch(const Tensor& hidden, const Weight& head,
                            const Tensor& row_to_global_ids, const LinearTopKWorkspace& workspace,
                            cudaStream_t stream);
+// The direct-rows Q4 head through the unified sliced-K MMA (fused_route_table
+// "unified/q4_linear_topk").
+void linear_topk_q4_unified_launch(const Tensor& hidden, const Weight& head,
+                                   const Tensor& row_to_global_ids,
+                                   const LinearTopKWorkspace& workspace, cudaStream_t stream);
 // row_to_global_ids is null for the full head.
 void linear_topk_t2_launch(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
                            const Tensor* row_to_global_ids, Tensor& logits,

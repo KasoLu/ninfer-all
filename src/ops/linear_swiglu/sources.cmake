@@ -1,6 +1,7 @@
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_gemm_mma.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_gemv.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_small_t_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q4/q4_linear_swiglu_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/q4a8/q4a8_linear_swiglu.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q4a8/q5a8_linear_add.cu"

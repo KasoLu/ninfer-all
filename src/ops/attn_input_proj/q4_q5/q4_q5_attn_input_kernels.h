@@ -10,6 +10,13 @@ namespace ninfer::ops::detail {
 void q4_q5_attn_input_small_t_launch(const Tensor& x, const Weight& query_key_weight,
                                      const Weight& gate_value_weight, Tensor& q, Tensor& gate,
                                      Tensor& k, Tensor& v, cudaStream_t stream);
+// Upstream's small-T split form over the unified GEMV, SIMT, direct-SIMT and sliced-K MMA
+// templates, taken by the launcher above where fused_route_table "unified/q4_q5_attn_input" says
+// so.
+void q4_q5_attn_input_small_t_unified_launch(const Tensor& x, const Weight& query_key_weight,
+                                             const Weight& gate_value_weight, Tensor& q,
+                                             Tensor& gate, Tensor& k, Tensor& v,
+                                             cudaStream_t stream);
 void q4_q5_attn_input_small_t_mma_launch(const Tensor& x, const Weight& query_key_weight,
                                          const Weight& gate_value_weight, Tensor& q, Tensor& gate,
                                          Tensor& k, Tensor& v, cudaStream_t stream);

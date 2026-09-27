@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string_view>
 
 namespace ninfer::ops::detail {
 
@@ -24,6 +25,12 @@ enum class LinearRouteFamily : std::uint8_t {
 // measured faster on this device's class, and the legacy table everywhere else;
 // NINFER_LINEAR_ROUTES=legacy|unified takes one table for every width.
 [[nodiscard]] LinearRouteTable linear_route_table(LinearRouteFamily family, std::int32_t t);
+
+// The launches a fused projection Op (a Linear with its consumer fused into the epilogue) takes at
+// one width: its own, or upstream's move of the same routes onto the unified templates where the
+// device profile's `key` entry names "unified" for the width. NINFER_LINEAR_ROUTES and
+// force_linear_route_table() force one table here too.
+[[nodiscard]] LinearRouteTable fused_route_table(std::string_view key, std::int32_t width);
 
 // Tests run each shape under both tables: a forced table wins over the environment and the device
 // default until it is cleared with nullopt. Not for use while other threads launch Linear Ops.

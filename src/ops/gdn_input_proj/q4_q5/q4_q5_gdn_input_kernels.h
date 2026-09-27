@@ -10,6 +10,11 @@ namespace ninfer::ops::detail {
 void q4_q5_gdn_input_independent_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                         Tensor& z, cudaStream_t stream);
+// Upstream's independent Q4/Q5 launches over the unified templates, taken by the launcher above
+// where fused_route_table "unified/q4_q5_gdn_input" says so.
+void q4_q5_gdn_input_independent_unified_launch(const Tensor& x, const Weight& qk_weight,
+                                                const Weight& value_z_weight, Tensor& qk,
+                                                Tensor& value, Tensor& z, cudaStream_t stream);
 void q4_q5_gdn_input_small_t_launch(const Tensor& x, const Weight& qk_weight,
                                     const Weight& value_z_weight, Tensor& qk, Tensor& value,
                                     Tensor& z, cudaStream_t stream);

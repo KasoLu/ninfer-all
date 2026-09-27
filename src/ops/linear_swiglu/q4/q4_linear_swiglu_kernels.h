@@ -25,6 +25,11 @@ void q4_linear_swiglu_mma_split_half_pair_r32_c128_tail_launch(const Tensor& x, 
                                                                Tensor& out, cudaStream_t stream);
 void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Tensor& out,
                                            cudaStream_t stream);
+// Upstream's small-T route over the unified sliced-K MMA (eight K warps, pairwise reduction, launch
+// bounds per tile width), taken by the tiled launcher where fused_route_table
+// "unified/q4_linear_swiglu" says so.
+void q4_linear_swiglu_small_t_unified_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                             cudaStream_t stream);
 // Bench-only: forces the runtime-column-count instantiation that the launcher above drops when a
 // width fills its tile exactly, so the cost of masking stays measurable rather than remembered.
 void q4_linear_swiglu_small_t_tiled_masked_launch(const Tensor& x, const Weight& w, Tensor& out,

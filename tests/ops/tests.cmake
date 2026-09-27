@@ -236,3 +236,17 @@ add_test(NAME ninfer_gdn_replay_fold_wide_test
   COMMAND ninfer_tests ninfer_gdn_replay_fold_test --wide-only)
 set_tests_properties(ninfer_gdn_replay_fold_wide_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
+
+# The fused projections once more with every width on each route table: their own routes, and
+# upstream's over the unified templates that a device profile may take per width.
+foreach(table IN ITEMS legacy unified)
+  foreach(test IN ITEMS attn_input_proj attn_input_small_t gdn_input_proj gdn_input_small_t
+                        gdn_input_proj_conv_snapshot gdn_input_proj_conv_record linear_add_q4_a16
+                        linear_add_q5_a16 linear_add_q5_small_t linear_add_q8_a16
+                        linear_pair_q8_a16 linear_swiglu_q4_a16 linear_swiglu_q8_a16 linear_topk
+                        context_kv_materialize linear_dynamic_grouped_conv_add)
+    add_test(NAME ninfer_${test}_${table}_routes_test COMMAND ninfer_tests ninfer_${test}_test)
+    set_tests_properties(ninfer_${test}_${table}_routes_test
+      PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 ENVIRONMENT NINFER_LINEAR_ROUTES=${table})
+  endforeach()
+endforeach()
