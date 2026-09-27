@@ -20,6 +20,10 @@
 #include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
+#include "ops/attn_input_proj/fp8/fp8_attn_input_plan_unified.h"
+#include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan_unified.h"
+#include "ops/linear_add/fp8/fp8_linear_add_plan_unified.h"
+#include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan_unified.h"
 
 #include <stdexcept>
 
@@ -57,5 +61,30 @@ void fp8_linear_swiglu_a8_launch(const Tensor&, const Weight&, Tensor&, Workspac
                                  cudaStream_t) {
     reject_fp8_a8();
 }
+
+// The same routes of upstream's unified FP8 family.
+namespace unified {
+
+void fp8_attn_input_a8_launch(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, Tensor&,
+                              Fp8A8Workspace, cudaStream_t) {
+    reject_fp8_a8();
+}
+
+void fp8_gdn_input_a8_launch(const Tensor&, const Weight&, Tensor&, Tensor&, Fp8A8Workspace,
+                             cudaStream_t) {
+    reject_fp8_a8();
+}
+
+void fp8_linear_add_a8_launch(const Tensor&, const Weight&, Tensor&, WorkspaceArena&,
+                              cudaStream_t) {
+    reject_fp8_a8();
+}
+
+void fp8_linear_swiglu_a8_launch(const Tensor&, const Weight&, Tensor&, WorkspaceArena&,
+                                 cudaStream_t) {
+    reject_fp8_a8();
+}
+
+} // namespace unified
 
 } // namespace ninfer::ops::detail

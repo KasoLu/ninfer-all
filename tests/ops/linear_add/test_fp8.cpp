@@ -112,6 +112,10 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
     for (int columns = wide_only ? 33 : 2; columns <= (wide_only ? 64 : 32); ++columns) {
         invocations.push_back({columns, ops::LinearPolicy::A16Only});
     }
+    if (!wide_only) {
+        for (int columns : {63, 64, 65, 127, 128, 129, 1024})
+            invocations.push_back({columns, ops::LinearPolicy::A16Only});
+    }
     const std::int32_t kMaximumTokens = wide_only ? 64 : 1024;
     quantized_weight::PackedWeight host_weight =
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, n, k, seed);

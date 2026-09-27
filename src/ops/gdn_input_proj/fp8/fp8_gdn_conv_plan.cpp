@@ -1,3 +1,5 @@
+#include "ops/linear/common/route_table.h"
+#include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan_unified.h"
 #include "core/weight.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 
@@ -106,11 +108,22 @@ Fp8GdnConvPlan fp8_gdn_record_resolve_plan(LinearPolicy policy, std::int32_t wid
     return fp8_gdn_snapshot_resolve_plan(policy, width, batch_size);
 }
 
+// Upstream registers the record route only through W=16, where this line's reaches W=64 for one
+// sequence. Wider blocks stay on this line's routes for the snapshot too, so that record and
+// snapshot keep one arithmetic for the same block.
+constexpr std::int32_t kUnifiedMaxWidth = 16;
+
+bool unified_route(std::int32_t width) {
+    return width <= kUnifiedMaxWidth &&
+           fused_route_table("unified/fp8_gdn_input", width) == LinearRouteTable::Unified;
+}
+
 } // namespace
 
-std::size_t fp8_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy, std::int32_t batch_size,
-                                                      std::int32_t min_width,
-                                                      std::int32_t max_width) {
+static std::size_t fp8_gdn_snapshot_workspace_capacity_bytes_own(LinearPolicy policy,
+                                                                 std::int32_t batch_size,
+                                                                 std::int32_t min_width,
+                                                                 std::int32_t max_width) {
     if (min_width <= 0 || max_width < min_width) {
         throw std::invalid_argument("fp8 GDN snapshot workspace: invalid width interval");
     }
@@ -130,15 +143,50 @@ std::size_t fp8_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy, std::
                              batch_size * max_width);
 }
 
-std::size_t fp8_gdn_record_workspace_capacity_bytes(LinearPolicy policy, std::int32_t batch_size,
-                                                    std::int32_t min_width,
-                                                    std::int32_t max_width) {
+std::size_t fp8_gdn_snapshot_workspace_capacity_bytes(LinearPolicy policy, std::int32_t batch_size,
+                                                      std::int32_t min_width,
+                                                      std::int32_t max_width) {
+    return capacity_by_table(
+        min_width, max_width,
+        [](std::int32_t width) {
+            return unified_route(width) ? LinearRouteTable::Unified : LinearRouteTable::Legacy;
+        },
+        [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
+            return table == LinearRouteTable::Unified
+                       ? unified::fp8_gdn_snapshot_workspace_capacity_bytes(policy, batch_size,
+                                                                            first, last)
+                       : fp8_gdn_snapshot_workspace_capacity_bytes_own(policy, batch_size, first,
+                                                                       last);
+        });
+}
+
+static std::size_t fp8_gdn_record_workspace_capacity_bytes_own(LinearPolicy policy,
+                                                               std::int32_t batch_size,
+                                                               std::int32_t min_width,
+                                                               std::int32_t max_width) {
     if (min_width < 2 || max_width < min_width) {
         throw std::invalid_argument("fp8 GDN record workspace: invalid width interval");
     }
     (void)fp8_gdn_record_resolve_plan(policy, min_width, batch_size);
     const Fp8GdnConvPlan maximum = fp8_gdn_record_resolve_plan(policy, max_width, batch_size);
     return record_capacity(maximum, batch_size * max_width);
+}
+
+std::size_t fp8_gdn_record_workspace_capacity_bytes(LinearPolicy policy, std::int32_t batch_size,
+                                                    std::int32_t min_width,
+                                                    std::int32_t max_width) {
+    return capacity_by_table(
+        min_width, max_width,
+        [](std::int32_t width) {
+            return unified_route(width) ? LinearRouteTable::Unified : LinearRouteTable::Legacy;
+        },
+        [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
+            return table == LinearRouteTable::Unified
+                       ? unified::fp8_gdn_record_workspace_capacity_bytes(policy, batch_size, first,
+                                                                          last)
+                       : fp8_gdn_record_workspace_capacity_bytes_own(policy, batch_size, first,
+                                                                     last);
+        });
 }
 
 namespace {
@@ -200,6 +248,12 @@ void fp8_gdn_snapshot_dispatch(const Tensor& x, const Weight& weight, const Tens
                                Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                LinearPolicy policy, WorkspaceArena& workspace,
                                cudaStream_t stream) {
+    if (unified_route(x.ne[1])) {
+        unified::fp8_gdn_snapshot_dispatch(x, weight, conv_weight, conv_states, valid_columns,
+                                           initial_slot, snapshot_base_slot, query, key, value, z,
+                                           policy, workspace, stream);
+        return;
+    }
     launch_snapshot_plan(
         x, weight, conv_weight, conv_states, valid_columns, initial_slot, snapshot_base_slot, query,
         key, value, z, fp8_gdn_snapshot_resolve_plan(policy, x.ne[1], x.ne[2]), workspace, stream);
@@ -210,6 +264,12 @@ void fp8_gdn_record_dispatch(const Tensor& x, const Weight& weight, const Tensor
                              const Tensor& initial_slot, Tensor& conv_record, Tensor& query,
                              Tensor& key, Tensor& value, Tensor& z, LinearPolicy policy,
                              WorkspaceArena& workspace, cudaStream_t stream) {
+    if (unified_route(x.ne[1])) {
+        unified::fp8_gdn_record_dispatch(x, weight, conv_weight, conv_states, valid_columns,
+                                         initial_slot, conv_record, query, key, value, z, policy,
+                                         workspace, stream);
+        return;
+    }
     launch_record_plan(x, weight, conv_weight, conv_states, valid_columns, initial_slot,
                        conv_record, query, key, value, z,
                        fp8_gdn_record_resolve_plan(policy, x.ne[1], x.ne[2]), workspace, stream);

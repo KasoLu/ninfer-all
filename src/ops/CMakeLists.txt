@@ -47,7 +47,7 @@ if(NINFER_COMPAT_PATH)
   if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
     get_target_property(ninfer_ops_sources ninfer_ops SOURCES)
     list(FILTER ninfer_ops_sources EXCLUDE REGEX "nvfp4/.+_w4a4\\.cu$")
-    list(FILTER ninfer_ops_sources EXCLUDE REGEX "fp8/.+_a8\\.cu$")
+    list(FILTER ninfer_ops_sources EXCLUDE REGEX "fp8/.+_a8(_unified)?\\.cu$")
     set_property(TARGET ninfer_ops PROPERTY SOURCES ${ninfer_ops_sources})
     target_sources(ninfer_ops PRIVATE
       "${CMAKE_CURRENT_LIST_DIR}/nvfp4_sm86_stubs.cpp"

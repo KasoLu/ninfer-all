@@ -1,3 +1,5 @@
+#include "ops/linear/common/route_table.h"
+#include "ops/linear_topk/linear_topk_launch_unified.h"
 #include "core/weight.h"
 #include "ops/linear_topk/linear_topk_launch.h"
 
@@ -245,6 +247,10 @@ constexpr auto kLaunchers = make_launchers(std::make_index_sequence<3>{});
 
 void linear_topk_fp8_launch(const Tensor& hidden, const Weight& head, std::int32_t valid_rows,
                             const LinearTopKWorkspace& workspace, cudaStream_t stream) {
+    if (fused_route_table("unified/fp8_linear_topk", hidden.ne[1]) == LinearRouteTable::Unified) {
+        unified::linear_topk_fp8_launch(hidden, head, valid_rows, workspace, stream);
+        return;
+    }
     if (workspace.tile_columns == 0) {
         kLaunchers[(hidden.ne[1] - 1) / 8](hidden, head, valid_rows, workspace, stream);
     } else {

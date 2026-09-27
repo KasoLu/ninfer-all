@@ -1,3 +1,5 @@
+#include "ops/linear/common/route_table.h"
+#include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan_unified.h"
 #include "core/weight.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 
@@ -48,8 +50,9 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
 
 } // namespace
 
-std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
-                                                       std::int32_t max_tokens) {
+static std::size_t fp8_linear_swiglu_workspace_capacity_bytes_own(LinearPolicy policy,
+                                                                  std::int32_t min_tokens,
+                                                                  std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("fp8 linear_swiglu workspace: invalid token interval");
     }
@@ -61,9 +64,27 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
                : 0;
 }
 
+std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
+                                                       std::int32_t max_tokens) {
+    return capacity_by_table(
+        min_tokens, max_tokens,
+        [](std::int32_t width) { return fused_route_table("unified/fp8_linear_swiglu", width); },
+        [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
+            return table == LinearRouteTable::Unified
+                       ? unified::fp8_linear_swiglu_workspace_capacity_bytes(unified_policy(policy),
+                                                                             first, last)
+                       : fp8_linear_swiglu_workspace_capacity_bytes_own(policy, first, last);
+        });
+}
+
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
                                 LinearPolicy policy, WorkspaceArena& workspace,
                                 cudaStream_t stream) {
+    if (fused_route_table("unified/fp8_linear_swiglu", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::fp8_linear_swiglu_dispatch(x, weight, out, unified_policy(policy), workspace,
+                                            stream);
+        return;
+    }
     if (resolve_route(policy, x.ne[1]) == Fp8LinearSwiGluRoute::A16) {
         launch_a16(x, weight, out, stream);
         return;

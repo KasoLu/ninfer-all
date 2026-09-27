@@ -1,3 +1,5 @@
+#include "ops/linear/common/route_table.h"
+#include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan_unified.h"
 #include "core/weight.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 
@@ -25,8 +27,9 @@ Fp8GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
 
 } // namespace
 
-std::size_t fp8_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
-                                                   std::int32_t max_tokens) {
+static std::size_t fp8_gdn_input_workspace_capacity_bytes_own(LinearPolicy policy,
+                                                              std::int32_t min_tokens,
+                                                              std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("fp8 gdn_input_proj workspace: invalid token interval");
     }
@@ -34,6 +37,18 @@ std::size_t fp8_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::int
     return resolve_route(policy, max_tokens) == Fp8GdnInputRoute::A8
                ? fp8_a8_workspace_capacity_bytes(max_tokens, Fp8N16384K5120::kInputRows)
                : 0;
+}
+
+std::size_t fp8_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t min_tokens,
+                                                   std::int32_t max_tokens) {
+    return capacity_by_table(
+        min_tokens, max_tokens,
+        [](std::int32_t width) { return fused_route_table("unified/fp8_gdn_input", width); },
+        [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
+            return table == LinearRouteTable::Unified
+                       ? unified::fp8_gdn_input_workspace_capacity_bytes(policy, first, last)
+                       : fp8_gdn_input_workspace_capacity_bytes_own(policy, first, last);
+        });
 }
 
 void fp8_gdn_input_a16_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
@@ -54,6 +69,10 @@ void fp8_gdn_input_a8_dispatch(const Tensor& x, const Weight& weight, Tensor& qk
 
 void fp8_gdn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                             LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
+    if (fused_route_table("unified/fp8_gdn_input", x.ne[1]) == LinearRouteTable::Unified) {
+        unified::fp8_gdn_input_dispatch(x, weight, qkv, z, policy, workspace, stream);
+        return;
+    }
     if (resolve_route(policy, x.ne[1]) == Fp8GdnInputRoute::A16) {
         fp8_gdn_input_a16_dispatch(x, weight, qkv, z, stream);
         return;

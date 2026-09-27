@@ -250,3 +250,12 @@ foreach(table IN ITEMS legacy unified)
       PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 ENVIRONMENT NINFER_LINEAR_ROUTES=${table})
   endforeach()
 endforeach()
+
+# The FP8 Linear and fused suites on each table too.
+foreach(table IN ITEMS legacy unified)
+  foreach(test IN ITEMS linear_fp8_a16 linear_fp8_a8 linear_add_fp8 linear_swiglu_fp8)
+    add_test(NAME ninfer_${test}_${table}_routes_test COMMAND ninfer_tests ninfer_${test}_test)
+    set_tests_properties(ninfer_${test}_${table}_routes_test
+      PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 ENVIRONMENT NINFER_LINEAR_ROUTES=${table})
+  endforeach()
+endforeach()
