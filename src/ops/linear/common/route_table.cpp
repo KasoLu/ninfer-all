@@ -36,21 +36,32 @@ struct FamilyBands {
 // 320..1024 in steps of 64; graph execution, L2 flushed) averaged: at least 3% faster over the
 // shapes' geometric mean and no shape more than 3% slower, where a difference under one 2 us timer
 // tick counts as a tie. A band spans at least two measured widths and takes the unmeasured widths
-// between them.
+// between them. The FP8 and NVFP4 shapes count once per policy the card runs them under: A16, and
+// also A8 or A4 on the RTX 5090.
 constexpr std::array<WidthBand, 1> kRtx3090Q4{{{25, 32}}};
 constexpr std::array<WidthBand, 1> kRtx3090Q5{{{7, 96}}};
 constexpr std::array<WidthBand, 3> kRtx3090Q6{{{4, 18}, {21, 40}, {56, 96}}};
 constexpr std::array<WidthBand, 1> kRtx3090Q8{{{5, 6}}};
+constexpr std::array<WidthBand, 1> kRtx3090Fp8{{{31, 1024}}};
+constexpr std::array<WidthBand, 2> kRtx3090Nvfp4{{{27, 28}, {32, 1024}}};
+constexpr std::array<WidthBand, 3> kRtx3090Bf16{{{9, 16}, {25, 64}, {136, 1024}}};
 
 constexpr std::array<WidthBand, 3> kRtx4090Q4{{{25, 72}, {88, 96}, {704, 1024}}};
 constexpr std::array<WidthBand, 2> kRtx4090Q5{{{9, 128}, {320, 384}}};
 constexpr std::array<WidthBand, 2> kRtx4090Q6{{{7, 32}, {56, 96}}};
 constexpr std::array<WidthBand, 3> kRtx4090Q8{{{7, 8}, {40, 48}, {104, 120}}};
+constexpr std::array<WidthBand, 4> kRtx4090Fp8{{{9, 10}, {12, 16}, {19, 320}, {448, 1024}}};
+constexpr std::array<WidthBand, 2> kRtx4090Nvfp4{{{15, 16}, {26, 1024}}};
+constexpr std::array<WidthBand, 3> kRtx4090Bf16{{{14, 16}, {21, 64}, {136, 1024}}};
 
 constexpr std::array<WidthBand, 4> kRtx5090Q4{{{25, 112}, {232, 256}, {384, 576}, {704, 768}}};
 constexpr std::array<WidthBand, 1> kRtx5090Q5{{{5, 1024}}};
 constexpr std::array<WidthBand, 2> kRtx5090Q6{{{4, 32}, {56, 96}}};
 constexpr std::array<WidthBand, 1> kRtx5090Q8{{{1, 48}}};
+constexpr std::array<WidthBand, 7> kRtx5090Fp8{
+    {{5, 6}, {8, 23}, {27, 31}, {40, 128}, {232, 240}, {256, 384}, {512, 1024}}};
+constexpr std::array<WidthBand, 4> kRtx5090Nvfp4{{{3, 22}, {24, 200}, {216, 224}, {320, 384}}};
+constexpr std::array<WidthBand, 1> kRtx5090Bf16{{{6, 1024}}};
 
 enum class DeviceClass : std::uint8_t {
     Unmeasured,
@@ -62,11 +73,14 @@ enum class DeviceClass : std::uint8_t {
 FamilyBands bands_for(DeviceClass device) {
     switch (device) {
     case DeviceClass::Sm86:
-        return {kRtx3090Q4, kRtx3090Q5, kRtx3090Q6, kRtx3090Q8};
+        return {kRtx3090Q4,  kRtx3090Q5,    kRtx3090Q6,  kRtx3090Q8,
+                kRtx3090Fp8, kRtx3090Nvfp4, kRtx3090Bf16};
     case DeviceClass::Sm89:
-        return {kRtx4090Q4, kRtx4090Q5, kRtx4090Q6, kRtx4090Q8};
+        return {kRtx4090Q4,  kRtx4090Q5,    kRtx4090Q6,  kRtx4090Q8,
+                kRtx4090Fp8, kRtx4090Nvfp4, kRtx4090Bf16};
     case DeviceClass::Sm12x:
-        return {kRtx5090Q4, kRtx5090Q5, kRtx5090Q6, kRtx5090Q8};
+        return {kRtx5090Q4,  kRtx5090Q5,    kRtx5090Q6,  kRtx5090Q8,
+                kRtx5090Fp8, kRtx5090Nvfp4, kRtx5090Bf16};
     case DeviceClass::Unmeasured:
         break;
     }
