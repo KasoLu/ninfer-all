@@ -664,8 +664,28 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
             profile.routes[family.key] = std::move(bands);
             ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
         }
-        // The fast prompt kernel against the standard one (as the PV choice above left it): one
-        // wave-aligned chunk at 32K and one at 131K of context.
+        // The standard prompt kernel with each KV head's query heads packed into its tiles, as the
+        // PV choice above left it: one 1024-token chunk at 32K and one at 131K of context.
+        const Family pack{"attn_pack_gqa",
+                          {"on"},
+                          {1},
+                          [&](std::int32_t, cudaStream_t stream) {
+                              run(chunk, 32768, stream);
+                              run(chunk, 131072, stream);
+                          },
+                          [&](std::int32_t) {
+                              return std::pair<const void*, std::size_t>{
+                                  prompt_out.p, static_cast<std::size_t>(head_dim) * q_heads};
+                          },
+                          {}};
+        auto pack_bands = sweep(pack, timer, options);
+        if (!pack_bands.empty()) {
+            profile.routes[pack.key] = std::move(pack_bands);
+            ops::install_device_route_profile(
+                std::make_shared<const ops::DeviceRouteProfile>(profile));
+        }
+        // The fast prompt kernel against the standard one (as the PV and packing choices above
+        // left it): one wave-aligned chunk at 32K and one at 131K of context.
         const Family fast{"attn_prompt_fast",
                           {"on"},
                           {1},

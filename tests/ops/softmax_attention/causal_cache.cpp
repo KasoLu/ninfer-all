@@ -4186,6 +4186,19 @@ int run_softmax_attention_int8_prompt_tests() {
     return failures ? 1 : 0;
 }
 
+// The standard INT8 prompt kernel with each KV head's query heads packed into its tiles. The caller
+// sets NINFER_PROMPT_FAST=0 and NINFER_PROMPT_PACK_GQA=1 before the first launch, so every
+// INT8-family prompt case below, every key coding included, runs the packed tiles.
+int run_softmax_attention_pack_gqa_tests() {
+    if (cuda_unavailable()) return 77;
+    int failures = run_int8_prompt_cases(false);
+    for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
+    failures += run_rk4v4_e8_cases();
+    failures += run_rk2v4_e8_cases();
+    std::cout << (failures ? "FAIL" : "PASS") << " packed-GQA INT8 prompt causal attention\n";
+    return failures ? 1 : 0;
+}
+
 int run_softmax_attention_dflash2_tests() {
     // Profile validation first, and without a GPU: it is pure host logic, and if it is broken the
     // sweep below is the thing it was meant to protect.

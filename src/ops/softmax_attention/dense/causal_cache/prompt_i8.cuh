@@ -143,8 +143,13 @@ static_assert(kCausalPromptI8SmemBytes == 93184);
 // root codes). As in the small-T kernel, the next tile's packed keys are loaded into registers
 // where the INT8 path issues its cp.async, stay in flight across the PV MMAs, and are expanded into
 // the unchanged INT8 K tile before the tile barrier.
+//
+// PackGqa packs the rows of one KV head's query heads token-major into each tile (row = token *
+// GroupSize + head within the group), so a CTA stages every K/V tile once for the whole group
+// instead of once per query head; the grid runs over packed row blocks and KV heads. Everything
+// past the row mapping -- quantization, both MMAs, the online softmax -- is unchanged.
 template <typename Geometry, typename Metadata, bool PackedValues = false,
-          KvKeyCoding Keys = KvKeyCoding::Int8, bool PvF16 = false>
+          KvKeyCoding Keys = KvKeyCoding::Int8, bool PvF16 = false, bool PackGqa = false>
 __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
     const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
@@ -188,25 +193,48 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
     __nv_bfloat16* q_b16 = reinterpret_cast<__nv_bfloat16*>(q_i8);
     __nv_bfloat16* k_b16 = reinterpret_cast<__nv_bfloat16*>(k_i8);
 
-    const int q_block = static_cast<int>(blockIdx.x);
-    const int q_head  = static_cast<int>(blockIdx.y);
-    const int tid     = static_cast<int>(threadIdx.x);
-    const int warp    = tid >> 5;
-    const int lane    = tid & 31;
-    const int q0      = q_block * Br;
-    const int kv_head = q_head / Geometry::GroupSize;
-    const int tokens  = metadata.valid_tokens(width);
-    if (q_head >= Geometry::QHeads || q0 >= width) { return; }
-    if (q0 >= tokens) {
-        causal_prompt_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
-                                                 kCausalPromptI8Threads);
+    constexpr int PackGroup = PackGqa ? Geometry::GroupSize : 1;
+    const int q_block       = static_cast<int>(blockIdx.x);
+    const int head          = static_cast<int>(blockIdx.y);
+    const int tid           = static_cast<int>(threadIdx.x);
+    const int warp          = tid >> 5;
+    const int lane          = tid & 31;
+    // q0 counts rows: tokens, or packed (token, head) pairs under PackGqa.
+    const int q0         = q_block * Br;
+    const int q_head     = head;
+    const int kv_head    = PackGqa ? head : head / Geometry::GroupSize;
+    const int tokens     = metadata.valid_tokens(width);
+    const int row_count  = PackGroup * width;
+    const int valid_rows = PackGroup * tokens;
+    const auto row_token = [&](int row) { return PackGqa ? (q0 + row) / PackGroup : q0 + row; };
+    const auto row_head  = [&](int row) {
+        return PackGqa ? kv_head * PackGroup + (q0 + row) % PackGroup : q_head;
+    };
+    // Zeroes the tile rows [row_begin, row_end) of inactive columns.
+    [[maybe_unused]] const auto zero_packed_rows = [&](int row_begin, int row_end) {
+        for (int element = tid; element < (row_end - row_begin) * D;
+             element += kCausalPromptI8Threads) {
+            const int row = row_begin + element / D;
+            const int d   = element - (row - row_begin) * D;
+            out[causal_prompt_q_index<Geometry>(row_head(row), d, row_token(row))] =
+                __float2bfloat16(0.0f);
+        }
+    };
+    if (head >= (PackGqa ? Geometry::KVHeads : Geometry::QHeads) || q0 >= row_count) { return; }
+    if (q0 >= valid_rows) {
+        if constexpr (PackGqa) {
+            zero_packed_rows(0, min(Br, row_count - q0));
+        } else {
+            causal_prompt_zero_output_rows<Geometry>(out, q_head, q0, min(q0 + Br, width), tid,
+                                                     kCausalPromptI8Threads);
+        }
         return;
     }
     const int base_pos              = positions[0];
     const std::int32_t* block_table = metadata.block_table();
 
-    const int tile_rows     = min(Br, tokens - q0);
-    const int max_query_abs = base_pos + q0 + tile_rows - 1;
+    const int tile_rows     = min(Br, valid_rows - q0);
+    const int max_query_abs = base_pos + row_token(tile_rows - 1);
     const int key_blocks    = max_query_abs / Bc + 1;
 
     // Quantize Q cooperatively. One full warp rotates and encodes one D256 row at a time.
@@ -217,8 +245,8 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
             const int d = lane + 32 * r;
             q_values[r] = 0.0f;
             if (row < tile_rows) {
-                q_values[r] =
-                    __bfloat162float(q[causal_prompt_q_index<Geometry>(q_head, d, q0 + row)]);
+                q_values[r] = __bfloat162float(
+                    q[causal_prompt_q_index<Geometry>(row_head(row), d, row_token(row))]);
             }
         }
         normalized_hadamard_d256_inplace(q_values, lane);
@@ -453,9 +481,10 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
 
             const int row0             = row_base + gid;
             const int row1             = row0 + 8;
-            const int qabs0            = row0 < tile_rows ? base_pos + q0 + row0 : -1;
-            const int qabs1            = row1 < tile_rows ? base_pos + q0 + row1 : -1;
-            const bool full_score_tile = q0 + Br <= tokens && k0 + Bc - 1 <= base_pos + q0;
+            const int qabs0            = row0 < tile_rows ? base_pos + row_token(row0) : -1;
+            const int qabs1            = row1 < tile_rows ? base_pos + row_token(row1) : -1;
+            const bool full_score_tile =
+                q0 + Br <= valid_rows && k0 + Bc - 1 <= base_pos + row_token(0);
             float bm0                  = -CUDART_INF_F;
             float bm1                  = -CUDART_INF_F;
 #pragma unroll
@@ -645,17 +674,21 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
         const int d0 = (d_slice * PVNtPerWarp + n) * 8 + 2 * lid;
         if (row0 < tile_rows) {
             *reinterpret_cast<unsigned*>(
-                &out[causal_prompt_q_index<Geometry>(q_head, d0, q0 + row0)]) =
+                &out[causal_prompt_q_index<Geometry>(row_head(row0), d0, row_token(row0))]) =
                 pack_bf16x2(acc[n][0] * inv_l0, acc[n][1] * inv_l0);
         }
         if (row1 < tile_rows) {
             *reinterpret_cast<unsigned*>(
-                &out[causal_prompt_q_index<Geometry>(q_head, d0, q0 + row1)]) =
+                &out[causal_prompt_q_index<Geometry>(row_head(row1), d0, row_token(row1))]) =
                 pack_bf16x2(acc[n][2] * inv_l1, acc[n][3] * inv_l1);
         }
     }
-    causal_prompt_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid,
-                                             kCausalPromptI8Threads);
+    if constexpr (PackGqa) {
+        if (valid_rows - q0 < Br) { zero_packed_rows(valid_rows - q0, min(Br, row_count - q0)); }
+    } else {
+        causal_prompt_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid,
+                                                 kCausalPromptI8Threads);
+    }
 }
 
 } // namespace ninfer::ops

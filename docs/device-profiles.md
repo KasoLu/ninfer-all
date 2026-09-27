@@ -58,10 +58,11 @@ survives a second interleaved measurement, and its output matches the compiled r
 | `q4_q5_attn_input/...`, `q4_q5_gdn_input/...`, `q5_linear_add/...`, `q4_linear_swiglu/...` | fused groupwise (Qwen3.6/3.8) projection schedules | the model shapes, widths 1 to 64 |
 | `attn_i8_small/h24/<kv>/w<W>` | warps, CTAs per SM, key block, split QK (`q`) and early fetch (`e`) of the INT8-family small-T attention | query widths 1 to 8, KV windows 8K, 64K and 262K, for `int8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8` |
 | `attn_pv_f16` | FP16 accumulation of the probability-times-value product per key tile | a 1024-token prompt chunk at 32K and a decode step at 131K |
+| `attn_pack_gqa` | the standard INT8 prompt kernel with each KV head's query heads packed into its tiles (PackGQA) | a 1024-token prompt chunk at 32K and 131K |
 | `attn_prompt_fast` | the fast prompt-attention kernel (rows kept in registers, FP16 PV per tile) | a wave-aligned prompt chunk at 32K and 131K |
 
-`NINFER_SMALLT_PV_F16`, `NINFER_PROMPT_PV_F16` and `NINFER_PROMPT_FAST` (`0` or `1`) override the
-profile for their route. `--fast-prefill-kernel` turns the fast prompt kernel on regardless.
+`NINFER_SMALLT_PV_F16`, `NINFER_PROMPT_PV_F16`, `NINFER_PROMPT_PACK_GQA` and `NINFER_PROMPT_FAST`
+(`0` or `1`) override the profile for their route. `--fast-prefill-kernel` turns the fast prompt kernel on regardless.
 
 ## Batch composition
 

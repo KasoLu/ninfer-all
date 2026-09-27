@@ -33,6 +33,18 @@ bool prompt_pv_f16() {
     return device_route_schedule("attn_pv_f16", 1) == "on";
 }
 
+// Packs one KV head's query heads into each INT8 prompt tile (causal_attention_prompt_i8_kernel's
+// PackGqa) where the device profile's "attn_pack_gqa" says "on"; NINFER_PROMPT_PACK_GQA=0|1
+// overrides the profile. The fast kernel already issues a row block's heads together.
+bool prompt_pack_gqa() {
+    static const int forced = [] {
+        const char* value = std::getenv("NINFER_PROMPT_PACK_GQA");
+        return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
+    }();
+    if (forced >= 0) { return forced == 1; }
+    return device_route_schedule("attn_pack_gqa", 1) == "on";
+}
+
 // Both fast INT8 variants run one CTA per SM and every CTA of a launch sweeps a similar key range,
 // so a launch costs about (waves) x (one CTA's sweep). A four-warp CTA sweeps in about 0.72 of an
 // eight-warp CTA's time (measured on RTX 5090 at 64K context) but covers half the rows.
@@ -127,56 +139,8 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
     }
     const Tensor& cache_k = cache.k_pages;
     const Tensor& cache_v = cache.v_pages;
-    // Both dtype-specialized kernels exceed the default 48 KiB dynamic-smem ceiling.
-    configure_cuda_device_once([&] {
-        return cudaFuncSetAttribute(causal_attention_prompt_bf16_kernel<Geometry, Metadata>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptSmemBytes);
-    });
-    configure_cuda_device_once([&] {
-        return cudaFuncSetAttribute(causal_attention_prompt_i8_kernel<Geometry, Metadata, false>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptI8SmemBytes);
-    });
-    configure_cuda_device_once([&] {
-        return cudaFuncSetAttribute(causal_attention_prompt_i8_kernel<Geometry, Metadata, true>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptI8SmemBytes);
-    });
-    configure_cuda_device_once([&] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_i8_kernel<Geometry, Metadata, true, KvKeyCoding::Lloyd4>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptI8SmemBytes);
-    });
-    configure_cuda_device_once([&] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_i8_kernel<Geometry, Metadata, true, KvKeyCoding::Int4E8>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptI8SmemBytes);
-    });
-    configure_cuda_device_once([&] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_i8_kernel<Geometry, Metadata, true, KvKeyCoding::RootE8>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptI8SmemBytes);
-    });
-    configure_cuda_device_once([&] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_i8_kernel<Geometry, Metadata, true, KvKeyCoding::Int8, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptI8SmemBytes);
-    });
-    configure_cuda_device_once([&] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_i8_kernel<Geometry, Metadata, true, KvKeyCoding::Lloyd4, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptI8SmemBytes);
-    });
-    configure_cuda_device_once([&] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_i8_kernel<Geometry, Metadata, true, KvKeyCoding::Int4E8, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptI8SmemBytes);
-    });
-
-    const auto tokens = static_cast<std::int32_t>(q.ne[2]);
+    const auto tokens     = static_cast<std::int32_t>(q.ne[2]);
     if (kv_cache_is_int8_family(cache.storage)) {
-        const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptI8Br)),
-                                  static_cast<unsigned>(Geometry::QHeads), 1u);
-        const Tensor& cache_k_scale = cache.k_scale_pages;
-        const Tensor& cache_v_scale = cache.v_scale_pages;
         // The INT8 family is the one place that deliberately does not take its plane types from
         // ops/kv_cache/plane_types.h. One kernel serves both codings, so its value parameter is
         // std::int8_t* for int8-g64 and for rk8v4 alike, and the packed-int4 path re-casts to
@@ -184,90 +148,65 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
         // KvValueCodeT<RotatedInt8KeyInt4ValueGroup64>, which is U8 because the profile describes
         // the plane's storage rather than this kernel's signature, would not be a cleanup. Leave
         // it; the dtype check below is the guard that matters here.
+        const bool pack_gqa  = Geometry::GroupSize > 1 && prompt_pack_gqa();
+        const auto launch_i8 = [&]<bool PackedValues, KvKeyCoding Keys, bool PvF16>() {
+            const auto launch = [&]<bool PackGqa>() {
+                const auto kernel =
+                    causal_attention_prompt_i8_kernel<Geometry, Metadata, PackedValues, Keys, PvF16,
+                                                      PackGqa>;
+                // The kernel exceeds the default 48 KiB dynamic-smem ceiling.
+                configure_cuda_device_once([&] {
+                    return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                kCausalPromptI8SmemBytes);
+                });
+                const dim3 grid =
+                    PackGqa ? dim3(static_cast<unsigned>(
+                                       div_up(tokens * Geometry::GroupSize, kCausalPromptI8Br)),
+                                   static_cast<unsigned>(Geometry::KVHeads), 1u)
+                            : dim3(static_cast<unsigned>(div_up(tokens, kCausalPromptI8Br)),
+                                   static_cast<unsigned>(Geometry::QHeads), 1u);
+                kernel<<<grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const std::int8_t*>(cache_k.data),
+                    static_cast<const std::int8_t*>(cache_v.data),
+                    static_cast<const __half*>(cache.k_scale_pages.data),
+                    static_cast<const __half*>(cache.v_scale_pages.data), metadata,
+                    static_cast<const std::int32_t*>(positions.data), scale,
+                    static_cast<__nv_bfloat16*>(out.data), tokens);
+            };
+            if (pack_gqa) {
+                launch.template operator()<true>();
+            } else {
+                launch.template operator()<false>();
+            }
+        };
         // A U8 key plane is a packed key coding (rk4v4, rk4v4-e8 or rk2v4-e8), told apart by
         // storage; a U8 value plane is the packed signed int4 coding they share with rk8v4.
-        if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value && prompt_pv_f16()) {
-            causal_attention_prompt_i8_kernel<Geometry, Metadata, true, KvKeyCoding::Lloyd4, true>
-                <<<attention_grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const std::int8_t*>(cache_k.data),
-                    static_cast<const std::int8_t*>(cache_v.data),
-                    static_cast<const __half*>(cache_k_scale.data),
-                    static_cast<const __half*>(cache_v_scale.data), metadata,
-                    static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens);
+        const bool pv_f16 = prompt_pv_f16();
+        if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value && pv_f16) {
+            launch_i8.template operator()<true, KvKeyCoding::Lloyd4, true>();
         } else if (cache.storage == KvCacheStorage::RotatedLloyd4KeyInt4Value) {
-            causal_attention_prompt_i8_kernel<Geometry, Metadata, true, KvKeyCoding::Lloyd4>
-                <<<attention_grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const std::int8_t*>(cache_k.data),
-                    static_cast<const std::int8_t*>(cache_v.data),
-                    static_cast<const __half*>(cache_k_scale.data),
-                    static_cast<const __half*>(cache_v_scale.data), metadata,
-                    static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens);
-        } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8 && prompt_pv_f16()) {
-            causal_attention_prompt_i8_kernel<Geometry, Metadata, true, KvKeyCoding::Int4E8, true>
-                <<<attention_grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const std::int8_t*>(cache_k.data),
-                    static_cast<const std::int8_t*>(cache_v.data),
-                    static_cast<const __half*>(cache_k_scale.data),
-                    static_cast<const __half*>(cache_v_scale.data), metadata,
-                    static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens);
+            launch_i8.template operator()<true, KvKeyCoding::Lloyd4, false>();
+        } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8 && pv_f16) {
+            launch_i8.template operator()<true, KvKeyCoding::Int4E8, true>();
         } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
-            causal_attention_prompt_i8_kernel<Geometry, Metadata, true, KvKeyCoding::Int4E8>
-                <<<attention_grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const std::int8_t*>(cache_k.data),
-                    static_cast<const std::int8_t*>(cache_v.data),
-                    static_cast<const __half*>(cache_k_scale.data),
-                    static_cast<const __half*>(cache_v_scale.data), metadata,
-                    static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens);
+            launch_i8.template operator()<true, KvKeyCoding::Int4E8, false>();
         } else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
-            causal_attention_prompt_i8_kernel<Geometry, Metadata, true, KvKeyCoding::RootE8>
-                <<<attention_grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const std::int8_t*>(cache_k.data),
-                    static_cast<const std::int8_t*>(cache_v.data),
-                    static_cast<const __half*>(cache_k_scale.data),
-                    static_cast<const __half*>(cache_v_scale.data), metadata,
-                    static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens);
-        } else if (cache_v.dtype == DType::U8 && prompt_pv_f16()) {
-            causal_attention_prompt_i8_kernel<Geometry, Metadata, true, KvKeyCoding::Int8, true>
-                <<<attention_grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const std::int8_t*>(cache_k.data),
-                    static_cast<const std::int8_t*>(cache_v.data),
-                    static_cast<const __half*>(cache_k_scale.data),
-                    static_cast<const __half*>(cache_v_scale.data), metadata,
-                    static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens);
+            launch_i8.template operator()<true, KvKeyCoding::RootE8, false>();
+        } else if (cache_v.dtype == DType::U8 && pv_f16) {
+            launch_i8.template operator()<true, KvKeyCoding::Int8, true>();
         } else if (cache_v.dtype == DType::U8) {
-            causal_attention_prompt_i8_kernel<Geometry, Metadata, true>
-                <<<attention_grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const std::int8_t*>(cache_k.data),
-                    static_cast<const std::int8_t*>(cache_v.data),
-                    static_cast<const __half*>(cache_k_scale.data),
-                    static_cast<const __half*>(cache_v_scale.data), metadata,
-                    static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens);
+            launch_i8.template operator()<true, KvKeyCoding::Int8, false>();
         } else {
-            causal_attention_prompt_i8_kernel<Geometry, Metadata, false>
-                <<<attention_grid, kCausalPromptI8Threads, kCausalPromptI8SmemBytes, stream>>>(
-                    static_cast<const __nv_bfloat16*>(q.data),
-                    static_cast<const std::int8_t*>(cache_k.data),
-                    static_cast<const std::int8_t*>(cache_v.data),
-                    static_cast<const __half*>(cache_k_scale.data),
-                    static_cast<const __half*>(cache_v_scale.data), metadata,
-                    static_cast<const std::int32_t*>(positions.data), scale,
-                    static_cast<__nv_bfloat16*>(out.data), tokens);
+            launch_i8.template operator()<false, KvKeyCoding::Int8, false>();
         }
     } else {
+        // The kernel exceeds the default 48 KiB dynamic-smem ceiling.
+        configure_cuda_device_once([&] {
+            return cudaFuncSetAttribute(causal_attention_prompt_bf16_kernel<Geometry, Metadata>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        kCausalPromptSmemBytes);
+        });
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kCausalPromptBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);
         causal_attention_prompt_bf16_kernel<Geometry, Metadata>
