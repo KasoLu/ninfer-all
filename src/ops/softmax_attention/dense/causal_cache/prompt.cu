@@ -72,16 +72,18 @@ void causal_attention_prompt_i8_fast_launch_for(const Tensor& q, const Tensor& p
                                                 float scale, const CacheView& cache,
                                                 Metadata metadata, Tensor& out,
                                                 cudaStream_t stream) {
-    static const cudaError_t attr_wide = cudaFuncSetAttribute(
-        causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 8, PackedValues, Keys>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        CausalPromptI8FastShape<8, PackedValues>::SmemBytes);
-    CUDA_CHECK(attr_wide);
-    static const cudaError_t attr_narrow = cudaFuncSetAttribute(
-        causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 4, PackedValues, Keys>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        CausalPromptI8FastShape<4, PackedValues>::SmemBytes);
-    CUDA_CHECK(attr_narrow);
+    configure_cuda_device_once([] {
+        return cudaFuncSetAttribute(
+            causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 8, PackedValues, Keys>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            CausalPromptI8FastShape<8, PackedValues>::SmemBytes);
+    });
+    configure_cuda_device_once([] {
+        return cudaFuncSetAttribute(
+            causal_attention_prompt_i8_fast_kernel<Geometry, Metadata, 4, PackedValues, Keys>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            CausalPromptI8FastShape<4, PackedValues>::SmemBytes);
+    });
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     const auto launch = [&]<int Warps>() {
