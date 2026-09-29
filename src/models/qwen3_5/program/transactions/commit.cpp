@@ -732,6 +732,9 @@ bool ProgramImpl::salvage_continuation(SequenceState& state, RequestControl& req
             state.dflash_context_frontier < frontier) {
             return false;
         }
+        // An aborted prefill leaves the MTP head's KV and tail hidden state behind the cursor; the next
+        // request of the conversation could not materialize such an endpoint.
+        if (speculative_backend == SpeculativeBackend::Mtp) { return false; }
     } else if (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Finishable) {
         frontier = state.execution_frontier;
         if (frontier < kSalvageMinFrontier || state.text_kv_valid != frontier) { return false; }
