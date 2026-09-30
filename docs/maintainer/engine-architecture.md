@@ -645,6 +645,11 @@ transfer, then target verification. The host function calls no CUDA API; it capt
 for rethrow after stream synchronization and before any token can be published. All node addresses
 belong to Program and outlive graph replay.
 
+Draft frames are compact at each round's actual proposal width, which may be narrower than the
+maximum ngram/copy window. D2H staging must preserve the fixed host-row pitch used by the grammar
+callback; a contiguous whole-frame copy cannot substitute for row-strided transfer. Graph replay
+must retain this mapping for every compact row, independently of its physical lane.
+
 SamplingConfig carries an optional bitset pointer and column stride. Column i describes the
 grammar after drafts[0..i). The mask is applied before penalties and sampling filters. After an
 illegal draft or EOS, suffix columns are unreachable and need no grammar traversal. Every reachable

@@ -52,10 +52,19 @@ void CUDART_CB StructuredRound::callback(void* opaque) noexcept {
 }
 
 void StructuredRound::enqueue_dflash(const Tensor& drafts, cudaStream_t stream) {
+    if (drafts.dtype != DType::I32 || drafts.ne[0] <= 0 ||
+        static_cast<std::uint32_t>(drafts.ne[0]) >= width_ || drafts.ne[1] <= 0 ||
+        static_cast<std::uint32_t>(drafts.ne[1]) > lanes_ || drafts.ne[2] != 1 ||
+        drafts.ne[3] != 1 || drafts.nb[0] != sizeof(TokenId)) {
+        throw std::logic_error("structured draft tensor exceeds its reserved frame");
+    }
     // No CUDA calls or exceptions escape the host function. The transfers and host node are
     // captured together: verification cannot observe masks until the CPU matcher has filled them.
-    CUDA_CHECK(cudaMemcpyAsync(host_drafts_.data(), drafts.data, drafts.bytes(),
-                               cudaMemcpyDeviceToHost, stream));
+    // The device frame is compact at this round's width (neural/copy widths can differ).
+    // The callback addresses fixed maximum-width host rows; preserve that pitch on every replay.
+    CUDA_CHECK(cudaMemcpy2DAsync(host_drafts_.data(), (width_ - 1U) * sizeof(TokenId),
+                                 drafts.data, drafts.nb[1], drafts.ne[0] * sizeof(TokenId),
+                                 drafts.ne[1], cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaLaunchHostFunc(stream, callback, this));
     CUDA_CHECK(cudaMemcpyAsync(masks_.data, host_masks_.data(), masks_.bytes(),
                                cudaMemcpyHostToDevice, stream));
