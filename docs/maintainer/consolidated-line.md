@@ -7,10 +7,11 @@ pipeline stages, most of both written by Warlax (WarlaxZ); that line continues
 this fork's production behaviours and ternary work, the patches of
 [TertiumOrganum1/ninfer-3090](https://github.com/TertiumOrganum1/ninfer-3090), ideas from
 [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090), pull requests to
-[Neroued/ninfer](https://github.com/Neroued/ninfer) and work from the forks listed below. When the
-base moves, these commits are applied again on its new head one by one, each adapted to what changed
-underneath rather than merged, so every commit stands on its own and carries its rationale and its
-authors; this note is the map.
+[Neroued/ninfer](https://github.com/Neroued/ninfer) and work from the forks listed below. Until
+September the line re-applied its commits on each new base head one by one; since the October 2
+update the base is merged (v0.12.0, merge commit `ed10eae5`, conflicts resolved semantically), and
+later fork and upstream changes are ported as individual commits that keep their authors and name
+their source commit. This note is the map.
 
 ## What the line carries over its base
 
@@ -133,7 +134,7 @@ requests and `master`), each change re-applied on this tree and opt-in where it 
 | David Oelfke | CPU Vision (`--vision-residency cpu`): the tower in FP32 on host threads with packed token panels and key-blocked attention, no device Vision memory; `--rope-scaling-factor` and `--rope-scaling-original-context` interpolate positions past a threshold in the RoPE kernel | `models/qwen3_5/{load,execution}/vision_cpu.*`, `ops/kernel/rope.cuh`, `product/rope_yarn_options.h` |
 | Ian Ranson (Wallawalla47) | `--assistant-prefill`, `--unconstrained-response-format`, grouped `--help`, the build id, `--log-colours`, `--log-stats-panel`, levelled diagnostics records, a native Windows build | `serve/`, `apps/`, `product/logging/`, `CMakeLists.txt` |
 | Ian Ranson (Wallawalla47) | decode-graph kernels launched as programmatic dependents (`NINFER_PDL` on compatibility builds, always on native ones), split-KV attention for short prefill steps over long contexts, a runtime-shape BF16 GEMM fallback, MTP banks of mixed formats, measured CUDA Graph memory in `server_start` | `ops/`, `models/qwen3_5/program/graphs.cpp`, `core/device.cu` |
-| Ian Ranson (Wallawalla47) | ModelOpt NVFP4/FP8 and Quasar NVFP4 conversion, the `grouped_mse` scale search | `tools/convert/` |
+| Ian Ranson (Wallawalla47) | ModelOpt NVFP4/FP8 and Quasar NVFP4 conversion, the `grouped_mse` scale search (folded into the base's `grouped_search` by the October merge) | `tools/convert/` |
 | MGS Creativa, IMGillusion, Alexey Dubkov, Duncan Betts, giveen | a Vision loan takes only pages no reservation needs; LRU disk-tier eviction and positioned I/O; a quoted parameter closer stays inside its value; the fused RMSNorm and NVFP4 attention input at every width; the shared catalog default | `runtime/engine/context_cache/`, `core/disk_kv_*`, `models/qwen3_5/frontend/tool_call_parser.cpp`, `ops/attn_input_proj/nvfp4/` |
 | [Neroued/ninfer](https://github.com/Neroued/ninfer) `master` | the unified Q4, Q5, Q6 and Q8 A16 Linear templates with sliced-K schedules, beside this line's routes and kernels; each card class takes them only in the width bands where two sweeps on an RTX 3090, 4090 and 5090 measured them faster, and `NINFER_LINEAR_ROUTES=legacy\|unified` forces one table | `ops/linear/common/route_table.{h,cpp}`, `ops/linear/q{4,5,6,8}/` |
 | [Neroued/ninfer](https://github.com/Neroued/ninfer) `master` | the unified FP8, NVFP4 and BF16 Linear templates, and upstream's moves of the Q4, Q5, Q8, FP8, NVFP4 and BF16 fused projections onto them (attention and GDN inputs with their conv forms, LinearAdd, SwiGLU, the Q8 pair, the top-k heads, the Q8 grouped convolution and context-KV materialization), compiled beside this line's routes in `ops::detail::unified`; the FP8, NVFP4 and BF16 Linear shapes take them per width through `LinearRouteFamily` bands and each fused Op through its `unified/<op>` device-profile key, only where measured faster on the card | `ops/linear/common/route_table.{h,cpp}`, `ops/linear/{fp8,nvfp4,bf16}/`, `ops/{attn_input_proj,gdn_input_proj,linear_add,linear_swiglu,linear_pair,linear_topk,context_kv_materialize,dynamic_grouped_conv}/` |
@@ -295,3 +296,21 @@ and have not been run.
 
 Deployment files are not part of this public line. The production checkout adds them on a
 private branch on top of `master`.
+
+The October 2 sweep (base v0.12.0 merged; upstream `master`, Wallawalla47, gzenz and the smaller
+forks ported commit by commit, each naming its source):
+
+| source | behaviour | where it lives in the tree |
+|---|---|---|
+| fixes from every source | about forty fixes: engine admission, demotion pricing, shared-slot reservation, capture skipping, statistics publication, slot digests, Ctrl+C shutdown (`Engine::stop`), sparse-MoE grid capping, DFlash prefill controls, Anthropic `tool_choice` any, empty model names, `top_k` clamping, tool-call parameter ends, FFmpeg logging, reasoning-effort rendering, state-image byte counts | the commits after `ed10eae5` |
+| Ian Ranson (Wallawalla47) | the hybrid prefix cache keeps each conversation's resume point (#335 delta), a persistent save with `PrefixCacheSaveControl`, the prompt's n-gram index built off the worker | `runtime/engine/context_cache/hybrid_resource_manager.h`, `models/qwen3_5/program/prefix/`, `ngram.cpp` |
+| Gideon Zenz | branch anchors: a request whose prompt stops matching a retained conversation captures where it diverges (`ContextCacheOptions::branch_anchors`, from 1024 tokens of gain) | `resource_manager.h`, `planning/request_plan.cpp`, `engine_core.h` |
+| Warlax | the Q6 vocabulary-head GEMV and small-T MMA, small-T Q4 linear_add for 9-32 columns, Q4 MLP-down A8, MTP graph executables shared by launch shape past eight verify columns, an imatrix-searched 27B recipe, held-out perplexity and a llama.cpp KLD harness | `ops/linear/q6/`, `ops/linear_add/q4/`, `planning/graph_profiles.cpp`, `tools/` |
+| Neroued (adapted) | parallel query tiles for single-row chunked small-T attention over INT8-family caches (`attn_parallel_tiles`, opt-in) | `causal_softmax_attention.cpp`, `small_t.cu` |
+| Neroued | MX FP8 MMA (`kind::mxf8f6f4` with unit scales) and TMA split-K schedules for the FP8 A8 projections; native FP8/NVFP4 widening on CUDA 13.2+ | `ops/linear/fp8/`, `ops/common/mma.cuh`, `fp8_a16_codec.cuh` |
+| Ian Ranson, Duncan Betts (Wallawalla47) | Blackwell: the FP4 Tensor Core NVFP4-KV prompt kernel, a third stage for the NVFP4 linear_add tile, reciprocal NVFP4 activation quantize on the linear MMA route, two-row sliced-K tiles (FP8 head, unified Q8), PDL on the unified kernels with the fold submitted without a host wait, captured TMA descriptor copies on staged-descriptor builds | `prompt_nvfp4_fast.*`, `ops/linear/{nvfp4,fp8,q8}/`, `core/pdl.cuh`, `core/tma_descriptor_staging.cuh`, `program/prefill.cpp` |
+| build | every CUDA fatbin compressed: the merged ops archive passed 2 GiB on sm_86 and no app linked | `cmake/NinferTargets.cmake` |
+
+Not taken: control vectors (to be evaluated separately); Neroued #353 (closed; on Blackwell the FP4
+prompt kernel above is faster), #355/#351 (the FP4 prompt kernel splits keys itself), #324
+(superseded by the TMA split-K schedules).
