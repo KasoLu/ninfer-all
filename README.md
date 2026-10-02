@@ -108,6 +108,22 @@ filled to it, both models find two of the three needles.
   planner shared one executable between windows where BF16 takes the prompt kernel (up to 128 keys)
   and windows where it takes small-T. The planner now asks the attention op which route each
   captured call takes.
+- **Parallel query tiles (opt-in).** A single-row verification or short prefill over an INT8-family
+  cache can run its 9 to 64 columns as parallel tiles of one split-KV launch after one batched KV
+  append, instead of serial chunks: the device profile key `attn_parallel_tiles` (calibrated) or
+  `NINFER_ATTN_PARALLEL_TILES=1`.
+- **Branch anchors (opt-in).** `--branch-anchors` captures a request where its prompt stops
+  matching a retained conversation, so an edited or forked conversation resumes from there.
+- **Blackwell kernels.** FP8 A8 projections use the block-scaled MX FP8 MMA with TMA split-K
+  schedules; an NVFP4 KV cache prefills past 2048 visible keys with QK on FP4 tensor cores under
+  `--fast-prefill-kernel` or the profile's `attn_prompt_fast`; the unified kernels launch as
+  programmatic dependents in captured graphs; with CUDA 13.2 the FP8 and NVFP4 A16 operands widen
+  natively. All of it compiles only into `120a` builds.
+- **Qwen3.8-Flash-Next (in progress, not loadable yet).** The converter maps its text weights,
+  the n-gram table can be read from disk or RAM, and its new operations (hyper-connections, PLE,
+  the sparse-attention indexer and attention, the 512-expert router) pass their FP64 oracles. The
+  engine cannot load the model yet; the [plan](docs/maintainer/qwen3-8-flash-next-plan.md) tracks
+  what remains.
 - **Reference measurements** of Ternary Bonsai 2 27B and Qwen3.8-27B on the RTX 3090, 4090 and
   5090 up to the full window, the largest context each card serves and fills, every draft length
   from one to fifteen, several requests at once, and the previous master on the same hosts:
@@ -135,7 +151,8 @@ filled to it, both models find two of the three needles.
   - A Paged KV exhaustion names its page numbers, and three in a row mark the engine unhealthy.
   - Several context-cache fixes keep long agent sessions from re-prefilling: private reclamation,
     the demand window, and the capture search for a zero-value candidate.
-- **Build.** Tests build against CUDA 13's `cudaGraphGetEdges`.
+- **Build.** Tests build against CUDA 13's `cudaGraphGetEdges`. Device code is compressed for size
+  (CUDA 12.8 and newer), which keeps the linked binaries under 2 GiB.
 
 Taken from [TertiumOrganum1's fork](https://github.com/TertiumOrganum1/ninfer-3090):
 
