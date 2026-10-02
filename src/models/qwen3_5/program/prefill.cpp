@@ -78,7 +78,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
-    card.set_layer_ready(state.layer_ready);
+    if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
@@ -106,7 +106,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
-    card.set_layer_ready(state.layer_ready);
+    if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
@@ -1112,7 +1112,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             schedule_state.first_token_logits = first_token_logits_host->data();
         }
         // The first pass after a Host restore waits for each layer's copies (hybrid spec §6.5).
-        schedule_state.layer_ready = hybrid_take_restore_layers(sequence.lane);
+        // The chunk function takes the events itself: they are a view into the landing batch, and
+        // the KV commits between chunks (the MTP bridge's among them) poll the cache, which frees
+        // a batch that has landed. A landed batch yields no events; its copies are complete.
+        schedule_state.take_layer_ready = [this, lane = sequence.lane] {
+            return hybrid_take_restore_layers(lane);
+        };
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -1214,7 +1219,6 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
                 timing.include(result.timing);
                 timing.resume_post();
-                schedule_state.layer_ready = {};
                 if (result.processed_tokens == 0 || result.processed_tokens > remaining) {
                     throw std::logic_error("ordinary prefill chunk made invalid progress");
                 }

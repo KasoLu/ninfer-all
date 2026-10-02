@@ -1263,7 +1263,9 @@ private:
     std::optional<HybridCachePersistence> hybrid_shutdown_save_;
 
     void create_hybrid_prefix_cache(const StartupObserver& observer);
-    // The per-layer events the lane's first prefill pass waits on, consumed by this call.
+    // The per-layer events the lane's first prefill pass waits on, consumed by this call; empty
+    // once the batch has landed. The view is valid only until the cache's next poll(), which every
+    // KV commit runs, so only PrefillContext::take_layer_ready calls it, inside the chunk function.
     [[nodiscard]] std::span<const cudaEvent_t> hybrid_take_restore_layers(std::uint32_t lane);
     // True when a sibling lane still prefilling a prompt that shares more with this one than the
     // cache offers will publish a snapshot where they diverge soon enough to wait for. Plans that
