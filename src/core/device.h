@@ -166,6 +166,9 @@ struct DeviceContext {
     void activate_rank(std::size_t rank);
     void synchronize_rank(std::size_t rank) const;
     void synchronize() const;
+    // Submits every rank's queued work without waiting for it. On a batched driver model (WDDM) a
+    // launch can otherwise sit in the command buffer until the next blocking call or launch.
+    void flush() const;
     int sm() const noexcept;
 
 private:

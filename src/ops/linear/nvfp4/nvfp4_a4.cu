@@ -50,16 +50,18 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
     }
     // The row-major plane feeds the MMA routes, the decode widths a CUDA Graph captures.
     if (reciprocal) {
-        nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::RowMajor, true>
-            <<<blocks, kThreads, 0, stream>>>(input, workspace.codes, workspace.scales, tokens,
-                                              written_tokens, weight.input_scale_divisor);
-        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(pdl::launch_consumer(
+            {dim3(blocks), dim3(kThreads), 0, stream},
+            nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::RowMajor,
+                                     true>,
+            input, workspace.codes, workspace.scales, tokens, written_tokens,
+            weight.input_scale_divisor));
         return;
     }
-    nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::RowMajor>
-        <<<blocks, kThreads, 0, stream>>>(input, workspace.codes, workspace.scales, tokens,
-                                          written_tokens, weight.input_scale_divisor);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(blocks), dim3(kThreads), 0, stream},
+        nvfp4_a4_quantize_kernel<ActivationGeometry, kThreads, Nvfp4ScaleLayout::RowMajor>, input,
+        workspace.codes, workspace.scales, tokens, written_tokens, weight.input_scale_divisor));
 }
 
 } // namespace

@@ -9,6 +9,7 @@
 // an optional caller epilogue may instead consume the FP32 tile. Two row tiles share the staged
 // activation and its B fragments and serve identity rows with the plain tile store only.
 
+#include "core/pdl.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/q8/q8_schedule.cuh"
@@ -77,6 +78,10 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
                                                     Epilogue epilogue, RowPolicy row_policy = {},
                                                     int token_begin            = 0,
                                                     ColumnPolicy column_policy = {}) {
+    // Every kernel built on this streams its weights through the K loop: wait for the producer
+    // before reading anything else (a no-op unless the launch is a programmatic dependent), and let
+    // dependents launch once that loop is done.
+    pdl::enter_streaming();
     constexpr int ActiveCols        = Schedule::kTokenCapacity;
     const auto* __restrict__ x      = operands.x;
     const auto* __restrict__ codes  = operands.codes;
@@ -366,6 +371,8 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
             __syncthreads();
         }
     }
+    // The weights have streamed; a dependent launched as a programmatic consumer may start.
+    pdl::trigger_dependents();
 
     __syncthreads();
     auto* partial            = shared.partial;
