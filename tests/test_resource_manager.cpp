@@ -729,6 +729,7 @@ public:
                       const FakeSharedPrefixHandle* shared_source,
                       std::optional<CheckpointRef> checkpoint, bool must_retain_source) {
         ++admission_inspections;
+        if (!admission_boundary_ready) { return std::nullopt; }
         if (source != nullptr) {
             inspected_private_sources.push_back(source->id);
             if (source->content_key != prompt.content_key || !checkpoint) { return std::nullopt; }
@@ -1264,6 +1265,7 @@ public:
     bool ladder_feasibility_mode                         = false;
     std::uint32_t min_feasible_sacrifice                 = 0;
     bool abort_start                                     = false;
+    bool admission_boundary_ready                        = true;
     bool abort_progress                                  = false;
     bool malform_last_private_victim                     = false;
     bool malform_last_capture_private_victim             = false;
@@ -2908,6 +2910,141 @@ void test_aborted_source_selection_does_not_create_hit_history() {
     require(program.started_action_ids.size() == 1 &&
                 program.started_action_ids.front() == 2000U + first.sequence.id,
             "aborted source selection incorrectly biased later retention policy");
+}
+
+// Retention depth was one in production: A reuses, B (another conversation) takes one turn, A
+// misses. The reuse hit was recorded on A's observation and then cleared on the consume path, and
+// the republished endpoint's frontier had moved so the exact-ref lookup rebuilt the observation
+// from zero anyway. The frontier must advance between A's two publications here, as it does on
+// every real turn.
+void test_republished_owner_keeps_reuse_history() {
+    constexpr std::uint32_t republish_frontier = 20;
+    FakeManager manager                        = make_manager(1, 2);
+    FakeProgram program;
+    // A into slot 0, B into slot 1: the private catalog is full.
+    const ActiveRequest a1 = start_active(manager, program, 61, make_base(61), 1);
+    (void)finish_active(manager, program, a1, 16);
+    const ActiveRequest b1 = start_active(manager, program, 62, make_base(62), 2);
+    (void)finish_active(manager, program, b1, republish_frontier);
+
+    // A reuses its own endpoint: consume, then republish into the same cell.
+    const ActiveRequest a2 = start_active(manager, program, 61, make_base(61), 3);
+    require(program.started_source_mode == PrivateSourceMode::ConsumeToActive,
+            "reuse of an owner's own endpoint was not a consume");
+    (void)finish_active(manager, program, a2, republish_frontier);
+
+    // A cold third conversation needs a slot: the never-reused B must be the victim.
+    program.required_pressure_actions = 1;
+    program.require_evictions         = true;
+    auto pressure = manager.inspect(program, FakePreparedPrompt{63}, make_base(63), 4);
+    require(pressure.choice.has_value(), "cold admission under a full catalog found no plan");
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*pressure.choice),
+                                          FakePreparedPrompt{63}, {});
+    require(program.started_action_ids.size() == 1,
+            "cold admission under a full catalog did not evict exactly one owner");
+    const std::uint64_t action = program.started_action_ids.front();
+    require(action != 2000U + a2.sequence.id,
+            "planner evicted the owner that reused one request ago (retention depth one)");
+    require(action == 2000U + b1.sequence.id, "planner did not evict the never-reused owner");
+}
+
+// Reuse of a private checkpoint consumes it by default. A read-only request would move the only
+// copy into a lane that gives nothing back, and a request that declares an explicit boundary at
+// the reused frontier means that prefix to stay published; both retain instead.
+void test_read_only_and_declared_boundary_reuse_retain_the_source() {
+    FakeManager manager = make_manager(1, 3);
+    FakeProgram program;
+    const ActiveRequest owner = start_active(manager, program, 61, make_base(61), 1);
+    (void)finish_active(manager, program, owner, 16);
+
+    FakeRequestBasePlan read_only        = make_base(61);
+    read_only.value.publish_continuation = false;
+    const ActiveRequest reader           = start_active(manager, program, 61, read_only, 2);
+    require(program.started_source_mode == PrivateSourceMode::Retain,
+            "a read-only request consumed the checkpoint it reused");
+    (void)finish_active(manager, program, reader, 16);
+
+    FakeRequestBasePlan declared = make_base(61);
+    declared.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .frontier = 16,
+    });
+    const ActiveRequest publisher = start_active(manager, program, 61, declared, 3);
+    require(program.started_source_mode == PrivateSourceMode::Retain,
+            "a request declaring an explicit boundary at the reused frontier consumed it");
+    (void)finish_active(manager, program, publisher, 16);
+
+    const ActiveRequest plain = start_active(manager, program, 61, make_base(61), 4);
+    require(program.started_source_mode == PrivateSourceMode::ConsumeToActive,
+            "an ordinary same-content request no longer consumes its own endpoint");
+    (void)finish_active(manager, program, plain, 16);
+}
+
+// A read-only request that the Program releases at finish leaves the catalog exactly as it was:
+// the source still catalogued and reusable at its frontier, no entry of its own.
+void test_read_only_request_leaves_the_catalog_unchanged() {
+    FakeManager manager = make_manager(1, 3);
+    FakeProgram program;
+    const ActiveRequest owner = start_active(manager, program, 61, make_base(61), 1);
+    (void)finish_active(manager, program, owner, 16);
+    const auto catalogued = [&] {
+        std::uint32_t count = 0;
+        for (std::uint32_t slot = 0; slot < 3; ++slot) {
+            count += manager.catalog_state(slot) == FakeManager::CatalogState::Catalogued ? 1U : 0U;
+        }
+        return count;
+    };
+    require(catalogued() == 1, "the publishing owner was not catalogued");
+
+    FakeRequestBasePlan read_only        = make_base(61);
+    read_only.value.publish_continuation = false;
+    const ActiveRequest reader           = start_active(manager, program, 61, read_only, 2);
+    require(program.started_source_mode == PrivateSourceMode::Retain,
+            "a read-only request consumed the checkpoint it reused");
+    program.finish_release          = true;
+    const FakeFinishResult released = finish_active(manager, program, reader, 16);
+    program.finish_release          = false;
+    require(released.disposition == FinishDisposition::Released,
+            "the fake did not release the read-only request");
+    require(catalogued() == 1 && manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "a read-only request changed the catalog");
+    require(manager.lane_state(reader.lane) == ninfer::runtime::LogicalLaneState::Free,
+            "the read-only lane did not return to Free");
+
+    auto again = manager.inspect(program, FakePreparedPrompt{61}, make_base(61), 3);
+    require(again.readiness == Readiness::Ready && again.choice &&
+                again.choice->summary().reusable_prompt_tokens == 16,
+            "the source was not reusable after a read-only request finished");
+}
+
+void test_admission_waits_for_program_boundary() {
+    FakeManager manager = make_manager(2, 3);
+    FakeProgram program;
+    const ActiveRequest active   = start_active(manager, program, 9, make_base(9), 1);
+    const auto starts            = program.start_calls;
+    const auto planning_sessions = program.pressure_planning_sessions;
+
+    // An active lane can have an unfinished StateImage fork even with a free destination lane and
+    // enough physical capacity. Pressure cannot complete that state transition.
+    program.admission_boundary_ready = false;
+    auto blocked = manager.inspect(program, FakePreparedPrompt{77}, make_base(77), 2);
+    require(blocked.readiness == Readiness::TemporarilyBlocked && !blocked.choice,
+            "unfinished Program boundary was treated as infeasibility or a fatal root error");
+    require(program.start_calls == starts &&
+                program.pressure_planning_sessions == planning_sessions &&
+                program.started_action_ids.empty() && program.released_continuations.empty() &&
+                program.abort_calls == 0,
+            "blocked admission changed active ownership or started pressure planning");
+
+    program.admission_boundary_ready = true;
+    const ActiveRequest admitted     = start_active(manager, program, 77, make_base(77), 3);
+    require(admitted.lane != active.lane && program.start_calls == starts + 1,
+            "settled Program boundary did not admit the waiting request on the free lane");
+    (void)finish_active(manager, program, admitted);
+    (void)finish_active(manager, program, active);
+    require(program.finish_calls == 2, "retry admission damaged the already active request");
 }
 
 void test_retained_source_is_protected_until_terminal() {
@@ -4920,8 +5057,14 @@ void test_automatic_reclaim_spares_the_prefix_the_capture_extends() {
     require(program.released_shared_prefix_keys.empty(),
             "an automatic reclaim released the shared prefix its own capture extends");
     (void)finish_active(manager, program, active);
-    require_shared_reuse(manager, program, 71, 4, true,
-                         "the extended shared prefix lost reuse to its own conversation");
+    // The extending request publishes no continuation, so it retained the private checkpoint it
+    // resumed from instead of consuming it; the conversation's next request resumes there, at
+    // least as deep as the shared prefix, and the shared prefix itself was never released.
+    require(program.released_shared_prefix_keys.empty(),
+            "the extended shared prefix was released when its conversation finished");
+    auto next = manager.inspect(program, FakePreparedPrompt{71}, make_base(71), 4);
+    require(next.choice.has_value() && next.choice->summary().reusable_prompt_tokens >= 64,
+            "the extended shared prefix lost reuse to its own conversation");
 }
 
 } // namespace
@@ -5197,7 +5340,13 @@ int main() {
              test_uncommitted_pressure_acknowledgement_is_not_degradation);
     run_test("aborted source is not a hit",
              test_aborted_source_selection_does_not_create_hit_history);
+    run_test("republished owner keeps reuse history", test_republished_owner_keeps_reuse_history);
+    run_test("read-only and declared-boundary reuse retain the source",
+             test_read_only_and_declared_boundary_reuse_retain_the_source);
+    run_test("read-only request leaves the catalog unchanged",
+             test_read_only_request_leaves_the_catalog_unchanged);
     run_test("retained source protection", test_retained_source_is_protected_until_terminal);
+    run_test("admission waits for Program boundary", test_admission_waits_for_program_boundary);
     run_test("session publication order", test_session_publication_order_controls_tied_source);
     run_test("canonical pressure", test_canonical_pressure_starts_with_disposable_owner);
     run_test("all preserving pressure alternatives",
