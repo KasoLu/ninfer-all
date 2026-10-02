@@ -314,7 +314,10 @@ public model id and `model_path` the artifact path the server was started with.
 ### Startup readiness
 
 The server binds its port and starts accepting connections before the Engine has loaded weights
-and finished warmup, so a port clash is reported in milliseconds rather than after loading. Every
+and finished warmup, so a port clash is reported in milliseconds rather than after loading. On
+Linux the listener sets `SO_REUSEADDR` beside cpp-httplib's `SO_REUSEPORT`, so connections left in
+`TIME_WAIT` by a stopped NInfer, or by another server that sets only `SO_REUSEADDR` (llama.cpp,
+uvicorn), do not block the next bind of the port for about a minute. Every
 route -- including `/health`, `OPTIONS`, and requests that would otherwise be unauthenticated --
 answers `503` with `Retry-After: 2` until warmup completes, in the target's own error shape:
 

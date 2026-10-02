@@ -194,6 +194,11 @@ void configure_http_server_socket(socket_t socket) noexcept {
     httplib::default_socket_options(socket);
 #if defined(__linux__)
     const int enabled = 1;
+    // httplib sets only SO_REUSEPORT. Linux binds over a port's TIME_WAIT connections only when
+    // the old and new sockets both set SO_REUSEADDR, or both set SO_REUSEPORT under one uid.
+    // Without this, a server that sets only SO_REUSEADDR (llama.cpp, uvicorn) cannot take the
+    // port for about a minute after NInfer stops, and NInfer cannot after such a server stops.
+    set_socket_option(socket, SOL_SOCKET, SO_REUSEADDR, enabled);
     set_socket_option(socket, SOL_SOCKET, SO_KEEPALIVE, enabled);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, kKeepAliveIdleSeconds);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPINTVL, kKeepAliveIntervalSeconds);
