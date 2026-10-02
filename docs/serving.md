@@ -1572,8 +1572,11 @@ Run `./build/apps/ninfer-serve --help` for the exact option contract.
 Serve writes human-readable operational records to stderr using
 `YYYY-MM-DD HH:MM:SS.mmm  LEVEL  message`. Normal output covers material startup milestones,
 readiness, request lifecycle, fixed-interval throughput, and shutdown; `--log-level debug` exposes
-internal startup and resource-planning detail. A terminal may use one transient line during startup,
-but Serve throughput is always a persistent record. Redirected stderr contains no terminal control
+internal startup and resource-planning detail. FFmpeg's media-decoding messages are records
+prefixed `media |`, so they never write inside the statistics panel: FFmpeg errors are warnings,
+and its warnings and notices, such as swscaler's `deprecated pixel format` notice for each JPEG,
+are `debug`. A terminal may use one transient line during startup, but Serve throughput is always a
+persistent record. Redirected stderr contains no terminal control
 sequences.
 
 With `--log-stats-panel on`, on an interactive terminal that accepts VT cursor control and at `info`

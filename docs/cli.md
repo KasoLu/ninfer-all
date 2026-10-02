@@ -22,7 +22,8 @@ the shared Main Text KV pool follows the example's 32,768-token `--max-context`.
 
 Answer content is streamed to stdout. Reasoning, model loading (including the registered target and
 canonical `weights_id`), timings, throughput, GPU memory, and speculative-decoding statistics are
-written to stderr, so stdout can be redirected independently:
+written to stderr, so stdout can be redirected independently. FFmpeg's media-decoding messages are
+records prefixed `media |`: FFmpeg errors are warnings and everything milder is `debug`.
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
