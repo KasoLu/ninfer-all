@@ -43,7 +43,9 @@ void write_exception(httplib::Response& res, const std::exception& ex) {
     write_openai_error(res, error);
 }
 
-bool is_anthropic_path(std::string_view path) { return path.starts_with("/v1/messages"); }
+bool is_anthropic_path(std::string_view path) {
+    return canonical_api_path(path).starts_with("/v1/messages");
+}
 
 bool is_openai_path(std::string_view path) {
     return path.starts_with("/v1/") && !is_anthropic_path(path);
@@ -148,7 +150,8 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.host_work.device_wait_ns != report.previous.host_work.device_wait_ns;
 }
 
-const char* endpoint_name(std::string_view path) noexcept {
+const char* endpoint_name(std::string_view request_path) noexcept {
+    const std::string_view path = canonical_api_path(request_path);
     if (path == "/v1/chat/completions") { return "openai_chat_completions"; }
     if (path == "/v1/responses") { return "openai_responses"; }
     if (path == "/v1/responses/input_tokens") { return "openai_responses_input_tokens"; }
@@ -195,19 +198,29 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
         error.code    = "request_too_large";
         error.message = "request body exceeds the configured payload limit of " +
                         std::to_string(options.max_request_bytes) + " bytes";
-    } else if (response.status == 404 && request.path.rfind("/v1/messages", 0) == 0) {
+    } else if (response.status == 404 && is_anthropic_path(request.path)) {
         error.status  = 404;
         error.code    = "not_found";
         error.message = "requested Anthropic resource was not found";
     } else {
         return httplib::Server::HandlerResponse::Unhandled;
     }
-    if (request.path.rfind("/v1/messages", 0) == 0) {
+    if (is_anthropic_path(request.path)) {
         write_anthropic_error(response, error, new_anthropic_request_id());
     } else {
         write_openai_error(response, error);
     }
     return httplib::Server::HandlerResponse::Handled;
+}
+
+std::string api_route_pattern(std::string_view endpoint) {
+    return "(?:/v1)?/v1" + std::string(endpoint);
+}
+
+std::string_view canonical_api_path(std::string_view path) noexcept {
+    constexpr std::string_view kVersion = "/v1";
+    if (path.starts_with("/v1/v1/")) { path.remove_prefix(kVersion.size()); }
+    return path;
 }
 
 bool matches_bearer_credential(std::string_view authorization, std::string_view api_key) noexcept {
@@ -399,7 +412,7 @@ httplib::Server::HandlerResponse HttpServer::pre_route(const httplib::Request& r
         // Weight load plus warmup measured ~10s on the 27B and longer on the 35B. Two seconds
         // is a polite poll interval rather than a promise about when readiness arrives.
         res.set_header("Retry-After", "2");
-        if (req.path.rfind("/v1/messages", 0) == 0) {
+        if (is_anthropic_path(req.path)) {
             write_anthropic_error(res, error, new_anthropic_request_id());
         } else {
             write_openai_error(res, error);
@@ -427,7 +440,7 @@ httplib::Server::HandlerResponse HttpServer::pre_route(const httplib::Request& r
         error.code    = "invalid_api_key";
         error.message = "missing or invalid API key";
         // Render the 401 in the shape the target endpoint speaks.
-        if (req.path.rfind("/v1/messages", 0) == 0) {
+        if (is_anthropic_path(req.path)) {
             write_anthropic_error(res, error, new_anthropic_request_id());
         } else {
             write_openai_error(res, error);
@@ -478,7 +491,7 @@ void HttpServer::register_routes() {
                         make_request_failure(RequestFailurePhase::Http, e.error()),
                         response_request_id(res));
                 }
-                if (req.path.rfind("/v1/messages", 0) == 0) {
+                if (is_anthropic_path(req.path)) {
                     write_anthropic_error(res, e.error(), new_anthropic_request_id());
                 } else {
                     write_openai_error(res, e.error());
@@ -488,7 +501,7 @@ void HttpServer::register_routes() {
                     endpoint_name(req.path),
                     make_internal_request_failure(RequestFailurePhase::Http, e.what()),
                     response_request_id(res));
-                if (req.path.rfind("/v1/messages", 0) == 0) {
+                if (is_anthropic_path(req.path)) {
                     ApiError error;
                     error.status  = 500;
                     error.message = e.what();
@@ -505,7 +518,7 @@ void HttpServer::register_routes() {
                 error.status  = 500;
                 error.type    = "internal_error";
                 error.message = "unknown error";
-                if (req.path.rfind("/v1/messages", 0) == 0) {
+                if (is_anthropic_path(req.path)) {
                     write_anthropic_error(res, error, new_anthropic_request_id());
                 } else {
                     write_openai_error(res, error);
@@ -515,9 +528,10 @@ void HttpServer::register_routes() {
 
     server_.Get("/health",
                 [this](const httplib::Request&, httplib::Response& res) { handle_health(res); });
-    server_.Get("/v1/load", [this](const httplib::Request& req, httplib::Response& res) {
-        handle_load(req, res);
-    });
+    server_.Get(api_route_pattern("/load"),
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_load(req, res);
+                });
     server_.Get("/metrics", [this](const httplib::Request& req, httplib::Response& res) {
         handle_metrics(req, res);
     });
@@ -538,50 +552,54 @@ void HttpServer::register_routes() {
             res.set_content(make_api_index(public_model_id_).dump(), "application/json");
         });
     }
-    server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
-        handle_models(req, res);
-    });
-    server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
-        handle_model(req, res);
-    });
-    server_.Post("/v1/chat/completions",
+    server_.Get(api_route_pattern("/models"),
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_models(req, res);
+                });
+    server_.Get(api_route_pattern(R"(/models/(.+))"),
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_model(req, res);
+                });
+    server_.Post(api_route_pattern("/chat/completions"),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_chat_completions(req, res);
                  });
-    server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
-        handle_responses(req, res);
-    });
-    server_.Post("/v1/responses/input_tokens",
+    server_.Post(api_route_pattern("/responses"),
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_responses(req, res);
+                 });
+    server_.Post(api_route_pattern("/responses/input_tokens"),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_input_tokens(req, res);
                  });
-    server_.Post("/v1/responses/compact",
+    server_.Post(api_route_pattern("/responses/compact"),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_compact(req, res);
                  });
-    server_.Post(R"(/v1/responses/([^/]+)/cancel)",
+    server_.Post(api_route_pattern(R"(/responses/([^/]+)/cancel)"),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_cancel(req, res);
                  });
-    server_.Get(R"(/v1/responses/([^/]+)/input_items)",
+    server_.Get(api_route_pattern(R"(/responses/([^/]+)/input_items)"),
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_response_input_items(req, res);
                 });
-    server_.Get(R"(/v1/responses/([^/]+))",
+    server_.Get(api_route_pattern(R"(/responses/([^/]+))"),
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_response_get(req, res);
                 });
-    server_.Delete(R"(/v1/responses/([^/]+))",
+    server_.Delete(api_route_pattern(R"(/responses/([^/]+))"),
                    [this](const httplib::Request& req, httplib::Response& res) {
                        handle_response_delete(req, res);
                    });
-    server_.Post("/v1/messages/count_tokens",
+    server_.Post(api_route_pattern("/messages/count_tokens"),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_count_tokens(req, res);
                  });
-    server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
-        handle_messages(req, res);
-    });
+    server_.Post(api_route_pattern("/messages"),
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_messages(req, res);
+                 });
     if (options_.webui_mcp_proxy) {
         const auto relay = [](const httplib::Request& req, httplib::Response& res) {
             relay_mcp_proxy(req, res);

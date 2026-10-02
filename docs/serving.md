@@ -264,6 +264,11 @@ this adds a CPU synchronization point and mask transfers per round. No speedup c
 | `POST /v1/messages` | Anthropic-style message generation |
 | `POST /v1/messages/count_tokens` | checkpoint-native expanded input-token count |
 
+Anthropic SDKs append `/v1/messages` to their base URL, so their base URL is
+`http://127.0.0.1:8080`, while OpenAI SDKs take `http://127.0.0.1:8080/v1`. A client given the
+OpenAI-style base URL requests `/v1/v1/...`; every `/v1/...` path above also answers under that
+doubled prefix, with the same behavior, errors, request IDs, and log endpoint names.
+
 Every OpenAI-compatible response carries a unique `x-request-id` header, including streaming and
 error responses. Anthropic endpoints use their separate `request-id` contract.
 
