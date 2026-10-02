@@ -1123,9 +1123,11 @@ int test_reasoning_summary_options() {
     OpenAIResponsesRuntimeValues runtime;
     const BuiltOpenAIResponse built =
         make_openai_response_object("resp_test", 1, request, runtime, sample_outcome());
-    failures += check(built.body.at("reasoning").at("summary").is_null() &&
-                          built.body.at("output")[0].at("summary").empty(),
-                      "no summary is reported because none was produced");
+    // This line answers a requested summary with its placeholder item and echoes the style
+    // (test_response_object holds the item's content); the base reported none.
+    failures += check(built.body.at("reasoning").at("summary") == "auto" &&
+                          built.body.at("output")[0].at("summary").size() == 1,
+                      "a requested summary is echoed and answered with the placeholder");
     return failures;
 }
 

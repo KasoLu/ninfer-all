@@ -3,6 +3,7 @@
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/program.h"
+#include "ninfer/ops/softmax_attention.h"
 
 #include <algorithm>
 #include <array>
@@ -33,18 +34,26 @@ void verify_profiles() {
                         mtp_graph_profiles(capacity, width, neural, kGeometry, storage);
                     require(!profiles.empty(), "valid verification width needs graph profiles");
                     unsigned frontier = 0;
-                    std::map<unsigned, unsigned> classes;
+                    std::map<unsigned, int> launches_of_class;
                     for (const auto& profile : profiles) {
                         require(profile.min == frontier && profile.max >= profile.min &&
                                     profile.max < capacity,
                                 "graph profile coverage has a gap");
                         frontier = profile.max + 1;
-                        // Past eight verify columns the chunked attention changes its launches
-                        // between profiles, so no two of them may share an executable.
-                        if (width + 1 > 8) {
-                            require(classes.emplace(profile.topology_class, 1).second,
-                                    "wide MTP graphs cannot alias");
-                        }
+                        // Profiles may share an executable only where the verify call's small-T
+                        // attention issues the same launches (past eight columns its chunk count
+                        // depends on the frontier).
+                        const std::uint64_t target = std::min<std::uint64_t>(
+                            capacity, static_cast<std::uint64_t>(profile.max) + width + 1);
+                        const int launches = ninfer::ops::causal_softmax_attention_small_t_launches(
+                            kGeometry, storage,
+                            ninfer::ops::CausalAttentionExecutionEnvelope{
+                                1U, static_cast<std::uint32_t>(target)},
+                            1, static_cast<std::int32_t>(width) + 1);
+                        const auto [entry, inserted] =
+                            launches_of_class.emplace(profile.topology_class, launches);
+                        require(inserted || entry->second == launches,
+                                "MTP graphs that alias must issue the same attention launches");
                     }
                     require(frontier == capacity, "graph profiles must cover full capacity");
                 }
