@@ -5,6 +5,14 @@
 #include <exception>
 #include <iostream>
 
+// The A8 workspace contracts describe the parts that run FP8 A8 (its TMA split-K partials are
+// sized there); an sm_8x build never admits A8 and does not carry those schedules.
+#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8)
+constexpr bool kA8Executable = false;
+#else
+constexpr bool kA8Executable = true;
+#endif
+
 namespace {
 
 using namespace ninfer;
@@ -202,10 +210,11 @@ int run_fp8_a8() {
         const std::size_t a16 = ops::linear_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16, problem.rows, problem.input_rows,
             ops::LinearPolicy::A16Only, 1, 2048);
-        if ((one != 0) != problem.a8_at_one || (two != 0) != problem.a8_at_two ||
+        if (kA8Executable &&
+            ((one != 0) != problem.a8_at_one || (two != 0) != problem.a8_at_two ||
             early_interval != 0 || forty_eight <= two || hot_interval != forty_eight ||
             exact_1024 <= forty_eight || exact_1048 <= exact_1024 || spanning != exact_1048 ||
-            a16 != 0) {
+            a16 != 0)) {
             std::cerr << "FP8 A8 workspace interval contract mismatch for N=" << problem.rows
                       << " K=" << problem.input_rows << '\n';
             ++failures;

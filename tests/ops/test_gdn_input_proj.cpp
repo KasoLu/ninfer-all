@@ -17,6 +17,14 @@ using namespace ninfer;
 using namespace ninfer::test;
 using namespace ninfer::test::input_projection;
 
+// The A8 workspace contracts describe the parts that run FP8 A8 (its TMA split-K partials are
+// sized there); an sm_8x build never admits A8 and does not carry those schedules.
+#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8)
+constexpr bool kA8Executable = false;
+#else
+constexpr bool kA8Executable = true;
+#endif
+
 namespace {
 
 // This criterion belongs to the complete A16 GDN-input-projection Op.
@@ -493,9 +501,13 @@ int run_fp8() {
         QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, ops::LinearPolicy::AllowA8, 1024, 1024);
     const std::size_t a16 = ops::gdn_input_proj_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, ops::LinearPolicy::A16Only, 1, 2048);
-    if (one != 0 || sixteen != 0 || seventeen == 0 || forty_eight <= seventeen ||
-        hot_interval != forty_eight || exact_1024 <= forty_eight || a16 != 0) {
-        std::cerr << "FP8 gdn input workspace interval contract mismatch\n";
+    if (kA8Executable &&
+        (one != 0 || sixteen != 0 || seventeen == 0 || forty_eight <= seventeen ||
+         hot_interval != forty_eight || exact_1024 <= forty_eight || a16 != 0)) {
+        std::cerr << "FP8 gdn input workspace interval contract mismatch: 1=" << one
+                  << " 16=" << sixteen << " 17=" << seventeen << " 48=" << forty_eight
+                  << " 1..48=" << hot_interval << " 1024=" << exact_1024 << " a16=" << a16
+                  << '\n';
         ++failures;
     }
 
