@@ -519,6 +519,7 @@ int main() {
     for (const int tokens : {1, 2, 3, 4, 7, 8, 16, 17, 64, 128, 129, 1024, 4096}) {
         failures += run_text_case(16, 2, tokens, tokens == 1 ? 0 : 131'072, 0x3000U + tokens);
         failures += run_text_case(24, 4, tokens, tokens == 1 ? 0 : 262'000, 0x4000U + tokens);
+        failures += run_text_case(24, 2, tokens, tokens == 1 ? 0 : 262'000, 0x4800U + tokens);
     }
     failures += run_text_case(16, 2, 4, 0, 0x3101U, true);
     failures += run_text_case(24, 4, 16, 262'000, 0x4101U, true);

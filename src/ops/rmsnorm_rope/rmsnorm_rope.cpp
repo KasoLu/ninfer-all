@@ -121,8 +121,9 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Te
         throw std::invalid_argument(
             "rmsnorm_rope: text T must be positive and fit the launch grid");
     }
-    if (!((query_heads == 16 && key_heads == 2) || (query_heads == 24 && key_heads == 4))) {
-        throw std::invalid_argument("rmsnorm_rope: text (Q,K) must be (16,2) or (24,4)");
+    if (!((query_heads == 16 && key_heads == 2) || (query_heads == 24 && key_heads == 4) ||
+          (query_heads == 24 && key_heads == 2))) {
+        throw std::invalid_argument("rmsnorm_rope: text (Q,K) must be (16,2), (24,4) or (24,2)");
     }
     require_tensor(q_in, DType::BF16, {kTextHeadDim, query_heads, tokens, 1}, "text q in");
     require_tensor(k_in, DType::BF16, {kTextHeadDim, key_heads, tokens, 1}, "text k in");
