@@ -3,6 +3,7 @@
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include "core/paged_kv_storage.h"
+#include "ops/common/device_multiprocessors.h"
 #include "ops/common/device_route.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/d256_profile.h"
@@ -163,19 +164,6 @@ int i8_partial_ctas_per_sm(std::int32_t tokens, std::int32_t window, KvCacheStor
     return 2;
 }
 
-int device_multiprocessors() {
-    static const int count = [] {
-        int device = 0;
-        int sms    = 0;
-        if (cudaGetDevice(&device) != cudaSuccess ||
-            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
-            return 0;
-        }
-        return sms;
-    }();
-    return count;
-}
-
 // Splits per full wave of a single-row INT8-family launch. The split tiers were set where their
 // largest count (85 splits of four KV heads at two CTAs per SM) is exactly one wave of a 170-SM
 // part; on a part with fewer SMs the same counts leave a nearly empty last wave that costs a full
@@ -184,7 +172,7 @@ int device_multiprocessors() {
 template <typename Geometry>
 std::int32_t causal_small_t_wave_splits(std::int32_t tokens, std::int32_t implementation_window,
                                         KvCacheStorage storage) {
-    return device_multiprocessors() *
+    return current_device_multiprocessors(0) *
            i8_partial_ctas_per_sm<Geometry>(tokens, implementation_window, storage) /
            Geometry::KVHeads;
 }
@@ -246,17 +234,21 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
         const int capacity =
             causal_small_t_launch_capacity<CausalD256H24Kv4>(envelope, tokens, cache_storage);
         if (batch_size > 1) {
-            // Keep complete grids within one or two 170-SM waves. Rounding from 160 CTAs
-            // leaves room for the indivisible 4*B group, including B=3/5/6/7.
+            // Keep complete grids within one or two waves of the current device. Rounding from
+            // sms - sms/16 CTAs (160 on the 170-SM part these targets were set on) leaves room
+            // for the indivisible 4*B group, including B=3/5/6/7. Targets sized for 170 SMs left
+            // a smaller part with partial waves and extra merge traffic.
+            const int sms     = current_device_multiprocessors(170);
+            const int wave    = sms - sms / 16;
             const bool narrow = tokens <= 5;
-            int target_ctas   = 160;
+            int target_ctas   = wave;
             if (cache_storage == KvCacheStorage::BFloat16)
                 target_ctas =
-                    narrow || batch_size >= 5 || envelope.max_visible_keys > 4096 ? 320 : 160;
+                    narrow || batch_size >= 5 || envelope.max_visible_keys > 4096 ? 2 * wave : wave;
             else if (cache_storage == KvCacheStorage::Int8Group64)
-                target_ctas = narrow || envelope.max_visible_keys > 4096 ? 320 : 160;
+                target_ctas = narrow || envelope.max_visible_keys > 4096 ? 2 * wave : wave;
             else if (cache_storage == KvCacheStorage::Nvfp4Group16)
-                target_ctas = narrow ? 320 : 160;
+                target_ctas = narrow ? 2 * wave : wave;
             const int grid_limit = div_up(target_ctas, 4 * batch_size);
             // A split stages at most 64 physical-page IDs, two of them for key-tile rounding and
             // page alignment; one that must span more reads the block table directly.
