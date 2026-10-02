@@ -55,6 +55,15 @@ __device__ __forceinline__ unsigned q8_bf16_pair_from_s8(unsigned values) {
 }
 
 // The contraction owns the shared layout; tiled launchers use the same type for opt-in capacity.
+// Names a row of the epilogue's apply_row in unevaluated operands only; never defined. A static
+// member of a class template: CUDA 12.8 evaluates a requires-expression naming a free function
+// template of this form, or std::declval of the array reference, as unsatisfied inside a device
+// function (and its cicc can crash on the latter).
+template <int Columns>
+struct Q8SlicedKRowProbe {
+    static const float (&row())[Columns];
+};
+
 template <class Schedule>
 union alignas(16) Q8SlicedKSharedStorage {
     struct {
@@ -109,10 +118,11 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
     constexpr bool kFragmentEpilogue = requires {
         epilogue.store_fragment(output, 0, 0, float4{}, operands.rows, 0);
     };
-    // std::declval names the row lvalue portably: Linux nvcc 13.4 rejects a dereferenced cast of
-    // nullptr here and crashes on a requires parameter list.
+    // Q8SlicedKRowProbe names the row lvalue: Linux nvcc 13.4 rejects a dereferenced cast of
+    // nullptr here and crashes on a requires parameter list, and CUDA 12.8's cicc crashes on
+    // std::declval of an array reference in this kernel.
     constexpr bool kRowEpilogue = requires {
-        epilogue.apply_row(output, 0, 0, std::declval<const float (&)[ActiveCols]>(), 0);
+        epilogue.apply_row(output, 0, 0, Q8SlicedKRowProbe<ActiveCols>::row(), 0);
     };
     static_assert(kRowTiles == 1 || (std::is_same_v<RowPolicy, Q8SlicedKIdentityRows> &&
                                      !kFragmentEpilogue && !kRowEpilogue),
