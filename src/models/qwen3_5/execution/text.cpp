@@ -1132,7 +1132,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         project_add(normalized, p.output, x, work_, s, InputBasis::Rotated);
         return;
     }
-    ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s);
+    ops::gated_rmsnorm(o, p.norm, z, ops::GateActivation::Silu, config_.rms_norm_eps, on, s);
     project_add(normalized, p.output, x, work_, s, InputBasis::Primal,
                 wide_residual_verification(ph, active_sequence_batch_, T, T));
 }

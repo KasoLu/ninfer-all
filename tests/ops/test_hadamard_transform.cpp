@@ -343,7 +343,7 @@ int run_gated_rmsnorm_hadamard_case(std::int32_t heads, std::int64_t columns, st
         tn(normalized.p, DType::BF16, {kD, heads, t}), tc(composed.p, DType::BF16, {width, t}),
         tf(fused.data(), DType::BF16, {width, t});
     DeviceContext device;
-    ops::gated_rmsnorm(tx, tw, tz, 1.0e-6F, tn, device.stream);
+    ops::gated_rmsnorm(tx, tw, tz, ops::GateActivation::Silu, 1.0e-6F, tn, device.stream);
     Tensor tn_columns = tn.view({width, t});
     ops::hadamard_transform(tn_columns, ts, false, tc, device.stream);
     ops::gated_rmsnorm_hadamard(tx, tw, tz, 1.0e-6F, ts, tf, device.stream);
