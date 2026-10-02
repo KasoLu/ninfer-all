@@ -2,10 +2,12 @@
 
 #include "runtime/engine/device_profiles_builtin.h"
 
+#include <cuda_runtime_api.h>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <cstdlib>
+#include <ctime>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -25,7 +27,8 @@ namespace {
 using Json = nlohmann::ordered_json;
 
 constexpr std::string_view kSchema = "ninfer.device-route-profiles";
-constexpr int kSchemaVersion       = 1;
+// 2: per-key layering over the compiled table and the "calibration" provenance block.
+constexpr int kSchemaVersion = 2;
 
 int process_id() noexcept {
 #if defined(_WIN32)
@@ -39,15 +42,31 @@ int process_id() noexcept {
     throw std::invalid_argument(std::string(source) + ": " + message);
 }
 
-ops::DeviceRouteProfile parse_device(const Json& entry, std::string_view source) {
+DeviceProfileEntry parse_device(const Json& entry, std::string_view source) {
     if (!entry.is_object() || !entry.contains("hardware_class") || !entry.contains("routes")) {
         fail(source, "a device entry needs hardware_class and routes");
     }
-    ops::DeviceRouteProfile profile;
+    DeviceProfileEntry parsed_entry;
+    ops::DeviceRouteProfile& profile = parsed_entry.profile;
     profile.hardware_class = entry.at("hardware_class").get<std::string>();
     if (profile.hardware_class.empty()) { fail(source, "hardware_class is empty"); }
     profile.multiprocessors = entry.value("multiprocessors", 0);
     profile.origin          = entry.value("origin", std::string(source));
+    if (entry.contains("calibration")) {
+        const Json& block = entry.at("calibration");
+        if (!block.is_object() || !block.contains("route_catalog") ||
+            !block.at("route_catalog").is_string() ||
+            block.at("route_catalog").get<std::string>().empty()) {
+            fail(source, profile.hardware_class + ": calibration needs a route_catalog");
+        }
+        DeviceProfileCalibration calibration;
+        calibration.route_catalog = block.at("route_catalog").get<std::string>();
+        calibration.ninfer_build  = block.value("ninfer_build", std::string());
+        calibration.cuda_driver   = block.value("cuda_driver", 0);
+        calibration.cuda_runtime  = block.value("cuda_runtime", 0);
+        calibration.date          = block.value("date", std::string());
+        parsed_entry.calibration  = std::move(calibration);
+    }
     const Json& routes      = entry.at("routes");
     if (!routes.is_object()) { fail(source, "routes must be an object"); }
     for (const auto& [key, bands] : routes.items()) {
@@ -68,20 +87,29 @@ ops::DeviceRouteProfile parse_device(const Json& entry, std::string_view source)
         }
         profile.routes.emplace(key, std::move(parsed));
     }
-    return profile;
+    return parsed_entry;
 }
 
-Json device_json(const ops::DeviceRouteProfile& profile) {
+Json device_json(const DeviceProfileEntry& entry) {
+    const ops::DeviceRouteProfile& profile = entry.profile;
     Json routes = Json::object();
     for (const auto& [key, bands] : profile.routes) {
         Json list = Json::array();
         for (const ops::DeviceRouteBand& band : bands) { list.push_back(Json::array({band.last, band.schedule})); }
         routes[key] = std::move(list);
     }
-    return Json{{"hardware_class", profile.hardware_class},
+    Json device{{"hardware_class", profile.hardware_class},
                 {"multiprocessors", profile.multiprocessors},
-                {"origin", profile.origin},
-                {"routes", std::move(routes)}};
+                {"origin", profile.origin}};
+    if (entry.calibration) {
+        device["calibration"] = Json{{"route_catalog", entry.calibration->route_catalog},
+                                     {"ninfer_build", entry.calibration->ninfer_build},
+                                     {"cuda_driver", entry.calibration->cuda_driver},
+                                     {"cuda_runtime", entry.calibration->cuda_runtime},
+                                     {"date", entry.calibration->date}};
+    }
+    device["routes"] = std::move(routes);
+    return device;
 }
 
 std::string read_file(const std::filesystem::path& path) {
@@ -90,41 +118,73 @@ std::string read_file(const std::filesystem::path& path) {
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
-std::optional<ops::DeviceRouteProfile> find_in(const std::vector<ops::DeviceRouteProfile>& profiles,
-                                               std::string_view hardware_class,
-                                               int multiprocessors) {
-    for (const ops::DeviceRouteProfile& profile : profiles) {
-        if (profile.hardware_class == hardware_class &&
-            (profile.multiprocessors == 0 || profile.multiprocessors == multiprocessors)) {
-            return profile;
+const DeviceProfileEntry* find_in(const std::vector<DeviceProfileEntry>& entries,
+                                  std::string_view hardware_class, int multiprocessors) {
+    for (const DeviceProfileEntry& entry : entries) {
+        if (entry.profile.hardware_class == hardware_class &&
+            (entry.profile.multiprocessors == 0 || entry.profile.multiprocessors == multiprocessors)) {
+            return &entry;
         }
     }
-    return std::nullopt;
+    return nullptr;
+}
+
+// A ninfer.device-route-profiles document of another schema_version than this build's.
+class OtherSchemaVersion : public std::invalid_argument {
+public:
+    OtherSchemaVersion(const std::string& message, bool older)
+        : std::invalid_argument(message), older(older) {}
+    bool older; // written by an older build (or with no version at all)
+};
+
+std::string utc_now_iso8601() {
+    const std::time_t now = std::time(nullptr);
+    std::tm utc{};
+#if defined(_WIN32)
+    gmtime_s(&utc, &now);
+#else
+    gmtime_r(&now, &utc);
+#endif
+    char text[32];
+    std::strftime(text, sizeof(text), "%Y-%m-%dT%H:%M:%SZ", &utc);
+    return text;
 }
 
 } // namespace
 
-std::vector<ops::DeviceRouteProfile> parse_device_route_profiles(std::string_view json,
-                                                                 std::string_view source_name) {
+std::vector<DeviceProfileEntry> parse_device_route_profiles(std::string_view json,
+                                                            std::string_view source_name) {
     Json document;
     try {
         document = Json::parse(json.begin(), json.end());
     } catch (const nlohmann::json::exception& error) {
         fail(source_name, std::string("invalid JSON: ") + error.what());
     }
-    if (!document.is_object() || document.value("schema", std::string()) != kSchema ||
-        document.value("schema_version", 0) != kSchemaVersion || !document.contains("devices") ||
-        !document.at("devices").is_array()) {
-        fail(source_name, "not a ninfer.device-route-profiles v1 document");
+    if (!document.is_object() || document.value("schema", std::string()) != kSchema) {
+        fail(source_name, "not a ninfer.device-route-profiles document");
     }
-    std::vector<ops::DeviceRouteProfile> profiles;
-    for (const Json& entry : document.at("devices")) { profiles.push_back(parse_device(entry, source_name)); }
-    return profiles;
+    const Json version =
+        document.contains("schema_version") ? document.at("schema_version") : Json();
+    if (!version.is_number_integer() || version.get<int>() != kSchemaVersion) {
+        throw OtherSchemaVersion(
+            std::string(source_name) + ": device profiles of schema_version " + version.dump() +
+            ", this build reads only version " + std::to_string(kSchemaVersion) +
+            "; recalibrate (ninfer-calibrate, or --device-profile calibrate), which replaces the file",
+            !version.is_number_integer() || version.get<int>() < kSchemaVersion);
+    }
+    if (!document.contains("devices") || !document.at("devices").is_array()) {
+        fail(source_name, "devices must be an array");
+    }
+    std::vector<DeviceProfileEntry> entries;
+    for (const Json& entry : document.at("devices")) {
+        entries.push_back(parse_device(entry, source_name));
+    }
+    return entries;
 }
 
-std::string serialize_device_route_profiles(const std::vector<ops::DeviceRouteProfile>& profiles) {
+std::string serialize_device_route_profiles(const std::vector<DeviceProfileEntry>& entries) {
     Json devices = Json::array();
-    for (const ops::DeviceRouteProfile& profile : profiles) { devices.push_back(device_json(profile)); }
+    for (const DeviceProfileEntry& entry : entries) { devices.push_back(device_json(entry)); }
     const Json document{{"schema", kSchema}, {"schema_version", kSchemaVersion}, {"devices", std::move(devices)}};
     return document.dump(1) + '\n';
 }
@@ -148,36 +208,130 @@ std::filesystem::path default_device_profile_path() {
     return std::filesystem::path("device-profiles.json");
 }
 
-std::optional<ops::DeviceRouteProfile> find_device_route_profile(std::string_view hardware_class,
-                                                                 int multiprocessors,
-                                                                 const std::filesystem::path& path) {
-    std::error_code error;
-    if (!path.empty() && std::filesystem::exists(path, error)) {
-        const auto profiles = parse_device_route_profiles(read_file(path), path.string());
-        if (auto found = find_in(profiles, hardware_class, multiprocessors)) { return found; }
+DeviceProfileEntry calibrated_device_profile_entry(ops::DeviceRouteProfile measured,
+                                                   std::string route_catalog) {
+    DeviceProfileEntry entry;
+    entry.profile = std::move(measured);
+    DeviceProfileCalibration calibration;
+    calibration.route_catalog = std::move(route_catalog);
+    calibration.ninfer_build  = std::string(ninfer_build_id());
+    if (cudaDriverGetVersion(&calibration.cuda_driver) != cudaSuccess) {
+        calibration.cuda_driver = 0;
     }
-    static const std::vector<ops::DeviceRouteProfile> compiled =
-        parse_device_route_profiles(compiled_device_route_profiles_json(), "compiled device profiles");
-    return find_in(compiled, hardware_class, multiprocessors);
+    if (cudaRuntimeGetVersion(&calibration.cuda_runtime) != cudaSuccess) {
+        calibration.cuda_runtime = 0;
+    }
+    calibration.date  = utc_now_iso8601();
+    entry.calibration = std::move(calibration);
+    return entry;
 }
 
-void upsert_device_route_profile_atomic(const std::filesystem::path& path,
-                                        const ops::DeviceRouteProfile& profile) {
-    std::vector<ops::DeviceRouteProfile> profiles;
-    std::error_code error;
-    if (std::filesystem::exists(path, error)) {
-        profiles = parse_device_route_profiles(read_file(path), path.string());
+ops::DeviceRouteProfile layer_device_route_profiles(const ops::DeviceRouteProfile& upper,
+                                                    const ops::DeviceRouteProfile& lower) {
+    ops::DeviceRouteProfile layered = lower;
+    layered.hardware_class          = upper.hardware_class;
+    layered.multiprocessors         = upper.multiprocessors;
+    layered.origin                  = upper.origin + " over " + lower.origin;
+    for (const auto& [key, bands] : upper.routes) {
+        const auto found = layered.routes.find(key);
+        if (found == layered.routes.end() || bands.empty()) {
+            layered.routes.insert_or_assign(key, bands);
+            continue;
+        }
+        // Past the upper layer's last band, the lower layer's bands answer; the first one kept is
+        // clipped to start after that band, as bands start after their predecessor.
+        std::vector<ops::DeviceRouteBand> merged = bands;
+        for (const ops::DeviceRouteBand& band : found->second) {
+            if (band.last <= merged.back().last) { continue; }
+            if (band.schedule == merged.back().schedule) {
+                merged.back().last = band.last;
+            } else {
+                merged.push_back(band);
+            }
+        }
+        found->second = std::move(merged);
     }
-    bool replaced = false;
-    for (ops::DeviceRouteProfile& existing : profiles) {
-        if (existing.hardware_class == profile.hardware_class &&
-            existing.multiprocessors == profile.multiprocessors) {
-            existing = profile;
-            replaced = true;
+    return layered;
+}
+
+std::optional<ops::DeviceRouteProfile> compiled_device_route_profile(std::string_view hardware_class,
+                                                                     int multiprocessors) {
+    static const std::vector<DeviceProfileEntry> compiled =
+        parse_device_route_profiles(compiled_device_route_profiles_json(), "compiled device profiles");
+    if (const DeviceProfileEntry* found = find_in(compiled, hardware_class, multiprocessors)) {
+        return found->profile;
+    }
+    return std::nullopt;
+}
+
+std::optional<ops::DeviceRouteProfile> find_device_route_profile(
+    std::string_view hardware_class, int multiprocessors, const std::filesystem::path& path,
+    std::string_view route_catalog, const std::function<void(const std::string&)>& log) {
+    const auto note = [&](const std::string& line) {
+        if (log) { log(line); }
+    };
+    std::optional<ops::DeviceRouteProfile> measured;
+    std::error_code error;
+    if (!path.empty() && std::filesystem::exists(path, error)) {
+        std::vector<DeviceProfileEntry> entries;
+        try {
+            entries = parse_device_route_profiles(read_file(path), path.string());
+        } catch (const std::exception& failure) {
+            note(std::string("device profile file skipped: ") + failure.what());
+        }
+        if (const DeviceProfileEntry* found = find_in(entries, hardware_class, multiprocessors)) {
+            if (!found->calibration) {
+                note(path.string() + ": the entry for " + std::string(hardware_class) +
+                     " records no route catalog and is ignored; recalibrate (ninfer-calibrate, or "
+                     "--device-profile calibrate)");
+            } else if (found->calibration->route_catalog != route_catalog) {
+                note(path.string() + ": the entry for " + std::string(hardware_class) +
+                     " was calibrated against route catalog " + found->calibration->route_catalog +
+                     " (build " + found->calibration->ninfer_build + "), this build's is " +
+                     std::string(route_catalog) +
+                     "; it is ignored. Recalibrate (ninfer-calibrate, or --device-profile calibrate)");
+            } else {
+                measured = found->profile;
+            }
         }
     }
-    if (!replaced) { profiles.push_back(profile); }
-    const std::string serialized = serialize_device_route_profiles(profiles);
+    std::optional<ops::DeviceRouteProfile> compiled =
+        compiled_device_route_profile(hardware_class, multiprocessors);
+    if (measured && compiled) { return layer_device_route_profiles(*measured, *compiled); }
+    return measured ? measured : compiled;
+}
+
+DeviceProfileEntry upsert_device_route_profile_atomic(const std::filesystem::path& path,
+                                                      const DeviceProfileEntry& entry) {
+    std::vector<DeviceProfileEntry> entries;
+    std::error_code error;
+    if (std::filesystem::exists(path, error)) {
+        try {
+            entries = parse_device_route_profiles(read_file(path), path.string());
+        } catch (const OtherSchemaVersion& outdated) {
+            if (!outdated.older) { throw; }
+            entries.clear(); // unusable by this build; replaced by this entry
+        }
+    }
+    const ops::DeviceRouteProfile& profile = entry.profile;
+    DeviceProfileEntry stored              = entry;
+    bool replaced                          = false;
+    for (DeviceProfileEntry& existing : entries) {
+        if (existing.profile.hardware_class != profile.hardware_class ||
+            existing.profile.multiprocessors != profile.multiprocessors) {
+            continue;
+        }
+        if (!replaced && existing.calibration && entry.calibration &&
+            existing.calibration->route_catalog == entry.calibration->route_catalog) {
+            for (const auto& [key, bands] : existing.profile.routes) {
+                stored.profile.routes.try_emplace(key, bands);
+            }
+        }
+        existing = stored;
+        replaced = true;
+    }
+    if (!replaced) { entries.push_back(stored); }
+    const std::string serialized = serialize_device_route_profiles(entries);
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
     std::filesystem::path temporary = path;
     temporary += ".tmp." + std::to_string(process_id()) + "." +
@@ -189,6 +343,7 @@ void upsert_device_route_profile_atomic(const std::filesystem::path& path,
         if (!output) { throw std::runtime_error("failed to write device profiles: " + temporary.string()); }
     }
     std::filesystem::rename(temporary, path);
+    return stored;
 }
 
 } // namespace ninfer::runtime

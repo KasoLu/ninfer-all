@@ -14,7 +14,7 @@ ninfer_add_test(ninfer_kv_capacity_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../te
   LIBRARIES ninfer_runtime_support)
 
 ninfer_add_test(ninfer_device_profile_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device_profile.cpp"
-  LIBRARIES ninfer_runtime_support)
+  LIBRARIES ninfer_runtime_support ninfer_calibration)
 
 ninfer_add_test(ninfer_context_cache_defaults_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_context_cache_defaults.cpp"

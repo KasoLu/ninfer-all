@@ -1,5 +1,7 @@
 #include "calibration/device_calibration.h"
 
+#include "calibration/route_catalog.h"
+
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/dtype.h"
@@ -220,9 +222,9 @@ private:
     cudaEvent_t stop_  = nullptr;
 };
 
+// One route key's measurement; its candidate schedules come from the route catalog.
 struct Family {
     std::string key;
-    std::vector<std::string> candidates;
     std::vector<std::int32_t> widths;
     std::function<void(std::int32_t, cudaStream_t)> run;
     // The BF16 output a run at this width writes, compared between the compiled route and each
@@ -261,8 +263,11 @@ void report(const CalibrationOptions& options, const std::string& line) {
     if (options.log) { options.log(line); }
 }
 
-// Times the compiled choice and every candidate at each width and turns the winners into bands.
-// An empty schedule is the compiled route; a candidate replaces it only when faster by `margin`.
+// Times the compiled choice and every catalog candidate at each width and turns the winners into
+// bands. An empty schedule is the compiled route; a candidate replaces it only when faster by
+// `margin`. A key whose every width keeps the compiled route is still returned (one compiled band):
+// the stored entry then records that this device measured the compiled route best, which overrides
+// a built-in profile's choice for the key. Empty only when `only` excludes the key.
 std::vector<ops::DeviceRouteBand> sweep(const Family& family, Timer& timer,
                                         const CalibrationOptions& options) {
     std::vector<ops::DeviceRouteBand> bands;
@@ -278,7 +283,7 @@ std::vector<ops::DeviceRouteBand> sweep(const Family& family, Timer& timer,
         }
         double best_us = compiled;
         std::string best;
-        for (const std::string& candidate : family.candidates) {
+        for (const std::string& candidate : calibration_candidates(family.key)) {
             const ops::DeviceRouteForce force(family.key, candidate);
             if (family.output) {
                 try {
@@ -332,9 +337,6 @@ std::vector<ops::DeviceRouteBand> sweep(const Family& family, Timer& timer,
             bands.push_back({width, best});
         }
     }
-    const bool any = std::any_of(bands.begin(), bands.end(),
-                                 [](const ops::DeviceRouteBand& band) { return !band.schedule.empty(); });
-    if (!any) { bands.clear(); }
     return bands;
 }
 
@@ -347,9 +349,6 @@ std::vector<std::int32_t> decode_widths() {
 void calibrate_ternary(ops::DeviceRouteProfile& profile, Timer& timer,
                        const CalibrationOptions& options) {
     constexpr std::int32_t hidden = 5120;
-    const std::vector<std::string> small = {"r16c8",   "r16c16",  "r32c32",   "r16c8w1",
-                                            "r16c8s3", "r32c8",   "r32c8k4",  "r16c16w1",
-                                            "r32c16",  "r16c32",  "r32c16k8"};
     constexpr std::int32_t max_tokens = 192;
     SyntheticWeight gdn_qk      = row_split_weight(QType::T2_G128_FP16, 4096, hidden);
     SyntheticWeight gdn_vz      = row_split_weight(QType::T2_G128_FP16, 12288, hidden);
@@ -429,15 +428,14 @@ void calibrate_ternary(ops::DeviceRouteProfile& profile, Timer& timer,
         CUDA_CHECK(cudaMemcpy(residual.p, residual_pristine.p, residual.bytes, cudaMemcpyDeviceToDevice));
     };
     const std::vector<Family> families = {
-        {"t2_i8_small/4096+12288x5120", small, decode_widths(), gdn_pair, view(qkv, 10240), {}},
-        {"t2_i8_small/7168+7168x5120", small, decode_widths(), attn_pair, view(q, 6144), {}},
-        {"t2_i8_small/5120x6144", small, decode_widths(), out_add, view(residual, hidden), reset_residual},
-        {"t2_i8_small/34816x5120", small, decode_widths(), gate_up_linear, view(wide, 34816), {}},
-        {"t2_i8_small/5120x17408", small, decode_widths(), down_add, view(residual, hidden), reset_residual},
-        {"t2_i8_small/248320x5120", small, {1, 2, 3, 4, 5, 6, 7, 8, 12, 16}, head_linear,
+        {"t2_i8_small/4096+12288x5120", decode_widths(), gdn_pair, view(qkv, 10240), {}},
+        {"t2_i8_small/7168+7168x5120", decode_widths(), attn_pair, view(q, 6144), {}},
+        {"t2_i8_small/5120x6144", decode_widths(), out_add, view(residual, hidden), reset_residual},
+        {"t2_i8_small/34816x5120", decode_widths(), gate_up_linear, view(wide, 34816), {}},
+        {"t2_i8_small/5120x17408", decode_widths(), down_add, view(residual, hidden), reset_residual},
+        {"t2_i8_small/248320x5120", {1, 2, 3, 4, 5, 6, 7, 8, 12, 16}, head_linear,
          view(logits, 248320), {}},
         {"t2_i8_route",
-         {"small", "tile"},
          {16, 24, 32, 48, 64, 96, 128, 160, 192},
          [&](std::int32_t cols, cudaStream_t stream) {
              gdn_pair(cols, stream);
@@ -499,8 +497,6 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
 
     const std::vector<Family> families = {
         {"q4_q5_attn_input/5120x6144x1024",
-         {"parent_split_fixed", "small_t_mma", "grouped_r32_c32_s4", "grouped_r32_c64_s4",
-          "mixed_r32_c64_s3", "pair_r32_c64_s3", "mixed_r64_c128_s2"},
          widths,
          [&](std::int32_t cols, cudaStream_t stream) {
              Tensor x = tensor(x_hidden, hidden, cols);
@@ -512,8 +508,6 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
          view(q, 6144),
          {}},
         {"q4_q5_gdn_input/5120x4096x12288",
-         {"independent_direct", "small_t_mma", "grouped_r64_c8", "grouped_r64_c16", "grouped_r64_c32",
-          "grouped_r64_c64", "grouped_r64_c128", "grouped_r32_c32_s2", "grouped_r32_c64_s4"},
          widths,
          [&](std::int32_t cols, cudaStream_t stream) {
              Tensor x  = tensor(x_hidden, hidden, cols);
@@ -523,8 +517,6 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
          view(qkv, 10240),
          {}},
         {"q5_linear_add/5120x6144",
-         {"split2_exact", "small_t_mma", "mma_r64_c16", "mma_r64_c24", "mma_r64_c32", "mma_r64_c64",
-          "mma_r64_c32_s3", "mma_r64_c32_s4", "mma_r64_c128"},
          widths,
          [&](std::int32_t cols, cudaStream_t stream) {
              Tensor x = tensor(x_mixer, 6144, cols), res = tensor(residual, hidden, cols);
@@ -533,8 +525,6 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
          view(residual, hidden),
          reset_residual},
         {"q5_linear_add/5120x17408",
-         {"split2_exact", "small_t_mma", "mma_r64_c16", "mma_r64_c24", "mma_r64_c32", "mma_r64_c64",
-          "mma_r64_c32_s3", "mma_r64_c32_s4", "mma_r64_c128"},
          widths,
          [&](std::int32_t cols, cudaStream_t stream) {
              Tensor x = tensor(x_intermediate, 17408, cols), res = tensor(residual, hidden, cols);
@@ -543,8 +533,6 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
          view(residual, hidden),
          reset_residual},
         {"q4_linear_swiglu/34816x17408x5120",
-         {"gemv_pair", "small_t_tiled", "split_half_pair_c40", "split_half_pair_c48",
-          "split_half_pair_c128", "split_half_pair_c128_tail"},
          widths,
          [&](std::int32_t cols, cudaStream_t stream) {
              Tensor x = tensor(x_hidden, hidden, cols), o = tensor(swiglu_out, 17408, cols);
@@ -564,37 +552,31 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
     };
     const std::vector<Family> unified_families = {
         {"unified/q4_q5_attn_input",
-         {"unified"},
          widths_to(12),
          families[0].run,
          families[0].output,
          {}},
         {"unified/q4_q5_gdn_input",
-         {"unified"},
          widths_to(15),
          families[1].run,
          families[1].output,
          {}},
         {"unified/q5_linear_add/5120x6144",
-         {"unified"},
          widths,
          families[2].run,
          families[2].output,
          families[2].reset},
         {"unified/q5_linear_add/5120x17408",
-         {"unified"},
          widths,
          families[3].run,
          families[3].output,
          families[3].reset},
         {"unified/q4_linear_swiglu",
-         {"unified"},
          widths_to(32),
          families[4].run,
          families[4].output,
          {}},
         {"unified/q4_linear_add",
-         {"unified"},
          widths,
          [&](std::int32_t cols, cudaStream_t stream) {
              Tensor x = tensor(x_mixer, 6144, cols), res = tensor(residual, hidden, cols);
@@ -667,7 +649,6 @@ void calibrate_linear_attention(ops::DeviceRouteProfile& profile, Timer& timer,
                                  stream);
         };
         const Family family{"gdn_two_stage/h" + std::to_string(value_heads),
-                            {"on"},
                             widths,
                             run,
                             [&](std::int32_t tokens) {
@@ -781,7 +762,6 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
                                                  workspace, ot, stream);
         };
         const Family family{"attn_pv_f16",
-                            {"on"},
                             {1},
                             [&](std::int32_t, cudaStream_t stream) {
                                 run(chunk, 32768, stream);
@@ -800,7 +780,6 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
         // The standard prompt kernel with each KV head's query heads packed into its tiles, as the
         // PV choice above left it: one 1024-token chunk at 32K and one at 131K of context.
         const Family pack{"attn_pack_gqa",
-                          {"on"},
                           {1},
                           [&](std::int32_t, cudaStream_t stream) {
                               run(chunk, 32768, stream);
@@ -820,7 +799,6 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
         // The fast prompt kernel against the standard one (as the PV and packing choices above
         // left it): one wave-aligned chunk at 32K and one at 131K of context.
         const Family fast{"attn_prompt_fast",
-                          {"on"},
                           {1},
                           [&](std::int32_t, cudaStream_t stream) {
                               run(wave_chunk, 32768, stream);
@@ -839,18 +817,6 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
     }
 
     for (std::int32_t width = 1; width <= 8; ++width) {
-        const std::int32_t row_tiles = (width * (q_heads / kv_heads) + 15) / 16;
-        std::vector<std::string> tiers;
-        if (row_tiles == 1) {
-            tiers = {"2x4x32",  "4x2x32",  "8x2x32",   "16x1x32", "2x2x32q",
-                     "4x2x32q", "4x2x32e", "8x2x32e",  "16x1x32e", "4x2x32qe"};
-        } else if (row_tiles == 2) {
-            tiers = {"4x2x32",  "8x2x32",  "16x1x32",  "32x1x32",  "4x2x32q",  "8x2x32q",
-                     "4x2x32e", "8x2x32e", "16x1x32e", "4x2x32qe", "8x2x32qe"};
-        } else {
-            tiers = {"6x2x32",  "12x1x32",  "12x1x64d", "24x1x32",  "6x2x32q",
-                     "12x1x32q", "6x2x32e", "12x1x32e", "6x2x32qe", "12x1x32qe"};
-        }
         const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
             geometry, storage, {1, static_cast<std::uint32_t>(max_window)}, 1, width, width);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
@@ -871,7 +837,7 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
                 {1, static_cast<std::uint32_t>(envelope)}, workspace, ot, stream);
         };
         const Family family{
-            "attn_i8_small/h24/" + std::string(coding) + "/w" + std::to_string(width), tiers, envelopes,
+            "attn_i8_small/h24/" + std::string(coding) + "/w" + std::to_string(width), envelopes,
             [&](std::int32_t envelope, cudaStream_t stream) {
                 attend(envelope, envelope, stream);
                 attend(envelope, std::max(width + 1, envelope / 16), stream);
@@ -920,9 +886,15 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
     }
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    std::size_t routed = 0;
+    for (const auto& [key, bands] : profile.routes) {
+        routed += std::any_of(bands.begin(), bands.end(),
+                              [](const ops::DeviceRouteBand& band) { return !band.schedule.empty(); });
+    }
     char line[160];
-    std::snprintf(line, sizeof(line), "calibration: %zu routed keys in %.1f s",
-                  profile.routes.size(), seconds);
+    std::snprintf(line, sizeof(line),
+                  "calibration: %zu keys measured, %zu routed off the compiled route in %.1f s",
+                  profile.routes.size(), routed, seconds);
     report(options, line);
     return profile;
 }

@@ -1,5 +1,6 @@
 #include "runtime/engine/model_instance.h"
 #include "calibration/device_calibration.h"
+#include "calibration/route_catalog.h"
 #include "core/arena.h"
 #include "ops/common/device_route.h"
 #include "runtime/engine/context_cache/context_cost.h"
@@ -410,7 +411,8 @@ namespace {
 
 // Installs each rank's GPU route profile before any Op runs (see EngineOptions::device_profile).
 // A device with no measured profile is calibrated once, in this process, before the weights claim
-// its memory; the result goes to the profile file for the next start.
+// its memory; the result goes to the profile file for the next start. The installed profile is the
+// calibrated entry layered over the compiled table's (runtime/engine/device_profile.h).
 void install_device_route_profile_on(const EngineOptions& options, int device) {
     if (options.device_profile == "off") {
         ops::install_device_route_profile(device, nullptr);
@@ -427,10 +429,15 @@ void install_device_route_profile_on(const EngineOptions& options, int device) {
     const std::filesystem::path path = options.device_profile_path.empty()
                                            ? default_device_profile_path()
                                            : options.device_profile_path;
+    const std::string& route_catalog = calibration::calibration_route_catalog_digest();
     std::optional<ops::DeviceRouteProfile> profile;
     if (!calibrate) {
         try {
-            profile = find_device_route_profile(hardware_class, multiprocessors, path);
+            profile = find_device_route_profile(
+                hardware_class, multiprocessors, path, route_catalog, [&](const std::string& line) {
+                    publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning, "%s",
+                                       line.c_str());
+                });
         } catch (const std::exception& error) {
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
                                "device profile %s ignored: %s", path.string().c_str(),
@@ -446,16 +453,21 @@ void install_device_route_profile_on(const EngineOptions& options, int device) {
         CUDA_CHECK(cudaSetDevice(device));
         ops::install_device_route_profile(device, nullptr);
         calibration::CalibrationOptions calibration_options;
-        profile = calibration::calibrate_device_routes(calibration_options);
+        DeviceProfileEntry entry = calibrated_device_profile_entry(
+            calibration::calibrate_device_routes(calibration_options), route_catalog);
         CUDA_CHECK(cudaSetDevice(previous));
-        profile->hardware_class = hardware_class;
+        entry.profile.hardware_class = hardware_class;
         try {
-            upsert_device_route_profile_atomic(path, *profile);
+            entry = upsert_device_route_profile_atomic(path, entry);
         } catch (const std::exception& error) {
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
                                "device profile not saved to %s: %s", path.string().c_str(),
                                error.what());
         }
+        // Keys calibration does not measure (the unified/* switches of the other formats) keep
+        // the compiled table's routes.
+        const auto compiled = compiled_device_route_profile(hardware_class, multiprocessors);
+        profile = compiled ? layer_device_route_profiles(entry.profile, *compiled) : entry.profile;
     }
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                        "device profile %s: %zu routed keys (%s)", hardware_class.c_str(),

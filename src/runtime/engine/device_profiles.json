@@ -1,4 +1,4 @@
-{"schema": "ninfer.device-route-profiles", "schema_version": 1, "devices": [
+{"schema": "ninfer.device-route-profiles", "schema_version": 2, "devices": [
     {"hardware_class": "nvidia-geforce-rtx-3090-sm86", "multiprocessors": 82, "origin": "built in: RTX 3090 at 390 W, 2026-09-25; unified routes and two-stage GDN at 420 W, 2026-09-27",
      "routes": {
         "attn_i8_small/h24/int8/w3": [[1048576, "8x2x32q"]],
