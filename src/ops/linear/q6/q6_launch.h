@@ -15,6 +15,20 @@ void launch_q6_a16_simt_r8_t6_cg(const Tensor& x, const Weight& weight, Tensor& 
                                  cudaStream_t stream);
 void launch_q6_a16_simt_r8_t7_cg(const Tensor& x, const Weight& weight, Tensor& out,
                                  cudaStream_t stream);
+// One warp per row of the 248320x5120 head, one or two tokens per weight read
+// (q6_a16_rowsplit_gemv.cu).
+void launch_q6_a16_rowsplit_gemv_t1(const Tensor& x, const Weight& weight, Tensor& out,
+                                    cudaStream_t stream);
+void launch_q6_a16_rowsplit_gemv_t2(const Tensor& x, const Weight& weight, Tensor& out,
+                                    cudaStream_t stream);
+// One m16 row tile per CTA, eight warps splitting K; up to 8 / 16 / 32 tokens
+// (q6_a16_small_t_mma.cu).
+void launch_q6_a16_small_t_c8(const Tensor& x, const Weight& weight, Tensor& out,
+                              cudaStream_t stream);
+void launch_q6_a16_small_t_c16(const Tensor& x, const Weight& weight, Tensor& out,
+                               cudaStream_t stream);
+void launch_q6_a16_small_t_c32(const Tensor& x, const Weight& weight, Tensor& out,
+                               cudaStream_t stream);
 void launch_q6_a16_gemv_r4_w2_g16(const Tensor& x, const Weight& weight, Tensor& out,
                                   cudaStream_t stream);
 void launch_q6_a16_sliced_r16_t8_w4_s2(const Tensor& x, const Weight& weight, Tensor& out,
