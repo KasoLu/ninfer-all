@@ -32,6 +32,10 @@
 namespace ninfer::runtime {
 
 inline constexpr std::uint32_t kInvalidCatalogSlot = std::numeric_limits<std::uint32_t>::max();
+// A branch anchor is captured only where it saves at least this much prefill over the matched
+// owner's deepest restorable checkpoint, since the capture itself costs a prefill split and a
+// StateImage.
+inline constexpr std::uint32_t kBranchAnchorMinimumGainTokens = 1024;
 
 enum class LogicalLaneState : std::uint8_t {
     Free,
@@ -275,6 +279,47 @@ public:
         for (std::uint32_t lane = 0; lane < lane_count_; ++lane) {
             active_[lane].shared_sources.reserve(shared_catalog_capacity);
         }
+    }
+
+    // The depth at which a request should capture a branch anchor, or nothing: the deepest point
+    // its prompt matches a catalogued continuation or shared prefix to (tokens and identity), when
+    // the owner's restorable checkpoints all end at least kBranchAnchorMinimumGainTokens below it.
+    // A later request that diverges from the stored content at the same point then resumes there
+    // instead of re-prefilling the matched tail from an older checkpoint. Computed before the base
+    // plan, which captures the anchor through its own capture list.
+    [[nodiscard]] std::optional<std::uint32_t>
+    branch_anchor_frontier(const Program& program, const PreparedPrompt& prompt) const {
+        std::uint32_t best   = 0;
+        const auto consider = [&](std::uint32_t tokens, std::uint32_t restorable) {
+            if (tokens >= restorable + kBranchAnchorMinimumGainTokens && tokens > best) {
+                best = tokens;
+            }
+        };
+        const auto restorable_below = [](const ContinuationSummary& summary, std::uint32_t tokens) {
+            std::uint32_t restorable = 0;
+            const auto take          = [&](std::uint32_t frontier) {
+                if (frontier <= tokens) { restorable = std::max(restorable, frontier); }
+            };
+            if (summary.endpoint) { take(summary.endpoint->ref.frontier); }
+            if (summary.rewrite) { take(summary.rewrite->ref.frontier); }
+            for (const auto& anchor : summary.long_anchors) { take(anchor.ref.frontier); }
+            return restorable;
+        };
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            const CatalogEntry& entry = catalog_[slot];
+            if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
+            const std::uint32_t tokens = program.matched_prefix_tokens(*entry.handle, prompt);
+            consider(tokens, restorable_below(entry.summary, tokens));
+        }
+        for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+            const SharedCatalogEntry& entry = shared_catalog_[slot];
+            if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+            const std::uint32_t tokens = program.matched_prefix_tokens(*entry.handle, prompt);
+            const std::uint32_t frontier = entry.summary.checkpoint.ref.frontier;
+            consider(tokens, frontier <= tokens ? frontier : 0U);
+        }
+        if (best == 0) { return std::nullopt; }
+        return best;
     }
 
     [[nodiscard]] Inspection inspect(Program& program, const PreparedPrompt& prompt,

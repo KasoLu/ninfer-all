@@ -387,6 +387,13 @@ struct ContextCacheOptions {
     // prompt end (gap k >= spacing * 2^k), so the grid is sparse near the end and still reaches
     // deep history. Zero anchors every one of the last L message boundaries.
     std::uint32_t long_anchor_min_spacing_tokens = 1024;
+    // Branch anchors: before a request is planned, the engine finds the deepest point at which its
+    // prompt matches a retained continuation or shared prefix token for token, and when no
+    // checkpoint of that owner lies at or near that depth, the request captures a private long
+    // anchor there, so the next request that diverges at the same point resumes from it instead of
+    // from an older checkpoint. Costs a scan of the catalog per planned request and, where it
+    // fires, a prefill split and a StateImage. Off by default.
+    bool branch_anchors = false;
 };
 
 struct ContextCostOptions {

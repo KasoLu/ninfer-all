@@ -621,7 +621,12 @@ public:
     ~ProgramImpl() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
-                                               const runtime::ResolvedExecutionOptions& options);
+                                               const runtime::ResolvedExecutionOptions& options,
+                                               std::optional<std::uint32_t> branch_anchor = {});
+    [[nodiscard]] std::uint32_t matched_prefix_tokens(const ContinuationHandle& owner,
+                                                      const PreparedPromptData& prompt) const;
+    [[nodiscard]] std::uint32_t matched_prefix_tokens(const SharedPrefixHandle& owner,
+                                                      const PreparedPromptData& prompt) const;
     [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&& prompt,
                                                   std::uint32_t first_target);
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(

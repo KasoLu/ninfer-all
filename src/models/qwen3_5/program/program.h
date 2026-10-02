@@ -996,8 +996,18 @@ public:
 
     // Engine owns scheduling and logical residency policy. Program owns physical lanes, opaque
     // capabilities, model state and one immutable pending transaction at a time.
+    // `branch_anchor`: a prompt depth at which the plan also captures a private long anchor
+    // (EngineOptions::context_cache.branch_anchors), the depth this prompt matched retained content
+    // to below any checkpoint that could resume it.
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPrompt& prompt,
-                                               const runtime::ResolvedExecutionOptions& options);
+                                               const runtime::ResolvedExecutionOptions& options,
+                                               std::optional<std::uint32_t> branch_anchor = {});
+    // Tokens the prompt shares with a retained owner's ledger from position zero, with the prefix
+    // identity agreeing over them (zero when it does not); a stale or identity-less owner is zero.
+    [[nodiscard]] std::uint32_t matched_prefix_tokens(const ContinuationHandle& owner,
+                                                      const PreparedPrompt& prompt) const;
+    [[nodiscard]] std::uint32_t matched_prefix_tokens(const SharedPrefixHandle& owner,
+                                                      const PreparedPrompt& prompt) const;
     [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt,
                                                   std::uint32_t first_target);
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(

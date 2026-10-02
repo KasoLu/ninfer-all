@@ -303,9 +303,20 @@ Program::Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept : impl_(std
 
 Program::~Program() noexcept = default;
 
+std::uint32_t Program::matched_prefix_tokens(const ContinuationHandle& owner,
+                                             const PreparedPrompt& prompt) const {
+    return impl_->matched_prefix_tokens(owner, PreparedPromptAccess::view(prompt));
+}
+
+std::uint32_t Program::matched_prefix_tokens(const SharedPrefixHandle& owner,
+                                             const PreparedPrompt& prompt) const {
+    return impl_->matched_prefix_tokens(owner, PreparedPromptAccess::view(prompt));
+}
+
 RequestBasePlan Program::plan_request(const PreparedPrompt& prompt,
-                                      const runtime::ResolvedExecutionOptions& options) {
-    return impl_->plan_request(PreparedPromptAccess::view(prompt), options);
+                                      const runtime::ResolvedExecutionOptions& options,
+                                      std::optional<std::uint32_t> branch_anchor) {
+    return impl_->plan_request(PreparedPromptAccess::view(prompt), options, branch_anchor);
 }
 
 std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target) {

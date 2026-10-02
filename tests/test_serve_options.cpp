@@ -683,6 +683,7 @@ int main() {
                                                {"--max-long-anchors-per-continuation", "2"},
                                                {"--long-anchor-spacing", "0"},
                                                {"--auto-long-anchors"},
+                                               {"--branch-anchors"},
                                                {"--auto-prefix-grid"},
                                                {"--derive-session-keys"},
                                                {"--context-cache-policy", "rolling"},
@@ -938,6 +939,7 @@ int main() {
                                         "--auto-long-anchors",
                                         "--auto-prefix-grid",
                                         "--auto-save-evicted",
+                                        "--branch-anchors",
                                         "--cache-tap-ladder",
                                         "--cache-tap-min-gap",
                                         "--cache-taps-per-request",
@@ -1449,6 +1451,10 @@ int main() {
                              "--long-anchor-spacing", "0"})
                               .context_cache.long_anchor_min_spacing_tokens == 0U,
                   "--auto-long-anchors was not an off-by-default switch carrying its spacing");
+        failures += check(!parse({"ninfer-serve", "model.ninfer"}).context_cache.branch_anchors &&
+                              parse({"ninfer-serve", "model.ninfer", "--branch-anchors"})
+                                  .context_cache.branch_anchors,
+                          "--branch-anchors was not an off-by-default switch");
         bool spacing_without_anchors_rejected = false;
         try {
             (void)parse({"ninfer-serve", "model.ninfer", "--long-anchor-spacing", "512"});

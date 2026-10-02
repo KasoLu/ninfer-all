@@ -723,6 +723,25 @@ public:
         return base.isolated_feasible;
     }
 
+    // Tokens a prompt shares with an owner's ledger: matched_tokens[id] when the content keys
+    // agree, else zero.
+    [[nodiscard]] std::uint32_t matched_prefix_tokens(const FakeContinuationHandle& owner,
+                                                      const FakePreparedPrompt& prompt) const {
+        const auto found = matched_tokens.find(owner.id);
+        return found == matched_tokens.end() || owner.content_key != prompt.content_key
+                   ? 0U
+                   : found->second;
+    }
+    [[nodiscard]] std::uint32_t matched_prefix_tokens(const FakeSharedPrefixHandle& owner,
+                                                      const FakePreparedPrompt& prompt) const {
+        const auto found = matched_tokens.find(owner.id);
+        return found == matched_tokens.end() || (owner.content_key != prompt.content_key &&
+                                                 owner.content_key != prompt.prefix_key)
+                   ? 0U
+                   : found->second;
+    }
+    std::map<std::uint32_t, std::uint32_t> matched_tokens;
+
     [[nodiscard]] std::optional<FakeAdmissionCandidate>
     inspect_admission(const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base, LaneId,
                       const FakeContinuationHandle* source,
@@ -2733,6 +2752,28 @@ void test_root_lifecycle_and_prefix_reuse() {
             "selected endpoint did not reach the sealed Program plan");
     require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
             "failed start did not roll back its logical source claim");
+}
+
+// A branch anchor is placed at the deepest token match a catalogued owner offers, only where the
+// owner's restorable checkpoints end at least kBranchAnchorMinimumGainTokens below it.
+void test_branch_anchor_frontier_follows_the_deepest_unrestorable_match() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest first = start_active(manager, program, 7, make_base(7), 1);
+    (void)finish_active(manager, program, first, 16);
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "terminal continuation was not catalogued");
+    const FakePreparedPrompt prompt{7};
+    require(!manager.branch_anchor_frontier(program, prompt),
+            "an owner with no measured match produced a branch anchor");
+    program.matched_tokens[first.sequence.id] = 16 + ninfer::runtime::kBranchAnchorMinimumGainTokens - 1;
+    require(!manager.branch_anchor_frontier(program, prompt),
+            "a match within the minimum gain of the endpoint produced a branch anchor");
+    program.matched_tokens[first.sequence.id] = 4096;
+    const auto anchor = manager.branch_anchor_frontier(program, prompt);
+    require(anchor && *anchor == 4096, "the deepest unrestorable match was not anchored");
+    require(!manager.branch_anchor_frontier(program, FakePreparedPrompt{8}),
+            "a prompt of other content produced a branch anchor");
 }
 
 void test_state_transfer_statistics_use_payload_bytes() {
@@ -5305,6 +5346,8 @@ void test_value_weights_rank_private_victims_by_rebuild_cost() {
 int main() {
     TimerResolution timer_resolution;
     run_test("state transfer payload statistics", test_state_transfer_statistics_use_payload_bytes);
+    run_test("branch anchor at the deepest unrestorable match",
+             test_branch_anchor_frontier_follows_the_deepest_unrestorable_match);
     run_test("independent complete-target oracle",
              test_complete_search_against_small_exhaustive_oracle);
     run_test("publication-only construction",

@@ -95,6 +95,7 @@ public:
         : instance_(instance), device_(device), max_context_(options.max_context),
           structured_output_(options.structured_output), max_concurrency_(options.max_concurrency),
           thorough_admission_search_(options.context_cache.thorough_admission_search),
+          branch_anchors_(options.context_cache.enabled && options.context_cache.branch_anchors),
           recover_invariant_failures_(options.recover_invariant_failures),
           kv_lease_growth_(options.context_cache.kv_lease_growth),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
@@ -1906,8 +1907,15 @@ private:
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
         if (!request->base_plan) {
-            request->base_plan.emplace(
-                instance_.program->plan_request(request->prompt, request->options.execution));
+            std::optional<std::uint32_t> branch_anchor;
+            if constexpr (kLegacyContextCache) {
+                if (branch_anchors_) {
+                    branch_anchor =
+                        resources_.branch_anchor_frontier(*instance_.program, request->prompt);
+                }
+            }
+            request->base_plan.emplace(instance_.program->plan_request(
+                request->prompt, request->options.execution, branch_anchor));
         }
         const RequestPlanSummary& summary = request->base_plan->summary();
         if (summary.service_work_quanta == 0) {
@@ -2870,6 +2878,7 @@ private:
     const bool structured_output_;
     const std::uint32_t max_concurrency_;
     const bool thorough_admission_search_;
+    const bool branch_anchors_;
     const bool recover_invariant_failures_;
     const bool kv_lease_growth_;
     const std::size_t max_outstanding_;

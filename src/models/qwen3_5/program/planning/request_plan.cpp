@@ -229,8 +229,48 @@ std::uint32_t ProgramImpl::concurrent_output_budget(std::uint32_t prompt_tokens)
                                             prompt_tokens);
 }
 
+namespace {
+
+std::uint32_t shared_token_prefix(std::span<const TokenId> prompt, std::span<const TokenId> stored) {
+    const std::size_t limit = std::min(prompt.size(), stored.size());
+    std::size_t shared      = 0;
+    while (shared < limit && prompt[shared] == stored[shared]) { ++shared; }
+    return static_cast<std::uint32_t>(shared);
+}
+
+} // namespace
+
+std::uint32_t ProgramImpl::matched_prefix_tokens(const ContinuationHandle& owner,
+                                                 const PreparedPromptData& prompt) const {
+    if (!valid_continuation(owner)) { return 0; }
+    const SequenceState& sequence = continuation_states[ContractAccess::index(owner)];
+    const std::uint32_t tokens    = shared_token_prefix(prompt.token_ids, sequence.ledger);
+    // Same tokens are not the same history when an earlier turn re-rendered (a stripped
+    // reasoning block, media at another place): the identity chain has to agree as well.
+    if (tokens == 0 || !qwen3_5::detail::prefix_matches(prompt, sequence.ledger,
+                                                        sequence.prefix_identity, tokens)) {
+        return 0;
+    }
+    return tokens;
+}
+
+std::uint32_t ProgramImpl::matched_prefix_tokens(const SharedPrefixHandle& owner,
+                                                 const PreparedPromptData& prompt) const {
+    if (!valid_shared_prefix(owner)) { return 0; }
+    const SharedPrefixState& shared = shared_prefix_states[ContractAccess::index(owner)];
+    if (!shared.identity || shared.identity->prefix_identity() == nullptr) { return 0; }
+    const std::uint32_t tokens = shared_token_prefix(prompt.token_ids, shared.identity->ledger());
+    if (tokens == 0 || !qwen3_5::detail::prefix_matches(prompt, shared.identity->ledger(),
+                                                        *shared.identity->prefix_identity(),
+                                                        tokens)) {
+        return 0;
+    }
+    return tokens;
+}
+
 RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
-                                          const runtime::ResolvedExecutionOptions& options) {
+                                          const runtime::ResolvedExecutionOptions& options,
+                                          std::optional<std::uint32_t> branch_anchor) {
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
     if (prompt.token_ids.size() > capacity) {
         throw std::invalid_argument("prompt exceeds configured context capacity");
@@ -401,6 +441,12 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                         opportunity.kind == PromptCacheMarkerKind::SharedStablePrefix,
                         opportunity.kind == PromptCacheMarkerKind::PrivateLongAnchor,
                         opportunity.evidence);
+        }
+        // The branch anchor joins through the plan's own capture list, so it is merged, ordered,
+        // given an identity and priced like a client marker. A capture added after the plan is
+        // sealed has no identity, and the Engine refuses it.
+        if (branch_anchor && *branch_anchor != 0 && *branch_anchor < base->summary.prompt_tokens) {
+            add_capture(*branch_anchor, 0, std::nullopt, false, true, SharedCandidateEvidence::None);
         }
         std::sort(base->capture_groups.begin(), base->capture_groups.end(),
                   [](const CaptureGroup& left, const CaptureGroup& right) {

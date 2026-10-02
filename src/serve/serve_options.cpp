@@ -191,6 +191,10 @@ std::string serve_usage_text(const char* argv0) {
            "                                every request, so a request that rewrites\n"
            "                                earlier history resumes from the nearest anchor\n"
            "                                instead of root (off)\n"
+           "  --branch-anchors              anchor a request where its prompt stops matching\n"
+           "                                a retained conversation, when no checkpoint lies\n"
+           "                                near that depth, so the next request diverging\n"
+           "                                there resumes from it (off)\n"
            "  --long-anchor-spacing N       with --auto-long-anchors, minimum tokens between\n"
            "                                anchors, doubling per anchor back from the\n"
            "                                prompt end (default 1024; 0 anchors every\n"
@@ -737,6 +741,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             legacy_cache_flag                            = "--auto-long-anchors";
             options.context_cache.automatic_long_anchors = true;
             context_capacity_explicit                    = true;
+        } else if (arg == "--branch-anchors") {
+            legacy_cache_flag                    = "--branch-anchors";
+            options.context_cache.branch_anchors = true;
         } else if (arg == "--long-anchor-spacing") {
             legacy_cache_flag                                    = "--long-anchor-spacing";
             options.context_cache.long_anchor_min_spacing_tokens = static_cast<std::uint32_t>(
