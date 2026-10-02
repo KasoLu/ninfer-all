@@ -355,8 +355,18 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
     const SharedPrefixHandle* replacement,
     std::optional<runtime::CheckpointRef> private_replacement, bool permit_shared_publication,
     std::optional<CapturePressureCandidate> pressure, runtime::CancellationFlagView cancellation) {
-    if (has_context_transaction() || has_unsettled_state_fork() || !valid_capture_offer(offer)) {
-        throw std::logic_error("capture transaction is not reservable");
+    if (!valid_capture_offer(offer)) {
+        // A stale offer is an internal-consistency failure, not contention: keep it loud and
+        // distinct from the contention skip below.
+        throw std::logic_error("capture offer is stale for this program state");
+    }
+    // Contention is not corruption. Another context transaction, or an unsettled state fork left
+    // by a shared-prefix reuse, owns the program; a capture is optional retention, so it degrades
+    // to a skip and the lane still reaches a finite terminal state instead of failing the whole
+    // batch through a worker recovery.
+    if (has_context_transaction() || has_unsettled_state_fork()) {
+        skip_capture(std::move(offer));
+        return runtime::ContextTransactionReserveStatus::Aborted;
     }
     if (cancellation.requested()) {
         skip_capture(std::move(offer));
