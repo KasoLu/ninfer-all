@@ -577,11 +577,13 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             detail::causal_attention_split_capacity(q.ne[1], width, cache.storage, envelope, batch);
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
-        // Only the shared BF16/INT8 reducer carries a gate. The FP8, NVFP4 and K8V4 storages reach
-        // their own reduce kernels, so they take the standalone multiply like the routes that
-        // cannot fold it at all; every caller still sees one contract.
-        const bool fusable = cache.storage == KvCacheStorage::BFloat16 ||
-                             cache.storage == KvCacheStorage::Int8Group64;
+        // Only the shared BF16/INT8-family reducer carries a gate; its epilogue rounds exactly as
+        // the standalone multiply does, whatever the key/value coding (int8, rk8v4, rk4v4,
+        // rk4v4-e8, rk2v4-e8). The FP8, NVFP4 and K8V4 storages reach their own reduce kernels, so
+        // they take the standalone multiply like the routes that cannot fold it at all; every
+        // caller still sees one contract.
+        const bool fusable =
+            cache.storage == KvCacheStorage::BFloat16 || kv_cache_is_int8_family(cache.storage);
         detail::causal_attention_small_t_launch(
             q, k, v, positions, valid_columns, kv_table_rows, scale, cache, envelope, 0, width,
             partial.acc, partial.m, partial.l, out, stream,

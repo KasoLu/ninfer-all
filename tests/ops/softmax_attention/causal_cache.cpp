@@ -3009,8 +3009,9 @@ void validate_batch_case(const BatchAttentionCase& test_case) {
 }
 
 // Handing the Op a gate must produce exactly what applying sigmoid_mul afterwards produces -- on
-// the route that folds the multiply into the reduce epilogue and on the routes that fall back to
-// the standalone kernel alike. Re-running the Op is safe: appending the same k/v to the same rows
+// the route that folds the multiply into the reduce epilogue (BF16 and every INT8-family coding:
+// int8, rk8v4, rk4v4, rk4v4-e8, rk2v4-e8) and on the routes that fall back to the standalone
+// kernel alike. Re-running the Op is safe: appending the same k/v to the same rows
 // again leaves the cache byte-identical, which the first run's cache check has just established.
 int verify_gated_attention(const std::string& label, const Geometry& geometry,
                            const BatchAttentionCase& test_case, const Tensor& tq, const Tensor& tk,
@@ -3564,6 +3565,12 @@ int run_batch_cases() {
         kGeometries[1], kPlanRk4v4, {1, {0, 31, 63, 127, 511, 1023, 2047, 4095},
                                      {1, 1, 1, 1, 1, 1, 1, 1}, {7, 0, 5, 2, 6, 1, 4, 3},
                                      MappingPattern::Identity, 509u});
+    // Single-row rk-family decode and verification through the whole-wave split policy, whose
+    // reducer now carries the gate: T=1 at 8K keys, and T=6 inside the 5K-8.2K split cap.
+    failures += run_batch_case(kGeometries[0], kPlanRk4v4,
+                               {1, {8191}, {1}, {0}, MappingPattern::Fragmented, 510u});
+    failures += run_batch_case(kGeometries[0], kPlanRk8v4,
+                               {6, {5600}, {6}, {0}, MappingPattern::Identity, 511u});
     failures += run_case_allowing_arch_skip(
         "causal_softmax_attention FP8 KV cache batched", [&] {
             return run_batch_case(kGeometries[0], kPlanFp8,
