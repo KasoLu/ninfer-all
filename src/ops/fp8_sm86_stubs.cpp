@@ -25,6 +25,8 @@
 #include "ops/linear_add/fp8/fp8_linear_add_plan_unified.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan_unified.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -84,6 +86,12 @@ void fp8_linear_swiglu_a8_launch(const Tensor&, const Weight&, Tensor&, Workspac
                                  cudaStream_t) {
     reject_fp8_a8();
 }
+
+// The TMA split-K partials of those routes: none, since no A8 launch runs here.
+std::size_t fp8_attn_input_partial_capacity_bytes(std::int32_t) { return 0; }
+std::size_t fp8_gdn_input_partial_capacity_bytes(std::int32_t) { return 0; }
+std::size_t fp8_linear_add_partial_capacity_bytes(std::int32_t, std::int32_t) { return 0; }
+std::size_t fp8_linear_swiglu_partial_capacity_bytes(std::int32_t) { return 0; }
 
 } // namespace unified
 

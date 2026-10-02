@@ -9,8 +9,13 @@ endfunction()
 # Device code is compressed in every fatbin: the INT8-family small-T attention alone instantiates
 # several hundred kernels per query width (route tiers x KV codings x batch and mask forms), and
 # uncompressed the ops archive passed the 2 GiB that a linked image can address with 32-bit
-# relocations. Compression cuts the SASS about 3.5x; the driver expands a module when it loads.
+# relocations. Compressed for size it is about 3.5x smaller; the driver expands a module when it
+# loads.
 set(NINFER_CUDA_FATBIN_OPTIONS "-Xfatbin=-compress-all")
+# The default (speed) mode barely shrinks these kernels; the size mode, from CUDA 12.8, does.
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
+  list(APPEND NINFER_CUDA_FATBIN_OPTIONS "-compress-mode=size")
+endif()
 
 # Whole-program device code: every device symbol is defined and used in one translation unit (no
 # extern __device__ or __constant__, no cross-unit device calls), and relocatable device code made
@@ -21,7 +26,7 @@ function(ninfer_cuda_archive target)
     set_target_properties(${target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
   endif()
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
-    $<$<COMPILE_LANGUAGE:CUDA>:${NINFER_CUDA_FATBIN_OPTIONS}>)
+    "$<$<COMPILE_LANGUAGE:CUDA>:${NINFER_CUDA_FATBIN_OPTIONS}>")
 endfunction()
 
 function(ninfer_cuda_non_rdc_archive target)
@@ -32,7 +37,7 @@ function(ninfer_cuda_non_rdc_archive target)
     set_target_properties(${target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
   endif()
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
-    $<$<COMPILE_LANGUAGE:CUDA>:${NINFER_CUDA_FATBIN_OPTIONS}>)
+    "$<$<COMPILE_LANGUAGE:CUDA>:${NINFER_CUDA_FATBIN_OPTIONS}>")
 endfunction()
 
 # Runtime DLL staging for the apps and tests.
