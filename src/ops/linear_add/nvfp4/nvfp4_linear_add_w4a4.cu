@@ -31,9 +31,10 @@ void launch_gemm(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace work
     const Nvfp4W4a4MaterializedActivation activation{workspace.codes, workspace.scales};
     auto* output      = static_cast<__nv_bfloat16*>(residual.data);
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
+    constexpr auto kernel =
+        nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4AddResidualEpilogue, Nvfp4ContiguousOutput>;
     CUDA_CHECK(pdl::launch_consumer(
-        {grid, dim3(Schedule::kThreads), 0, stream},
-        nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4AddResidualEpilogue, Nvfp4ContiguousOutput>,
+        {grid, dim3(Schedule::kThreads), nvfp4_w4a4_shared_bytes<Schedule>(kernel), stream}, kernel,
         activation, static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), tokens, alpha,
         Nvfp4AddResidualEpilogue{output, Geometry::kOutputRows},

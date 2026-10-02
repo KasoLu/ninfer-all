@@ -99,7 +99,9 @@ void launch_nvfp4_a4_mma(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace w
     const Nvfp4ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data),
                                        Geometry::kOutputRows};
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
-    nvfp4_w4a4_mma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
+    constexpr auto kernel =
+        nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4ContiguousOutput>;
+    kernel<<<grid, Schedule::kThreads, nvfp4_w4a4_shared_bytes<Schedule>(kernel), stream>>>(
         activation, static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
         output);
