@@ -202,6 +202,7 @@ public:
         out.ffn                 = ffn(w);
         if (const auto* a = std::get_if<AttentionWeights>(&w.mixer)) {
             LinearParameters attention_output = rotated_linear(a->output);
+            integer_route(attention_output, QType::Q4_G64_FP16, 5120, 6144);
             integer_route(attention_output, QType::Q5_G64_FP16, 5120, 6144);
             integer_route(attention_output, QType::T2_G128_FP16, 5120, 6144);
             ops::ProjectionWeights attention_projection = ops::prepare_attn_input_proj_weights(
@@ -218,6 +219,7 @@ public:
         } else {
             const auto& g              = std::get<GdnWeights>(w.mixer);
             LinearParameters gdn_output = rotated_linear(g.output);
+            integer_route(gdn_output, QType::Q4_G64_FP16, 5120, 6144);
             integer_route(gdn_output, QType::Q5_G64_FP16, 5120, 6144);
             integer_route(gdn_output, QType::T2_G128_FP16, 5120, 6144);
             ops::ProjectionWeights gdn_projection = ops::prepare_gdn_input_proj_weights(
