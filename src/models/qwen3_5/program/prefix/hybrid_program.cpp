@@ -1306,7 +1306,14 @@ bool ProgramImpl::hybrid_finish_lane(SequenceState& sequence, RequestControl& re
                 (!is_masked_draft_backend(speculative_backend) ||
                  sequence.dflash_context_frontier == frontier);
             const std::uint32_t anchor_blocks = frontier / kBlock;
-            if (endpoint && backend_caught_up && frontier != 0 &&
+            // Moving the endpoint image into the index commits this lane to the strict KV release
+            // below, which cannot report failure; a release that would fail keeps the image here
+            // so the ordinary strict clear can refuse it and the Engine recovers.
+            const bool kv_releasable =
+                text_kv_addresses->can_release_after_deactivate(sequence.kv->text) &&
+                (!sequence.kv->backend || backend_kv_addresses->can_release_after_deactivate(
+                                              *sequence.kv->backend));
+            if (endpoint && kv_releasable && backend_caught_up && frontier != 0 &&
                 frontier >= lane_state.deepest_snapshot + pc::kMinimumTapSeparation &&
                 frontier <= sequence.ledger.size() && lane_state.path.size() >= anchor_blocks &&
                 !sequence.state.fork_pending && sequence.state.read == sequence.state.write &&
@@ -1364,10 +1371,9 @@ bool ProgramImpl::hybrid_finish_lane(SequenceState& sequence, RequestControl& re
     }
     hybrid_release_lane(lane);
     if (!image_moved) { return clear_lane_strict(sequence, request); }
-    // The endpoint StateImage now belongs to the index; release the rest of the lane.
-    try {
-        release_active_sequence_kv_strict(sequence);
-    } catch (...) { std::terminate(); }
+    // The endpoint StateImage now belongs to the index; release the rest of the lane. The release
+    // was checked before the image moved, so its strict invariants hold here.
+    release_active_sequence_kv_strict(sequence);
     retire_continuation_slot(static_cast<std::uint32_t>(&sequence - continuation_states.data()));
     request.retire();
     return true;
