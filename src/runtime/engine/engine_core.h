@@ -779,7 +779,10 @@ private:
         }
     }
 
-    void require_session_digest(const typename ResourceManagement::CatalogSlotView& view,
+    // A template over the view so the Hybrid instantiation, whose manager has no catalog slots,
+    // never names the Legacy view type; only the Legacy slot paths call it.
+    template <class CatalogSlotView>
+    void require_session_digest(const CatalogSlotView& view,
                                 std::string_view expected_digest) const {
         if (expected_digest.empty()) { return; }
         const std::string digest =
