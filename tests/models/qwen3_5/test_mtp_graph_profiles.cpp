@@ -1,10 +1,12 @@
-// Contract of Variant::mtp_graph_profiles: profiles that resolve to different attention routes
-// must not share a topology class, because instantiate_graph_family instantiates one
-// cudaGraphExec_t per class and installs every other profile of that class through
-// cudaGraphExecUpdate, which cannot cross a change of node count.
+// Contract of Variant::mtp_graph_profiles: profiles whose attention calls launch different node
+// sequences (another route, or another number of small-T chunks past eight columns) must not
+// share a topology class, because instantiate_graph_family instantiates one cudaGraphExec_t per
+// class and installs every other profile of that class through cudaGraphExecUpdate, which cannot
+// cross a change of node count.
 
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/round_buffers.h"
+#include "ninfer/ops/softmax_attention.h"
 #include "ninfer/types.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
@@ -43,6 +45,16 @@ CausalAttentionRoute route_at(AttentionHeadGeometry geometry, std::uint32_t capa
     return causal_attention_resolve_route(
         geometry.query_heads, static_cast<std::int32_t>(draft_window) + 1, 1, storage,
         CausalAttentionExecutionEnvelope{1U, static_cast<std::uint32_t>(target)});
+}
+
+// The small-T launches of the verify call at a frontier: its chunk count past eight columns.
+int launches_at(AttentionHeadGeometry geometry, std::uint32_t capacity, std::uint32_t draft_window,
+                std::uint32_t frontier, KvCacheStorage storage) {
+    const std::uint64_t target =
+        std::min<std::uint64_t>(capacity, static_cast<std::uint64_t>(frontier) + draft_window + 1);
+    return ninfer::ops::causal_softmax_attention_small_t_launches(
+        geometry, storage, CausalAttentionExecutionEnvelope{1U, static_cast<std::uint32_t>(target)},
+        1, static_cast<std::int32_t>(draft_window) + 1);
 }
 
 int failures = 0;
@@ -109,9 +121,24 @@ void check(AttentionHeadGeometry geometry, std::uint32_t capacity, std::uint32_t
         }
     }
 
-    // 3. the autoregressive draft steps (one column each, up to max + K + 1 + step) take one route
+    // 3. one small-T launch count per class: past eight columns the chunk width can change with
+    //    the window (INT8 at 9 or 10 columns over more than 4096 keys).
+    std::map<std::uint32_t, int> launches_of_class;
+    for (const auto& profile : profiles) {
+        const int launches = launches_at(geometry, capacity, draft_window, profile.max, storage);
+        const auto [it, inserted] = launches_of_class.emplace(profile.topology_class, launches);
+        if (!inserted && it->second != launches) {
+            std::cerr << "heads=" << geometry.query_heads << " capacity=" << capacity
+                      << " k=" << draft_window << " kv=" << kv << ": class "
+                      << profile.topology_class << " carries " << it->second << " and "
+                      << launches << " small-T launches (profile [" << profile.min << ","
+                      << profile.max << "])\n";
+            ++failures;
+        }
+    }
+
+    // 4. the autoregressive draft steps (one column each, up to max + K + 1 + step) take one route
     //    per class too, since the class's executable captures them as well.
-    if (draft_window + 1U > 8U) { return; }
     std::map<std::uint32_t, std::vector<CausalAttentionRoute>> steps_of_class;
     for (const auto& profile : profiles) {
         std::vector<CausalAttentionRoute> steps;

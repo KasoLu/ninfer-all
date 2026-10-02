@@ -216,6 +216,18 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                                         std::int32_t width);
 
 /**
+ * Return how many small-T launches such a call makes: one on the small-T route, one per query-row
+ * chunk on the chunked route (the chunk width can depend on the envelope), zero on the prompt
+ * route. Together with the route family it fixes the call's node sequence, so CUDA Graph planners
+ * may update one executable across calls that agree on both.
+ */
+[[nodiscard]] int causal_softmax_attention_small_t_launches(AttentionHeadGeometry geometry,
+                                                            KvCacheStorage cache_storage,
+                                                            CausalAttentionExecutionEnvelope envelope,
+                                                            std::int32_t batch_size,
+                                                            std::int32_t width);
+
+/**
  * Return the prompt-route width granule of one registered head geometry on the current device.
  * A single-sequence call whose width is a multiple of the granule launches whole waves of prompt
  * CTAs, so a caller that splits a long prompt into such calls leaves no SM idle behind a partial

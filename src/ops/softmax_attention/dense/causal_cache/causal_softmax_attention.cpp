@@ -432,6 +432,27 @@ int causal_softmax_attention_route_family(AttentionHeadGeometry geometry,
     return 2;
 }
 
+int causal_softmax_attention_small_t_launches(AttentionHeadGeometry geometry,
+                                              KvCacheStorage cache_storage,
+                                              CausalAttentionExecutionEnvelope envelope,
+                                              std::int32_t batch_size, std::int32_t width) {
+    require_causal_geometry(geometry, "causal_softmax_attention small-T launches");
+    switch (detail::causal_attention_resolve_route(geometry.query_heads, width, batch_size,
+                                                   cache_storage, envelope)) {
+    case detail::CausalAttentionRoute::SmallT:
+        return 1;
+    case detail::CausalAttentionRoute::ChunkedSmallT: {
+        // launch_chunked_small_t's loop: one launch per chunk of this width.
+        const std::int32_t chunk = causal_attention_chunk_tokens(geometry.query_heads, width,
+                                                                 batch_size, cache_storage, envelope);
+        return (width + chunk - 1) / chunk;
+    }
+    case detail::CausalAttentionRoute::Prompt:
+        return 0;
+    }
+    return 0;
+}
+
 std::int32_t causal_softmax_attention_prompt_wave_tokens(AttentionHeadGeometry geometry) {
     require_causal_geometry(geometry, "causal_softmax_attention prompt wave");
     int device          = 0;
