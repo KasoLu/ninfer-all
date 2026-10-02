@@ -25,6 +25,8 @@ constexpr std::string_view kParamOpen     = "<parameter=";
 constexpr std::string_view kParamClose    = "</parameter>";
 constexpr std::string_view kFunctionCallsOpen  = "<function_calls>";
 constexpr std::string_view kFunctionCallsClose = "</function_calls>";
+constexpr std::string_view kThinkOpen          = "<think>";
+constexpr std::string_view kThinkClose         = "</think>";
 
 // Reserved name for a call the recovery pass could not read. No client declares it, so the client
 // answers with an unknown-tool error and nothing runs; the arguments tell the model what went wrong.
@@ -651,7 +653,7 @@ private:
         std::size_t next              = 0;
         if (lenient_ && find_unclosed_parameter_end(value_begin, function_close, value_end)) {
             next = value_end;
-        } else if (find_parameter_close(value_begin, *form, value_end)) {
+        } else if (find_parameter_close(value_begin, *form, function_close, value_end)) {
             next = value_end + form->close.size();
         } else {
             return FallbackReason::MalformedStructure;
@@ -704,16 +706,30 @@ private:
     }
 
     // The format has no escape, so a value that quotes its own closing tag is ambiguous. A closer
-    // that runs on into ordinary text is value text; one followed, after whitespace, by markup or
-    // by the end of the output ends the value. A malformed tag after a real closer is still
-    // markup, so it is reported rather than folded into the value.
-    bool ends_value(std::size_t pos) const {
+    // ends the value only where the call can go on after it (after whitespace): the end of the
+    // output, another parameter, the tool close, or the function's own close followed by the end,
+    // the tool close, the next call or the container close. A closer that runs into a call opener
+    // or a reasoning tag is a broken call rather than payload, so it still ends the value and the
+    // break is reported. Anything else after it -- text, a function close that runs on into text,
+    // or markup such as the HTML or template of a Write/Edit payload -- makes it value text.
+    bool ends_value(std::size_t pos, std::string_view function_close) const {
         skip_format_whitespace(text_, pos);
-        return pos == text_.size() || text_[pos] == '<';
+        if (pos == text_.size() || tag_form_at(text_, pos, kParameterForms) != nullptr ||
+            starts_with_at(text_, pos, kToolClose) || opens_call(text_, pos) ||
+            starts_with_at(text_, pos, kFunctionCallsOpen) ||
+            starts_with_at(text_, pos, kFunctionCallsClose) ||
+            starts_with_at(text_, pos, kThinkOpen) || starts_with_at(text_, pos, kThinkClose)) {
+            return true;
+        }
+        if (!starts_with_at(text_, pos, function_close)) { return false; }
+        pos += function_close.size();
+        skip_format_whitespace(text_, pos);
+        return pos == text_.size() || starts_with_at(text_, pos, kToolClose) ||
+               opens_call(text_, pos) || starts_with_at(text_, pos, kFunctionCallsClose);
     }
 
     bool find_parameter_close(std::size_t value_begin, const TagForm& form,
-                              std::size_t& value_end) const {
+                              std::string_view function_close, std::size_t& value_end) const {
         std::size_t depth = 1;
         std::size_t scan  = value_begin;
         for (;;) {
@@ -727,7 +743,7 @@ private:
                 continue;
             }
 
-            if (depth != 1 || ends_value(close + form.close.size())) { --depth; }
+            if (depth != 1 || ends_value(close + form.close.size(), function_close)) { --depth; }
             if (depth == 0) {
                 value_end = close;
                 return true;
