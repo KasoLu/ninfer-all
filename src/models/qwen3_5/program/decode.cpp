@@ -216,19 +216,6 @@ void ProgramImpl::mark_workspace_usage(std::size_t phase_bytes) noexcept {
     workspace_logical_peak_bytes = std::max(workspace_logical_peak_bytes, phase_bytes);
 }
 
-void ProgramImpl::upload_dflash_prefill_controls(const SequenceState& sequence) {
-    *dflash_host_ingress                            = {};
-    dflash_host_ingress->active_lanes[0]            = static_cast<std::int32_t>(sequence.lane);
-    const StateImageSelectors selectors             = state_selectors(sequence);
-    dflash_host_ingress->state_source_slots[0]      = selectors.source;
-    dflash_host_ingress->state_destination_slots[0] = selectors.destination;
-    dflash_host_ingress->dflash_kv_table_rows[0] =
-        sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
-    CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                               offsetof(qwen3_5::DFlashDecodeIngress, ngram_tokens),
-                               cudaMemcpyHostToDevice, device.stream));
-}
-
 std::vector<NgramProposer::Match>
 ProgramImpl::propose_ngram(std::span<const std::uint32_t> lanes,
                            std::span<const runtime::RoundBudget> budgets) {

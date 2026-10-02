@@ -239,8 +239,22 @@ broad additions without a concrete regression risk do not belong in the permanen
 
 ## DFlash2 Engine integration
 
-The real test uses an artifact containing DFlash2 and checks output budgets, speculative activity,
-penalty-enabled sampling, compact batches with unequal budgets, same-route same-seed replay,
+The DFlash prefill regression checks actual draft KV contents after a StateImage fork and a
+conflicting decode binding, including shortened chunks and oversized local/full KV appends. It
+uses native Program storage and the production prefill route; select the draft component stored in
+the artifact:
+
+```bash
+cmake --build build -j --target ninfer_qwen3_5_dflash_prefill_real_test
+NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  build/tests/ninfer_qwen3_5_dflash_prefill_real_test dflash2
+NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
+  build/tests/ninfer_qwen3_5_dflash_prefill_real_test dflash
+```
+
+The Engine test uses an artifact containing DFlash2 and checks output budgets, speculative activity,
+a forced thinking-control append, penalty-enabled sampling, compact batches with unequal budgets,
+same-route same-seed replay,
 retained/fresh prefix behavior and absence of a full backend KV pool. A shared DFlash/DFlash2 fixture starts decode at token 63, verifies across the page
 boundary, stops after one target column at token 64, and checks the exact retained frontier and
 subsequent generation with and without reuse.
