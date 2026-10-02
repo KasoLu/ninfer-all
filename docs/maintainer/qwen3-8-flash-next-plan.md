@@ -28,6 +28,7 @@ HF repository, and Strata is github.com/Niko1221/Strata (MIT).
 | M1 | an FP64 reference forward of the text path (PLE, hyper-connections, GDN, QSA, MoE, mixer, head) loading tensors lazily from the checkpoint | `tools/reference/qwen4_exp.py` |
 | M2 | the converter's logical parameters for the text component; the PLE n-gram hash constants (held to the checkpoint's stored buffers) and row ids; n-gram table rows read from disk (default) or RAM | `tools/convert/qwen4_exp.py`, `src/models/qwen4_exp/ngram_hash.*`, `ngram_table.*` |
 | M3 | `hyper_connection` read/write, `ple_inject`, `ngram_embed_rows` (FP8 row-scale, BF16), the sigmoid gate of `gated_rmsnorm`, `qsa_indexer` (pooled keys, top-512 block selection), `sparse_softmax_attention` (BF16 KV), `moe_route` (512-expert top-10 and shared gate), `moe_experts_bf16`, each against its FP64 oracle | `src/ops/{hyper_connection,ple_inject,qsa_indexer,sparse_attention,moe_route,moe_experts}/` |
+| M3 | the Ops composed over the checkpoint's first four layers (three GDN, one QSA) and the head on BF16 weights, against the FP64 reference on 16 tokens: stack relative L2 ≈ 1.1e-2 per layer, top-1 agreement 16/16 (RTX 3090) | `tests/models/qwen4_exp/test_slice_real.cpp`, `tools/reference/fetch_slice.py` |
 
 Not started: the family's load/execution/program (the M0 runtime split, M4), quantized expert formats and KV codecs
 for the new Ops (the 24 GB fit needs them), the n-gram companion artifact, MTP, hybrid CPU/GPU experts.

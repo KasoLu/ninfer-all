@@ -121,8 +121,9 @@ filled to it, both models find two of the three needles.
   natively. All of it compiles only into `120a` builds.
 - **Qwen3.8-Flash-Next (in progress, not loadable yet).** The converter maps its text weights,
   the n-gram table can be read from disk or RAM, and its new operations (hyper-connections, PLE,
-  the sparse-attention indexer and attention, the 512-expert router) pass their FP64 oracles. The
-  engine cannot load the model yet; the [plan](docs/maintainer/qwen3-8-flash-next-plan.md) tracks
+  the sparse-attention indexer and attention, the 512-expert router) pass their FP64 oracles; composed
+  over the checkpoint's first four layers and the head they match the FP64 reference's top-1 token on
+  all 16 test tokens. The engine cannot load the model yet; the [plan](docs/maintainer/qwen3-8-flash-next-plan.md) tracks
   what remains.
 - **Reference measurements** of Ternary Bonsai 2 27B and Qwen3.8-27B on the RTX 3090, 4090 and
   5090 up to the full window, the largest context each card serves and fills, every draft length
