@@ -179,6 +179,16 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_5_moe_real_test --output-on-failure
 ```
 
+Qwen3.8-Flash-Next has no loadable artifact yet; its Ops are composed over a checkpoint slice
+instead. `tools/reference/fetch_slice.py` range-fetches the first blocks, embedding, final mixer, head
+and the needed n-gram rows (`--exclude ngram_embedding` keeps the 102 GB table out), and
+`tools/reference/qwen4_exp.py --layers 4 --head --out DIR/golden` writes the FP64 golden:
+
+```bash
+NINFER_QWEN4_EXP_SLICE=$PWD/fn_slice \
+  ctest --test-dir build -R ninfer_qwen4_exp_slice_real --output-on-failure
+```
+
 Without `NINFER_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Run GPU integration
 tests serially. `NINFER_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as `vision`,
 `pressure-resume` or `concurrent`; the default is `all`. These integration checks
