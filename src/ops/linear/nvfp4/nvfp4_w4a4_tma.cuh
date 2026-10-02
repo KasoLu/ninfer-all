@@ -411,14 +411,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
             // so clamp the token index the epilogue reads with and drop its store below.
             const int global_token0 = min(token_begin + token0, token_count - 1);
             const int global_token1 = min(token_begin + token1, token_count - 1);
-            const float value00 =
-                epilogue.apply(global_row0, global_token0, accumulators[mma_m][mma_n][0] * alpha);
-            const float value01 =
-                epilogue.apply(global_row1, global_token0, accumulators[mma_m][mma_n][1] * alpha);
-            const float value10 =
-                epilogue.apply(global_row0, global_token1, accumulators[mma_m][mma_n][2] * alpha);
-            const float value11 =
-                epilogue.apply(global_row1, global_token1, accumulators[mma_m][mma_n][3] * alpha);
+            const float value00     = epilogue.apply_scaled(global_row0, global_token0,
+                                                            accumulators[mma_m][mma_n][0], alpha);
+            const float value01     = epilogue.apply_scaled(global_row1, global_token0,
+                                                            accumulators[mma_m][mma_n][1], alpha);
+            const float value10     = epilogue.apply_scaled(global_row0, global_token1,
+                                                            accumulators[mma_m][mma_n][2], alpha);
+            const float value11     = epilogue.apply_scaled(global_row1, global_token1,
+                                                            accumulators[mma_m][mma_n][3], alpha);
             *destination0 = __floats2bfloat162_rn(value00, value01);
             *destination1 = __floats2bfloat162_rn(value10, value11);
         }

@@ -417,17 +417,22 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
             auto* destination1 = reinterpret_cast<__nv_bfloat162*>(
                 shared_output + (token1 - token_begin) * kOutputStride + local_row0);
             const int parent_row1 = row_policy.weight_row(row_begin, local_row0 + 1);
-            float value00         = accumulators[mma_m][mma_n][0] * alpha;
-            float value01         = accumulators[mma_m][mma_n][1] * alpha;
-            float value10         = accumulators[mma_m][mma_n][2] * alpha;
-            float value11         = accumulators[mma_m][mma_n][3] * alpha;
+            // A padded token keeps its scaled value, which a pair-completing output policy reads.
+            float value00 = accumulators[mma_m][mma_n][0], value01 = accumulators[mma_m][mma_n][1];
+            float value10 = accumulators[mma_m][mma_n][2], value11 = accumulators[mma_m][mma_n][3];
             if (token0 < active) {
-                value00 = epilogue.apply(parent_row0, token0, value00);
-                value01 = epilogue.apply(parent_row1, token0, value01);
+                value00 = epilogue.apply_scaled(parent_row0, token0, value00, alpha);
+                value01 = epilogue.apply_scaled(parent_row1, token0, value01, alpha);
+            } else {
+                value00 *= alpha;
+                value01 *= alpha;
             }
             if (token1 < active) {
-                value10 = epilogue.apply(parent_row0, token1, value10);
-                value11 = epilogue.apply(parent_row1, token1, value11);
+                value10 = epilogue.apply_scaled(parent_row0, token1, value10, alpha);
+                value11 = epilogue.apply_scaled(parent_row1, token1, value11, alpha);
+            } else {
+                value10 *= alpha;
+                value11 *= alpha;
             }
             *destination0 = __floats2bfloat162_rn(value00, value01);
             *destination1 = __floats2bfloat162_rn(value10, value11);

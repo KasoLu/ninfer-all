@@ -1396,6 +1396,12 @@ struct Nvfp4SourceDivisorEpilogue {
         const int index = shift >= 0 ? (row >> shift) : (row / divisor_rows);
         return value * __frcp_rn(divisors[index]);
     }
+
+    // Only multiplications, so nothing to contract: the same result as apply(value * scale).
+    __device__ __forceinline__ float apply_scaled(std::int32_t row, std::int32_t token, float value,
+                                                  float scale) const {
+        return apply(row, token, value * scale);
+    }
 };
 
 // A stacked plane reads its divisors per row; a plane with one carries its reciprocal and never
