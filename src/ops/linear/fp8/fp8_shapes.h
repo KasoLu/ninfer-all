@@ -8,6 +8,9 @@ struct Fp8LinearShape {
     Fp8Launch a16;
     void (*a8)(const Tensor&, const Weight&, Tensor&, Fp8A8Workspace, cudaStream_t);
     bool (*uses_a8)(std::int32_t min_tokens, std::int32_t max_tokens);
+    // Split-K partial bytes an A8 call of up to max_tokens columns needs (the unified TMA
+    // tail-wave routes); null where the shape has none.
+    std::size_t (*partial_capacity_bytes)(std::int32_t max_tokens) = nullptr;
 };
 
 extern const Fp8LinearShape kFp8N14336K5120;

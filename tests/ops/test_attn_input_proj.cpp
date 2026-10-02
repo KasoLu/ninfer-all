@@ -171,7 +171,7 @@ int run_q4_q5() {
     for (int t = 1; t <= 128; ++t)
         failures +=
             run_target_projection_case(query_key, &gate_value, t, ops::LinearPolicy::A16Only);
-    for (int t : {129, 144, 145, 160, 161, 192, 193, 256, 257, 1024})
+    for (int t : {129, 191, 192, 193, 256, 257, 287, 288, 289, 383, 384, 385, 512, 513, 1024, 1025})
         failures +=
             run_target_projection_case(query_key, &gate_value, t, ops::LinearPolicy::A16Only);
     // The replayed set covers the Q5 split4 band's new counts (7 and 9) next to the ones already
@@ -539,12 +539,14 @@ int run_fp8_target() {
             std::cerr << "FP8 attention projection workspace interval mismatch\n";
             ++failures;
         }
-        for (int t : {129, 144, 145, 160, 161, 192, 193, 256, 257, 1024})
+        for (int t : {129, 144, 145, 160, 161, 191, 192, 193, 256, 257, 287, 288, 289, 383, 384,
+                      385, 512, 513, 1024, 1025})
             failures += run_case_allowing_arch_skip(tag + " T=" + std::to_string(t), [&] {
                 return run_target_projection_case(parent, nullptr, t, policy);
             });
-        for (int t : {1,  4,  5,  6,  8,  9,  16,  24,  25,  32,  33,  34,
-                      64, 65, 80, 81, 96, 97, 128, 129, 144, 145, 160, 161})
+        for (int t : {1,   4,   5,   6,   8,   9,   16,  17,  24,  25,  32,  33,  34,  64,
+                      65,  80,  81,  96,  97,  128, 129, 144, 145, 160, 161, 192, 193, 288,
+                      289, 385, 512, 513, 1025})
             failures += run_case_allowing_arch_skip(tag + " split T=" + std::to_string(t), [&] {
                 return run_target_projection_case(parent, nullptr, t, policy, true);
             });
