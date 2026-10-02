@@ -2,6 +2,7 @@
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 
 #include "core/device.h"
+#include "ops/common/device_multiprocessors.h"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
@@ -467,19 +468,11 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_small_ro
 // so any grid is correct; this caps the launch when the work list is long.
 constexpr int kPrefillMaxBlocksPerSm = 32;
 
+// Taken per device: a model split over several GPUs launches each stage on its own device.
 int prefill_max_blocks() {
-    static const int blocks = [] {
-        int device = 0;
-        int sms    = 0;
-        if (cudaGetDevice(&device) != cudaSuccess ||
-            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess ||
-            sms <= 0) {
-            cudaGetLastError();
-            sms = 170;
-        }
-        return kPrefillMaxBlocksPerSm * sms;
-    }();
-    return blocks;
+    const int sms = current_device_multiprocessors(0);
+    if (sms <= 0) { (void)cudaGetLastError(); }
+    return kPrefillMaxBlocksPerSm * (sms > 0 ? sms : 170);
 }
 
 // The narrow routed gate/up ships in both depths and the route picks one. A job is one nonempty
