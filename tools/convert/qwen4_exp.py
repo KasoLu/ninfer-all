@@ -144,3 +144,89 @@ def mtp_config(source: dict) -> dict:
         "architectures": ["Qwen4ExpMTP"],
         "rope_theta": _f32(mtp.get("rope_theta"), "text.mtp.rope_theta"),
     }
+
+
+# --- logical parameters ---------------------------------------------------------------------------
+# Names follow the Qwen3.5 adapter's where the mathematics is shared (attention, Gated DeltaNet,
+# MoE); hyper-connections, the indexer and PLE add their own. The n-gram table is not a parameter of
+# the main artifact: it ships as a companion (see the plan's section 2.5).
+
+def _hyper_connection(builder, prefix, source_prefix, store, config, *, inject):
+    width = config["hc_count"] * config["hidden_size"]
+    lowrank = config["hc_lowrank"]
+    builder.add(prefix + "norm", store, source_prefix + "hc_norm.weight", (width,))
+    builder.add(prefix + "down", store, source_prefix + "input_mix_weight_down.weight",
+                (lowrank, width), inputs=(prefix + "normalized",))
+    builder.add(prefix + "up", store, source_prefix + "input_mix_weight_up.weight",
+                (width, lowrank), inputs=(prefix + "low",))
+    if inject:
+        builder.add(prefix + "inject", store, source_prefix + "block_inject_weight.weight",
+                    (config["hc_count"], width), inputs=(prefix + "normalized",))
+
+
+def _indexer(builder, prefix, source_prefix, store, config):
+    h = config["hidden_size"]
+    heads, dim = config["indexer_n_heads"], config["indexer_head_dim"]
+    source = source_prefix + "self_attn.indexer."
+    for role, start, count in (("query", 0, heads * dim), ("key", heads * dim, dim)):
+        builder.add(prefix + "indexer/" + role, store, source + "index_qk_proj.weight",
+                    (count, h), source_shape=((heads + 1) * dim, h),
+                    rows=((start, start + count),), inputs=(prefix + "mixer_input",))
+    for role, field in (("query_norm", "q_layernorm"), ("key_norm", "k_layernorm")):
+        builder.add(prefix + "indexer/" + role, store, source + field + ".weight", (dim,))
+    builder.group(prefix + "indexer/query", prefix + "indexer/key")
+
+
+def _ple(builder, prefix, source_prefix, store, config):
+    h, hc = config["hidden_size"], config["hc_count"]
+    taps = config["ple_conv_kernel_size"]
+    source = source_prefix + "ple."
+    builder.add(prefix + "ple/key", store, source + "key_proj.weight",
+                (hc * h, config["ple_embed_dim"]), inputs=(prefix + "ple/embedding",))
+    builder.add(prefix + "ple/value", store, source + "value_proj.weight",
+                (h, config["ple_embed_dim"]), inputs=(prefix + "ple/embedding",))
+    builder.group(prefix + "ple/key", prefix + "ple/value")
+    for role in ("norm_key", "norm_query", "norm_conv"):
+        builder.add(prefix + "ple/" + role, store, source + role + ".weight", (hc * h,))
+    # Each channel's taps stay contiguous, oldest first, as ple_inject reads them.
+    builder.add(prefix + "ple/convolution", store, source + "conv1d.weight",
+                (hc * h, taps), source_shape=(hc * h, 1, taps))
+
+
+def build_model(base, *, resource_overrides=None):
+    """The text component of a Qwen3.8-Flash-Next checkpoint (no Vision, MTP or n-gram table)."""
+    from .model import Model
+    from .qwen3_5 import _Builder
+    from .resources import load_resources
+
+    config = text_config(base.config)
+    records = {"text": {"config": config}}
+    refs, resources, count, special = load_resources(
+        base.root, vocab_size=config["vocab_size"], vision_config=None,
+        overrides=resource_overrides)
+    for component, resource_refs in refs.items():
+        records[component]["resources"] = resource_refs
+    model = Model(records, resources=resources, token_count=count, special_token_ids=special)
+    builder = _Builder(model)
+    h, vocab = config["hidden_size"], config["vocab_size"]
+    prefix = "model.language_model."
+    builder.add("text/token_embedding", base, prefix + "embed_tokens.weight", (vocab, h))
+    head = prefix + "embed_tokens.weight" if config["tie_word_embeddings"] else "lm_head.weight"
+    builder.add("text/output_head", base, head, (vocab, h), inputs=("text/final_hidden",))
+    _hyper_connection(builder, "text/final_mixer/", prefix + "hyper_connection_mixer.", base,
+                      config, inject=False)
+    for i, kind in enumerate(config["layer_types"]):
+        p, sp = f"text/layers/{i}/", prefix + f"layers.{i}."
+        _hyper_connection(builder, p + "attn_hc/", sp + "attn_hyper_connection.", base, config,
+                          inject=True)
+        _hyper_connection(builder, p + "mlp_hc/", sp + "mlp_hyper_connection.", base, config,
+                          inject=True)
+        if kind == "full_attention":
+            builder.attention(p, sp, base, config)
+            _indexer(builder, p, sp, base, config)
+        else:
+            builder.gdn(p, sp, base, config)
+        builder.moe(p, sp, base, config)
+        if i in config["ple_layers"]:
+            _ple(builder, p, sp, base, config)
+    return model
