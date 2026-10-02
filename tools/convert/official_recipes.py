@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, import_encoded
+from .methods import (
+    cast_direct,
+    fp8_row_maxabs,
+    grouped_absmax,
+    grouped_search,
+    import_encoded,
+)
 from .sources.compressed_tensors import compressed_matrix_source
 
 Q4 = "q4_g64_fp16"
@@ -93,6 +99,48 @@ def qwen3_8_27b(model, recipe, sources):
 
 def qwen3_8_27b_q6(model, recipe, sources):
     _dense_groupwise(model, recipe, Q8, gate_up=Q6)
+
+
+def qwen3_8_27b_imatrix(model, recipe, sources):
+    """Qwen3.8-27B sized for one 24 GB card: ``grouped_search`` with signed scales over every
+    text matrix, weighted by ``--source imatrix=PATH`` (a file from ``tools.convert.imatrix``);
+    a Q4 embedding, a Q6 head, and Q4 mixer outputs and MLP down in layers 36-63. Vision, MTP
+    and draft components keep the ``grouped_absmax`` formats of ``_optional``.
+
+    The Q4 MLP down (5120x17408) needs the Q4 ``linear_add`` route of that shape."""
+
+    if "num_experts" in model.config:
+        raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
+    _optional(model, recipe)
+    search = {
+        "method": grouped_search,
+        "parameters": {"imatrix": str(sources["imatrix"].path), "negative_scales": True},
+    }
+    recipe.assign("text/token_embedding", format=Q4, **search)
+    recipe.assign("text/output_head", format=Q6, **search)
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/layers/") or not parameter.projection:
+            continue
+        if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
+            recipe.separate(name)
+            continue
+        layer = int(name.split("/")[2])
+        if name.endswith(
+            (
+                "/attention/query",
+                "/attention/key",
+                "/gdn/query",
+                "/gdn/key",
+                "/mlp/gate",
+                "/mlp/up",
+            )
+        ):
+            format = Q4
+        elif name.endswith(("/attention/output", "/gdn/output", "/mlp/down")) and layer >= 36:
+            format = Q4
+        else:
+            format = Q5
+        recipe.assign(name, format=format, **search)
 
 
 def qwen3_6_35b_a3b(model, recipe, sources):
@@ -339,6 +387,7 @@ RECIPES = {
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
     "qwen3_8_27b_q6": qwen3_8_27b_q6,
+    "qwen3_8_27b_imatrix": qwen3_8_27b_imatrix,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_8_27b_nvfp4_nvidia": qwen3_8_27b_nvfp4_nvidia,
     "qwen3_8_27b_nvfp4_orcarouter": qwen3_8_27b_nvfp4_orcarouter,

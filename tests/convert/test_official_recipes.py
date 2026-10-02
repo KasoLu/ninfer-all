@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 import torch
 
-from tools.convert.methods import fp8_row_maxabs, import_encoded
+from tools.convert.methods import fp8_row_maxabs, grouped_search, import_encoded
 from tools.convert.model import Model, Parameter
 from tools.convert.official_recipes import (
     RECIPES,
     qwen3_8_27b,
+    qwen3_8_27b_imatrix,
     qwen3_8_27b_nvfp4_nvidia,
     qwen3_8_27b_q6,
 )
@@ -160,3 +165,61 @@ def _selection_formats(recipe: Recipe) -> dict[str, set[str]]:
         name: {selection.format for selection in selections}
         for name, selections in recipe.selections.items()
     }
+
+
+def _imatrix_recipe() -> Recipe:
+    model = Model({"text": {"config": {}}})
+    names = ["text/token_embedding", "text/output_head"]
+    for layer in (35, 36):
+        for role in (
+            "gdn/a_projection", "gdn/query", "gdn/value", "gdn/output", "attention/query",
+            "attention/gate", "attention/output", "mlp/gate", "mlp/up", "mlp/down",
+        ):
+            names.append(f"text/layers/{layer}/{role}")
+    for name in names:
+        inputs = () if name == "text/token_embedding" else ("input",)
+        source = array_source(torch.ones((4, 8), dtype=torch.bfloat16), name)
+        model.add(Parameter(name, (4, 8), source, inputs=inputs))
+    recipe = Recipe(model)
+    qwen3_8_27b_imatrix(model, recipe, {"imatrix": SimpleNamespace(path=Path("im.safetensors"))})
+    return recipe
+
+
+def test_imatrix_recipe_searches_every_text_matrix_with_signed_scales() -> None:
+    recipe = _imatrix_recipe()
+    assert RECIPES["qwen3_8_27b_imatrix"] is qwen3_8_27b_imatrix
+    for name, selections in recipe.selections.items():
+        if name.endswith("/gdn/a_projection"):
+            assert name in recipe.separate_parameters
+            continue
+        (selection,) = selections
+        assert selection.method is grouped_search, name
+        assert selection.parameters == {"imatrix": "im.safetensors", "negative_scales": True}
+
+
+@pytest.mark.parametrize(
+    "name, format",
+    [
+        ("text/token_embedding", Q4),
+        ("text/output_head", Q6),
+        ("text/layers/35/gdn/query", Q4),
+        ("text/layers/35/gdn/value", Q5),
+        ("text/layers/35/attention/gate", Q5),
+        ("text/layers/35/mlp/up", Q4),
+        ("text/layers/35/gdn/output", Q5),
+        ("text/layers/35/attention/output", Q5),
+        ("text/layers/35/mlp/down", Q5),
+        ("text/layers/36/gdn/output", Q4),
+        ("text/layers/36/attention/output", Q4),
+        ("text/layers/36/mlp/down", Q4),
+        ("text/layers/36/gdn/value", Q5),
+    ],
+)
+def test_imatrix_recipe_formats(name, format) -> None:
+    assert _single(_selection_formats(_imatrix_recipe()), name) == format
+
+
+def test_imatrix_recipe_requires_the_imatrix_source() -> None:
+    model = _dense_model()
+    with pytest.raises(KeyError):
+        qwen3_8_27b_imatrix(model, Recipe(model), {})
