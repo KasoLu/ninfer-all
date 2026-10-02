@@ -10,6 +10,7 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/gated_delta_net.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_plan.h"
@@ -468,6 +469,8 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
     SyntheticWeight down    = row_split_weight(QType::Q5_G64_FP16, hidden, 17408);
     SyntheticWeight gate_up = row_split_weight(QType::Q4_G64_FP16, 34816, hidden);
     SyntheticWeight out_q4            = row_split_weight(QType::Q4_G64_FP16, hidden, 6144);
+    SyntheticWeight down_q4           = row_split_weight(QType::Q4_G64_FP16, hidden, 17408);
+    SyntheticWeight head_q6           = row_split_weight(QType::Q6_G64_FP16, 248320, hidden);
     DeviceBuffer x_hidden       = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
     DeviceBuffer x_mixer        = bf16_buffer(static_cast<std::size_t>(6144) * max_tokens);
     DeviceBuffer x_intermediate = bf16_buffer(static_cast<std::size_t>(17408) * max_tokens);
@@ -479,6 +482,7 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
     DeviceBuffer z              = bf16_buffer(static_cast<std::size_t>(6144) * max_tokens);
     DeviceBuffer residual       = bf16_buffer(static_cast<std::size_t>(hidden) * max_tokens);
     DeviceBuffer swiglu_out     = bf16_buffer(static_cast<std::size_t>(17408) * max_tokens);
+    DeviceBuffer logits         = bf16_buffer(static_cast<std::size_t>(248320) * 32);
     WorkspaceArena workspace(256ULL << 20);
     const auto tensor = [](DeviceBuffer& buffer, std::int32_t rows, std::int32_t cols) {
         return Tensor(buffer.p, DType::BF16, {rows, cols});
@@ -539,6 +543,30 @@ void calibrate_groupwise(ops::DeviceRouteProfile& profile, Timer& timer,
              ops::detail::q4_linear_swiglu_dispatch(x, gate_up.weight, o, workspace, stream);
          },
          view(swiglu_out, 17408),
+         {}},
+        {"q4_linear_add/5120x6144",
+         decode_widths(),
+         [&](std::int32_t cols, cudaStream_t stream) {
+             Tensor x = tensor(x_mixer, 6144, cols), res = tensor(residual, hidden, cols);
+             ops::detail::select_q4_linear_add(hidden, 6144, cols)(x, out_q4.weight, res, stream);
+         },
+         view(residual, hidden),
+         reset_residual},
+        {"q4_linear_add/5120x17408",
+         decode_widths(),
+         [&](std::int32_t cols, cudaStream_t stream) {
+             Tensor x = tensor(x_intermediate, 17408, cols), res = tensor(residual, hidden, cols);
+             ops::detail::select_q4_linear_add(hidden, 17408, cols)(x, down_q4.weight, res, stream);
+         },
+         view(residual, hidden),
+         reset_residual},
+        {"q6_head/248320x5120",
+         decode_widths(),
+         [&](std::int32_t cols, cudaStream_t stream) {
+             Tensor x = tensor(x_hidden, hidden, cols), o = tensor(logits, 248320, cols);
+             ops::linear(x, head_q6.weight, o, stream);
+         },
+         view(logits, 248320),
          {}},
     };
     // Upstream's move of these projections onto the unified templates, against the routes the

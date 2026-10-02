@@ -40,6 +40,12 @@ std::vector<RouteCatalogEntry> build_catalog() {
         "mma_r64_c64",  "mma_r64_c32_s3", "mma_r64_c32_s4", "mma_r64_c128"};
     add("q5_linear_add/5120x6144", q5_linear_add);
     add("q5_linear_add/5120x17408", q5_linear_add);
+    // Q4 output and down projections (an imatrix-searched artifact stores them as Q4) and the
+    // Q6 vocabulary head: the small-T kernels per column tile, and the head's per-row GEMV.
+    const std::vector<std::string> q4_linear_add = {"small_t_c8", "small_t_c16", "small_t_c32"};
+    add("q4_linear_add/5120x6144", q4_linear_add);
+    add("q4_linear_add/5120x17408", q4_linear_add);
+    add("q6_head/248320x5120", {"gemv", "small_t"});
     add("q4_linear_swiglu/34816x17408x5120",
         {"gemv_pair", "small_t_tiled", "split_half_pair_c40", "split_half_pair_c48",
          "split_half_pair_c128", "split_half_pair_c128_tail"});
