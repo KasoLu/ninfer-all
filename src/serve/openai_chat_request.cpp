@@ -999,11 +999,11 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
         output.generation.structured_output =
             parse_structured_output(body.at("response_format"), true, "response_format");
     }
-    // One model is resident, so an omitted model means that one; llama.cpp's WebUI omits it.
-    if (body.contains("model")) {
-        if (!body.at("model").is_string() || body.at("model").get<std::string>().empty()) {
-            bad_request("model must be a non-empty string", "model");
-        }
+    // One model is resident, so an omitted, null or empty model means that one: llama.cpp's
+    // WebUI omits it or sends "". The HTTP layer substitutes the served model. A model that is
+    // present but not a string is still a malformed request.
+    if (body.contains("model") && !body.at("model").is_null()) {
+        if (!body.at("model").is_string()) { bad_request("model must be a string", "model"); }
         output.model = body.at("model").get<std::string>();
     }
 

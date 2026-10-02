@@ -657,7 +657,8 @@ and availability failures retain their dedicated codes. Internal invariant failu
 relabeled as client input errors.
 
 The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
-the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
+the explicit `--model-id` override. A Chat Completions request that omits `model` or sends it null
+or empty, as the llama.cpp WebUI does, is served by the loaded model. Reasoning is returned separately as `reasoning_content`; answer
 text remains in `content`.
 
 Across Chat Completions, Responses, and Anthropic Messages, an explicit top-level tool-parameter

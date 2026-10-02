@@ -1265,9 +1265,14 @@ int test_common_objects() {
     without_model.erase("model");
     failures += check(parse(without_model).model.empty(),
                       "Chat Completions accepts a request that omits the model");
+    for (const Json& unnamed : {Json(""), Json(nullptr)}) {
+        without_model["model"] = unnamed;
+        failures += check(parse(without_model).model.empty(),
+                          "Chat Completions accepts an empty or null model as the served one");
+    }
     without_model["model"] = 42;
     failures += check(api_error([&] { (void)parse(without_model); }).param == "model",
-                      "a model that is present must still be a non-empty string");
+                      "a model that is present must still be a string");
     const ninfer::ModelMetadata metadata{
         .model_id       = "qwen3.6-27b",
         .weights_id     = "groupwise-int",
