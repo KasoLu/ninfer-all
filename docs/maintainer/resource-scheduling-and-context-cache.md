@@ -279,6 +279,16 @@ Shared prefix 是不可变的复用来源，可以被多个 private branches For
 checkpoints 可以引用相同 address space 的不同 prefix，但每个 checkpoint 都有自己的完整 StateImage
 identity。
 
+Session persistence（`ninfer-serve --slot-save-path`）是唯一一条不经 materialization 或 capture
+transaction 就发布 catalog owner 的路径。它只在没有打开的 context transaction、目标 cell 没有 active
+edge 时于 execution mutex 下运行：`Program::save_continuation` 只读地把 catalogued continuation 的
+ledger、exact identity、shortlist digests、checkpoint 目录、去重后的 StateImage 和 committed frontier
+以内的 KV pages 复制到 host bytes；`Program::restore_continuation` 在空闲 lane 的 execution row 上临时
+激活新的 address space 上传 pages，StateImage 优先落 Device slot、否则落 HostOnly replica，endpoint
+必需、放不下的可选 checkpoint 被丢弃，然后以 `Catalogued` 角色发布并推进 resource revision；
+`ResourceManager::adopt_restored` 把它作为匿名 `RecentPrivate` owner 放入空 cell，之后只按 prefix
+匹配复用。格式与字段见 `src/models/qwen3_5/program/storage/session_snapshot.cpp`。
+
 ### 4.3 Checkpoint 种类
 
 | Kind | 语义 |
@@ -521,6 +531,15 @@ candidates：全部 tools 之后、连续 leading System/Developer 之后，以�
 frontier。栅格 candidate 只带 `EngineObserved`，既不是 declared 也不是 surplus，所以永远不会被投机性地
 占用空闲 shared slot；只有当两个独立 reuse domain 都提出同一个 key 时才会发布。开启后单请求最多十五个
 prepared candidates。
+
+`ContextCacheHints::automatic_private_anchors`（`ninfer-serve --auto-long-anchors N`，默认等于
+`max_long_anchors_per_continuation`）让 Frontend 在最后 `N` 个位于 prompt 内部的 message boundary 上各提出一个
+`PrivateLongAnchor` candidate：跳过第一条 message 之前的空 boundary，也跳过最后一条 message 之后的 boundary
+（endpoint 与 rewrite checkpoint 已覆盖尾部）。Chat Completions 与 Anthropic 请求无法表达显式的
+`PrivateLongAnchor` marker，没有它们时，改写 rewrite checkpoint 以下历史的请求没有 reuse candidate，只能从
+token 0 重新 prefill。它们是 candidates 而非 markers：不计入显式 marker 上限，与同一 frontier 上的显式 anchor
+合并，并使单请求 prepared candidates 上限增加 `N`；保留数量仍受 `max_long_anchors_per_continuation` 限制，满额时替换最浅的
+anchor。
 
 Shared catalog 是 Engine-wide 公共容量，不是每条 lineage 的配额。启用 context cache 时，默认 logical
 capacity 同时覆盖 active concurrency 下限和单请求最多七个 prepared candidates，即

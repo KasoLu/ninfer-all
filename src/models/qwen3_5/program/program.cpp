@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen3_5/program/graft_injection.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include <stdexcept>
@@ -544,6 +545,33 @@ ReleaseResult Program::release_continuation(ContinuationHandle&& continuation) n
     return impl_->release_continuation(std::move(continuation));
 }
 
+SessionSnapshot Program::save_continuation(const ContinuationHandle& continuation,
+                                           std::string_view model_binding) {
+    return impl_->save_continuation(continuation, model_binding);
+}
+
+ContinuationHandle Program::restore_continuation(std::span<const std::uint8_t> snapshot,
+                                                 std::string_view model_binding) {
+    return impl_->restore_continuation(snapshot, model_binding);
+}
+
+std::uint32_t Program::continuation_depth(const ContinuationHandle& continuation) const noexcept {
+    return impl_->continuation_depth(continuation);
+}
+
+std::string Program::continuation_digest(const ContinuationHandle& continuation) const {
+    return impl_->continuation_digest(continuation);
+}
+
+std::vector<SlotCheckpoint>
+Program::continuation_checkpoints(const ContinuationHandle& continuation) const {
+    return impl_->continuation_checkpoints(continuation);
+}
+
+ContinuationSummary Program::continuation_summary(const ContinuationHandle& continuation) const {
+    return impl_->continuation_summary(continuation);
+}
+
 ReleaseResult Program::release_shared_prefix(SharedPrefixHandle&& shared) noexcept {
     return impl_->release_shared_prefix(std::move(shared));
 }
@@ -613,11 +641,17 @@ PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->p
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
 
+std::uint32_t Program::concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept {
+    return impl_->concurrent_output_budget(prompt_tokens);
+}
+
 void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
 
 SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
-                                      DeviceContext& device, const EngineOptions& options) {
-    return SequencePlanner(detail::make_sequence_planner_impl(parameters, device, options));
+                                      DeviceContext& device, const EngineOptions& options,
+                                      std::uint32_t resident_main_pages) {
+    return SequencePlanner(
+        detail::make_sequence_planner_impl(parameters, device, options, resident_main_pages));
 }
 
 std::size_t prepare_vision_overlay(const execution::Parameters& parameters, DeviceContext& device,
@@ -668,6 +702,26 @@ std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
     return std::unique_ptr<Program>(new Program(std::move(impl)));
 }
 
+void Program::inject_graft(const PromptGraft& graft) {
+    inject_direct_graft(*impl_, graft);
+}
+
+std::vector<Program::GraftCatalogEntry> Program::graft_catalog_entries() {
+    std::vector<GraftCatalogEntry> result;
+    for (const auto& [name, entry] : impl_->graft_prefix_slots) {
+        auto handle = detail::RuntimeContractAccess::make_shared_prefix(
+            impl_.get(), entry.slot_index, entry.generation);
+        const auto& shared = impl_->shared_prefix_states[entry.slot_index];
+        auto summary = impl_->shared_prefix_summary(shared);
+        result.push_back({name, std::move(handle), summary});
+    }
+    return result;
+}
+
+void Program::set_graft_rm_slot(const std::string& name, std::uint32_t rm_slot) {
+    impl_->graft_rm_catalog_slots[name] = rm_slot;
+}
+
 } // namespace ninfer::models::qwen3_5
 
 namespace ninfer::models::qwen3_5 {
@@ -705,6 +759,10 @@ const runtime::IdentityMaterializationAssessment&
 AdmissionCandidate::identity_assessment() const noexcept {
     static const runtime::IdentityMaterializationAssessment empty;
     return impl_ != nullptr ? impl_->identity_assessment : empty;
+}
+
+std::optional<std::uint32_t> AdmissionCandidate::graft_shared_slot() const noexcept {
+    return impl_ != nullptr ? impl_->graft_shared_slot_index : std::nullopt;
 }
 
 } // namespace ninfer::models::qwen3_5

@@ -29,6 +29,10 @@ ninfer_add_test(ninfer_cli_options_test
 
 target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
 
+ninfer_add_test(ninfer_slot_files_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_slot_files.cpp"
+  LIBRARIES ninfer_serve)
+
 ninfer_add_test(ninfer_openai_schema_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_openai_schema.cpp"
   LIBRARIES ninfer_serve)
@@ -53,16 +57,16 @@ ninfer_add_test(ninfer_serve_options_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_options.cpp"
   LIBRARIES ninfer_serve)
 
+ninfer_add_test(ninfer_serve_metrics_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_metrics.cpp"
+  LIBRARIES ninfer_serve)
+
 ninfer_add_test(ninfer_request_log_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_request_log.cpp"
   LIBRARIES ninfer_serve)
 
 ninfer_add_test(ninfer_load_report_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_load_report.cpp"
-  LIBRARIES ninfer_serve)
-
-ninfer_add_test(ninfer_serve_metrics_test
-  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_metrics.cpp"
   LIBRARIES ninfer_serve)
 
 ninfer_add_test(ninfer_console_stats_test

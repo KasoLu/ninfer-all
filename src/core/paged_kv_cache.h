@@ -313,6 +313,13 @@ public:
                                 std::span<const DeviceKVPageHandle> destination,
                                 const HostKVPageLayout& layout, std::size_t plane_begin,
                                 std::size_t plane_end, RankStreams streams) const;
+    // The same copies against caller-owned memory laid out by `host`, for images that do not live
+    // in a Host KV arena (session snapshots). `host` must describe this pool's geometry.
+    void copy_to_host(std::span<const DeviceKVPageHandle> source, std::byte* destination,
+                      const HostKVPageLayout& host, RankStreams streams = {}) const;
+    void copy_from_host(const std::byte* source, const HostKVPageLayout& host,
+                        std::span<const DeviceKVPageHandle> destination,
+                        RankStreams streams = {}) const;
 
 private:
     friend class DeviceKVPageLease;

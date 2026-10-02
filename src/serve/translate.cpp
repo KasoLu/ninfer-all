@@ -135,6 +135,28 @@ std::string render_tool_definition(const ToolDefinition& tool) {
     return Json{{"type", "function"}, {"function", std::move(function)}}.dump();
 }
 
+// Clients carry a wider effort vocabulary than the Qwen templates expose: OpenAI and Claude Code
+// send 'high', pi sends 'minimal' and 'max'. The maintained templates offer three rungs (low,
+// medium, xhigh) and raise on anything else, so the outer values collapse onto the nearest rung
+// rather than failing the request -- rejecting 'high' is what makes Claude Code unusable against a
+// stock Qwen3.8 template (QwenLM/Qwen3.8#217).
+ninfer::ReasoningEffort template_reasoning_effort(RequestedReasoningEffort effort) {
+    switch (effort) {
+    case RequestedReasoningEffort::None:
+        return ninfer::ReasoningEffort::None;
+    case RequestedReasoningEffort::Minimal:
+    case RequestedReasoningEffort::Low:
+        return ninfer::ReasoningEffort::Low;
+    case RequestedReasoningEffort::Medium:
+        return ninfer::ReasoningEffort::Medium;
+    case RequestedReasoningEffort::High:
+    case RequestedReasoningEffort::XHigh:
+    case RequestedReasoningEffort::Max:
+        return ninfer::ReasoningEffort::XHigh;
+    }
+    throw std::logic_error("invalid requested reasoning effort");
+}
+
 } // namespace
 
 ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& request,
@@ -194,9 +216,10 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     // family's templates treat an absent enable_thinking. A concrete value is what lets the
     // assistant-prefill guard below refuse a prefill that would open a thinking turn.
     ResolvedPromptSemantics result{
-        .enable_thinking           = thinking ? thinking : server.enable_thinking.value_or(true),
-        .preserve_thinking         = preserve ? preserve : server.preserve_thinking,
-        .chat_template_kwargs_json = kwargs.dump(),
+        .enable_thinking             = thinking ? thinking : server.enable_thinking.value_or(true),
+        .preserve_thinking           = preserve ? preserve : server.preserve_thinking,
+        .requested_preserve_thinking = preserve,
+        .chat_template_kwargs_json   = kwargs.dump(),
     };
     // The server's default effort yields to everything the request decides: its own thinking
     // switch, a forced call, and an assistant prefill.
@@ -213,29 +236,22 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
             invalid_prompt_option("reasoning effort conflicts with enable_thinking",
                                   "reasoning_effort", "conflicting_template_option");
         // A request effort overrides the server's thinking default.
-        result.enable_thinking = enables;
-        // Clients carry a wider effort vocabulary than the Qwen templates expose: OpenAI and
-        // Claude Code send 'high', pi sends 'minimal' and 'max'. The maintained templates offer
-        // three rungs (low, medium, xhigh) and raise on anything else, so the outer values collapse
-        // onto the nearest rung rather than failing the request -- rejecting 'high' is what makes
-        // Claude Code unusable against a stock Qwen3.8 template (QwenLM/Qwen3.8#217).
-        switch (*applied) {
-        case RequestedReasoningEffort::None:
-            result.reasoning_effort = ninfer::ReasoningEffort::None;
-            break;
-        case RequestedReasoningEffort::Minimal:
-        case RequestedReasoningEffort::Low:
-            result.reasoning_effort = ninfer::ReasoningEffort::Low;
-            break;
-        case RequestedReasoningEffort::Medium:
-            result.reasoning_effort = ninfer::ReasoningEffort::Medium;
-            break;
-        case RequestedReasoningEffort::High:
-        case RequestedReasoningEffort::XHigh:
-        case RequestedReasoningEffort::Max:
-            result.reasoning_effort = ninfer::ReasoningEffort::XHigh;
-            break;
+        result.enable_thinking  = enables;
+        result.reasoning_effort = template_reasoning_effort(*applied);
+        // The client's own choice; a server-default effort is logged as unset.
+        result.requested_reasoning_effort = effort;
+    }
+    // An unset request field takes the server default; an explicit empty name opts out of it.
+    const std::string& graft = request.graft ? *request.graft : server.default_graft;
+    if (!graft.empty()) {
+        const bool loaded = std::any_of(
+            server.grafts.begin(), server.grafts.end(),
+            [&](const ninfer::GraftSource& source) { return source.name == graft; });
+        if (!loaded) {
+            invalid_prompt_option("graft '" + graft + "' is not loaded on this server", "graft",
+                                  "unknown_graft");
         }
+        result.graft = graft;
     }
     if (!request.tool_choice.forced_name.empty() && result.enable_thinking != false) {
         // The call opener is written into the generation prompt, and a thinking prompt ends
@@ -355,6 +371,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.reasoning_effort                 = semantics.reasoning_effort;
     input.options.preserve_thinking                = semantics.preserve_thinking;
     input.options.chat_template_kwargs_json        = semantics.chat_template_kwargs_json;
+    input.options.graft                            = semantics.graft;
     input.options.add_vision_id                    = false;
     const std::vector<const ToolDefinition*> tools = effective_tools(request);
     input.options.tool_jsons.reserve(tools.size());

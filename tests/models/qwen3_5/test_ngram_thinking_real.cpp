@@ -108,7 +108,7 @@ int main(int argc, char** argv) {
                       << " ngram_accepted=" << fresh.speculative.ngram_accepted_tokens << std::endl;
             require(fresh.reused_prompt_tokens == 0, "fresh control unexpectedly reused a prefix");
             for (const auto* result : {&fresh, &seeded, &reused, &repeated}) {
-                require(result->thinking.configured_budget == budget &&
+                require(result->thinking.requested_budget == budget &&
                             result->thinking.model_thinking_tokens <= budget,
                         "thinking budget accounting escaped its bound");
                 require(result->generated_token_ids.size() <= 512,

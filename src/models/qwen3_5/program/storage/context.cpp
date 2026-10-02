@@ -43,7 +43,7 @@ bool ProgramImpl::valid_shared_prefix(const SharedPrefixHandle& handle) const no
     const std::uint32_t index = ContractAccess::index(handle);
     return index < shared_prefix_capacity &&
            ContractAccess::epoch(handle) == shared_prefix_slots[index].generation &&
-           shared_prefix_slots[index].role == SharedPrefixSlotRole::Catalogued;
+           is_live_shared_prefix_role(shared_prefix_slots[index].role);
 }
 
 bool ProgramImpl::valid_capture_offer(const CaptureOffer& offer) const noexcept {
@@ -401,7 +401,7 @@ ProgramImpl::owner_exclusive_resources(const SharedPrefixState& shared) const {
     }
     detail::PhysicalResources out;
     {
-        if (!shared.kv || !shared.identity || !state_store->valid(shared.state)) {
+        if (!shared.kv || !state_store->valid(shared.state)) {
             throw std::logic_error("shared prefix has incomplete resident physical state");
         }
         if (state_store->checkpoint_references(shared.state) == 0) {
@@ -909,7 +909,7 @@ void ProgramImpl::populate_continuation_summary(const SequenceState& sequence,
 
 qwen3_5::SharedPrefixSummary
 ProgramImpl::shared_prefix_summary(const SharedPrefixState& shared) const {
-    if (!shared.kv || !shared.identity || shared.frontier == 0 ||
+    if (!shared.kv || shared.frontier == 0 ||
         !state_store->valid(shared.state)) {
         throw std::logic_error("shared-prefix summary source is incomplete");
     }
@@ -922,6 +922,12 @@ ProgramImpl::shared_prefix_summary(const SharedPrefixState& shared) const {
     } else if (state_location != StateReplicaResidency::DeviceOnly) {
         throw std::logic_error("shared-prefix StateImage has no published replica");
     }
+    // Grafts have identity == nullptr; use a zero-digest shortlist key with the
+    // correct frontier so the summary passes validation. The digests being zero
+    // keeps it invisible to the prefix-index matching loop.
+    const PrefixShortlistKey shortlist_key =
+        shared.identity ? shared.identity->shortlist_key
+                        : PrefixShortlistKey{.frontier = shared.frontier};
     return qwen3_5::SharedPrefixSummary{
         .checkpoint =
             {
@@ -931,7 +937,7 @@ ProgramImpl::shared_prefix_summary(const SharedPrefixState& shared) const {
                         .frontier = shared.frontier,
                     },
                 .scope           = runtime::CheckpointScope::Shared,
-                .shortlist_key   = shared.identity->shortlist_key,
+                .shortlist_key   = shortlist_key,
                 .state_residency = residency,
                 .required_kv =
                     {
@@ -989,7 +995,7 @@ bool ProgramImpl::can_clear_lane_strict(const SequenceState& sequence) const {
          ++position) {
         const std::uint32_t index = sequence.shared_prefix_references[position];
         if (index >= shared_prefix_capacity ||
-            shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued) {
+            !is_live_shared_prefix_role(shared_prefix_slots[index].role)) {
             return false;
         }
         const std::uint32_t required = static_cast<std::uint32_t>(std::count(
@@ -1071,7 +1077,7 @@ bool ProgramImpl::can_clear_lane_strict(const SequenceState& sequence) const {
 void ProgramImpl::release_active_shared_references_strict(SequenceState& sequence) noexcept {
     for (const std::uint32_t index : sequence.shared_prefix_references) {
         if (index >= shared_prefix_capacity ||
-            shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued ||
+            !is_live_shared_prefix_role(shared_prefix_slots[index].role) ||
             shared_prefix_states[index].active_references == 0) {
             std::terminate();
         }
@@ -1412,7 +1418,7 @@ void ProgramImpl::release_sequence_state(SequenceState& sequence) noexcept {
 void ProgramImpl::release_active_shared_references(SequenceState& sequence) noexcept {
     for (const std::uint32_t index : sequence.shared_prefix_references) {
         if (index >= shared_prefix_capacity ||
-            shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued ||
+            !is_live_shared_prefix_role(shared_prefix_slots[index].role) ||
             shared_prefix_states[index].active_references == 0) {
             continue;
         }

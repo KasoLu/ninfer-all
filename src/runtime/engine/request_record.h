@@ -198,6 +198,9 @@ struct RequestRecord {
     // The switch to post-thinking sampling has been applied to this request's lane.
     bool post_thinking_applied = false;
     MaterializationDiagnostics materialization_diagnostics;
+    // The catalog cell and session digest the finished session was retained under, if any.
+    std::int32_t retained_slot = -1;
+    std::string retained_session_digest;
 
     std::mutex mutex;
     std::condition_variable cv;

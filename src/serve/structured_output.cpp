@@ -35,6 +35,10 @@ StructuredOutputOptions parse_structured_output(const RequestJson& format, bool 
         }
         options.kind   = StructuredOutputKind::JsonSchema;
         options.schema = spec.at("schema").dump();
+        // OpenAI strict mode: an object schema without additionalProperties admits only its
+        // declared properties. Without it, standard JSON Schema defaults apply.
+        options.strict = spec.contains("strict") && spec.at("strict").is_boolean() &&
+                         spec.at("strict").get<bool>();
     } else {
         fail("unsupported response format type: " + type);
     }

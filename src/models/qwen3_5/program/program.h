@@ -3,6 +3,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
+#include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "runtime/prefix_cache/cost.h"
 
@@ -15,6 +16,8 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -119,6 +122,14 @@ struct ContinuationSummary {
                                          const ContinuationSummary&) noexcept = default;
 };
 
+// A retained continuation serialized for disk: the session snapshot bytes, the resident depth
+// and the session digest (FNV-1a 64 of the token ledger, 16 hex characters).
+struct SessionSnapshot {
+    std::vector<std::uint8_t> bytes;
+    std::uint32_t tokens = 0;
+    std::string session_digest;
+};
+
 struct SharedPrefixSummary {
     CheckpointSummary checkpoint;
     std::uint32_t active_references = 0;
@@ -211,7 +222,7 @@ public:
     std::unique_ptr<detail::SequencePlannerImpl> impl_;
 
     friend SequencePlanner make_sequence_planner(const execution::Parameters&, DeviceContext&,
-                                                 const EngineOptions&);
+                                                 const EngineOptions&, std::uint32_t);
 };
 
 // Hybrid prefix cache admission quote (docs/maintainer/hybrid-prefix-cache-spec.md §6). The
@@ -299,6 +310,7 @@ public:
     [[nodiscard]] const runtime::RequestPlanSummary& summary() const noexcept;
     [[nodiscard]] const runtime::IdentityMaterializationAssessment&
     identity_assessment() const noexcept;
+    [[nodiscard]] std::optional<std::uint32_t> graft_shared_slot() const noexcept;
 
 public:
     // Family-private construction/storage seam. Exact packages expose only the completed alias;
@@ -1108,6 +1120,22 @@ public:
     // it; hybrid_shutdown_save() reports the result.
     [[nodiscard]] std::optional<PhysicalUsageSnapshot> shutdown_cleanup() noexcept;
 
+    // Session persistence. Both run only when no context transaction is open. Save copies a
+    // catalogued continuation to host bytes without changing it. Restore builds a new catalogued
+    // continuation from bytes a server with the same model binding and execution configuration
+    // saved; the caller adopts the returned handle into its catalog or releases it.
+    [[nodiscard]] SessionSnapshot save_continuation(const ContinuationHandle& continuation,
+                                                    std::string_view model_binding);
+    [[nodiscard]] ContinuationHandle restore_continuation(std::span<const std::uint8_t> snapshot,
+                                                          std::string_view model_binding);
+    [[nodiscard]] std::uint32_t
+    continuation_depth(const ContinuationHandle& continuation) const noexcept;
+    [[nodiscard]] std::string continuation_digest(const ContinuationHandle& continuation) const;
+    [[nodiscard]] std::vector<SlotCheckpoint>
+    continuation_checkpoints(const ContinuationHandle& continuation) const;
+    [[nodiscard]] ContinuationSummary
+    continuation_summary(const ContinuationHandle& continuation) const;
+
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
 
     // Hybrid prefix cache mode (ContextCacheMode::Hybrid). Admission runs as the same context
@@ -1140,7 +1168,24 @@ public:
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    // Largest output budget for a prompt of `prompt_tokens` whose admission entitlement (main KV and
+    // any MTP/DFlash backend KV, draft window included) fits one lane's share of each pool, so that
+    // every configured lane can hold such a request at once; clamped to the remaining context. Reads
+    // only fixed startup capacities, so any thread may call it.
+    [[nodiscard]] std::uint32_t concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept;
     void reset_memory_peaks() noexcept;
+
+    // Inject a direct_kv or softprompt_kv graft into a synthesized shared-prefix entry.
+    // Called once at startup before any request is admitted.
+    void inject_graft(const PromptGraft& graft);
+
+    struct GraftCatalogEntry {
+        std::string name;
+        SharedPrefixHandle handle;
+        SharedPrefixSummary summary;
+    };
+    [[nodiscard]] std::vector<GraftCatalogEntry> graft_catalog_entries();
+    void set_graft_rm_slot(const std::string& name, std::uint32_t rm_slot);
 
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept;
@@ -1300,7 +1345,8 @@ struct RuntimeContractAccess {
 
 [[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
                                                     DeviceContext& device,
-                                                    const EngineOptions& options);
+                                                    const EngineOptions& options,
+                                                    std::uint32_t resident_main_pages = 0);
 
 // Overlay Vision residency: sizes one encode window for these options, checks that the evictable
 // weight tail covers it and captures the weight pool's window mirror. Call once after load and

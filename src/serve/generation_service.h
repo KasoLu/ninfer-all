@@ -73,6 +73,10 @@ struct FirstTokenLogprobsView {
 };
 
 struct GenerationOutcome {
+    // The catalog cell and session digest the finished session was retained under; -1 and empty
+    // when it was not retained.
+    std::int32_t id_slot = -1;
+    std::string session_digest;
     std::string text;
     std::string reasoning;
     std::vector<ninfer::GeneratedToolCall> tool_calls;
@@ -114,10 +118,19 @@ struct PreparedRequest {
     double acquisition_seconds = 0.0;
     PromptPreparationStats preparation;
     int prompt_tokens    = 0;
+    // The output budget submitted to the Engine, after any concurrent-lane derivation.
+    int requested_output_tokens = 0;
     bool enable_thinking = true;
     std::optional<std::uint32_t> thinking_budget;
+    std::optional<std::uint32_t> effective_thinking_budget;
     std::optional<ninfer::ReasoningEffort> reasoning_effort;
+    // The client's own effort choice, or unset when the server default resolved reasoning_effort
+    // instead. Logging reports this, not reasoning_effort, so a defaulted request logs null.
+    std::optional<RequestedReasoningEffort> requested_reasoning_effort;
     std::optional<bool> preserve_thinking;
+    // The client's own choice, or unset when the server default resolved preserve_thinking
+    // instead. Logging reports this, not preserve_thinking, so a defaulted request logs null.
+    std::optional<bool> requested_preserve_thinking;
     // False trims the finished response to a single tool call. See GenerationRequest.
     bool parallel_tool_calls = true;
     std::shared_ptr<RequestLifetime> lifetime;
@@ -129,8 +142,10 @@ struct PreparedRequest {
 
 class GenerationService {
 public:
-    explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {},
-                               DiagnosticObserver diagnostic_observer = {});
+    explicit GenerationService(
+        ServeOptions options, StartupObserver startup_observer = {},
+        DiagnosticObserver diagnostic_observer                                   = {},
+        std::function<void(const ninfer::SlotAutoSaveEvent&)> auto_save_listener = {});
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
 
@@ -149,6 +164,22 @@ public:
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
+
+    // Session persistence over the private context-cache catalog; see ninfer::Engine.
+    [[nodiscard]] std::vector<ninfer::SlotState> slot_states() const {
+        return engine_->slot_states();
+    }
+    [[nodiscard]] ninfer::SlotSaveResult slot_save(std::uint32_t slot, const std::string& path,
+                                                   const std::string& expected_digest) {
+        return engine_->save_slot(slot, path, expected_digest);
+    }
+    [[nodiscard]] ninfer::SlotRestoreResult slot_restore(std::uint32_t slot,
+                                                         const std::string& path) {
+        return engine_->restore_slot(slot, path);
+    }
+    std::uint32_t slot_erase(std::uint32_t slot, const std::string& expected_digest) {
+        return engine_->erase_slot(slot, expected_digest);
+    }
 
     // Requests currently holding ingress capacity (max_concurrency + max_pending_requests).
     [[nodiscard]] std::size_t admitted_requests() const;

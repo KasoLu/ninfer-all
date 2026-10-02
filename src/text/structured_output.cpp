@@ -209,11 +209,13 @@ StructuredCompiler::compile(const StructuredOutputOptions& options,
     if (options.kind == StructuredOutputKind::None) { return {}; }
     std::lock_guard lock(impl_->mutex);
     try {
-        // strict_mode=false retains JSON Schema defaults for additional properties/items.
-        auto grammar = impl_->compiler.CompileJSONSchema(
+        // strict_mode=false retains JSON Schema defaults for additional properties/items; a
+        // strict JsonSchema request closes undeclared object properties.
+        const bool strict = options.kind == StructuredOutputKind::JsonSchema && options.strict;
+        auto grammar      = impl_->compiler.CompileJSONSchema(
             options.kind == StructuredOutputKind::JsonObject ? "{\"type\":\"object\"}"
-                                                             : options.schema,
-            true, std::nullopt, std::nullopt, false, 8);
+                                                                  : options.schema,
+            true, std::nullopt, std::nullopt, strict, 8);
         if (!envelope.reasoning_close.empty() || !envelope.alternative_format.empty()) {
             std::ostringstream ebnf;
             ebnf << grammar.GetGrammar();

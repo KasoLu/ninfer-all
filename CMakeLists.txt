@@ -144,7 +144,9 @@ if(MSVC)
     $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
   # CUDA's static runtime requests LIBCMT even when the application and vcpkg dependencies use
-  # the project-wide /MD runtime. Keep one CRT in the final process.
+  # the project-wide /MD runtime. Keep one CRT in the final process. $<HOST_LINK:...> keeps this
+  # off the CUDA relocatable device-link step, which forwards it to cl.exe without the /link
+  # passthrough separator and only produces a harmless but noisy D9002 "unknown option" warning.
   add_link_options($<HOST_LINK:/NODEFAULTLIB:LIBCMT>)
 else()
   # Schedule dispatch in this project is a switch per Op mapping a schedule id to a kernel launch,

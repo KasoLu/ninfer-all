@@ -1005,19 +1005,33 @@ void parse_reasoning(const Json& body, OpenAIResponsesPromptRequest& out) {
     static const std::unordered_set<std::string> allowed = {"effort", "context", "summary",
                                                             "generate_summary", "mode"};
     reject_nonnull_unknown_members(reasoning, allowed, "reasoning");
-    if (reasoning.contains("summary") && !reasoning.at("summary").is_null()) {
-        if (!reasoning.at("summary").is_string()) {
-            bad_request("reasoning.summary must be a string", "reasoning");
-        }
-        out.reasoning_summary = reasoning.at("summary").get<std::string>();
-    }
-    for (const char* key : {"context", "generate_summary", "mode"}) {
+    for (const char* key : {"context", "mode"}) {
         if (reasoning.contains(key) && !reasoning.at(key).is_null()) {
             bad_request("reasoning." + std::string(key) +
                             " changes reasoning input or output and is not supported",
                         "reasoning", "reasoning_option_not_supported");
         }
     }
+    // summary and its deprecated alias generate_summary ask for a summary of the reasoning. NInfer
+    // has no summarizer: a valid value requests the fixed protocol placeholder summary, without
+    // changing model execution, and is echoed in the response.
+    std::optional<std::string> summary_style;
+    for (const char* key : {"summary", "generate_summary"}) {
+        if (!reasoning.contains(key) || reasoning.at(key).is_null()) { continue; }
+        const std::string param = "reasoning." + std::string(key);
+        const Json& member      = reasoning.at(key);
+        const std::string value = member.is_string() ? member.get<std::string>() : std::string();
+        if (value != "auto" && value != "concise" && value != "detailed") {
+            bad_request(param + " must be one of auto, concise, or detailed", param,
+                        "invalid_value");
+        }
+        if (summary_style && *summary_style != value) {
+            bad_request("reasoning.summary and reasoning.generate_summary conflict", param,
+                        "invalid_value");
+        }
+        summary_style = value;
+    }
+    out.reasoning_summary = summary_style;
     if (!reasoning.contains("effort") || reasoning.at("effort").is_null()) { return; }
     if (!reasoning.at("effort").is_string()) {
         bad_request("reasoning.effort must be a string", "reasoning");
@@ -1130,7 +1144,8 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
     parse_text(body, out.prompt);
     parse_truncation(body);
     parse_preserve_thinking(body, out.prompt);
-    out.prompt.generation.max_tokens = limits.default_max_tokens;
+    out.prompt.generation.graft = parse_graft_field(body);
+    apply_default_output_limit(out.prompt.generation, limits);
     return out;
 }
 
@@ -1215,6 +1230,7 @@ void validate_common_top_level(const Json& body, bool create) {
                                                                   "client_metadata",
                                                                   "context_management",
                                                                   "conversation",
+                                                                  "graft",
                                                                   "include",
                                                                   "input",
                                                                   "instructions",
@@ -1239,6 +1255,7 @@ void validate_common_top_level(const Json& body, bool create) {
                                                                   "stream_options",
                                                                   "temperature",
                                                                   "text",
+                                                                  "thinking_budget",
                                                                   "tool_choice",
                                                                   "tools",
                                                                   "top_logprobs",
@@ -1247,6 +1264,7 @@ void validate_common_top_level(const Json& body, bool create) {
                                                                   "user"};
     static const std::unordered_set<std::string> count_fields  = {"chat_template_kwargs",
                                                                   "conversation",
+                                                                  "graft",
                                                                   "input",
                                                                   "instructions",
                                                                   "model",
@@ -1297,6 +1315,7 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     out.parallel_tool_calls     = parsed.parallel_tool_calls;
     out.store                   = optional_bool(body, "store", true);
     out.stream                  = optional_bool(body, "stream", false);
+    out.prompt.generation.thinking_budget = parse_thinking_budget_field(body);
     validate_metadata(body, out.metadata);
 
     // Codex attaches per-request tracing information here. It is an opaque client hint and has no
@@ -1381,8 +1400,9 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
         if (*max_output < 0) {
             bad_request("max_output_tokens must be non-negative", "max_output_tokens");
         }
-        out.requested_max_output_tokens  = *max_output;
-        out.prompt.generation.max_tokens = *max_output;
+        out.requested_max_output_tokens            = *max_output;
+        out.prompt.generation.max_tokens           = *max_output;
+        out.prompt.generation.derive_output_budget = false;
     }
     return out;
 }

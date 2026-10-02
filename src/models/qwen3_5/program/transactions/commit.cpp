@@ -13,6 +13,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <string>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -123,7 +124,17 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         actual.device.active_lanes               = 1;
         const detail::PhysicalResources expected = active;
         if (actual != expected) {
-            throw std::logic_error("materialized sequence does not match its active entitlement");
+            const auto describe = [](const detail::PhysicalResources& r) {
+                return "lanes " + std::to_string(r.device.active_lanes) + " state_slots " +
+                       std::to_string(r.device.state_slots) + " main_kv_pages " +
+                       std::to_string(r.device.main_kv_pages) + " backend_kv_pages " +
+                       std::to_string(r.device.backend_kv_pages) + " host_state_slots " +
+                       std::to_string(r.host.state_slots) + " host_kv_bytes " +
+                       std::to_string(r.host.kv_bytes);
+            };
+            throw std::logic_error(
+                "materialized sequence does not match its active entitlement (actual: " +
+                describe(actual) + "; expected: " + describe(expected) + ")");
         }
         if (details.reuse != ReusePath::Root) {
             if (transaction.state_restored) {
@@ -818,7 +829,8 @@ bool ProgramImpl::can_release_shared_prefix_state(std::uint32_t index,
         return false;
     }
     const SharedPrefixState& shared = shared_prefix_states[index];
-    if (shared.active_references != 0 || !shared.kv || !shared.identity ||
+    const bool needs_identity = expected_role != SharedPrefixSlotRole::Pinned;
+    if (shared.active_references != 0 || !shared.kv || (needs_identity && !shared.identity) ||
         !state_store->valid(shared.state) || !text_kv_addresses->can_release(shared.kv->text) ||
         (shared.kv->backend &&
          (!backend_kv_addresses || !backend_kv_addresses->can_release(*shared.kv->backend)))) {
@@ -866,12 +878,13 @@ ReleaseResult ProgramImpl::release_shared_prefix(SharedPrefixHandle&& handle) no
         shared_prefix_slots[index].generation != generation) {
         return out;
     }
+    const SharedPrefixSlotRole actual_role = shared_prefix_slots[index].role;
     try {
-        if (!can_release_shared_prefix_state(index, SharedPrefixSlotRole::Catalogued)) {
+        if (!can_release_shared_prefix_state(index, actual_role)) {
             return out;
         }
     } catch (...) { return out; }
-    (void)release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
+    (void)release_shared_prefix_state_strict(index, actual_role);
     ContractAccess::consume(handle);
     advance_resource_revision();
     out.status = runtime::ConsumeStatus::Consumed;
@@ -912,7 +925,7 @@ ProgramImpl::fail_all_cleanup(ProgramCleanup cleanup) noexcept {
         }
     }
     for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
-        if (shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued) { continue; }
+        if (!is_live_shared_prefix_role(shared_prefix_slots[index].role)) { continue; }
         shared_prefix_states[index].active_references = 0;
         auto handle =
             ContractAccess::make_shared_prefix(this, index, shared_prefix_slots[index].generation);

@@ -13,7 +13,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -43,12 +42,12 @@ private:
     ApiError error_;
 };
 
-// An output limit that only the context bounds: the Engine clamps every request to its capacity.
-inline constexpr int kUnboundedOutputTokens = std::numeric_limits<int>::max();
-
 // Server-side context needed while parsing/validating a request.
 struct RequestLimits {
-    int default_max_tokens = 8192;
+    // --default-max-tokens: the fixed budget of a request that omits its limit. Unset, such a
+    // request receives the Engine's concurrent lane budget once its prompt is prepared.
+    std::optional<int> default_max_tokens;
+    int max_context = 8192; // --max-context, the upper bound of any derived budget
     // Accept top_logprobs for the first generated token (--first-token-logprobs).
     bool first_token_logprobs = false;
     // Continue a trailing Chat Completions assistant message in place (--assistant-prefill).
@@ -205,11 +204,17 @@ struct GenerationRequest {
     // Caller-supplied stop tokens and stop strings still apply.
     bool ignore_eos = false;
     int max_tokens                       = 0; // resolved budget; zero means immediate output limit
+    // The request omitted its limit and the server has no fixed default: GenerationService replaces
+    // max_tokens (then the --max-context upper bound) with Engine::concurrent_output_budget().
+    bool derive_output_budget = false;
     std::optional<bool> enable_thinking;      // unset => use the server default
     std::optional<std::uint32_t> thinking_budget;
     std::optional<RequestedReasoningEffort> reasoning_effort;
     std::optional<bool> preserve_thinking;
     std::string chat_template_kwargs_json;
+    // NInfer extension: name of a phantom-kv graft loaded with --graft. Unset => use the server's
+    // --default-graft (if any); an empty name explicitly selects no graft.
+    std::optional<std::string> graft;
     ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
     bool private_cache_boundary_at_prompt_end   = false;
     bool allow_engine_automatic_shared_prefixes = true;
@@ -245,5 +250,11 @@ struct GenerationRequest {
         return false;
     }
 };
+
+// The output limit of a request that omitted one.
+inline void apply_default_output_limit(GenerationRequest& request, const RequestLimits& limits) {
+    request.derive_output_budget = !limits.default_max_tokens.has_value();
+    request.max_tokens           = limits.default_max_tokens.value_or(limits.max_context);
+}
 
 } // namespace ninfer::serve

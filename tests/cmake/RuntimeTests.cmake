@@ -4,6 +4,9 @@ ninfer_add_test(ninfer_admission_policy_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/
 ninfer_add_test(ninfer_context_cost_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_context_cost.cpp"
   LIBRARIES ninfer_runtime_support ninfer::json)
 
+ninfer_add_test(ninfer_slot_spill_guard_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_slot_spill_guard.cpp")
+
 ninfer_add_test(ninfer_resource_manager_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_resource_manager.cpp"
   LIBRARIES ninfer_runtime_support)
 
@@ -24,3 +27,7 @@ ninfer_add_test(ninfer_sampling_defaults_test
 ninfer_add_test(ninfer_prefix_cache_index_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_prefix_cache_index.cpp"
   LIBRARIES ninfer_runtime_support)
+
+ninfer_add_test(ninfer_effective_thinking_budget_test
+  STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_effective_thinking_budget.cpp")

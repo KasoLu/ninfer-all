@@ -37,9 +37,13 @@ namespace ninfer::qwen3_5 {
 // lookup drafting elsewhere should check the baseline's acceptance first -- against a weak drafter
 // the same technique is transformative, and against this one it is a trim.
 //
-// **Where the real headroom is:** at 100% acceptance tokens per round is set by the draft window.
-// Measured when MTP stopped at 5: K=3/4/5 gave 148.9/169.3/191.0 tok/s. The window now reaches 15,
-// so a lookup that keeps matching can propose that far ahead within one MTP round.
+// **Where the headroom was:** at 100% acceptance tokens per round is set by the draft window, which
+// was capped at five (K=3/4/5: 148.9/169.3/191.0 tok/s). The cap is now kMtpDecodeMaximumDrafts =
+// 15, and the lookup proposes up to the same window. MEASURED, 2026-09-28, same card and model,
+// rk4v4, 512 tokens of a "rename an identifier, return the whole file" answer: K=15 decodes at
+// 262.6 tok/s without lookup and 262.4 with --lookup-ngram 8, at the same 12.46 tokens per round.
+// On output that copies its input the draft head copies too, so the wider window, not the lookup,
+// is what pays there; the lookup's remaining value is the case the head misses.
 //
 // Returns the number of drafts written, and zero when the n-gram has not been seen before -- which
 // the round already treats as a plain decode step.

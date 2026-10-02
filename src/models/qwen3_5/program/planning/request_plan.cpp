@@ -207,6 +207,28 @@ detail::PhysicalResources positive_difference(detail::PhysicalResources value,
 
 } // namespace
 
+KVEntitlementShape ProgramImpl::kv_entitlement_shape() const noexcept {
+    return KVEntitlementShape{
+        .capacity = capacity, .draft_window = draft_window, .backend = speculative_backend};
+}
+
+std::uint32_t ProgramImpl::concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept {
+    // A Device KV lease holds a bounded window of the output, not the whole budget, so lanes do
+    // not compete for the pool up front: the remaining context stays the budget.
+    if (context_cache.kv_lease_growth) {
+        return prompt_tokens == 0 || prompt_tokens > capacity ? 0U
+                                                              : capacity - prompt_tokens + 1U;
+    }
+    // Each lane's fair share of every pool admission reserves from, at the pools' fixed physical
+    // extent: an overlay Vision window's transient loan is not a reason to shrink the budget.
+    const std::uint32_t main_share = decoder->text_kv.page_pool().capacity_pages() / max_concurrency;
+    const qwen3_5::PagedKVCache* backend = backend_kv_cache();
+    const std::uint32_t backend_share =
+        backend != nullptr ? backend->page_pool().capacity_pages() / max_concurrency : 0U;
+    return detail::concurrent_output_budget(kv_entitlement_shape(), main_share, backend_share,
+                                            prompt_tokens);
+}
+
 RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                           const runtime::ResolvedExecutionOptions& options) {
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
@@ -259,19 +281,12 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
     base->summary.publish_continuation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
     if (!context_cache.kv_lease_growth) {
-        const std::uint32_t reserved_context_tokens =
-            base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
-                                               ? 0U
-                                               : base->summary.effective_output_tokens - 1U);
-        base->text_kv_page_entitlement = kv_pages_for_tokens(reserved_context_tokens);
-        if (speculative_backend == SpeculativeBackend::Mtp) {
-            const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                capacity,
-                static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
-            base->backend_kv_page_entitlement = kv_pages_for_tokens(mtp_tokens);
-        } else if (speculative_backend == SpeculativeBackend::DFlash) {
-            base->backend_kv_page_entitlement = kv_pages_for_tokens(reserved_context_tokens);
-        }
+        // One formula with concurrent_output_budget (planning/output_budget.h).
+        const KVPageEntitlement entitlement =
+            kv_page_entitlement(kv_entitlement_shape(), base->summary.prompt_tokens,
+                                base->summary.effective_output_tokens);
+        base->text_kv_page_entitlement    = entitlement.main_pages;
+        base->backend_kv_page_entitlement = entitlement.backend_pages;
     } else {
         // The lease covers a bounded window of the remaining output, not the whole client budget:
         // a client that asks for far more output than it uses would otherwise hold the cache out
@@ -469,7 +484,8 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
 std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base_plan,
     const SequenceState* source, const SharedPrefixState* shared_source,
-    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source) {
+    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
+    bool is_graft) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     const RequestControl& request = requests[lane];
     if (request.lifecycle != Lifecycle::Empty) {
@@ -495,22 +511,35 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     if (shared_source != nullptr) {
         const runtime::CheckpointRef selected = *checkpoint;
         plan->selected_checkpoint             = selected;
-        if (selected.kind != runtime::CheckpointKind::SharedStablePrefix || selected.ordinal != 0 ||
-            selected.frontier == 0 || selected.frontier != shared_source->frontier ||
-            !shared_source->identity || !shared_source->kv ||
-            !state_store->valid(shared_source->state)) {
-            throw std::logic_error("catalog shared-prefix summary disagrees with Program state");
+        if (is_graft) {
+            if (selected.kind != runtime::CheckpointKind::SharedStablePrefix ||
+                selected.ordinal != 0 || selected.frontier == 0 ||
+                selected.frontier != shared_source->frontier || !shared_source->kv ||
+                !state_store->valid(shared_source->state)) {
+                throw std::logic_error("graft shared-prefix state is invalid");
+            }
+            plan->reuse       = ReusePath::SharedStablePrefix;
+            plan->reuse_base  = selected.frontier;
+            plan->source_mode = runtime::PrivateSourceMode::Retain;
+        } else {
+            if (selected.kind != runtime::CheckpointKind::SharedStablePrefix ||
+                selected.ordinal != 0 || selected.frontier == 0 ||
+                selected.frontier != shared_source->frontier || !shared_source->identity ||
+                !shared_source->kv || !state_store->valid(shared_source->state)) {
+                throw std::logic_error(
+                    "catalog shared-prefix summary disagrees with Program state");
+            }
+            if (!base.allow_prefix_reuse || !prompt.identity.reusable) { return std::nullopt; }
+            const auto* shared_identity = shared_source->identity->prefix_identity();
+            if (shared_identity == nullptr ||
+                !qwen3_5::detail::prefix_matches(prompt, shared_source->identity->ledger(),
+                                                 *shared_identity, selected.frontier)) {
+                return std::nullopt;
+            }
+            plan->reuse       = ReusePath::SharedStablePrefix;
+            plan->reuse_base  = selected.frontier;
+            plan->source_mode = runtime::PrivateSourceMode::Retain;
         }
-        if (!base.allow_prefix_reuse || !prompt.identity.reusable) { return std::nullopt; }
-        const auto* shared_identity = shared_source->identity->prefix_identity();
-        if (shared_identity == nullptr ||
-            !qwen3_5::detail::prefix_matches(prompt, shared_source->identity->ledger(),
-                                             *shared_identity, selected.frontier)) {
-            return std::nullopt;
-        }
-        plan->reuse              = ReusePath::SharedStablePrefix;
-        plan->reuse_base         = selected.frontier;
-        plan->source_mode = runtime::PrivateSourceMode::Retain;
     } else if (source != nullptr) {
         const runtime::CheckpointRef selected = *checkpoint;
         plan->selected_checkpoint             = selected;
@@ -652,6 +681,9 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                     continue;
                 }
                 unique.push_back(state);
+                // An anchor another owner also references is not part of this lineage's
+                // exclusive entitlement, exactly as in the rewrite-restore branch below.
+                if (!state_exclusive_to_sequence(*source, state)) { continue; }
                 const StateReplicaResidency residency = state_store->residency(state);
                 if (residency == StateReplicaResidency::DeviceOnly ||
                     residency == StateReplicaResidency::Both) {

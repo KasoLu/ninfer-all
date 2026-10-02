@@ -54,8 +54,8 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
 
 /**
  * Distinct-state form of the same recurrence. `ssm_state_out` receives the final state;
- * `ssm_state_in` and `ssm_state_out` may be disjoint or exactly the same storage. No other
- * arguments may overlap either state.
+ * `ssm_state_in` and `ssm_state_out` may be disjoint or exactly the same storage and must share
+ * one dtype. No other arguments may overlap either state.
  */
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,

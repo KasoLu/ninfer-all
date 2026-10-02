@@ -22,6 +22,8 @@ namespace {
 // a 170-SM part the crossing sits between 176 and 192 blocks: one block per SM, so the cutoff is
 // the SM count of the current device, cached per device index because a model split over several
 // GPUs launches each stage on its own device. A failed query keeps the swept part's 170.
+// On the 3090 (82 SMs) the per-device cutoff measured indistinguishable from 170 at the timer's
+// 1 us resolution for gated27 T=8..64.
 std::int64_t rms_prefetch_blocks() noexcept {
     constexpr std::int64_t kSweptPartSms = 170;
     constexpr int kCachedDevices         = 64;

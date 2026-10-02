@@ -77,9 +77,6 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int DB16                 = D / 2;
     constexpr int Threads              = Wc * 32;
     constexpr int Groups               = kKVCacheInt8Groups;
-    // Value scale rows always use the wider packed-int4 stride so one arena serves both
-    // codings; the INT8 coding uses the leading Groups entries of each row.
-    constexpr int VGroups              = kKVCacheInt4ValueGroups;
     constexpr int GroupKc              = kKVCacheInt8Group / 32;
     constexpr int QKKs                 = D / 32;
     constexpr int QKNt                 = Bc / 8;
@@ -386,6 +383,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int b_rin    = lane & 7;
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
+    // Replacing these runtime-lane __shfl_sync broadcasts (and the k/v-scale ones below) with
+    // direct shared-memory reads was tried on the 3090: it removed every SHFL.IDX but grew the
+    // stack frame of the production T=8 Bc=32 rk4v4 instantiations (16/48 -> 48/80 bytes at the
+    // 168-register cap) and measured -0.1 to -0.9% end to end, so the shuffles stay.
     float q_scale_r0[Groups];
     float q_scale_r1[Groups];
     if (warp < ProducerWarps) {
@@ -600,38 +601,38 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     store_vec(&v_i8[key_l * D + (d >> 1)], make_int2(0, 0));
                 }
             }
-            ninfer::ops::cp_commit();
-            return;
-        }
+        } else {
 #pragma unroll 1
-        for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
-            const int key_l = chunk / (D / 16);
-            const int dc    = chunk - key_l * (D / 16);
-            const int d     = dc * 16;
-            const int key   = tile_k0 + key_l;
-            if (key >= split_start && key < split_end) {
-                const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
-                    physical_page, kv_head, d, key & kPagedKVPageMask);
-                std::int8_t* dst = &k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2];
-                ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
-                if constexpr (PackedValues) {
-                    // Sixteen dimensions occupy eight packed bytes, staged into the leading half
-                    // of the same value slot so the arena footprint matches the INT8 coding.
-                    const std::int64_t voff = kv_cache_int4_value_code_index<Geometry>(
-                        physical_page, kv_head, d >> 1, key & kPagedKVPageMask);
-                    ninfer::ops::cp_async<8>(
-                        &v_i8[key_l * D + (d >> 1)],
-                        reinterpret_cast<const std::uint8_t*>(cache_v_i8) + voff);
+            for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
+                const int key_l = chunk / (D / 16);
+                const int dc    = chunk - key_l * (D / 16);
+                const int d     = dc * 16;
+                const int key   = tile_k0 + key_l;
+                if (key >= split_start && key < split_end) {
+                    const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
+                        physical_page, kv_head, d, key & kPagedKVPageMask);
+                    std::int8_t* dst = &k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2];
+                    ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
+                    if constexpr (PackedValues) {
+                        // Sixteen dimensions occupy eight packed bytes, staged into the leading
+                        // half of the same value slot so the arena footprint matches the INT8
+                        // coding.
+                        const std::int64_t voff = kv_cache_int4_value_code_index<Geometry>(
+                            physical_page, kv_head, d >> 1, key & kPagedKVPageMask);
+                        ninfer::ops::cp_async<8>(
+                            &v_i8[key_l * D + (d >> 1)],
+                            reinterpret_cast<const std::uint8_t*>(cache_v_i8) + voff);
+                    } else {
+                        ninfer::ops::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
+                    }
                 } else {
-                    ninfer::ops::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
-                }
-            } else {
-                std::int8_t* dst = &k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2];
-                store_vec(dst, make_int4(0, 0, 0, 0));
-                if constexpr (PackedValues) {
-                    store_vec(&v_i8[key_l * D + (d >> 1)], make_int2(0, 0));
-                } else {
-                    store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
+                    std::int8_t* dst = &k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2];
+                    store_vec(dst, make_int4(0, 0, 0, 0));
+                    if constexpr (PackedValues) {
+                        store_vec(&v_i8[key_l * D + (d >> 1)], make_int2(0, 0));
+                    } else {
+                        store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
+                    }
                 }
             }
         }

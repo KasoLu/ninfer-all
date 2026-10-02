@@ -446,6 +446,29 @@ int contract_rejection_cases() {
         std::cerr << "gated_delta_net accepted a non-divisible head map\n";
         ++failures;
     }
+    {
+        // A distinct-state call whose read and write views differ in dtype is rejected before
+        // any launch: the FP32-only chunked kernels would otherwise misread an FP16 view.
+        DeviceBuffer state_in_buffer(kStateDim * kStateDim * 8 * sizeof(std::uint16_t));
+        Tensor q(q_buffer.p, DType::BF16, {kStateDim, 4, 1});
+        Tensor k(k_buffer.p, DType::BF16, {kStateDim, 4, 1});
+        Tensor v(v_buffer.p, DType::BF16, {kStateDim, 8, 1});
+        Tensor g(g_buffer.p, DType::FP32, {8, 1});
+        Tensor beta(beta_buffer.p, DType::FP32, {8, 1});
+        Tensor state_in(state_in_buffer.p, DType::FP16, {kStateDim, kStateDim, 8});
+        Tensor state_out(state_buffer.p, DType::FP32, {kStateDim, kStateDim, 8});
+        Tensor out(out_buffer.p, DType::BF16, {kStateDim, 8, 1});
+        bool rejected = false;
+        try {
+            ops::gated_delta_net(q, k, v, g, beta, scale, true, workspace, state_in, state_out,
+                                 out, nullptr);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        cuda_synchronize();
+        if (!rejected) {
+            std::cerr << "gated_delta_net accepted FP16-in/FP32-out state views\n";
+            ++failures;
+        }
+    }
     return failures;
 }
 

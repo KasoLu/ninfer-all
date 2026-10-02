@@ -121,6 +121,15 @@ Frontend 拥有模型家族的输入与输出语义：
 Frontend 可以预览一次模型输出将产生的语义效果，但只有 Engine 完成提交后才能发布该效果。
 Frontend 不拥有等待队列、cache catalog 或物理模型状态。
 
+结构化输出（`OutputOptions::format`，JSON object/schema）同样属于 Frontend：它在提交线程上用模型
+tokenizer 编译语法（XGrammar，按语法文本缓存），`OutputSession` 持有随 preview/commit 推进的 matcher，
+并以 `runtime::TokenMaskSource` 的形式暴露给 Program。Engine 在每次 `decode`/`advance_prefill`
+调用中按行借出这些 source；Program 在每个采样决策前向其索取 mask（投机轮按每个验证列、以该列之前的
+draft 为前缀计算），经 `SamplingConfig::token_mask` 交给采样 Op。Program 只读取 mask，不推进 matcher
+状态；因此 preview 永远不会看到语法外的 token，第 6.2 节的 accepted-prefix 规则不变。DFlash/DFlash2
+在轮内产生 draft，其 round 分为 proposal、target verify、accept 三段 CUDA Graph，受约束的轮在后两段
+之间读取 draft 并上传 mask。
+
 ### 2.3 Engine
 
 Engine 是请求控制平面，拥有：
@@ -521,6 +530,18 @@ Cancellation 不修改 in-flight mapping，也不从未完成的 active state �
 
 Cleanup 顺序必须先终止 Program 中未决的 resource/model transaction，再释放 active state，最后清空
 ResourceManager 与完成所有 request response。内部不变量错误不能降级成 cache miss、等待或重试。
+
+Worker 捕获的 host 侧异常（CUDA 错误直接终止进程，不会到达这里）先同步 device（恢复与锁存都会释放
+物理状态，二者都必须先等待已发出的工作），再尝试恢复而不是永久锁存：执行同样的 Program cleanup 与
+ResourceManager 清空，以错误完成 active lanes 与 materializing request，保留尚未触及物理状态的 FIFO
+队列。只有 cleanup 后 Program 没有打开的 transaction、`physical_usage()` 的 Device/Host State 与 KV
+占用全部为零时才继续服务；否则，或第三次连续失败（其间没有未取消的请求发布成功结果）时，才锁存为
+Engine-wide failure，`is_available()` 此后为 false。
+恢复清空整个 context cache 而不是把不变量错误解释成 cache miss；启动时 pinned 的 prompt graft 随之
+释放，因此在确认物理占用为零之后按启动时的同一路径重新注入并登记为 external shared prefix，失败则锁存；`RuntimeStats::engine_recoveries`
+计数每次恢复。修复后的缺陷不再能从公开 API 触发，因此 `runtime/engine/worker_fault.h` 提供验证
+接缝：`arm_worker_failures(N)` 让随后 N 个 prefill unit 在 Program 执行后抛出，使恢复必须释放持有
+live KV 与 State 的 lane；未启用时每个 prefill unit 只多一次 relaxed atomic load。
 
 ---
 

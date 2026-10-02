@@ -132,7 +132,7 @@ int test_envelope_and_field_policy() {
     body["top_k"] = 21;
     failures += check(api_param([&] { (void)parse(body); }) == "top_k",
                       "Engine top_k range was not enforced");
-    body                  = base_request();
+    body                     = base_request();
     body["post_thinking"]    = Json{{"temperature", 0.2}, {"top_p", 0.9}};
     const auto post_thinking = parse(body).generation.post_thinking;
     failures += check(post_thinking && post_thinking->temperature == 0.2 &&
@@ -145,8 +145,9 @@ int test_envelope_and_field_policy() {
     body["output_config"] =
         Json{{"format", Json{{"type", "json_schema"}, {"schema", Json{{"type", "object"}}}}}};
     failures += check(parse(body).generation.structured_output.kind ==
-                          ninfer::StructuredOutputKind::JsonSchema,
-                      "Anthropic schema retained");
+                              ninfer::StructuredOutputKind::JsonSchema &&
+                          parse(body).generation.structured_output.strict,
+                      "Anthropic schema retained and always strict");
     body["output_config"] = Json{{"format", Json{{"type", "json_schema"}}}};
     failures += check(api_code([&] { (void)parse(body); }) == "invalid_response_format",
                       "structured output was silently downgraded");
@@ -279,6 +280,94 @@ Json tool_result(std::string id, std::string content, bool is_error = false) {
                 {"tool_use_id", std::move(id)},
                 {"content", std::move(content)},
                 {"is_error", is_error}};
+}
+
+Json message(const char* role, Json content) {
+    return Json{{"role", role}, {"content", std::move(content)}};
+}
+
+std::vector<ninfer::ChatRole> roles_of(const GenerationRequest& request) {
+    std::vector<ninfer::ChatRole> roles;
+    for (const ChatTurn& turn : request.messages) { roles.push_back(turn.role); }
+    return roles;
+}
+
+int test_system_message_positions() {
+    using ninfer::ChatRole;
+    int failures = 0;
+
+    // Shapes that used to be rejected: each System message now renders in place.
+    Json body        = base_request();
+    body["messages"] = Json::array(
+        {message("user", "a"), message("system", "between users"), message("user", "b")});
+    GenerationRequest request = parse(body).generation;
+    failures += check(roles_of(request) == std::vector<ChatRole>{ChatRole::User, ChatRole::System,
+                                                                  ChatRole::User} &&
+                          request.messages[1].content[0].text == "between users" &&
+                          request.messages[2].content[0].text == "b",
+                      "a System message between two User messages was not kept in place");
+    failures += check(prompt(request).messages.size() == 3,
+                      "a System message between User messages did not translate");
+
+    body["messages"] = Json::array(
+        {message("user", "q"), message("assistant", "a"), message("system", "reminder")});
+    request = parse(body).generation;
+    failures += check(roles_of(request) == std::vector<ChatRole>{ChatRole::User,
+                                                                  ChatRole::Assistant,
+                                                                  ChatRole::System} &&
+                          request.continuation == ninfer::PromptContinuationMode::NewAssistantTurn,
+                      "a final System message after an Assistant turn was not kept in place");
+
+    body["messages"] = Json::array({message("user", "q"), message("assistant", "a"),
+                                    message("system", "reminder"), message("user", "next")});
+    request          = parse(body).generation;
+    failures += check(roles_of(request) == std::vector<ChatRole>{ChatRole::User,
+                                                                  ChatRole::Assistant,
+                                                                  ChatRole::System, ChatRole::User},
+                      "a System message between Assistant and User turns was not kept in place");
+
+    body["system"]   = "top level";
+    body["messages"] = Json::array({message("system", "leading"), message("user", "q")});
+    request          = parse(body).generation;
+    failures += check(roles_of(request) == std::vector<ChatRole>{ChatRole::System,
+                                                                  ChatRole::System, ChatRole::User} &&
+                          request.messages[0].content[0].text == "top level" &&
+                          request.messages[1].content[0].text == "leading",
+                      "a leading in-array System message did not follow the top-level system text");
+    body.erase("system");
+
+    // Appending a turn after a trailing reminder only extends the history, so the earlier
+    // request's turns stay an exact prefix and remain reusable.
+    Json first        = base_request();
+    first["messages"] = Json::array(
+        {message("user", "q"), message("assistant", "a"), message("system", "reminder 1")});
+    Json second = first;
+    second["messages"].push_back(message("user", "follow-up"));
+    const GenerationRequest before = parse(first).generation;
+    const GenerationRequest after  = parse(second).generation;
+    bool prefix                    = after.messages.size() == before.messages.size() + 1U;
+    for (std::size_t index = 0; prefix && index < before.messages.size(); ++index) {
+        prefix = before.messages[index].role == after.messages[index].role &&
+                 before.messages[index].content[0].text == after.messages[index].content[0].text;
+    }
+    failures += check(prefix, "appending after a System reminder rewrote the earlier history");
+
+    // A System message still cannot separate a tool_use from its tool_result.
+    body["messages"] =
+        Json::array({message("user", "q"), message("assistant", Json::array({tool_use("toolu_a")})),
+                     message("system", "interrupting"),
+                     message("user", Json::array({tool_result("toolu_a", "result")}))});
+    failures += check(api_code([&] { (void)parse(body); }) == "invalid_tool_history",
+                      "a System message between tool_use and tool_result was accepted");
+
+    // A trimmed history may still open with orphan tool results after leading System messages.
+    body["messages"] =
+        Json::array({message("system", "leading"),
+                     message("user", Json::array({tool_result("toolu_gone", "result")})),
+                     message("user", "continue")});
+    failures += check(api_code([&] { (void)parse(body); }).empty(),
+                      "orphan opening tool results after a leading System message were rejected");
+    return failures;
 }
 
 int test_tool_history() {
@@ -791,13 +880,31 @@ int test_stream() {
     return failures;
 }
 
+int test_graft_extension() {
+    Json body     = base_request();
+    body["graft"] = "product";
+    int failures  = check(parse(body).generation.graft == "product",
+                          "Messages graft name was not parsed");
+    body["graft"] = "";
+    failures += check(parse(body).generation.graft == "",
+                      "empty Messages graft did not explicitly select none");
+    body["graft"] = nullptr;
+    failures += check(!parse(body).generation.graft, "null Messages graft was not left unset");
+    body["graft"] = Json::array();
+    failures += check(api_param([&] { (void)parse(body); }) == "graft",
+                      "non-string Messages graft was accepted");
+    return failures;
+}
+
 } // namespace
 
 int main() {
     int failures = 0;
+    failures += test_graft_extension();
     failures += test_envelope_and_field_policy();
     failures += test_message_normalization();
     failures += test_attribution_system_block();
+    failures += test_system_message_positions();
     failures += test_tool_history();
     failures += test_tools();
     failures += test_prompt_object_order();

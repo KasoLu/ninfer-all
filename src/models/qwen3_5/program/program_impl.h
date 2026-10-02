@@ -10,6 +10,7 @@
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen3_5/program/graft_injection.h"
 
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
@@ -18,6 +19,7 @@
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
 #include "models/qwen3_5/program/prefix_identity.h"
+#include "models/qwen3_5/program/planning/output_budget.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -38,6 +40,9 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -54,10 +59,7 @@ using RewriteCheckpointSpec = qwen3_5::RewriteCheckpointSpec;
 // cannot spare one.
 inline constexpr std::uint32_t kKVLeaseGrowthMarginTokens = 4096;
 
-[[nodiscard]] constexpr std::uint32_t kv_pages_for_tokens(std::uint32_t tokens) noexcept {
-    return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
-}
-
+// kv_pages_for_tokens lives in planning/output_budget.h, beside the entitlement formula.
 [[nodiscard]] constexpr std::uint32_t kv_tokens_for_pages(std::uint32_t pages) noexcept {
     return pages == 0 ? 0U : (pages - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize) + 1U;
 }
@@ -282,6 +284,7 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     std::uint32_t disk_restore_frontier   = 0;
     bool text_retained_tail_release       = false;
     bool backend_retained_tail_release    = false;
+    std::optional<std::uint32_t> graft_shared_slot_index;
 };
 
 struct CapturePressureCandidateImpl : ResourceCandidateState {};
@@ -478,12 +481,25 @@ struct SharedPrefixState {
     std::uint32_t active_references = 0;
 };
 
+// A direct graft's pinned prefix is the only shared prefix without a capture identity: it is
+// restored from its own container rather than captured from a prompt, so there is no ledger to
+// compare the request against. Its content is selected by name, and the prompt's placeholder ids
+// stand for it.
+inline bool is_pinned_graft(const SharedPrefixState& state) noexcept {
+    return state.identity == nullptr;
+}
+
 enum class SharedPrefixSlotRole : std::uint8_t {
     Free,
     ReservedCapture,
     ReservedReplacement,
     Catalogued,
+    Pinned,
 };
+
+constexpr bool is_live_shared_prefix_role(SharedPrefixSlotRole role) noexcept {
+    return role == SharedPrefixSlotRole::Catalogued || role == SharedPrefixSlotRole::Pinned;
+}
 
 struct SharedPrefixSlot {
     SharedPrefixSlotRole role = SharedPrefixSlotRole::Free;
@@ -561,6 +577,11 @@ struct RequestControl {
         lease_ceiling        = 0;
     }
 };
+
+// FNV-1a 64 over the token ids of a ledger prefix, as 16 lowercase hex characters. Session and
+// checkpoint digests both use it, so a checkpoint digest equals the session digest of the same
+// prefix.
+[[nodiscard]] std::string ledger_prefix_digest(std::span<const TokenId> tokens);
 
 class ProgramImpl {
 public:
@@ -683,12 +704,26 @@ public:
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
+
+    [[nodiscard]] qwen3_5::SessionSnapshot
+    save_continuation(const ContinuationHandle& continuation, std::string_view model_binding);
+    [[nodiscard]] ContinuationHandle restore_continuation(std::span<const std::uint8_t> snapshot,
+                                                          std::string_view model_binding);
+    [[nodiscard]] std::uint32_t
+    continuation_depth(const ContinuationHandle& continuation) const noexcept;
+    [[nodiscard]] std::string continuation_digest(const ContinuationHandle& continuation) const;
+    [[nodiscard]] std::vector<SlotCheckpoint>
+    continuation_checkpoints(const ContinuationHandle& continuation) const;
+    [[nodiscard]] qwen3_5::ContinuationSummary
+    continuation_summary(const ContinuationHandle& continuation) const;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     [[nodiscard]] std::optional<qwen3_5::PhysicalUsageSnapshot>
     fail_all_cleanup(ProgramCleanup cleanup) noexcept;
     [[nodiscard]] bool context_stores_idle() const noexcept;
     [[nodiscard]] bool rebuild_context_stores() noexcept;
     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;
+    [[nodiscard]] KVEntitlementShape kv_entitlement_shape() const noexcept;
+    [[nodiscard]] std::uint32_t concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept;
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
 
     [[nodiscard]] bool hybrid_prefix_cache() const noexcept { return hybrid_ != nullptr; }
@@ -846,6 +881,12 @@ public:
     std::vector<ContinuationSlot> continuation_slots;
     std::vector<SharedPrefixState> shared_prefix_states;
     std::vector<SharedPrefixSlot> shared_prefix_slots;
+    struct GraftPrefixEntry {
+        std::uint32_t slot_index;
+        std::uint64_t generation;
+    };
+    std::unordered_map<std::string, GraftPrefixEntry> graft_prefix_slots;
+    std::unordered_map<std::string, std::uint32_t> graft_rm_catalog_slots;
     std::array<std::uint32_t, kMaximumConcurrency> active_continuations{};
     // Overlay Vision residency only: the one-window broker and the per-lane pinned result slots.
     // Declared before `requests`, whose Vision sessions borrow both.
@@ -879,6 +920,10 @@ public:
 
     std::size_t workspace_logical_peak_bytes = 0;
     std::size_t vision_handoff_peak_bytes    = 0;
+
+    friend class qwen3_5::Program;
+    // Injection builds the shared-prefix entry's backend KV through the private accessor.
+    friend void qwen3_5::inject_direct_graft(ProgramImpl&, const PromptGraft&);
 
 private:
     void advance_resource_revision() noexcept {
@@ -1267,7 +1312,8 @@ private:
     [[nodiscard]] std::optional<AdmissionCandidate>
     inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base,
                  const SequenceState* source, const SharedPrefixState* shared_source,
-                 std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source);
+                 std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
+                 bool is_graft = false);
     [[nodiscard]] StartResult start_request(MaterializationTransaction& transaction);
     void prepare_materialization(MaterializationTransaction& transaction);
     void enqueue_materialization_transfers(MaterializationTransaction& transaction);

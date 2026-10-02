@@ -385,22 +385,28 @@ public:
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
         }
+        requested_budget          = thinking.budget;
+        early_close_available     = thinking.early_close_available;
         state.in_reasoning        = split_reasoning;
         prefix_execution.tracking = starts_in_reasoning;
         started_in_reasoning      = starts_in_reasoning;
-        semantic.budget           = thinking.budget;
+        semantic.budget           = thinking.effective_budget.has_value()
+                                        ? thinking.effective_budget
+                                        : thinking.budget;
         // The presentation decoder already tracks normal reasoning output. Keep the independent
         // semantic tracker dormant unless a cap needs it, so the default unlimited path does not
         // decode every model token twice.
-        semantic.in_reasoning = starts_in_reasoning && thinking.budget.has_value();
+        semantic.in_reasoning = starts_in_reasoning && semantic.budget.has_value();
     }
 
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     StopPolicy policy;
     std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens;
-    bool preserve_special     = false;
-    bool split_reasoning      = false;
-    bool started_in_reasoning = false;
+    bool preserve_special      = false;
+    bool split_reasoning       = false;
+    bool started_in_reasoning  = false;
+    bool early_close_available = true;
+    std::optional<std::uint32_t> requested_budget;
     DecoderState state;
     DecoderState preview_state;
     SemanticThinkingState semantic;
@@ -520,7 +526,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
         if (impl_->preview_semantic.in_reasoning) {
             ++impl_->preview_semantic.model_thinking_tokens;
-            if (impl_->preview_semantic.budget &&
+            if (impl_->early_close_available && impl_->preview_semantic.budget &&
                 impl_->preview_semantic.model_thinking_tokens > *impl_->preview_semantic.budget) {
                 throw std::logic_error("model output exceeded the licensed thinking budget");
             }
@@ -565,7 +571,8 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
         terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, count);
         return complete(count, limit_reason);
     }
-    if (impl_->preview_semantic.in_reasoning && impl_->preview_semantic.budget &&
+    if (impl_->early_close_available && impl_->preview_semantic.in_reasoning &&
+        impl_->preview_semantic.budget &&
         impl_->preview_semantic.model_thinking_tokens == *impl_->preview_semantic.budget) {
         impl_->preview_semantic.control_pending = true;
         return complete(count, FinishReason::None, runtime::ContinuationAction::ApplyTargetControl);
@@ -576,7 +583,7 @@ runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> to
 std::uint32_t
 OutputSession::model_token_budget_remaining(std::uint32_t total_budget_remaining) const noexcept {
     if (impl_ == nullptr || !impl_->semantic.budget || !impl_->semantic.in_reasoning ||
-        impl_->semantic.applied) {
+        impl_->semantic.applied || !impl_->early_close_available) {
         return total_budget_remaining;
     }
     if (impl_->semantic.control_pending ||
@@ -657,23 +664,6 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     };
 }
 
-void OutputSession::validate_generation_capacity(std::uint32_t effective_output_tokens) const {
-    if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
-    if (!impl_->semantic.budget || !impl_->semantic.in_reasoning ||
-        effective_output_tokens <= *impl_->semantic.budget) {
-        return;
-    }
-    const std::uint64_t remaining =
-        static_cast<std::uint64_t>(effective_output_tokens) - *impl_->semantic.budget;
-    const std::uint64_t required =
-        static_cast<std::uint64_t>(impl_->thinking_control_tokens->size()) + 1U;
-    if (remaining < required) {
-        throw std::invalid_argument(
-            "effective output capacity after the thinking budget must fit the complete control "
-            "suffix and one post-close model token");
-    }
-}
-
 runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     if (impl_ == nullptr) { throw std::logic_error("output session is empty"); }
     if (impl_->state.terminal) { throw std::logic_error("output session is already terminal"); }
@@ -751,7 +741,10 @@ bool OutputSession::reasoning_closed() const noexcept {
 ThinkingBudgetStats OutputSession::thinking_stats() const noexcept {
     if (impl_ == nullptr) { return {}; }
     return ThinkingBudgetStats{
-        .configured_budget     = impl_->semantic.budget,
+        .requested_budget      = impl_->requested_budget,
+        // Without early close the cap is never enforced, so there is no effective budget.
+        .effective_budget      = impl_->early_close_available ? impl_->semantic.budget
+                                                              : std::nullopt,
         .model_thinking_tokens = impl_->semantic.model_thinking_tokens,
         .injected_tokens       = impl_->semantic.injected_tokens,
         .applied               = impl_->semantic.applied,

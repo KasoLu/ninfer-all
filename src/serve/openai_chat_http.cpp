@@ -25,10 +25,7 @@ std::string sse_error_event(const ApiError& error) {
 void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::Response& res) {
     OpenAIChatRequest request;
     try {
-        RequestLimits limits;
-        limits.default_max_tokens        = options_.default_max_tokens;
-        limits.first_token_logprobs      = options_.first_token_logprobs;
-        limits.assistant_prefill         = options_.assistant_prefill;
+        const RequestLimits limits       = request_limits(options_);
         const auto body                  = parse_json_body(req);
         request                          = parse_chat_completion_request(body, limits);
         request.generation.ngram_session = resolve_ngram_session(req, body, options_);

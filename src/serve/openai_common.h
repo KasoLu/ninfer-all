@@ -37,12 +37,16 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
 // call that can never arrive, which is worse than a clear error.
 [[nodiscard]] bool is_hosted_openai_tool_type(std::string_view type) noexcept;
 
-std::string make_models_list(const std::string& model_id, std::int64_t created,
-                             std::uint32_t max_model_len, bool vision,
-                             const ninfer::ModelMetadata& metadata);
-std::string make_model_object(const std::string& model_id, std::int64_t created,
-                              std::uint32_t max_model_len, bool vision,
-                              const ninfer::ModelMetadata& metadata);
+// What /v1/models advertises about the one resident model.
+struct ModelDescription {
+    std::string id;
+    std::uint32_t max_model_len = 0; // --max-context, each sequence's ceiling
+    bool vision                 = false;
+    ninfer::ModelMetadata metadata;
+};
+
+std::string make_models_list(const ModelDescription& model, std::int64_t created);
+std::string make_model_object(const ModelDescription& model, std::int64_t created);
 // The /v1 discovery document: startup announces the API base as a URL, so the bare base answers
 // with the configured model alias and the endpoints this build serves instead of a 404.
 nlohmann::json make_api_index(const std::string& model_id);

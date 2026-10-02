@@ -197,23 +197,39 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
 
 namespace {
 
-// vLLM/llama.cpp-compatible discovery metadata for the configured per-request context limit, under
-// both names clients read it by, whether the model accepts images, and llama.cpp's `meta` facts
-// about the registered artifact behind the alias: n_ctx is the per-request context ceiling,
-// n_ctx_train the model's native context, ftype the registered weights profile.
-Json model_json(const std::string& model_id, std::int64_t created, std::uint32_t max_model_len,
-                bool vision, const ninfer::ModelMetadata& metadata) {
-    return Json{{"id", model_id},
+// Discovery metadata for the one resident model. No client ecosystem agrees on one name for the
+// context limit: max_model_len is vLLM/llama.cpp's discovery field, context_window is Anthropic's
+// Models API field, and context_length is the OpenRouter/Ollama convention. OpenAI's own /v1/models
+// spec has none of them. The same per-request ceiling is mirrored under all three.
+//
+// Modalities are reported twice: llama.cpp's `modalities.vision` flag, and the OpenRouter
+// `architecture` object that llama.cpp's router-mode /models also emits, so clients that gate image
+// attachments on either see image and video input only when the server was started with --vision.
+// llama.cpp's `meta` carries facts about the registered artifact behind the alias: n_ctx is the
+// per-request context ceiling, n_ctx_train the model's native context, ftype the registered
+// weights profile.
+Json model_json(const ModelDescription& model, std::int64_t created) {
+    Json input = Json::array({"text"});
+    if (model.vision) {
+        input.push_back("image");
+        input.push_back("video");
+    }
+    const ninfer::ModelMetadata& metadata = model.metadata;
+    return Json{{"id", model.id},
                 {"object", "model"},
                 {"created", created},
                 {"owned_by", "ninfer"},
-                {"max_model_len", max_model_len},
-                {"context_window", max_model_len},
-                {"modalities", Json{{"vision", vision}}},
+                {"max_model_len", model.max_model_len},
+                {"context_window", model.max_model_len},
+                {"context_length", model.max_model_len},
+                {"modalities", Json{{"vision", model.vision}}},
+                {"architecture",
+                 Json{{"input_modalities", std::move(input)},
+                      {"output_modalities", Json::array({"text"})}}},
                 {"status", Json{{"value", "loaded"}}},
                 {"meta",
                  Json{{"n_vocab", metadata.vocab_size},
-                      {"n_ctx", max_model_len},
+                      {"n_ctx", model.max_model_len},
                       {"n_ctx_train", metadata.native_context},
                       {"n_embd", metadata.embedding_size},
                       {"n_params", metadata.parameters},
@@ -223,13 +239,8 @@ Json model_json(const std::string& model_id, std::int64_t created, std::uint32_t
 
 } // namespace
 
-std::string make_models_list(const std::string& model_id, std::int64_t created,
-                             std::uint32_t max_model_len, bool vision,
-                             const ninfer::ModelMetadata& metadata) {
-    const Json payload = {
-        {"object", "list"},
-        {"data", Json::array({model_json(model_id, created, max_model_len, vision, metadata)})}};
-    return payload.dump();
+std::string make_models_list(const ModelDescription& model, std::int64_t created) {
+    return Json{{"object", "list"}, {"data", Json::array({model_json(model, created)})}}.dump();
 }
 
 Json make_api_index(const std::string& model_id) {
@@ -245,7 +256,9 @@ Json make_api_index(const std::string& model_id) {
              {endpoint("GET", "/health", "process health"),
               endpoint("GET", "/v1/load", "serving capacity, current load, and token counters"),
               endpoint("GET", "/metrics", "Prometheus text metrics"),
-              endpoint("GET", "/slots", "llama.cpp-shaped lane table"),
+              endpoint("GET", "/slots", "llama.cpp-shaped listing of the context-cache cells"),
+              endpoint("POST", "/slots/{id}?action=save|restore|erase",
+                       "retained-session persistence (with --slot-save-path)"),
               endpoint("GET", "/props", "llama.cpp-shaped server properties"),
               endpoint("GET", "/v1/models", "configured OpenAI model alias"),
               endpoint("GET", "/v1/models/{id}", "lookup of the configured alias"),
@@ -264,10 +277,8 @@ Json make_api_index(const std::string& model_id) {
                        "checkpoint-native expanded input-token count")})}};
 }
 
-std::string make_model_object(const std::string& model_id, std::int64_t created,
-                              std::uint32_t max_model_len, bool vision,
-                              const ninfer::ModelMetadata& metadata) {
-    return model_json(model_id, created, max_model_len, vision, metadata).dump();
+std::string make_model_object(const ModelDescription& model, std::int64_t created) {
+    return model_json(model, created).dump();
 }
 
 std::string make_error_body(const ApiError& error) {

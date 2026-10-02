@@ -3,6 +3,7 @@
 #include "serve/console_stats.h"
 #include "serve/generation_service.h"
 #include "serve/load_report.h"
+#include "serve/openai_common.h"
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request_log.h"
@@ -129,9 +130,11 @@ private:
     void handle_stats(const httplib::Request& req, httplib::Response& res) const;
     void handle_health(httplib::Response& res) const;
     void handle_slots(const httplib::Request& req, httplib::Response& res) const;
+    void handle_slot_action(const httplib::Request& req, httplib::Response& res);
     void handle_props(const httplib::Request& req, httplib::Response& res) const;
     void handle_webui(const httplib::Request& req, httplib::Response& res) const;
     [[nodiscard]] LoadSample load_sample() const;
+    [[nodiscard]] ModelDescription model_description() const;
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
 

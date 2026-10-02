@@ -177,6 +177,11 @@ void validate_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const T
     require_shape(ssm_state_in, detail::gated_delta_net::kStateDim,
                   detail::gated_delta_net::kStateDim, geometry.value_heads, 1, "ssm_state_in");
     require_contiguous_nonnull(ssm_state_in, "ssm_state_in");
+    // The WY pipeline stages through FP32 only when the written state is FP16; a mixed pair would
+    // hand an FP16 read view to the FP32-only chunked kernels.
+    if (ssm_state_in.dtype != ssm_state_out.dtype) {
+        throw std::invalid_argument("gated_delta_net: state read/write dtypes differ");
+    }
 }
 
 struct ChunkedWorkspace {

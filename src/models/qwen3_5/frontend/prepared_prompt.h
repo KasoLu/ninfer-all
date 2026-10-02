@@ -11,6 +11,7 @@
 #include <optional>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -165,6 +166,8 @@ struct PreparedPromptData {
     std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output;
     bool starts_in_reasoning = false;
     PrepareStats prepare;
+    std::string graft_name;
+    std::uint32_t graft_frontier = 0;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
 

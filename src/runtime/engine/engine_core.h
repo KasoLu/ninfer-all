@@ -12,6 +12,8 @@
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/engine/effective_thinking_budget.h"
+#include "runtime/engine/worker_fault.h"
 
 #include <algorithm>
 #include <array>
@@ -22,6 +24,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <deque>
+#include <functional>
 #include <exception>
 #include <future>
 #include <limits>
@@ -32,6 +35,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -67,6 +71,9 @@ public:
     using AdmissionGrant     = typename Scheduling::AdmissionGrant;
     using ResourceManagement = Manager;
     using ResourceInspection = typename ResourceManagement::Inspection;
+    // Session slots, grafts and the private catalog exist only in the Legacy context cache.
+    static constexpr bool kLegacyContextCache =
+        std::is_same_v<Manager, ResourceManager<ModelContract>>;
     using Clock              = std::chrono::steady_clock;
 
     [[nodiscard]] static Manager make_resource_manager(const EngineOptions& options,
@@ -93,6 +100,7 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
+          context_cache_enabled_(options.context_cache.enabled),
           resources_(make_resource_manager(options, std::move(context_cost))) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
@@ -116,6 +124,21 @@ public:
                 .total_bytes   = options.speculative.ngram_archive_bytes});
         }
         diagnostics_ = options.diagnostic_observer;
+        if constexpr (kLegacyContextCache) {
+            catalog_pinned_grafts();
+            slot_session_paths_.resize(resources_.catalog_capacity());
+            slot_digest_cache_.resize(resources_.catalog_capacity());
+            resources_.set_eviction_observer(
+                [this](std::uint32_t slot,
+                       const typename ModelContract::ContinuationHandle& handle) {
+                    spill_catalog_slot(slot, handle);
+                });
+            // A slot file binding belongs to the session that saved or restored it; the cell is
+            // only where that session lives now. Ending the binding with the catalog entry keeps
+            // it from being inherited by the next session in the cell.
+            resources_.set_slot_release_observer(
+                [this](std::uint32_t slot) { clear_slot_session(slot); });
+        }
         std::promise<void> startup;
         std::future<void> started = startup.get_future();
         worker_                   = std::thread([this, startup = std::move(startup)]() mutable {
@@ -155,13 +178,15 @@ public:
         ~Submission() { reset(); }
 
         Submission(Submission&& other) noexcept
-            : owner_(std::exchange(other.owner_, nullptr)), request_(std::move(other.request_)) {}
+            : owner_(std::exchange(other.owner_, nullptr)), request_(std::move(other.request_)),
+              effective_thinking_budget_(other.effective_thinking_budget_) {}
 
         Submission& operator=(Submission&& other) noexcept {
             if (this != &other) {
                 reset();
                 owner_   = std::exchange(other.owner_, nullptr);
                 request_ = std::move(other.request_);
+                effective_thinking_budget_ = other.effective_thinking_budget_;
             }
             return *this;
         }
@@ -182,9 +207,16 @@ public:
             return owner->wait_for_request(std::exchange(request_, nullptr), sink, cancellation);
         }
 
+        // Fixed when the request was admitted; never reads the session the worker mutates.
+        [[nodiscard]] std::optional<std::uint32_t> effective_thinking_budget() const noexcept {
+            return effective_thinking_budget_;
+        }
+
     private:
-        Submission(EngineCore& owner, std::shared_ptr<Request> request) noexcept
-            : owner_(&owner), request_(std::move(request)) {}
+        Submission(EngineCore& owner, std::shared_ptr<Request> request,
+                   std::optional<std::uint32_t> effective_thinking_budget) noexcept
+            : owner_(&owner), request_(std::move(request)),
+              effective_thinking_budget_(effective_thinking_budget) {}
 
         void reset() noexcept {
             if (owner_ != nullptr && request_ != nullptr) {
@@ -195,6 +227,7 @@ public:
 
         EngineCore* owner_ = nullptr;
         std::shared_ptr<Request> request_;
+        std::optional<std::uint32_t> effective_thinking_budget_;
 
         friend class EngineCore;
     };
@@ -237,29 +270,27 @@ public:
         }
 
         std::shared_ptr<Request> request;
+        std::optional<std::uint32_t> effective_budget;
         try {
             if (ngram_archive_ && !options.ngram_session.key.empty()) {
                 std::random_device entropy;
                 options.execution.sampling.seed ^=
                     (static_cast<std::uint64_t>(entropy()) << 32) ^ entropy();
             }
+            apply_effective_thinking_budget(
+                options.execution.thinking,
+                effective_output_capacity(options.execution.requested_output_tokens, max_context_,
+                                          prompt_summary.prompt_tokens),
+                instance_.frontend.thinking_control_token_count());
             auto output = instance_.frontend.make_output_session(
                 prompt, options.stop, options.output, options.execution.thinking,
                 options.execution.structured_output);
             options.execution.grammar = output.grammar_state();
-            const std::uint32_t capacity_output =
-                max_context_ - prompt_summary.prompt_tokens + static_cast<std::uint32_t>(1);
-            try {
-                output.validate_generation_capacity(
-                    std::min(options.execution.requested_output_tokens, capacity_output));
-            } catch (const std::invalid_argument& error) {
-                throw RequestError(RequestErrorKind::ThinkingBudgetCapacityInsufficient,
-                                   error.what());
-            }
             request = std::make_shared<Request>(request_id, publication_order, std::move(prompt),
                                                 std::move(output), prompt_summary, prepare_seconds,
                                                 std::move(options), consumer_mode, observation,
                                                 pending_deadline, submitted);
+            effective_budget = request->output.thinking_stats().effective_budget;
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -276,7 +307,7 @@ public:
         }
         request_admission_check();
         queue_cv_.notify_one();
-        return Submission(*this, std::move(request));
+        return Submission(*this, std::move(request), effective_budget);
     }
 
     [[nodiscard]] MemorySummary memory_summary() const {
@@ -311,6 +342,123 @@ public:
         return !stopping_ && !failed_ &&
                consecutive_context_cache_exhaustions_.load(std::memory_order_relaxed) <
                    kStuckContextCacheExhaustions;
+    }
+
+    // Session persistence. A slot is one private catalog cell. Each entry point takes the
+    // execution mutex, so its copies run between units, and refuses (Overloaded) rather than
+    // waits when a resource transaction is open or the cell is in use. A non-empty
+    // expected_digest is a precondition on the cell's resident session, checked atomically with
+    // the operation. A successful save or restore binds the cell to session_path so an
+    // involuntary eviction can write the session back there (see spill_catalog_slot).
+    // `claim` runs under the execution mutex once the operation has succeeded, so the caller can
+    // mark every spill queued before it as superseded and every spill queued after it as newer.
+    [[nodiscard]] typename ModelContract::SessionSnapshot
+    save_slot(std::uint32_t slot, std::string_view model_binding,
+              std::string_view expected_digest, std::string_view session_path,
+              const std::function<void()>& claim) {
+        std::scoped_lock lock(execution_mutex_);
+        device_.bind_to_current_thread();
+        require_settled_slot(slot);
+        const auto view = resources_.catalog_slot(slot);
+        if (view.state != ResourceManagement::CatalogState::Catalogued || view.handle == nullptr) {
+            throw std::invalid_argument("slot holds no retained session");
+        }
+        require_session_digest(view, expected_digest);
+        auto snapshot = instance_.program->save_continuation(*view.handle, model_binding);
+        bind_slot_session(slot, session_path);
+        claim();
+        return snapshot;
+    }
+
+    [[nodiscard]] std::pair<std::uint32_t, std::string>
+    restore_slot(std::uint32_t slot, std::span<const std::uint8_t> snapshot,
+                 std::string_view model_binding, std::string_view session_path,
+                 const std::function<void()>& claim) {
+        std::scoped_lock lock(execution_mutex_);
+        device_.bind_to_current_thread();
+        if (!context_cache_enabled_) {
+            // Without the cache no finished request can reuse a retained session.
+            throw std::invalid_argument("session restore requires the context cache to be enabled");
+        }
+        require_settled_slot(slot);
+        bool idle_lane = false;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            idle_lane = idle_lane || slots_[lane] == nullptr;
+        }
+        if (!idle_lane || materializing_) {
+            throw RequestError(RequestErrorKind::Overloaded,
+                               "session restore requires an idle Engine lane");
+        }
+        const auto view = resources_.catalog_slot(slot);
+        if (view.state == ResourceManagement::CatalogState::Catalogued && view.handle != nullptr) {
+            // Involuntary for the session that held the cell: the client asked for a restore,
+            // not for that session's destruction. A resident bound to the very file being
+            // restored is not written back over it: the client has declared the file's content.
+            if (slot < slot_session_paths_.size() && slot_session_paths_[slot] == session_path) {
+                clear_slot_session(slot);
+            }
+            spill_catalog_slot(slot, *view.handle);
+            auto evicted = resources_.take_catalogued(slot);
+            (void)instance_.program->release_continuation(std::move(evicted));
+        }
+        clear_slot_session(slot);
+        auto restored = instance_.program->restore_continuation(snapshot, model_binding);
+        const std::uint32_t tokens = instance_.program->continuation_depth(restored);
+        std::string digest         = instance_.program->continuation_digest(restored);
+        try {
+            const auto summary = instance_.program->continuation_summary(restored);
+            resources_.adopt_restored(slot, std::move(restored), summary);
+        } catch (...) {
+            // adopt_restored throws only before taking the handle.
+            (void)instance_.program->release_continuation(std::move(restored));
+            throw;
+        }
+        bind_slot_session(slot, session_path);
+        claim();
+        publish_runtime_stats();
+        return {tokens, std::move(digest)};
+    }
+
+    // `claim` receives the file the erased session was bound to, if any, so spills of it still
+    // queued are superseded: an explicit erase never writes the slot file.
+    std::uint32_t erase_slot(std::uint32_t slot, std::string_view expected_digest,
+                             const std::function<void(const std::string&)>& claim) {
+        std::scoped_lock lock(execution_mutex_);
+        require_settled_slot(slot);
+        const auto view = resources_.catalog_slot(slot);
+        require_session_digest(view, expected_digest);
+        const std::string bound_path =
+            slot < slot_session_paths_.size() ? slot_session_paths_[slot] : std::string();
+        clear_slot_session(slot);
+        if (!bound_path.empty()) { claim(bound_path); }
+        if (view.state != ResourceManagement::CatalogState::Catalogued || view.handle == nullptr) {
+            return 0;
+        }
+        const std::uint32_t tokens = instance_.program->continuation_depth(*view.handle);
+        auto evicted               = resources_.take_catalogued(slot);
+        (void)instance_.program->release_continuation(std::move(evicted));
+        publish_runtime_stats();
+        return tokens;
+    }
+
+    // Served from the snapshot the worker publishes at unit boundaries: the execution mutex is
+    // held for most of a running request, so a reader that waited on it would stall behind a
+    // long prefill.
+    [[nodiscard]] std::vector<SlotState> slot_states() const {
+        std::lock_guard lock(stats_mutex_);
+        std::vector<SlotState> states = published_slots_;
+        if constexpr (kLegacyContextCache) { states.resize(resources_.catalog_capacity()); }
+        return states;
+    }
+
+    // Installs the auto-save sink: the model binding a snapshot carries, and a consumer that
+    // takes each spilled session's (path, snapshot) and writes the file off-thread.
+    void set_eviction_sink(
+        std::string model_binding,
+        std::function<void(std::string, typename ModelContract::SessionSnapshot&&)> sink) {
+        std::scoped_lock lock(execution_mutex_);
+        eviction_model_binding_ = std::move(model_binding);
+        eviction_sink_          = std::move(sink);
     }
 
     void reset_memory_peaks() noexcept {
@@ -602,6 +750,8 @@ private:
             if (slots_[lane]->capture_pending) { ++snapshot.capture_pending_requests; }
             if (slots_[lane]->terminal_reason) { ++snapshot.terminal_pending_requests; }
         }
+        std::vector<SlotState> slot_snapshot;
+        if constexpr (kLegacyContextCache) { slot_snapshot = collect_slot_states(); }
         detail_range.reset();
         record_detail(&RuntimeHostWorkStats::stats_publication_ns,
                       &RuntimeHostWorkStats::stats_publication_invocations, detail_started);
@@ -610,6 +760,111 @@ private:
         snapshot.host_work = cumulative_stats_.host_work;
         std::lock_guard lock(stats_mutex_);
         published_stats_ = snapshot;
+        published_slots_ = std::move(slot_snapshot);
+    }
+
+    void require_settled_slot(std::uint32_t slot) const {
+        if (slot >= resources_.catalog_capacity()) {
+            throw std::invalid_argument("slot id is outside the retained-session catalog");
+        }
+        if (instance_.program->has_context_transaction() ||
+            resources_.context_transaction_kind()) {
+            throw RequestError(RequestErrorKind::Overloaded,
+                               "slot catalog is busy with a resource transaction");
+        }
+        const auto view = resources_.catalog_slot(slot);
+        if (view.state == ResourceManagement::CatalogState::Claimed ||
+            view.state == ResourceManagement::CatalogState::ReservedForActive || view.active_edge) {
+            throw RequestError(RequestErrorKind::Overloaded, "slot is in use by an active request");
+        }
+    }
+
+    void require_session_digest(const typename ResourceManagement::CatalogSlotView& view,
+                                std::string_view expected_digest) const {
+        if (expected_digest.empty()) { return; }
+        const std::string digest =
+            view.state == ResourceManagement::CatalogState::Catalogued && view.handle != nullptr
+                ? instance_.program->continuation_digest(*view.handle)
+                : std::string();
+        if (digest != expected_digest) {
+            throw SlotSessionMismatch("slot session does not match if_digest");
+        }
+    }
+
+    // Best-effort spill of a retained session about to be destroyed involuntarily. The snapshot
+    // runs on the calling thread; the file write runs on the Engine's writer thread through the
+    // sink. Only sessions bound to a slot file spill, and a failed spill never blocks the
+    // eviction: it costs the client one cold prefill, as without the feature.
+    void spill_catalog_slot(std::uint32_t slot,
+                            const typename ModelContract::ContinuationHandle& handle) noexcept {
+        if (!eviction_sink_ || slot >= slot_session_paths_.size() ||
+            slot_session_paths_[slot].empty()) {
+            return;
+        }
+        try {
+            auto snapshot = instance_.program->save_continuation(handle, eviction_model_binding_);
+            eviction_sink_(slot_session_paths_[slot], std::move(snapshot));
+        } catch (...) {}
+        // The binding stays: a planned eviction whose transaction aborts leaves the session in the
+        // cell, still bound. The release observer clears it when the entry really goes.
+    }
+
+    void clear_slot_session(std::uint32_t slot) noexcept {
+        if (slot < slot_session_paths_.size()) { slot_session_paths_[slot].clear(); }
+    }
+
+    // A slot file binds to at most one cell. A conversation's live continuation can move to a
+    // new cell turn to turn (an anchor or rewrite restore retains its source), leaving an older
+    // copy in another cell bound to the same file; if that copy were evicted later it would
+    // overwrite the newer save. Whoever saved or restored a path last owns it, and every other
+    // cell holding it is unbound. Called under execution_mutex_.
+    void bind_slot_session(std::uint32_t slot, std::string_view session_path) {
+        if (session_path.empty() || slot >= slot_session_paths_.size()) { return; }
+        for (std::size_t other = 0; other < slot_session_paths_.size(); ++other) {
+            if (other != slot && slot_session_paths_[other] == session_path) {
+                slot_session_paths_[other].clear();
+            }
+        }
+        slot_session_paths_[slot] = std::string(session_path);
+    }
+
+    // Per-cell occupancy for slot readers. Digests come from a cache keyed by the catalog
+    // entry's (id, revision), so an unchanged session is not rehashed every unit.
+    [[nodiscard]] std::vector<SlotState> collect_slot_states() {
+        std::vector<SlotState> out(resources_.catalog_capacity());
+        for (std::uint32_t slot = 0; slot < out.size(); ++slot) {
+            const auto view = resources_.catalog_slot(slot);
+            if (view.state != ResourceManagement::CatalogState::Catalogued ||
+                view.handle == nullptr) {
+                continue;
+            }
+            SlotDigestCacheEntry& cache = slot_digest_cache_[slot];
+            if (cache.id != view.id || cache.revision != view.revision) {
+                cache.id          = view.id;
+                cache.revision    = view.revision;
+                cache.depth       = instance_.program->continuation_depth(*view.handle);
+                cache.digest      = instance_.program->continuation_digest(*view.handle);
+                cache.checkpoints = instance_.program->continuation_checkpoints(*view.handle);
+            }
+            SlotState& state     = out[slot];
+            state.retained       = true;
+            state.prompt_tokens  = cache.depth;
+            state.cached_tokens  = cache.depth;
+            state.session_digest = cache.digest;
+            state.checkpoints    = cache.checkpoints;
+        }
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] == nullptr) { continue; }
+            const std::optional<std::uint32_t> publication =
+                resources_.lane_publication_slot(LaneId{lane});
+            if (!publication || *publication >= out.size()) { continue; }
+            SlotState& state    = out[*publication];
+            state.processing    = true;
+            state.prompt_tokens = slots_[lane]->prompt_summary.prompt_tokens;
+            state.cached_tokens =
+                slots_[lane]->begin ? slots_[lane]->begin->reused_prompt_tokens : 0U;
+        }
+        return out;
     }
 
     void record_prefix_selection(const RequestPlanSummary& summary) noexcept {
@@ -994,6 +1249,8 @@ private:
             result.ngram_archive = stats;
         }
         result.materialization = request->materialization_diagnostics;
+        result.slot                    = request->retained_slot;
+        result.session_digest          = request->retained_session_digest;
         if (request->first_token) {
             result.timings.first_token_seconds =
                 request->prepare_seconds +
@@ -1085,11 +1342,37 @@ private:
                 throw std::logic_error("terminal-pending request has invalid ownership");
             }
             const FinishReason reason = *request->terminal_reason;
+            // Where the finishing session will be retained, read before finish() settles the lane.
+            std::optional<std::uint32_t> publication;
+            std::optional<std::uint32_t> retained_source;
+            if constexpr (kLegacyContextCache) {
+                publication     = resources_.lane_publication_slot(*request->lane);
+                retained_source = resources_.lane_retained_private_source_slot(*request->lane);
+            }
             auto finished =
                 resources_.finish(*instance_.program, *request->lane, *request->sequence);
             request->generation_timings = finished.timings;
             request->speculative_stats  = std::move(finished.speculative);
             if (finished.salvaged) { ++cumulative_stats_.salvaged_continuations; }
+            if constexpr (kLegacyContextCache) {
+                if (finished.disposition == FinishDisposition::Catalogued && publication) {
+                    const auto view = resources_.catalog_slot(*publication);
+                    if (view.state == ResourceManagement::CatalogState::Catalogued &&
+                        view.handle != nullptr) {
+                        request->retained_slot = static_cast<std::int32_t>(*publication);
+                        request->retained_session_digest =
+                            instance_.program->continuation_digest(*view.handle);
+                        // A conversation continued from a retained source lives on in the new
+                        // cell; its slot file follows it there, leaving the older copy unbound.
+                        if (retained_source && *retained_source != *publication &&
+                            *retained_source < slot_session_paths_.size() &&
+                            !slot_session_paths_[*retained_source].empty()) {
+                            const std::string path = slot_session_paths_[*retained_source];
+                            bind_slot_session(*publication, path);
+                        }
+                    }
+                }
+            }
             request->terminal_reason.reset();
 
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
@@ -1301,6 +1584,11 @@ private:
                 std::move(pending), std::span<const CommitDecision>(decisions.data(), row_count),
                 CommitObservation::ReleasedRowsOnly, &program_call.failed_timing());
             program_call.finish(committed.timing);
+            // The commit samples and settles the unit's output, so its time belongs to the unit:
+            // a decode round, or the prefill unit that emitted the first token.
+            (decode_round ? cumulative_stats_.decode_seconds_total
+                          : cumulative_stats_.prefill_seconds_total) +=
+                static_cast<double>(committed.timing.elapsed_ns()) * 1e-9;
             committed_storage.emplace(std::move(committed));
             phase.resume_range();
         } catch (...) {
@@ -1547,6 +1835,9 @@ private:
         auto progress =
             instance_.program->advance_prefill(*request->sequence, &program_call.failed_timing());
         program_call.finish(progress.timing);
+        cumulative_stats_.prefill_seconds_total +=
+            static_cast<double>(progress.timing.elapsed_ns()) * 1e-9;
+        consume_armed_worker_failure();
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         // A completed prefill already re-arms admission (owner cleared above). Re-arm again when
         // the request keeps prefilling: each prefill boundary is an admission point, so a waiting
@@ -2034,6 +2325,8 @@ private:
         auto pending = instance_.program->decode(
             membership.sequence_span(), membership.budget_span(), &program_call.failed_timing());
         program_call.finish(pending.execution_timing());
+        cumulative_stats_.decode_seconds_total +=
+            static_cast<double>(pending.execution_timing().elapsed_ns()) * 1e-9;
         commit_pending(std::move(pending), membership.lane_span(), true, cancelled_at_unit_start);
         publish_runtime_stats();
     }
@@ -2151,6 +2444,10 @@ private:
                                                               membership.size),
                 &program_call.failed_timing());
             program_call.finish(timing);
+            // Forced control tokens are counted as committed decode tokens below, so their
+            // execution time belongs to the decode total as well.
+            cumulative_stats_.decode_seconds_total +=
+                static_cast<double>(timing.elapsed_ns()) * 1e-9;
             phase.resume_range();
         } catch (...) {
             rollback_generated();
@@ -2182,8 +2479,22 @@ private:
     // materializing requests, resets the scheduler and program state, but leaves pending requests
     // in the FIFO so they can retry once memory is freed.  The worker loop continues after this.
     // The worker holds execution_mutex_ across the failing operation and this cleanup.
-    void recover_from_oom_locked(std::exception_ptr error) noexcept {
+    //
+    // The cleanup frees pages, StateImages and Host KV that work issued before the failure may
+    // still reference, so the device is synchronized first; a device that cannot be synchronized
+    // refuses recovery and the caller latches. The cleanup also releases the startup-pinned
+    // grafts; they are reinstalled exactly as startup did, and an Engine that cannot reinstall
+    // them is not serving what it was configured with, so it latches too. Returns false when the
+    // caller must latch.
+    [[nodiscard]] bool recover_from_oom_locked(std::exception_ptr error) noexcept {
         if (!error) { error = oom_fallback_error_; }
+        try {
+            device_.synchronize();
+        } catch (...) {
+            publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                               "worker recovery: device synchronization failed - latching");
+            return false;
+        }
         try { scheduler_.reset(); } catch (...) {}
         const std::shared_ptr<Request> materializing_request =
             materializing_ ? materializing_->request : nullptr;
@@ -2199,10 +2510,24 @@ private:
         if (materializing_request != nullptr) {
             force_complete_error(materializing_request, error);
         }
+        if constexpr (kLegacyContextCache) {
+            try {
+                instance_.inject_pinned_grafts();
+                device_.synchronize();
+                catalog_pinned_grafts();
+            } catch (...) {
+                publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                   "worker recovery: startup grafts could not be reinstalled - "
+                                   "latching");
+                return false;
+            }
+        }
+        ++cumulative_stats_.engine_recoveries;
         // The failing unit may have consumed the admission check: re-arm it so the still-pending
         // FIFO requests are inspected again without waiting for a new submission.
         request_admission_check();
         try { publish_runtime_stats(); } catch (...) {}
+        return true;
     }
 
     enum class ProgramCleanup : std::uint8_t {
@@ -2214,6 +2539,10 @@ private:
     // Drops every Program owner and the Engine's catalog of them. Reports when the Program had to
     // rebuild its context stores because an owner could not be released cleanly.
     void cleanup_program_locked(ProgramCleanup cleanup = ProgramCleanup::Failure) noexcept {
+        // The cleanup frees physical state that work issued before a failure may still
+        // reference; wait for the device first. A device that cannot synchronize is freed anyway:
+        // the Engine is latching or shutting down at that point.
+        try { device_.synchronize(); } catch (...) {}
         decltype(instance_.program->fail_all_cleanup()) leaked;
         try {
             leaked = cleanup == ProgramCleanup::Shutdown ? instance_.program->shutdown_cleanup()
@@ -2275,6 +2604,16 @@ private:
         try {
             publish_runtime_stats();
         } catch (...) {}
+    }
+
+    // Catalogs each graft the Program holds pinned as an external shared prefix, so requests that
+    // select it by name plan against it.
+    void catalog_pinned_grafts() {
+        for (auto& entry : instance_.program->graft_catalog_entries()) {
+            const std::uint32_t rm_slot = resources_.register_external_shared_prefix(
+                std::move(entry.handle), std::move(entry.summary));
+            instance_.program->set_graft_rm_slot(entry.name, rm_slot);
+        }
     }
 
     void worker_loop() noexcept {
@@ -2420,7 +2759,11 @@ private:
                 try { oom_error = std::current_exception(); } catch (...) {}
                 if (!oom_error) { oom_error = oom_fallback_error_; }
                 HostPhaseMeasurement cleanup = begin_host_phase();
-                recover_from_oom_locked(oom_error);
+                if (!recover_from_oom_locked(oom_error)) {
+                    fail_all_locked(oom_error);
+                    finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
+                    return;
+                }
                 finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
                 oom_backoff_ = kOomBackoffIterations;
                 // Scheduler state was cleared by recover_from_oom_locked; treat the next
@@ -2442,7 +2785,11 @@ private:
                     return;
                 }
                 HostPhaseMeasurement cleanup = begin_host_phase();
-                recover_from_oom_locked(std::current_exception());
+                if (!recover_from_oom_locked(std::current_exception())) {
+                    fail_all_locked(std::current_exception());
+                    finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
+                    return;
+                }
                 finish_engine_phase(cleanup, EngineHostPhase::Maintenance);
                 oom_backoff_             = kOomBackoffIterations;
                 previous_unit_was_decode = false;
@@ -2467,6 +2814,7 @@ private:
     const bool kv_lease_growth_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
+    const bool context_cache_enabled_;
     ResourceManagement resources_;
     std::unique_ptr<NgramArchive> ngram_archive_;
 
@@ -2491,6 +2839,21 @@ private:
     // Worker-thread only: when a snapshot last carried a non-empty queue.
     Clock::time_point last_queue_publication_{};
     RuntimeStats published_stats_;
+    // Guarded by stats_mutex_, republished with the runtime stats.
+    std::vector<SlotState> published_slots_;
+    // Session persistence, guarded by execution_mutex_: the file each cell is bound to, the
+    // auto-save sink, and the per-cell digest cache.
+    struct SlotDigestCacheEntry {
+        std::uint64_t id       = 0;
+        std::uint64_t revision = 0;
+        std::uint32_t depth    = 0;
+        std::string digest;
+        std::vector<SlotCheckpoint> checkpoints;
+    };
+    std::vector<std::string> slot_session_paths_;
+    std::vector<SlotDigestCacheEntry> slot_digest_cache_;
+    std::string eviction_model_binding_;
+    std::function<void(std::string, typename ModelContract::SessionSnapshot&&)> eviction_sink_;
     bool stopping_ = false;
     bool failed_   = false;
     static constexpr std::uint32_t kOomBackoffIterations = 4;

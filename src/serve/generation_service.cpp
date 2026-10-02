@@ -13,6 +13,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace ninfer::serve {
@@ -50,11 +51,6 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
     case ninfer::RequestErrorKind::ContextLengthExceeded:
         error.status = 400;
         error.code   = "context_length_exceeded";
-        break;
-    case ninfer::RequestErrorKind::ThinkingBudgetCapacityInsufficient:
-        error.param.clear();
-        error.status = 400;
-        error.code   = "thinking_budget_capacity_insufficient";
         break;
     case ninfer::RequestErrorKind::MediaBudgetExceeded:
         error.status = 400;
@@ -135,6 +131,12 @@ using Clock = std::chrono::steady_clock;
     error.param   = "messages";
     error.code    = code;
     error.message = exception.what();
+    // Translation already refuses a graft the server did not load; the Engine's own check is the
+    // same contract, so it keeps the protocol code.
+    if (std::string_view(error.message).starts_with("unknown graft '")) {
+        error.param = "graft";
+        error.code  = "unknown_graft";
+    }
     throw ApiException(std::move(error));
 }
 
@@ -262,6 +264,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.fast_prefill_kernel      = options.fast_prefill_kernel;
     engine_options.kv_cache                 = options.kv_cache;
     engine_options.enable_vision            = options.enable_vision;
+    engine_options.grafts                   = options.grafts;
     engine_options.vision_residency         = options.vision_residency;
     engine_options.vision_max_merged_tokens = options.vision_max_merged_tokens;
     engine_options.use_cuda_graph           = options.use_cuda_graph;
@@ -288,6 +291,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
     engine_options.speculative              = options.speculative;
     engine_options.context_cache            = options.context_cache;
+    engine_options.slot_auto_save.enabled   = options.auto_save_evicted;
     engine_options.devices                  = options.devices;
     engine_options.stage_layers             = options.stage_layers;
     engine_options.context_cost.preset_path = options.context_cost_presets;
@@ -299,8 +303,9 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     return engine_options;
 }
 
-GenerationService::GenerationService(ServeOptions options, StartupObserver startup_observer,
-                                     DiagnosticObserver diagnostic_observer)
+GenerationService::GenerationService(
+    ServeOptions options, StartupObserver startup_observer, DiagnosticObserver diagnostic_observer,
+    std::function<void(const ninfer::SlotAutoSaveEvent&)> auto_save_listener)
     : options_(std::move(options)) {
     // Inline ECC on GDDR6X GeForce cards reserves ~6.25% of VRAM for checksums and taxes
     // memory bandwidth on every access. Decode is bandwidth-bound, so an ECC-enabled card
@@ -324,6 +329,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     ninfer::EngineOptions engine_options = make_engine_options(options_);
     engine_options.startup_observer      = std::move(startup_observer);
     engine_options.diagnostic_observer   = std::move(diagnostic_observer);
+    engine_options.slot_auto_save.listener = std::move(auto_save_listener);
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
@@ -401,12 +407,14 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& incomin
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     ninfer::RequestOptions request_options  = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
-    request_options.ngram_session = request.ngram_session;
-    prepared.thinking_budget      = request_options.execution.thinking.budget;
-    prepared.reasoning_effort     = semantics.reasoning_effort;
-    prepared.preserve_thinking    = semantics.preserve_thinking;
-    prepared.parallel_tool_calls  = request.parallel_tool_calls;
-    const bool request_has_media  = request.media_item_count() != 0;
+    request_options.ngram_session        = request.ngram_session;
+    prepared.thinking_budget             = request_options.execution.thinking.budget;
+    prepared.reasoning_effort            = semantics.reasoning_effort;
+    prepared.requested_reasoning_effort  = semantics.requested_reasoning_effort;
+    prepared.preserve_thinking           = semantics.preserve_thinking;
+    prepared.requested_preserve_thinking = semantics.requested_preserve_thinking;
+    prepared.parallel_tool_calls         = request.parallel_tool_calls;
+    const bool request_has_media         = request.media_item_count() != 0;
     if (request_has_media && !options_.enable_vision) {
         const std::invalid_argument error("Vision is disabled for this server");
         throw_invalid_input(error, "vision_disabled");
@@ -453,8 +461,15 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& incomin
         if (!prepared.enable_thinking) {
             request_options.execution.thinking.budget.reset();
             prepared.thinking_budget.reset();
+            prepared.effective_thinking_budget.reset();
         }
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
+        if (request.derive_output_budget) {
+            request_options.execution.requested_output_tokens =
+                engine_->concurrent_output_budget(prompt);
+        }
+        prepared.requested_output_tokens =
+            static_cast<int>(request_options.execution.requested_output_tokens);
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
@@ -463,7 +478,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& incomin
                                                   ? ninfer::OutputConsumerMode::Streaming
                                                   : ninfer::OutputConsumerMode::Aggregate,
                                               observation, prepared.lifetime->deadline);
-        prepared.sampling   = prepared.generation.resolved_sampling();
+        prepared.sampling                  = prepared.generation.resolved_sampling();
+        prepared.effective_thinking_budget = prepared.generation.effective_thinking_budget();
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);
     } catch (const std::invalid_argument& exception) {
@@ -564,6 +580,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
     outcome.metrics.engine_timing                = result.engine_timing;
     outcome.metrics.prefix_cache_hit_tokens      = result.reused_prompt_tokens;
+    outcome.id_slot                              = result.slot;
+    outcome.session_digest                       = result.session_digest;
     outcome.metrics.prefix_reuse_path            = result.prefix_reuse_path;
     outcome.metrics.materialization              = result.materialization;
     outcome.metrics.speculative_backend          = result.speculative.backend;

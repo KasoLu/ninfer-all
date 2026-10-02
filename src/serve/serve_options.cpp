@@ -3,6 +3,7 @@
 #include "product/rope_yarn_options.h"
 #include "product/speculative_options.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -90,10 +91,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
            "                                (default 1024)\n"
            "  --default-max-tokens N        output limit of a request that sets none\n"
-           "                                (default " +
-           std::to_string(kDefaultMaxTokens) +
-           "; 0 generates until the\n"
-           "                                context runs out)\n"
+           "                                (default: the largest budget that still lets\n"
+           "                                every lane be admitted at once, the remaining\n"
+           "                                context with one lane)\n"
            "  --model-id ID                 public model name instead of the artifact's\n"
            "                                metadata.name\n"
            "  --chat-template FILE          replace the artifact's chat template at startup\n"
@@ -236,6 +236,13 @@ std::string serve_usage_text(const char* argv0) {
            "                                disk tier\n"
            "  --disk-kv-directstorage       read restores through DirectStorage (Windows\n"
            "                                builds with NINFER_DIRECTSTORAGE)\n"
+           "  --slot-save-path DIR          enable POST /slots/{id}?action=save|restore|erase,\n"
+           "                                which writes a retained session to a file in DIR\n"
+           "                                or restores one from it\n"
+           "  --auto-save-evicted           write a retained session back to the slot file it\n"
+           "                                was last saved to or restored from before an\n"
+           "                                involuntary eviction destroys it (needs\n"
+           "                                --slot-save-path)\n"
            "  --use-alt-prefix-caching      the hybrid prefix cache instead of the checkpoint\n"
            "                                catalog: content-addressed KV blocks and sparse\n"
            "                                state snapshots; free VRAM becomes block cache\n"
@@ -334,6 +341,15 @@ std::string serve_usage_text(const char* argv0) {
            "  --default-reasoning-effort E  none, minimal, low, medium, high, xhigh or max\n"
            "                                for requests that set no effort and keep\n"
            "                                thinking on\n"
+           "\n"
+           "PROMPT GRAFTS\n"
+           "  --graft NAME=PATH             load a phantom-kv graft (a safetensors container\n"
+           "                                with a .json sidecar beside it); a request\n"
+           "                                selecting it with \"graft\": \"NAME\" runs as if\n"
+           "                                the graft's hidden turn preceded its own\n"
+           "                                messages; repeatable\n"
+           "  --default-graft NAME          apply a loaded graft to every request that names\n"
+           "                                none; a request opts out with \"graft\": \"\"\n"
            "\n"
            "API BEHAVIOR\n"
            "  --structured-output           accept JSON and JSON Schema response formats;\n"
@@ -462,7 +478,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         options.startup_argv.emplace_back(argv[i] == nullptr ? "" : argv[i]);
         redact_next = options.startup_argv.back() == "--api-key";
     }
-    bool default_max_tokens_explicit  = false;
     bool kv_capacity_explicit         = false;
     bool device_explicit              = false;
     bool context_capacity_explicit    = false;
@@ -793,10 +808,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
-            if (options.default_max_tokens == 0) {
-                options.default_max_tokens = kUnboundedOutputTokens;
-            }
-            default_max_tokens_explicit = true;
         } else if (arg == "--default-thinking-budget") {
             const std::uint64_t budget =
                 parse_u64(require_value("--default-thinking-budget"), "default-thinking-budget");
@@ -868,6 +879,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--derive-session-keys") {
             legacy_cache_flag           = "--derive-session-keys";
             options.derive_session_keys = true;
+        } else if (arg == "--slot-save-path") {
+            // Slots are the checkpoint catalog's private continuation cells.
+            legacy_cache_flag      = "--slot-save-path";
+            options.slot_save_path = require_value("--slot-save-path");
+            if (options.slot_save_path.empty()) {
+                throw std::invalid_argument("--slot-save-path must not be empty");
+            }
+        } else if (arg == "--auto-save-evicted") {
+            legacy_cache_flag         = "--auto-save-evicted";
+            options.auto_save_evicted = true;
         } else if (arg == "--auto-prefix-grid") {
             legacy_cache_flag        = "--auto-prefix-grid";
             options.auto_prefix_grid = true;
@@ -924,6 +945,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.enable_thinking = false;
         } else if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
+        } else if (arg == "--graft") {
+            const std::string_view spec = require_value("--graft");
+            const std::size_t equals    = spec.find('=');
+            if (equals == 0 || equals == std::string_view::npos || equals + 1 == spec.size()) {
+                throw std::invalid_argument("--graft must be NAME=PATH");
+            }
+            options.grafts.push_back(GraftSource{.name = std::string(spec.substr(0, equals)),
+                                                 .path = std::string(spec.substr(equals + 1))});
+        } else if (arg == "--default-graft") {
+            options.default_graft = require_value("--default-graft");
+            if (options.default_graft.empty()) {
+                throw std::invalid_argument("--default-graft needs a graft name");
+            }
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--no-webui") {
@@ -980,6 +1014,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }
+    }
+    if (!options.default_graft.empty() &&
+        std::none_of(options.grafts.begin(), options.grafts.end(), [&](const GraftSource& source) {
+            return source.name == options.default_graft;
+        })) {
+        throw std::invalid_argument("--default-graft '" + options.default_graft +
+                                    "' does not name a --graft");
     }
     if (!kv_capacity_explicit) {
         // The hybrid cache turns every Device page no active request holds into block cache, so
@@ -1054,6 +1095,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             throw std::invalid_argument(
                 "--no-prefix-reuse cannot be combined with --derive-session-keys");
         }
+        if (!options.slot_save_path.empty()) {
+            throw std::invalid_argument(
+                "--no-prefix-reuse cannot be combined with --slot-save-path");
+        }
         if (!options.context_cache.disk_kv_path.empty()) {
             throw std::invalid_argument("--no-prefix-reuse cannot be combined with --disk-kv-path");
         }
@@ -1075,6 +1120,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.request_log_max_mib != 0 && options.request_log_jsonl.empty()) {
         throw std::invalid_argument("--request-log-max-mib requires --request-log-jsonl");
+    }
+    if (options.auto_save_evicted && options.slot_save_path.empty()) {
+        throw std::invalid_argument("--auto-save-evicted requires --slot-save-path");
     }
     if (host_cache_budget_explicit) {
         // The budget is the one host RAM ceiling; the two component flags would silently
@@ -1143,10 +1191,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.ngram_native_sessions && options.speculative.ngram_archive_bytes == 0) {
         throw std::invalid_argument("--ngram-native-sessions requires --ngram-archive-mib");
     }
-    if (default_max_tokens_explicit) {
-        if (options.default_max_tokens <= 0) {
-            throw std::invalid_argument("--default-max-tokens must be positive");
-        }
+    if (options.default_max_tokens && *options.default_max_tokens <= 0) {
+        throw std::invalid_argument("--default-max-tokens must be positive");
     }
     return options;
 }

@@ -3,7 +3,8 @@
 One line of [NInfer](https://github.com/Neroued/ninfer) for the RTX 3090, RTX 4090, RTX 5090 and RTX
 PRO 6000 Blackwell, consolidated from the forks that carry it and extended with this repository's
 own work. The base is the `master` of
-[ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090): v0.11.0 and
+[ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090): v0.12.0 (with its prompt
+grafts, `/slots` session persistence, the effective thinking budget and worker recovery) and
 the multi-GPU pipeline stages, most of both written by [Warlax](https://github.com/WarlaxZ), on the
 line [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) started from Neroued's NInfer.
 On top of it come patches from [TertiumOrganum1/ninfer-3090](https://github.com/TertiumOrganum1/ninfer-3090),
@@ -201,8 +202,7 @@ named), re-implemented here:
   MinGW syntax check.
 
 Further 4090 ideas: a server default reasoning effort, MTP draft windows up to 15, `/metrics` and
-`/slots` (Sergiusz Michalik) and `/props`, a WebUI compiled in from `NINFER_WEBUI_DIR`, output limits bounded only by
-the context, the block sampler's candidates in shared memory, an opt-in bf16 residual add
+`/slots` (Sergiusz Michalik) and `/props`, a WebUI compiled in from `NINFER_WEBUI_DIR`, the block sampler's candidates in shared memory, an opt-in bf16 residual add
 (`-DNINFER_BF16_RESIDUAL_ADD=ON`), vector stores in the chunked GDN prefill, and bounded split
 compilation with ptxas reports as build options.
 

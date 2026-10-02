@@ -344,8 +344,13 @@ struct FakeAdmissionCandidate {
     std::uint32_t shared_source_id          = 0;
     std::uint32_t shared_source_content_key = 0;
     std::uint32_t shared_source_frontier    = 0;
+    std::optional<std::uint32_t> graft_slot;
 
     [[nodiscard]] const RequestPlanSummary& summary() const noexcept { return value; }
+
+    [[nodiscard]] std::optional<std::uint32_t> graft_shared_slot() const noexcept {
+        return graft_slot;
+    }
 
     [[nodiscard]] const ninfer::runtime::IdentityMaterializationAssessment&
     identity_assessment() const noexcept {
@@ -2602,6 +2607,7 @@ void test_feasible_identity_expands_when_pressure_can_remove_copy() {
     candidate.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Feasible;
     candidate.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
     candidate.identity.assessment_digest = 17;
+    candidate.value.reusable_prompt_tokens = 12;
 
     const std::array<Planner::CandidateInput, 1> candidates{
         Planner::CandidateInput{.candidate               = &candidate,
@@ -2646,6 +2652,7 @@ void test_feasible_identity_expands_when_pressure_can_remove_copy() {
 
     require(result && result->diagnostics.predicted_now_ns == 100'000'000 &&
                 result->diagnostics.selected_degradation_units == 1 &&
+                result->diagnostics.best_reuse_prompt_tokens == 12 &&
                 program.pressure_planning_sessions == 1 && !program.seal_attempts.empty() &&
                 program.seal_attempts.back() == std::vector<std::uint64_t>{1009},
             "feasible identity suppressed a cheaper complete pressure target");
@@ -2660,6 +2667,7 @@ void test_dominating_identity_does_not_build_pressure_graph() {
     candidate.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Feasible;
     candidate.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
     candidate.identity.assessment_digest = 23;
+    candidate.value.reusable_prompt_tokens = 40;
     const std::array<Planner::CandidateInput, 1> candidates{
         Planner::CandidateInput{.candidate               = &candidate,
                                 .id                      = PlanningCandidateId{.value = 0},
@@ -2683,7 +2691,8 @@ void test_dominating_identity_does_not_build_pressure_graph() {
                                pressure_inputs, logical_goal, Planner::Clock::now());
     require(result &&
                 result->diagnostics.stop_reason == ninfer::MaterializationStopReason::NoPressure &&
-                !pressure_inputs_built && program.pressure_planning_sessions == 0,
+                result->diagnostics.best_reuse_prompt_tokens == 40 && !pressure_inputs_built &&
+                program.pressure_planning_sessions == 0,
             "dominating identity eagerly constructed the pressure graph");
 }
 

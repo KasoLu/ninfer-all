@@ -126,6 +126,13 @@ on `setmaxnreg` register transfer, which RDC would discard. Their owning family 
 these sources into that target; host launchers connect them to the normal Ops. All three CUDA
 archive targets retain `-lineinfo`.
 
+Whole-program compilation is not a speed lever on every card. On the RTX 3090 (sm_86, CUDA 12.8, 27B
+DFlash2 bundle, rk4v4 KV, three interleaved rounds) the base line measured the switch at
+pp512/pp2048/pp8192 +0.4/-0.6/-1.4% and decode within +-0.3%, all inside run-to-run spread, while
+the server binary grows from 498 to 637 MB; the sm_89 fork reported +2.7-4.9% prefill from it. What
+it buys everywhere is the code generation described above; re-measure speed before attributing a
+gain to it on a new architecture or toolchain.
+
 Source-list maintenance must preserve language, architecture, RDC mode, device-link ownership
 and numerical compiler options. Splitting a manifest does not reduce kernel instantiation work
 or justify combining shape translation units or enabling unity builds.

@@ -52,6 +52,19 @@ bool optional_bool(const RequestJson& object, const char* key, bool fallback) {
     return object.at(key).get<bool>();
 }
 
+std::optional<std::string> parse_graft_field(const RequestJson& body) {
+    if (!body.contains("graft") || body.at("graft").is_null()) { return std::nullopt; }
+    if (!body.at("graft").is_string()) { bad_request("graft must be a string or null", "graft"); }
+    return body.at("graft").get<std::string>();
+}
+
+std::optional<std::uint32_t> parse_thinking_budget_field(const RequestJson& body) {
+    const std::optional<int> budget = optional_int(body, "thinking_budget");
+    if (!budget) { return std::nullopt; }
+    if (*budget < 1) { bad_request("thinking_budget must be a positive integer", "thinking_budget"); }
+    return static_cast<std::uint32_t>(*budget);
+}
+
 bool valid_tool_name(std::string_view name, std::size_t maximum_length) noexcept {
     if (name.empty() || name.size() > maximum_length) { return false; }
     for (const unsigned char character : name) {

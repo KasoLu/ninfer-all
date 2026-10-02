@@ -7,7 +7,9 @@
 #include "runtime/engine/diagnostics.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
+#include "core/paged_kv_cache.h"
 #include "core/startup.h"
+#include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
 
@@ -201,6 +203,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     case EnginePurpose::Generation:
         break;
     case EnginePurpose::CausalScoring:
+        if (!options.grafts.empty()) {
+            throw std::invalid_argument("a CausalScoring Engine takes no prompt grafts");
+        }
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
         options.prefill_chunk        = 1024;
@@ -235,6 +240,17 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("ngram draft widths above 15 require engine concurrency one");
     }
     const std::uint32_t concurrency = options.max_concurrency;
+    // Injected grafts stay resident for the life of the Engine, each in a StateImage and a
+    // shared-prefix slot of its own, so the pools grow by that many beyond what requests use.
+    const std::uint32_t direct_grafts = models::qwen3_5::count_direct_grafts(options.grafts);
+    if (!cache.enabled && direct_grafts != 0) {
+        throw std::invalid_argument(
+            "direct grafts are held in the context cache, which is disabled");
+    }
+    if (cache.enabled && cache.mode == ContextCacheMode::Hybrid && direct_grafts != 0) {
+        // A direct graft lives in a pinned Legacy shared-prefix slot; the hybrid tree has none.
+        throw std::invalid_argument("direct grafts require the legacy context cache");
+    }
     if (cache.enabled && cache.mode == ContextCacheMode::Hybrid) {
         if (cache.device_state_slots || cache.max_private_continuations ||
             cache.max_shared_prefixes || cache.max_long_anchors_per_continuation) {
@@ -324,12 +340,13 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         return options;
     }
 
-    cache.device_state_slots            = cache.device_state_slots.value_or(concurrency);
+    cache.device_state_slots = cache.device_state_slots.value_or(concurrency) + direct_grafts;
     const std::uint64_t default_private = 2ULL * concurrency;
     cache.max_private_continuations =
         cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));
     cache.max_shared_prefixes = cache.max_shared_prefixes.value_or(std::max(
-        concurrency, static_cast<std::uint32_t>(kMaximumPreparedPromptCacheCandidatesPerRequest)));
+        concurrency, static_cast<std::uint32_t>(kMaximumPreparedPromptCacheCandidatesPerRequest))) +
+                                direct_grafts;
     cache.max_long_anchors_per_continuation =
         cache.max_long_anchors_per_continuation.value_or(cache.automatic_long_anchors ? 4U : 2U);
     cache.max_cache_markers_per_request     = cache.max_cache_markers_per_request.value_or(4U);
@@ -377,10 +394,17 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                    ? options.context_cache.max_long_anchors_per_continuation.value_or(0U)
                    : 0U,
            .long_anchor_min_spacing_tokens =
-               options.context_cache.long_anchor_min_spacing_tokens})),
+               options.context_cache.long_anchor_min_spacing_tokens,
+           .grafts = models::qwen3_5::load_prompt_grafts(options.grafts, model->config().text)})),
       capacity(options.max_context) {}
 
 ModelInstance::~ModelInstance() = default;
+
+void ModelInstance::inject_pinned_grafts() {
+    for (const auto& graft : frontend.grafts()) {
+        if (graft.kind != models::qwen3_5::GraftKind::PrefillKV) { program->inject_graft(graft); }
+    }
+}
 
 namespace {
 
@@ -490,9 +514,18 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                 context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
+    // Each injected graft keeps its text KV pages for good; the pool grows by that many so a
+    // request can still use all the capacity that was asked for.
+    std::uint32_t graft_main_pages = 0;
+    for (const auto& graft : instance->frontend.grafts()) {
+        if (graft.kind != models::qwen3_5::GraftKind::PrefillKV) {
+            const auto page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
+            graft_main_pages += (graft.n_slots + page_tokens - 1U) / page_tokens;
+        }
+    }
     auto planner = models::qwen3_5::make_sequence_planner(
         instance->parameters, device,
-        artifact_scoped_disk_tier(options, instance->model->info().artifact_id));
+        artifact_scoped_disk_tier(options, instance->model->info().artifact_id), graft_main_pages);
     const std::vector<std::size_t> free_by_rank =
         free_bytes_by_rank(device, options.wddm_evictable_budget,
                            instance->model->storage_stats().device_capacity_bytes);
@@ -543,6 +576,7 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             };
         }
     }
+    instance->inject_pinned_grafts();
     device.synchronize();
     program.complete();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
