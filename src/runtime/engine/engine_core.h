@@ -1693,15 +1693,28 @@ private:
         } catch (...) {
             phase.finish();
             for (std::size_t index = 0; index < terminal_count; ++index) {
-                complete_success(terminal_requests[index], terminal_reasons[index]);
                 remove_completed_slot(terminal_lanes[index]);
+            }
+            if (terminal_count != 0) {
+                try {
+                    publish_runtime_stats();
+                } catch (...) {}
+            }
+            for (std::size_t index = 0; index < terminal_count; ++index) {
+                complete_success(terminal_requests[index], terminal_reasons[index]);
             }
             throw;
         }
         phase.finish();
+        // Free the slots and publish the post-release snapshot once before waking the callers, as
+        // the settle and cancel paths do, so runtime_stats() read after generate() returns
+        // reflects the released lanes.
+        for (std::size_t index = 0; index < terminal_count; ++index) {
+            remove_completed_slot(terminal_lanes[index]);
+        }
+        if (terminal_count != 0) { publish_runtime_stats(); }
         for (std::size_t index = 0; index < terminal_count; ++index) {
             complete_success(terminal_requests[index], terminal_reasons[index]);
-            remove_completed_slot(terminal_lanes[index]);
         }
     }
 
