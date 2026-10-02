@@ -1816,7 +1816,10 @@ worker boundary).
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in
 CPU/media preparation and completed model results whose response has not yet been released. A full
-capacity returns HTTP 429 with code `server_overloaded`. The absolute
+capacity returns HTTP 429 with code `server_overloaded`. Token-count requests (Anthropic
+`count_tokens`, Responses `input_tokens`) run the same preparation without generating; a separate
+capacity of the same size bounds how many run at once, and beyond it they are rejected as
+overloaded, as generation requests are. The absolute
 `--pending-timeout-ms` deadline starts before preparation, covers media acquisition and Engine FIFO
 waiting, and returns HTTP 503 with code `request_queue_timeout` if admission does not occur in time.
 There is no admission ETA or unbounded overflow queue. Because there is no preemption, a queued
