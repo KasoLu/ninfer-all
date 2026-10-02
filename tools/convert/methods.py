@@ -8,7 +8,7 @@ User methods accept the same PrepareRequest and return a PreparedMethod.
 from __future__ import annotations
 
 from bisect import bisect_right
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from math import prod
 import struct
 from typing import Callable, Mapping
@@ -26,7 +26,8 @@ from tools.artifact.schema import TensorSpec
 from tools.artifact.tensor_output import TensorOutput
 
 from .quantization.fp8_row import quantize_bf16_rows
-from .quantization.groupwise import quantize_matrix, quantize_matrix_mse
+from . import imatrix
+from .quantization.groupwise import quantize_matrix, search_quantize_matrix
 from .sources.logical import EncodedRows, LogicalSource
 
 UseKey = tuple[str, str]
@@ -220,16 +221,42 @@ def grouped_absmax(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
-def grouped_mse(request: PrepareRequest) -> PreparedMethod:
-    """Grouped quantisation with the per-group scale that minimises the
-    encoded squared error (ties keep the max-abs scale)."""
+def grouped_search(request: PrepareRequest) -> PreparedMethod:
+    """Grouped integer codes whose FP16 scales minimize importance-weighted rounding error.
+
+    Parameters: ``imatrix`` (optional path written by ``tools.convert.imatrix``; the vectors of
+    the target's logical parameters weight each input channel) and ``negative_scales`` (optional
+    bool, default false; admits full-range scales that map a group's largest value onto the most
+    negative code). See ``search_quantize_matrix``.
+    """
     if (
         not isinstance(get_format(request.target.format), QuantFormat)
         or len(request.target.shape) != 2
     ):
-        raise ValueError("grouped_mse requires a grouped-integer matrix target")
-    _preflight(request)
+        raise ValueError("grouped_search requires a grouped-integer matrix target")
+    unknown = set(request.parameters) - {"imatrix", "negative_scales"}
+    if unknown:
+        raise ValueError(
+            f"{request.target.id}: unknown grouped_search parameters {sorted(unknown)}"
+        )
+    negative = request.parameters.get("negative_scales", False)
+    if not isinstance(negative, bool):
+        raise ValueError("grouped_search negative_scales must be a bool")
+    _preflight(replace(request, parameters={}))
     n, k = request.target.shape
+    importance = None
+    if request.parameters.get("imatrix"):
+        vectors = imatrix.load(str(request.parameters["imatrix"]))
+        found = [
+            vectors[item.parameter] for item in request.inputs if item.parameter in vectors
+        ]
+        if found:
+            if any(tuple(vector.shape) != (k,) for vector in found):
+                raise ValueError(
+                    f"{request.target.id}: imatrix vector length differs from K={k}"
+                )
+            # Packed inputs read one activation, so their vectors agree up to calibration noise.
+            importance = torch.stack(found).mean(dim=0)
 
     def produce(output):
         for begin in range(0, n, request.rows_per_chunk):
@@ -237,10 +264,14 @@ def grouped_mse(request: PrepareRequest) -> PreparedMethod:
             values = request.values(begin * k, end * k).reshape(end - begin, k)
             if not values.dtype.is_floating_point:
                 raise TypeError(
-                    "grouped_mse source must provide floating-point values"
+                    "grouped_search source must provide floating-point values"
                 )
-            encoded = quantize_matrix_mse(
-                values, request.target.format, device=request.device
+            encoded = search_quantize_matrix(
+                values,
+                request.target.format,
+                importance=importance,
+                negative_scales=negative,
+                device=request.device,
             )
             output.write_codes(begin, encoded.codes, encoded.scales)
 
@@ -352,7 +383,7 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
 METHODS: dict[str, Method] = {
     "cast_direct": cast_direct,
     "grouped_absmax": grouped_absmax,
-    "grouped_mse": grouped_mse,
+    "grouped_search": grouped_search,
     "fp8_row_maxabs": fp8_row_maxabs,
     "import_encoded": import_encoded,
 }

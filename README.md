@@ -287,7 +287,7 @@ From other forks:
   graphs (`-DNINFER_PDL=ON` on compatibility builds), split-KV attention for short prefill steps
   over long contexts, a general BF16 GEMM fallback, MTP banks of mixed formats, the fused RMSNorm and
   NVFP4 attention input at every width, and converters for ModelOpt NVFP4/FP8 checkpoints, the
-  Quasar NVFP4 checkpoint and a `grouped_mse` scale search. A native Windows build against a
+  Quasar NVFP4 checkpoint and a least-squares scale search (now part of `grouped_search`). A native Windows build against a
   prebuilt vcpkg tree.
 - **Unified Linear templates** (Neroued). The Q4, Q5, Q6 and Q8 A16 Linear templates with sliced-K
   schedules sit beside this line's routes, and each card takes them only at the widths where two

@@ -452,14 +452,21 @@ codebook.
 A valid scale is either:
 
 - positive zero, binary16 bit pattern `0x0000`; or
-- a finite positive binary16 normal or subnormal number.
+- a finite nonzero binary16 normal or subnormal number of either sign.
 
-Negative finite values, negative zero, positive or negative infinity, and every NaN are invalid.
-Positive binary16 subnormals are valid; consumers must preserve their defined value. In particular,
-the minimum positive binary16 scale is `2^-24`, bit pattern `0x0001`.
+Negative zero, positive or negative infinity, and every NaN are invalid. Binary16 subnormals are
+valid; consumers must preserve their defined value. In particular, the minimum positive binary16
+scale is `2^-24`, bit pattern `0x0001`.
+
+A negative scale is an ordinary multiplier. It lets an encoder use the full code interval for a
+group whose largest-magnitude value is positive: with scale `-m / 8`, a Q4 group maps its largest
+value `m` onto code `-8`, a level no positive scale reaches because `+8` is not a legal Q4 code.
+Negating a group's scale and codes is therefore not an equivalent rewrite. Every consumer applies
+the scale as a signed multiply (Section 6.2) and none may assume its sign: no absolute value, sign
+mask or unsigned reinterpretation of a stored grouped scale.
 
 If a stored scale is positive zero, every logical code in that group must be zero. The converse is
-not required: a valid representation may have a positive scale and all-zero codes. The canonical
+not required: a valid representation may have a nonzero scale and all-zero codes. The canonical
 reference encoder nevertheless emits the unique `scale = +0, codes = 0` representation for an
 all-zero source group.
 
@@ -584,6 +591,18 @@ encoder may emit the same four schemes if all output codes and scales satisfy Se
 
 User recipes select these methods explicitly and record their provenance. An alternative method
 need not match `grouped_absmax` bit for bit. It must produce valid words of the selected format.
+
+The built-in `grouped_search` method (`search_quantize_matrix` in the same module) is one. Each
+group keeps the Section 7.2 result unless a candidate scale has a strictly smaller
+importance-weighted squared reconstruction error `sum_k imp[k] * (w[k] - s * q[k])^2`, with codes
+selected by the Section 7.2 reciprocal multiply. The candidates are 25 multiples (0.70 to 1.18) of
+the max-abs scale `amax / qmax` and of the full-range scale `extreme / qmin`, which maps the group's
+largest-magnitude value onto the most negative code; power-of-two multiples and binary16 neighbours
+of the max-abs scale; and the weighted least-squares scale of the max-abs codes and of the winning
+codes, with their neighbours. Computed candidates round through binary32 to binary16 as in Section
+7.2. Negative candidates compete only when the recipe enables `negative_scales`. The importance
+vector, one weight per input channel, comes from an activation importance matrix
+(`tools/convert/imatrix.py`); without it every channel weighs the same.
 A change to group geometry, scale type, code domain or reconstruction equation requires a different
 numeric format, with its own codec and consumer support.
 

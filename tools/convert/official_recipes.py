@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, grouped_mse, import_encoded
+from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, import_encoded
 from .sources.compressed_tensors import compressed_matrix_source
 
 Q4 = "q4_g64_fp16"
