@@ -977,7 +977,11 @@ public:
             const PressureTargetAssessment& assessment = assessed.assessment();
             if (assessment.candidate != candidates[incumbent.candidate_index].id ||
                 assessment.physical_status != MaterializationPhysicalStatus::Feasible) {
-                throw std::logic_error("selected identity target lost exact feasibility");
+                // A concurrent transition took the target's room between search and seal. Like
+                // the seal fallback below, that is a transient resource race, not a broken
+                // invariant: this admission yields no choice now and is re-planned on a later
+                // scheduling pass instead of failing every request through the worker loop.
+                return std::nullopt;
             }
             incumbent.assessed.emplace(std::move(assessed));
         }
