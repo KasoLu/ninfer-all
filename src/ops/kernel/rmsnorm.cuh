@@ -20,7 +20,7 @@ enum class RmsEpilogue {
 };
 
 // Whether the epilogue reads a gate row z.
-constexpr bool rms_has_gate(RmsEpilogue epilogue) {
+__host__ __device__ constexpr bool rms_has_gate(RmsEpilogue epilogue) {
     return epilogue == RmsEpilogue::Gated || epilogue == RmsEpilogue::GatedSigmoid;
 }
 
@@ -28,7 +28,7 @@ template <RmsEpilogue Epilogue>
 __device__ __forceinline__ float rmsnorm_epilogue(float x, float inv, float weight, float z) {
     if constexpr (Epilogue == RmsEpilogue::Offset) { weight += 1.0f; }
     float value = x * inv * weight;
-    if constexpr (rms_has_gate(Epilogue)) { value *= silu(z); }
+    if constexpr (Epilogue == RmsEpilogue::Gated) { value *= silu(z); }
     if constexpr (Epilogue == RmsEpilogue::GatedSigmoid) { value *= 1.0f / (1.0f + __expf(-z)); }
     return value;
 }

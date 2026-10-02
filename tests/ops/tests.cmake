@@ -5,6 +5,13 @@ set(ninfer_op_tests
   silu_mul
   residual_add
   sigmoid_mul
+  hyper_connection
+  ple_inject
+  ngram_rows
+  qsa_indexer
+  sparse_attention
+  moe_route
+  moe_experts
   rmsnorm
   rmsnorm_pack_tail
   gated_rmsnorm
