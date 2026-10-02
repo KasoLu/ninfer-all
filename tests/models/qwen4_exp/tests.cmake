@@ -10,3 +10,8 @@ ninfer_add_test(ninfer_qwen4_exp_config_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_config.cpp"
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_model_loading)
+
+ninfer_add_test(ninfer_qwen4_exp_slice_real
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_slice_real.cpp"
+  LIBRARIES ninfer_model_loading ninfer_ops)
+set_tests_properties(ninfer_qwen4_exp_slice_real PROPERTIES SKIP_RETURN_CODE 77)

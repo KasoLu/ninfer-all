@@ -81,14 +81,37 @@ def ngram_rows(ckpt: Checkpoint, layer: int, context: list[int]) -> list[int]:
     return rows
 
 
+def ngram_contexts(tokens: list[int], eos: int, order: int) -> list[list[int]]:
+    """Each token with its predecessors, newest first; an EOS predecessor cuts the older ones."""
+    previous = [eos] * (order - 1)
+    contexts = []
+    for token in tokens:
+        context, cut = [token], False
+        for p in previous:
+            context.append(eos if cut else p)
+            cut = cut or p == eos
+        contexts.append(context)
+        previous = [token] + previous[:-1]
+    return contexts
+
+
 class NgramTable:
-    """The checkpoint's BF16 n-gram table, read row by row from its 128 shards."""
+    """The checkpoint's BF16 n-gram table, read row by row from its 128 shards, or from the
+    sparse ngram_rows.npz that tools/reference/fetch_slice.py writes beside a slice."""
 
     def __init__(self, ckpt: Checkpoint, layer: int):
         self.ckpt, self.layer = ckpt, layer
         self.rows_per_shard = None
+        sparse = ckpt.root / "ngram_rows.npz"
+        self.sparse = None
+        if sparse.exists():
+            import numpy as np
+            self.sparse = {int(k): v for k, v in np.load(sparse).items()}
 
     def row(self, row: int) -> torch.Tensor:
+        if self.sparse is not None:
+            raw = torch.from_numpy(self.sparse[row].copy()).view(torch.bfloat16)
+            return raw.to(F64)
         if self.rows_per_shard is None:
             first = f"{PREFIX}layers.{self.layer}.ple.ple_embedding.ngram_embedding.shard_0.weight"
             handle = safe_open(str(self.ckpt.root / self.ckpt.files[first]), framework="pt")
@@ -100,7 +123,7 @@ class NgramTable:
 
 
 def ple(ckpt, layer, R, tokens, eos, table, eps, state):
-    """R (T, HC, H) += G + conv; state carries 'context' (last two raw tokens) and 'history' (9, HC*H)."""
+    """R (T, HC, H) += G + conv for a sequence from its start; state carries 'history' (9, HC*H)."""
     hc, h = R.shape[1], R.shape[2]
     key = ckpt.layer(layer, "ple.key_proj.weight")
     value = ckpt.layer(layer, "ple.value_proj.weight")
@@ -109,14 +132,8 @@ def ple(ckpt, layer, R, tokens, eos, table, eps, state):
     taps = conv.shape[1]
     dilation = int(ckpt.config["ngram_size"])
     out = R.clone()
-    for t, token in enumerate(tokens):
-        previous = state["context"]
-        context = [token]
-        cut = False
-        for p in previous:
-            context.append(eos if cut else p)
-            cut = cut or p == eos
-        state["context"] = [token] + previous[:-1]
+    order = int(ckpt.config["ngram_size"])
+    for t, context in enumerate(ngram_contexts(tokens, eos, order)):
         emb = torch.cat([table.row(r) for r in ngram_rows(ckpt, layer, context)])
         k = rms0((key @ emb).view(hc, h), nk, eps)
         v = value @ emb
@@ -272,8 +289,7 @@ def forward(ckpt: Checkpoint, tokens: list[int], layers: range, with_head: bool)
         state = {}
         if layer in ple_blocks:
             table = NgramTable(ckpt, layer)
-            pstate = {"context": [eos] * (int(cfg["ngram_size"]) - 1),
-                      "history": torch.zeros(9, hc * h, dtype=F64)}
+            pstate = {"history": torch.zeros(9, hc * h, dtype=F64)}
             R = ple(ckpt, layer, R, tokens, eos, table, eps, pstate)
         a, w1 = hc_read(ckpt, f"{PREFIX}layers.{layer}.attn_hyper_connection.", R, eps)
         if cfg["layer_types"][layer] == "linear_attention":
@@ -301,11 +317,36 @@ def main() -> None:
     parser.add_argument("--tokens", required=True, help="comma-separated token ids")
     parser.add_argument("--layers", type=int, default=48, help="run blocks 0 .. N-1")
     parser.add_argument("--head", action="store_true", help="also apply the final mixer and lm_head")
-    parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--list-ngram-rows", action="store_true",
+                        help="print the n-gram table rows the tokens address and exit")
     args = parser.parse_args()
+    if args.list_ngram_rows:
+        ckpt = Checkpoint(args.checkpoint)
+        tokens = [int(t) for t in args.tokens.split(",")]
+        layer = int(ckpt.config["ple_layer_ids"][0]) - 1
+        contexts = ngram_contexts(tokens, int(ckpt.config["eos_token_id"]), int(ckpt.config["ngram_size"]))
+        rows = sorted({r for c in contexts for r in ngram_rows(ckpt, layer, c)})
+        print(",".join(str(r) for r in rows))
+        return
+    if args.out is None:
+        parser.error("--out is required")
     ckpt = Checkpoint(args.checkpoint)
-    dumps = forward(ckpt, [int(t) for t in args.tokens.split(",")], range(args.layers), args.head)
+    tokens = [int(t) for t in args.tokens.split(",")]
+    dumps = forward(ckpt, tokens, range(args.layers), args.head)
     torch.save(dumps, args.out)
+    # Raw little-endian FP32 copies for C++ readers: golden.json names them.
+    root = args.out.parent
+    files = []
+    for layer, R in enumerate(dumps["R"]):
+        name = f"golden_R{layer}.f32"
+        R.to(torch.float32).numpy().tofile(root / name)
+        files.append(name)
+    meta = {"tokens": tokens, "layers": len(dumps["R"]), "R": files}
+    if "logits" in dumps:
+        dumps["logits"].to(torch.float32).numpy().tofile(root / "golden_logits.f32")
+        meta["logits"] = "golden_logits.f32"
+    (root / "golden.json").write_text(json.dumps(meta))
 
 
 if __name__ == "__main__":
