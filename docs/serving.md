@@ -1284,9 +1284,13 @@ strictly (see [Structured output](#structured-output)); Count Tokens ignores it.
 User-defined, non-strict tools support `name`, `description`, object `input_schema`, and
 `input_examples`. `tool_choice` `auto`, `none`, `tool` naming a declared tool, and `any` over a
 single callable tool are executable; the last two require reasoning to be disabled for the request.
-`any` over several tools, `strict:true`, active single-call enforcement, deferred tools, tools that
-exclude direct model calls, Anthropic-provided/server tools, toolsets, MCP, and containers are
-rejected because their required constraint or executor is absent. `tool_result` preserves text/image order and marks
+`any` over several tools is advisory: NInfer cannot make the model pick one of them, so the tools
+stay offered under automatic selection (Qwen Code sends `any` for its JSON side queries such as
+its permission classifier, session title and next-speaker check); `any` without tools is rejected.
+`disable_parallel_tool_use:true` is honoured as `parallel_tool_calls:false` is on the OpenAI
+endpoints: the response keeps the first tool call and drops the rest. `strict:true`, deferred
+tools, tools that exclude direct model calls, Anthropic-provided/server tools, toolsets, MCP, and
+containers are rejected because their required constraint or executor is absent. `tool_result` preserves text/image order and marks
 `is_error:true` explicitly in the model prompt. For a visible Assistant tool-use turn, the next
 User turn must provide exactly one leading result for every declared ID; valid results are matched
 by ID and normalized to call order. A history that begins with results remains valid as a truncated

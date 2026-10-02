@@ -509,13 +509,34 @@ int test_tools() {
     Json two_tools      = ordinary_tool();
     two_tools["name"]   = "search";
     body["tools"]       = Json::array({ordinary_tool(), two_tools});
+    // any over several tools is advisory: Qwen Code sends it for its JSON side queries, and the
+    // tools stay offered under automatic selection.
+    body["tool_choice"]              = Json{{"type", "any"}};
+    const GenerationRequest advisory = parse(body).generation;
+    failures += check(advisory.uses_tools() && advisory.tool_choice.mode == ToolChoiceMode::Auto &&
+                          advisory.tool_choice.forced_name.empty() &&
+                          prompt(advisory).options.tool_jsons.size() == 2,
+                      "any over several tools was rejected or did not keep the tools offered");
+    body          = base_request();
     body["tool_choice"] = Json{{"type", "any"}};
-    failures += check(api_code([&] { (void)parse(body); }) == "tool_choice_not_supported",
-                      "any over several tools stays rejected");
-    body["tools"]       = Json::array({ordinary_tool()});
-    body["tool_choice"] = Json{{"type", "auto"}, {"disable_parallel_tool_use", true}};
-    failures += check(api_code([&] { (void)parse(body); }) == "parallel_tool_use_not_supported",
-                      "active single-tool-call guarantee was silently downgraded");
+    failures += check(api_param([&] { (void)parse(body); }) == "tool_choice",
+                      "tool_choice any without tools was accepted");
+    // disable_parallel_tool_use is honoured as parallel_tool_calls=false: the response keeps the
+    // first call. It is still type-checked.
+    body["tools"] = Json::array({ordinary_tool()});
+    for (const Json& choice : {Json{{"type", "auto"}, {"disable_parallel_tool_use", true}},
+                               Json{{"type", "any"}, {"disable_parallel_tool_use", true}}}) {
+        body["tool_choice"]            = choice;
+        const GenerationRequest single = parse(body).generation;
+        failures += check(single.uses_tools() && !single.parallel_tool_calls,
+                          "disable_parallel_tool_use did not limit the response to one call");
+    }
+    body["tool_choice"] = Json{{"type", "auto"}, {"disable_parallel_tool_use", false}};
+    failures += check(parse(body).generation.parallel_tool_calls,
+                      "disable_parallel_tool_use=false limited the response to one call");
+    body["tool_choice"] = Json{{"type", "auto"}, {"disable_parallel_tool_use", "yes"}};
+    failures += check(!api_param([&] { (void)parse(body); }).empty(),
+                      "a non-boolean disable_parallel_tool_use was accepted");
 
     body          = base_request();
     body["tools"] = Json::array({Json{{"type", "web_search_20250305"}, {"name", "web_search"}}});
