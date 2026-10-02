@@ -19,6 +19,7 @@
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
 #include "models/qwen3_5/program/prefix_identity.h"
+#include "models/qwen3_5/program/shared_slot_release.h"
 #include "models/qwen3_5/program/planning/output_budget.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
 #include "models/qwen3_5/execution/text.h"
@@ -488,14 +489,6 @@ struct SharedPrefixState {
 inline bool is_pinned_graft(const SharedPrefixState& state) noexcept {
     return state.identity == nullptr;
 }
-
-enum class SharedPrefixSlotRole : std::uint8_t {
-    Free,
-    ReservedCapture,
-    ReservedReplacement,
-    Catalogued,
-    Pinned,
-};
 
 constexpr bool is_live_shared_prefix_role(SharedPrefixSlotRole role) noexcept {
     return role == SharedPrefixSlotRole::Catalogued || role == SharedPrefixSlotRole::Pinned;

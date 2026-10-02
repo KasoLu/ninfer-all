@@ -19,6 +19,9 @@ foreach(check lifecycle archive thinking stop_chat concurrent)
   set_tests_properties(ninfer_ngram_${check}_real PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
 
+ninfer_add_test(ninfer_shared_slot_release_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_shared_slot_release.cpp")
+
 ninfer_add_test(ninfer_qwen3_5_loading_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_real.cpp"
   LIBRARIES ninfer_model_loading)

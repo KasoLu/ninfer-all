@@ -852,17 +852,19 @@ void ProgramImpl::abort_active_capture(ActiveCaptureTransaction& transaction) no
     }
     if (transaction.shared_index && *transaction.shared_index < shared_prefix_capacity) {
         SharedPrefixSlot& slot = shared_prefix_slots[*transaction.shared_index];
-        if (transaction.replaces_shared && transaction.replacement_removed &&
-            slot.role == SharedPrefixSlotRole::ReservedCapture &&
-            slot.generation == transaction.replacement_generation) {
-            slot.role = SharedPrefixSlotRole::Free;
-        } else if (transaction.replaces_shared && !transaction.replacement_removed &&
-                   slot.role == SharedPrefixSlotRole::ReservedReplacement &&
-                   slot.generation == transaction.replacement_generation) {
-            slot.role = SharedPrefixSlotRole::Catalogued;
-        } else if (!transaction.replaces_shared &&
-                   slot.role == SharedPrefixSlotRole::ReservedCapture) {
-            slot.role = SharedPrefixSlotRole::Free;
+        // A reserved role of a transaction that goes away is never left reserved
+        // (shared_slot_release.h). A replacement flow keeps its generation guard: a slot that no
+        // longer carries the generation this transaction recorded is not its to dispose of.
+        const bool owned = !transaction.replaces_shared ||
+                           slot.generation == transaction.replacement_generation;
+        if (owned) {
+            switch (resolve_shared_slot_release(transaction.replacement_removed, slot.role)) {
+            case SharedSlotReleaseAction::Free: slot.role = SharedPrefixSlotRole::Free; break;
+            case SharedSlotReleaseAction::Catalogue:
+                slot.role = SharedPrefixSlotRole::Catalogued;
+                break;
+            case SharedSlotReleaseAction::Leave: break;
+            }
         }
     }
     transaction.prepared = false;
