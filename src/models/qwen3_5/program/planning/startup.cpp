@@ -388,9 +388,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const std::int32_t narrowest_drafts =
         *std::min_element(round_widths.begin(), round_widths.end()) - 1;
     const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
-    // Prefill chunks of 17 to 64 rows may take the chunked small-T route over a long context.
+    // Prefill chunks of 17 to 64 rows may take the chunked small-T route over a long context, and
+    // wider ones run the selected prompt kernel, whose fast NVFP4 form may split keys into
+    // workspace (see execution/text.cpp).
     const ops::CausalAttentionExecutionEnvelope prefill_envelope{
-        .min_visible_keys = 1, .max_visible_keys = plan.capacity, .small_prefill = true};
+        .min_visible_keys   = 1,
+        .max_visible_keys   = plan.capacity,
+        .fast_prompt_kernel = plan.fast_prefill_kernel,
+        .small_prefill      = true};
     const ops::CausalAttentionExecutionEnvelope verify_envelope{.min_visible_keys = 1,
                                                                 .max_visible_keys = plan.capacity,
                                                                 .wide_verification =

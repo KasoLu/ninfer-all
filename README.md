@@ -230,7 +230,10 @@ From other forks:
   64-key tile. This line extends it to `rk8v4` and the packed key codings and lets the device
   profile turn it on where it is faster (all three measured cards: 19 to 30% less prompt-attention
   time); `--fast-prefill-kernel` forces it. Quick-corpus perplexity at 64K on Ternary Bonsai 2 moves
-  from 5.2074 to 5.2079 (`rk8v4`), and the three needles at 131K are all found.
+  from 5.2074 to 5.2079 (`rk8v4`), and the three needles at 131K are all found. An `nvfp4` KV
+  cache on Blackwell has its own fast prompt kernel under the same switch, with QK on block-scaled
+  FP4 Tensor Cores straight from the stored codes (a two-term NVFP4 Q) past 2048 visible keys:
+  0.35-0.67x the tiled kernel's time per layer on RTX 5090, 3.5-14.4% faster prefill at 16K-64K.
 - **Agent-harness tool calls.** `<function name=...>`, `<invoke name=...>`, `<function_calls>` and
   `<param name=...>` are read as tool calls (upstream PR #300 by Pavel Kochubey, via Wallawalla47), next
   to the Qwen form, and go through the same recovery pass.

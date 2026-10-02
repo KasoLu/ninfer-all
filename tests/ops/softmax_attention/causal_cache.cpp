@@ -3872,6 +3872,42 @@ int run_nvfp4_prompt_cases() {
     return failures;
 }
 
+// The fast NVFP4 prompt kernel (Blackwell builds) over prompt-route widths above 2048 visible
+// keys: partial and full row blocks, launches over enough key pages to split them across CTAs
+// (including an envelope far past the populated keys, so late splits own no visible key), V
+// magnitudes whose group scales need its FP16-partial rescale, and a production prefill chunk
+// after a long history. Elsewhere the same cases exercise the tiled kernel.
+int run_nvfp4_fast_prompt_cases() {
+    constexpr KvCacheStorage storage = KvCacheStorage::Nvfp4Group16;
+    int failures                     = 0;
+    const auto fast                  = [](AttentionCase test_case) {
+        test_case.fast_prompt_kernel = true;
+        return test_case;
+    };
+    const auto values = [&](AttentionCase test_case, float amplitude) {
+        test_case.value_scale = amplitude;
+        return fast(test_case);
+    };
+    for (const Geometry& geometry : kGeometries) {
+        failures += run_a1_case(geometry, storage, fast({256, 4000, 4256, 920u}),
+                                MappingPattern::Fragmented);
+        failures += run_a3_case(geometry, storage, fast({300, 1900, 8192, 921u}),
+                                MappingPattern::Offset);
+        failures += run_a1_case(geometry, storage, fast({1100, 3000, 4100, 922u, false, true}),
+                                MappingPattern::Identity);
+    }
+    const Geometry& h24 = kGeometries[0];
+    // |V| up to 900 gives rotated V group scales around 150-250, above the kernel's unscaled limit
+    // of 128; |V| up to 2048 reaches the largest UE4M3 scales.
+    failures += run_a1_case(h24, storage, values({300, 2000, 2300, 923u}, 900.0f),
+                            MappingPattern::Identity);
+    failures += run_a3_case(h24, storage, values({400, 1800, 2200, 924u}, 2048.0f),
+                            MappingPattern::Fragmented);
+    failures += run_a1_case(h24, storage, fast({4096, 8192, 8192 + 4096, 925u}),
+                            MappingPattern::Fragmented);
+    return failures;
+}
+
 // K8V4 decode attention (small_t, T<=6) dequantizes its FP8 key plane to BF16 before ordinary MMA
 // (same fallback pattern as plain FP8 above) and is ported to sm_86/sm_89; its value plane
 // (NVFP4) was already portable. The prompt (T>6) kernel still needs the same QK matmul rewrite as
@@ -3997,6 +4033,9 @@ int run_softmax_attention_nvfp4_tests() {
     failures += run_case_allowing_arch_skip(
         "causal_softmax_attention nvfp4 independent correctness (prompt)",
         [] { return run_nvfp4_prompt_cases(); });
+    failures += run_case_allowing_arch_skip(
+        "causal_softmax_attention nvfp4 independent correctness (fast prompt)",
+        [] { return run_nvfp4_fast_prompt_cases(); });
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " causal_softmax_attention nvfp4 independent correctness\n";
     return failures == 0 ? 0 : 1;

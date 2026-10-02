@@ -2,6 +2,7 @@
 
 // ninfer::ops::detail - private launch prototypes for causal_softmax_attention policies.
 
+#include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -20,7 +21,8 @@ inline constexpr std::int32_t kPromptWaveRows = 128;
 
 // Whether a prompt call on this storage takes the fast kernel (register-resident rows, FP16 PV per
 // 64-key tile): when the caller asks for it (--fast-prefill-kernel), else as NINFER_PROMPT_FAST=0|1
-// or the device profile's "attn_prompt_fast" says. Storages outside the INT8 family never do.
+// or the device profile's "attn_prompt_fast" says. Of the other storages only NVFP4-G16 has one
+// (prompt_nvfp4_fast.cuh, Blackwell builds, over more than 2048 visible keys).
 [[nodiscard]] bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested);
 
 struct CausalSmallTInvocation {
@@ -149,6 +151,18 @@ void causal_attention_prompt_nvfp4_launch(const Tensor& q, const Tensor& k, cons
 void causal_attention_prompt_nvfp4_attention_launch(const Tensor& q, const Tensor& positions,
                                                     float scale, const PagedKVLayerView& cache,
                                                     Tensor& out, cudaStream_t stream);
+
+// The fast NVFP4 prompt kernel (block-scaled FP4 QK, V decoded in registers; Ian Ranson's
+// prompt_nvfp4_fast.cuh) over keys already in the cache. A single-row launch whose row blocks alone
+// would leave SMs idle splits its keys across CTAs into `workspace`. Blackwell (120a) builds only;
+// causal_attention_prompt_nvfp4_fast_applies() is false everywhere else.
+void causal_attention_prompt_nvfp4_fast_launch(const Tensor& q, const Tensor& positions,
+                                               const Tensor* valid_columns,
+                                               const Tensor* table_rows, float scale,
+                                               PagedKVBatchLayerView cache,
+                                               std::uint32_t max_visible_keys,
+                                               WorkspaceArena& workspace, Tensor& out,
+                                               cudaStream_t stream);
 
 void causal_attention_prompt_k8v4_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                          const Tensor& positions, const Tensor& valid_columns,

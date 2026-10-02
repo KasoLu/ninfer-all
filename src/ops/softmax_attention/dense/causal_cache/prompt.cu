@@ -224,7 +224,8 @@ bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested)
                            storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
                            storage == KvCacheStorage::RotatedLloyd4KeyInt4Value ||
                            storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8 ||
-                           storage == KvCacheStorage::RotatedE8RootKeyInt4Value;
+                           storage == KvCacheStorage::RotatedE8RootKeyInt4Value ||
+                           storage == KvCacheStorage::Nvfp4Group16;
     if (!supported) { return false; }
     if (requested) { return true; }
     static const int forced = [] {

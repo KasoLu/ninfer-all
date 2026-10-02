@@ -9,6 +9,7 @@
 #include "ops/kv_cache/append/launch.h"
 #include "ops/kv_cache/d256_profile.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast_plan.h"
 
 #include <algorithm>
 #include <cmath>
@@ -53,6 +54,23 @@ void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
           (geometry.query_heads == 16 && geometry.kv_heads == 2))) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
+}
+
+// Whether a prompt-route launch over this cache runs the fast NVFP4 kernel: NVFP4-G16 storage on a
+// Blackwell build, the fast prompt kernel selected (--fast-prefill-kernel, NINFER_PROMPT_FAST or the
+// profile's attn_prompt_fast), more than 2048 visible keys and a single query row.
+bool prompt_nvfp4_fast(KvCacheStorage storage, CausalAttentionExecutionEnvelope envelope,
+                       std::int32_t batch_size) {
+#if defined(NINFER_SM120_NVFP4)
+    return storage == KvCacheStorage::Nvfp4Group16 && batch_size == 1 &&
+           detail::causal_attention_prompt_fast_kernel(storage, envelope.fast_prompt_kernel) &&
+           detail::nvfp4_fast_prompt_applies(envelope.max_visible_keys);
+#else
+    (void)storage;
+    (void)envelope;
+    (void)batch_size;
+    return false;
+#endif
 }
 
 void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
@@ -618,6 +636,20 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
             maximum = std::max(maximum, exact_capacity(width));
         }
     }
+    if (prompt_nvfp4_fast(cache_storage, envelope, batch_size)) {
+        // The fast NVFP4 prompt kernel's split partials: its plan picks the split count from the
+        // visible keys of each launch, so reserve the most any split count within its 64 MiB
+        // budget can take at the widest width rather than the count the envelope's keys select.
+        constexpr std::size_t kSplitBudgetBytes = std::size_t{64} << 20;
+        std::size_t split_bytes                 = 0;
+        for (std::int32_t splits = 2; splits <= 16; ++splits) {
+            const std::size_t bytes =
+                detail::rotated_fast_prompt_split_bytes(q_heads, max_width, splits);
+            if (bytes > kSplitBudgetBytes) { break; }
+            split_bytes = bytes;
+        }
+        maximum = std::max(maximum, split_bytes);
+    }
     return maximum;
 }
 
@@ -679,6 +711,17 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         if (gate != nullptr && !fusable) { sigmoid_mul(*gate, out, stream); }
         return;
     }
+#if defined(NINFER_SM120_NVFP4)
+    if (prompt_nvfp4_fast(cache.storage, envelope, batch)) {
+        detail::kv_cache_append_batch_launch(k, v, positions, valid_columns, kv_table_rows, cache,
+                                             stream);
+        detail::causal_attention_prompt_nvfp4_fast_launch(
+            q, positions, valid_columns.data == nullptr ? nullptr : &valid_columns,
+            &kv_table_rows, scale, cache, envelope.max_visible_keys, workspace, out, stream);
+        if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
+        return;
+    }
+#endif
     detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                            cache, out, envelope.fast_prompt_kernel, stream);
     if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
@@ -708,6 +751,14 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
             q, positions, scale, cache, envelope, partial.acc, partial.m, partial.l, out, stream);
         return;
     }
+#if defined(NINFER_SM120_NVFP4)
+    if (prompt_nvfp4_fast(cache.storage, envelope, 1)) {
+        detail::causal_attention_prompt_nvfp4_fast_launch(
+            q, positions, nullptr, nullptr, scale, single_row_paged_kv_batch_view(cache),
+            envelope.max_visible_keys, workspace, out, stream);
+        return;
+    }
+#endif
     detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, out,
                                                      envelope.fast_prompt_kernel, stream);
 }
