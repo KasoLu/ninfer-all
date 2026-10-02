@@ -80,7 +80,7 @@ void nvfp4_attn_input_fused_rmsnorm_launch(const Tensor&, const Tensor&, float, 
 namespace unified {
 
 void launch_nvfp4_a4_quantize(const Tensor&, const Weight&, Nvfp4A4Workspace, Nvfp4ScaleLayout,
-                              cudaStream_t) {
+                              cudaStream_t, bool) {
     reject_nvfp4_a4();
 }
 
