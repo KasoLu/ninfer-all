@@ -227,7 +227,7 @@ void run(QType qtype, std::int32_t n, std::int32_t k,
          const ninfer::bench::SweepOptions& base) {
     const std::int32_t max_tokens = *std::max_element(base.tokens.begin(), base.tokens.end());
     ninfer::bench::PackedQuantizedWeight packed =
-        ninfer::bench::make_row_split_weight(qtype, n, k, k, {0x31, 0xa5, 0x3c00});
+        ninfer::bench::make_row_split_weight(qtype, n, k, k);
     ninfer::DeviceBuffer input(static_cast<std::size_t>(k) * max_tokens * 2);
     ninfer::DeviceBuffer output(static_cast<std::size_t>(n) * max_tokens * 2);
 

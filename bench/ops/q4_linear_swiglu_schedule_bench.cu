@@ -105,8 +105,8 @@ int main(int argc, char** argv) {
     if (tokens.empty()) { tokens = {1, 2, 4, 8, 16, 20, 24, 28, 32, 36, 40, 44, 48, 56, 64}; }
 
     const std::int32_t max_tokens = *std::max_element(tokens.begin(), tokens.end());
-    ninfer::bench::PackedQuantizedWeight packed = ninfer::bench::make_row_split_weight(
-        QType::Q4_G64_FP16, kGateUpRows, kHidden, kHidden, {0x31, 0xa5, 0x3c00});
+    ninfer::bench::PackedQuantizedWeight packed =
+        ninfer::bench::make_row_split_weight(QType::Q4_G64_FP16, kGateUpRows, kHidden, kHidden);
     ninfer::DeviceBuffer input(static_cast<std::size_t>(kHidden) * max_tokens * 2);
     ninfer::DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_tokens * 2);
     ninfer::DeviceBuffer flush(kFlushBytes);

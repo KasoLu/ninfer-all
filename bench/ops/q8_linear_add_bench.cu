@@ -157,8 +157,8 @@ int main(int argc, char** argv) {
         ninfer::DeviceBuffer input =
             bench::make_bf16(static_cast<std::size_t>(options.hidden) * max_t);
         ninfer::DeviceBuffer residual = bench::make_bf16(static_cast<std::size_t>(kRows) * max_t);
-        bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
-            QType::Q8_G32_FP16, kRows, options.hidden, options.hidden, {0x31, 0x00, 0x3c00});
+        bench::PackedQuantizedWeight packed =
+            bench::make_row_split_weight(QType::Q8_G32_FP16, kRows, options.hidden, options.hidden);
         const std::size_t workspace_capacity = ops::linear_add_workspace_capacity_bytes(
             QType::Q8_G32_FP16, kRows, options.hidden, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));

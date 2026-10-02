@@ -100,10 +100,10 @@ int main(int argc, char** argv) {
     constexpr std::int32_t parent_rows = q_rows + kv_rows;
     const std::int32_t max_tokens      = *std::max_element(tokens.begin(), tokens.end());
 
-    ninfer::bench::PackedQuantizedWeight qk = ninfer::bench::make_row_split_weight(
-        QType::Q4_G64_FP16, parent_rows, hidden, hidden, {0x31, 0x00, 0x3c00});
-    ninfer::bench::PackedQuantizedWeight gv = ninfer::bench::make_row_split_weight(
-        QType::Q5_G64_FP16, parent_rows, hidden, hidden, {0x31, 0xa5, 0x3c00});
+    ninfer::bench::PackedQuantizedWeight qk =
+        ninfer::bench::make_row_split_weight(QType::Q4_G64_FP16, parent_rows, hidden, hidden);
+    ninfer::bench::PackedQuantizedWeight gv =
+        ninfer::bench::make_row_split_weight(QType::Q5_G64_FP16, parent_rows, hidden, hidden);
 
     ninfer::DeviceBuffer input(static_cast<std::size_t>(hidden) * max_tokens * 2);
     ninfer::DeviceBuffer q(static_cast<std::size_t>(q_rows) * max_tokens * 2);

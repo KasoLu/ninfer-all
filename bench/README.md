@@ -268,6 +268,21 @@ entry retains the preceding numerical layer. After real-scenario acceptance, a m
 promote quantized values into the C++ table. The detailed `--json` report is diagnostic provenance
 and is not a runtime input.
 
+## Op benchmark fixtures and cold cache
+
+Op benchmark operands are reproducible pseudo-random data, never constant byte patterns. BF16/FP32
+activations hash every element index with a per-operand seed, and `bench/ops/quantized_weight.cuh`
+packs format-correct random weights: signed per-group codes in the RowSplit low/high planes (Q4,
+Q5, Q6, Q8, T2) with FP16 scales, random E2M1 codes with swizzled E4M3 group scales for NVFP4, and
+E4M3 codes with BF16 row scales for FP8. Constant weights compress, cache and toggle differently
+from a checkpoint and draw less power, which on Ampere can raise clocks; route tables tuned on
+them were tuned on a workload the Engine never runs.
+
+A cold sample evicts L2 by reading a 256 MiB buffer (`bench::flush_l2`). Writing it, as the
+harness did before, left an L2-sized dirty working set whose write-back DRAM traffic was charged
+to the measured Op. Timings taken before this change, with constant weights or write eviction,
+are not directly comparable to new ones.
+
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
@@ -357,7 +372,7 @@ calls reuse cached inputs. These rows are labeled `cold-before-graph-bundle` and
 percentages and the DRAM memory floor. Multiple calls are for timing and cannot be combined with
 `--profile`, which always captures one complete public call.
 
-Every ordinary sample is cold-cache: a 256 MiB L2 eviction write completes before the timed
+Every ordinary sample is cold-cache: a 256 MiB L2 eviction read completes before the timed
 interval. Reported effective bandwidth uses the encoded weight planes once, one BF16 activation
 read, and one BF16 output write. Reported FLOPs are the mathematical `2*N*K*T`; neither metric
 copies route-private tile, replay, padding, split, schedule, host-launcher, or kernel-instance
@@ -376,7 +391,7 @@ Q8 and row-FP8 full heads and the mapped Q4 optimized head. Its independent matr
 positive `--columns U` also exercises larger matrices; `--columns U,...` selects a representative
 set without a full sweep. Codes and stored scales vary across the physical head, including signs,
 so ranking is not timed only on identical weight rows. Each sample replays the complete Op in a
-CUDA Graph after a 256 MiB L2 eviction write; projection, partial-key reduction, workspace counter
+CUDA Graph after a 256 MiB L2 eviction read; projection, partial-key reduction, workspace counter
 initialization, and final ids/scores publication are included. Defaults are 8 warmups and 60 samples.
 Reported logical bandwidth counts the encoded head once, useful FLOPs count candidate-eligible rows, and
 workspace bytes and Graph nodes describe the actual public call. These are Op measurements.
@@ -395,7 +410,7 @@ cmake --build build -j --target ninfer_benches
 `ninfer_candidate_selector_bench` measures the complete public conditional selector for
 `K=1..15`, `B=1..8`, 16 candidates and rank 256, with full BF16 codebooks `[256,248320]`.
 The default sweep covers all K/B pairs in greedy, stochastic and mixed modes (B=1 omits the
-redundant mixed case). Each cold-cache CUDA Graph sample follows a 256 MiB L2 eviction write.
+redundant mixed case). Each cold-cache CUDA Graph sample follows a 256 MiB L2 eviction read.
 It reports the selected route's required caller workspace and actual Graph node count. The timed
 interval includes all device work of the complete public Op; fixture allocation and setup are outside it.
 

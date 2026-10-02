@@ -76,13 +76,9 @@ void run(Profile profile, std::int32_t columns, int warmup, int repeat) {
                                      : profile == Profile::Fp8 ? QType::FP8_E4M3FN_ROW_BF16
                                                                : QType::Q4_G64_FP16;
 
-    PackedQuantizedWeight packed =
-        profile == Profile::Fp8
-            ? make_fp8_weight(rows, kHidden)
-            : make_row_split_weight(qtype, rows, kHidden, kHidden,
-                                    QuantizedWeightFill{profile == Profile::Q4 ? std::uint8_t{0x11}
-                                                                               : std::uint8_t{0x01},
-                                                        0, 0x3c00});
+    PackedQuantizedWeight packed = profile == Profile::Fp8
+                                       ? make_fp8_weight(rows, kHidden)
+                                       : make_row_split_weight(qtype, rows, kHidden, kHidden);
     varied_codes<<<4096, 256>>>(static_cast<std::uint8_t*>(packed.storage.p), packed.low_bytes,
                                 profile);
     varied_scales<<<1024, 256>>>(

@@ -97,10 +97,10 @@ struct Fixture {
     DeviceBuffer unary_scores{host_unary.size() * sizeof(float)};
     DeviceBuffer projected_hidden = make_bf16(static_cast<std::size_t>(kRank) * kMaxSteps * 8);
     DeviceBuffer anchors{host_anchors.size() * sizeof(std::int32_t)};
-    DeviceBuffer predecessor_codebook{static_cast<std::size_t>(kRank) * kCodebookRows *
-                                      sizeof(std::uint16_t)};
-    DeviceBuffer successor_codebook{static_cast<std::size_t>(kRank) * kCodebookRows *
-                                    sizeof(std::uint16_t)};
+    DeviceBuffer predecessor_codebook =
+        make_bf16(static_cast<std::size_t>(kRank) * kCodebookRows, 0xc0deb00aU);
+    DeviceBuffer successor_codebook =
+        make_bf16(static_cast<std::size_t>(kRank) * kCodebookRows, 0xc0deb00bU);
     DeviceBuffer base_positions{host_positions.size() * sizeof(std::int32_t)};
     DeviceBuffer configs{8 * sizeof(ops::SamplingConfig)};
     DeviceBuffer drafts{static_cast<std::size_t>(kMaxSteps) * 8 * sizeof(std::int32_t)};
@@ -125,8 +125,6 @@ struct Fixture {
         unary_scores.copy_from_host(host_unary.data(), unary_scores.bytes);
         anchors.copy_from_host(host_anchors.data(), anchors.bytes);
         base_positions.copy_from_host(host_positions.data(), base_positions.bytes);
-        CUDA_CHECK(cudaMemset(predecessor_codebook.p, 0x3f, predecessor_codebook.bytes));
-        CUDA_CHECK(cudaMemset(successor_codebook.p, 0x3f, successor_codebook.bytes));
     }
 
     void set_mode(Mode mode, std::int32_t batch_size) {

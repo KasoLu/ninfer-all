@@ -181,9 +181,8 @@ int main(int argc, char** argv) {
         DeviceBuffer input =
             bench::make_bf16(static_cast<std::size_t>(problem.hidden) * (*maximum));
         DeviceBuffer output(static_cast<std::size_t>(problem.output_rows) * (*maximum) * 2);
-        auto packed =
-            bench::make_row_split_weight(QType::Q8_G32_FP16, problem.gate_up_rows, problem.hidden,
-                                         problem.hidden, {0x31, 0x00, 0x3c00});
+        auto packed         = bench::make_row_split_weight(QType::Q8_G32_FP16, problem.gate_up_rows,
+                                                           problem.hidden, problem.hidden);
         const auto capacity = ops::linear_swiglu_workspace_capacity_bytes(
             QType::Q8_G32_FP16, problem.gate_up_rows, problem.hidden, ops::LinearPolicy::A16Only,
             *minimum, *maximum);

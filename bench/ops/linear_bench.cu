@@ -545,8 +545,7 @@ LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
         throw std::overflow_error("padded K does not fit int32");
     }
     bench::PackedQuantizedWeight packed =
-        bench::make_row_split_weight(qtype, n, k, static_cast<std::int32_t>(padded_k_u64),
-                                     bench::QuantizedWeightFill{0x31, 0xa5, 0x3c00});
+        bench::make_row_split_weight(qtype, n, k, static_cast<std::int32_t>(padded_k_u64));
     const std::uint64_t model_bytes = packed.model_weight_bytes();
     return {std::move(packed.storage), packed.weight, model_bytes};
 }

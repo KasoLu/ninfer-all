@@ -535,26 +535,24 @@ Weight dense_weight(void* data, std::int32_t rows, std::int32_t columns) {
 // the routed gate/up plane carries one divisor per 512 rows, and routed down one per 2048. A shared
 // bank is one matrix and keeps a single divisor. Only NVFP4 stores divisors at all.
 bench::PackedQuantizedWeight make_expert_plane(QType qtype, std::int32_t n, std::int32_t k,
-                                               bench::QuantizedWeightFill fill,
-                                               std::int32_t divisor_rows = 0) {
-    return qtype == QType::NVFP4 ? bench::make_nvfp4_weight(n, k, divisor_rows)
-                                 : bench::make_row_split_weight(qtype, n, k, k, fill);
+                                               std::uint64_t seed, std::int32_t divisor_rows = 0) {
+    return qtype == QType::NVFP4 ? bench::make_nvfp4_weight(n, k, divisor_rows, seed)
+                                 : bench::make_row_split_weight(qtype, n, k, k, seed);
 }
 
 class BenchmarkWeights {
 public:
     BenchmarkWeights(CodecProfile profile, std::uint32_t seed, std::size_t flush_bytes)
         : router_(static_cast<std::size_t>(kRouterRows) * kHidden * 2),
-          routed_gate_(make_expert_plane(gate_codec(profile), kExperts * 1024, kHidden,
-                                         {static_cast<std::uint8_t>(0x31U ^ seed), 0xa5, 0x1401},
-                                         512)),
-          routed_down_(make_expert_plane(
-              down_codec(profile), kExperts * kHidden, kIntermediate,
-              {static_cast<std::uint8_t>(0x59U ^ (seed >> 8)), 0x6d, 0x1403}, kIntermediate * 4)),
-          shared_gate_(
-              make_expert_plane(shared_codec(profile), 1024, kHidden, {0x27, 0x00, 0x1405})),
+          routed_gate_(
+              make_expert_plane(gate_codec(profile), kExperts * 1024, kHidden, 0x31U ^ seed, 512)),
+          routed_down_(make_expert_plane(down_codec(profile), kExperts * kHidden, kIntermediate,
+                                         0x59U ^ (static_cast<std::uint64_t>(seed) << 8),
+                                         kIntermediate * 4)),
+          shared_gate_(make_expert_plane(shared_codec(profile), 1024, kHidden,
+                                         0x27U ^ (static_cast<std::uint64_t>(seed) << 16))),
           shared_down_(make_expert_plane(shared_codec(profile), kHidden, kIntermediate,
-                                         {0x73, 0x00, 0x1407})),
+                                         0x73U ^ (static_cast<std::uint64_t>(seed) << 24))),
           flush_(flush_bytes) {
         std::vector<std::uint16_t> router(static_cast<std::size_t>(kRouterRows) * kHidden,
                                           bench::f32_to_bf16(0.0F));
@@ -563,7 +561,6 @@ public:
         }
         router[static_cast<std::size_t>(kExperts) * kHidden + kExperts] = bench::f32_to_bf16(4.0F);
         router_.copy_from_host(router.data(), router_.bytes);
-        CUDA_CHECK(cudaMemset(flush_.p, 0xa5, flush_.bytes));
 
         weights_ = {
             dense_weight(router_.p, kRouterRows, kHidden),
@@ -577,9 +574,7 @@ public:
 
     [[nodiscard]] const ops::SparseMoeWeights& weights() const noexcept { return weights_; }
 
-    void flush(cudaStream_t stream) {
-        CUDA_CHECK(cudaMemsetAsync(flush_.p, 0xa5, flush_.bytes, stream));
-    }
+    void flush(cudaStream_t stream) { bench::flush_l2(flush_, stream); }
 
 private:
     DeviceBuffer router_;

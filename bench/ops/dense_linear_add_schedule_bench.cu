@@ -50,8 +50,8 @@ using Q8Mma = void (*)(bool, const Tensor&, const Weight&, Tensor&, cudaStream_t
 
 void sweep_q8(std::int32_t hidden, const ninfer::bench::SweepOptions& base) {
     const std::int32_t max_tokens = *std::max_element(base.tokens.begin(), base.tokens.end());
-    ninfer::bench::PackedQuantizedWeight packed = ninfer::bench::make_row_split_weight(
-        QType::Q8_G32_FP16, kRows, hidden, hidden, {0x31, 0x00, 0x3c00});
+    ninfer::bench::PackedQuantizedWeight packed =
+        ninfer::bench::make_row_split_weight(QType::Q8_G32_FP16, kRows, hidden, hidden);
     ninfer::DeviceBuffer input(static_cast<std::size_t>(hidden) * max_tokens * 2);
     ninfer::DeviceBuffer residual(static_cast<std::size_t>(kRows) * max_tokens * 2);
 
@@ -134,8 +134,8 @@ void sweep_q8(std::int32_t hidden, const ninfer::bench::SweepOptions& base) {
 void sweep_q4(const ninfer::bench::SweepOptions& base) {
     constexpr std::int32_t kHidden = 6144;
     const std::int32_t max_tokens  = *std::max_element(base.tokens.begin(), base.tokens.end());
-    ninfer::bench::PackedQuantizedWeight packed = ninfer::bench::make_row_split_weight(
-        QType::Q4_G64_FP16, kRows, kHidden, kHidden, {0x31, 0xa5, 0x3c00});
+    ninfer::bench::PackedQuantizedWeight packed =
+        ninfer::bench::make_row_split_weight(QType::Q4_G64_FP16, kRows, kHidden, kHidden);
     ninfer::DeviceBuffer input(static_cast<std::size_t>(kHidden) * max_tokens * 2);
     ninfer::DeviceBuffer residual(static_cast<std::size_t>(kRows) * max_tokens * 2);
 

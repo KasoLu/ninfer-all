@@ -169,8 +169,8 @@ int main(int argc, char** argv) {
         // contents: LinearAdd accumulates, and an accumulated operand is not the operand the
         // benchmark claims to measure.
         DeviceBuffer residual_init = bench::make_bf16(static_cast<std::size_t>(kRows) * max_t);
-        bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
-            QType::Q5_G64_FP16, kRows, options.hidden, options.hidden, {0x31, 0xa5, 0x3c00});
+        bench::PackedQuantizedWeight packed =
+            bench::make_row_split_weight(QType::Q5_G64_FP16, kRows, options.hidden, options.hidden);
 
         const std::size_t workspace_capacity = ops::linear_add_workspace_capacity_bytes(
             QType::Q5_G64_FP16, kRows, options.hidden, min_t, max_t);
