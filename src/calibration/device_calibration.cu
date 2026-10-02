@@ -842,6 +842,63 @@ void calibrate_attention(ops::DeviceRouteProfile& profile, Timer& timer,
             profile.routes[fast.key] = std::move(fast_bands);
             ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
         }
+        // Parallel query tiles against the serial chunks for single-row verification: 16 and 32
+        // columns (two and four 8-column tiles) at 32K and 131K of context. The serial and the
+        // tiled workspaces differ, so the arena takes the larger of the two.
+        constexpr std::int32_t kTiledWidth = 32;
+        const ops::CausalAttentionExecutionEnvelope verify_envelope{
+            .min_visible_keys = 1,
+            .max_visible_keys = static_cast<std::uint32_t>(max_window),
+            .wide_verification = true,
+        };
+        const auto verify_capacity = [&] {
+            return ops::causal_softmax_attention_workspace_capacity_bytes(
+                geometry, storage, verify_envelope, 1, 1, kTiledWidth);
+        };
+        std::size_t tiled_bytes = verify_capacity();
+        {
+            auto probe = std::make_shared<ops::DeviceRouteProfile>(profile);
+            probe->routes["attn_parallel_tiles"] = {ops::DeviceRouteBand{1, "on"}};
+            ops::install_device_route_profile(probe);
+            tiled_bytes = std::max(tiled_bytes, verify_capacity());
+            ops::install_device_route_profile(
+                std::make_shared<const ops::DeviceRouteProfile>(profile));
+        }
+        WorkspaceArena tiled_workspace(tiled_bytes);
+        const auto verify = [&](std::int32_t tokens, std::int32_t depth, cudaStream_t stream) {
+            std::vector<std::int32_t> host(static_cast<std::size_t>(tokens));
+            for (std::int32_t token = 0; token < tokens; ++token) {
+                host[static_cast<std::size_t>(token)] = depth - tokens + token;
+            }
+            CUDA_CHECK(cudaMemcpyAsync(prompt_positions.p, host.data(),
+                                       host.size() * sizeof(std::int32_t), cudaMemcpyHostToDevice,
+                                       stream));
+            Tensor qt(prompt_q.p, DType::BF16, {head_dim, q_heads, tokens});
+            Tensor ot(prompt_out.p, DType::BF16, {head_dim, q_heads, tokens});
+            Tensor pt(prompt_positions.p, DType::I32, {tokens});
+            auto scope = tiled_workspace.scope();
+            ops::causal_softmax_attention_cached(qt, pt, geometry, 0.0625f, cache_view(max_window),
+                                                 verify_envelope, tiled_workspace, ot, stream);
+        };
+        const Family tiles{"attn_parallel_tiles",
+                           {1},
+                           [&](std::int32_t, cudaStream_t stream) {
+                               verify(16, 32768, stream);
+                               verify(kTiledWidth, 32768, stream);
+                               verify(16, 131072, stream);
+                               verify(kTiledWidth, 131072, stream);
+                           },
+                           [&](std::int32_t) {
+                               return std::pair<const void*, std::size_t>{
+                                   prompt_out.p,
+                                   static_cast<std::size_t>(head_dim) * q_heads * kTiledWidth};
+                           },
+                           {}};
+        auto tile_bands = sweep(tiles, timer, options);
+        if (!tile_bands.empty()) {
+            profile.routes[tiles.key] = std::move(tile_bands);
+            ops::install_device_route_profile(std::make_shared<const ops::DeviceRouteProfile>(profile));
+        }
     }
 
     for (std::int32_t width = 1; width <= 8; ++width) {

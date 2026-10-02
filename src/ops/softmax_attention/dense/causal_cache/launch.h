@@ -54,6 +54,27 @@ void causal_attention_small_t_launch(const Tensor& q, const Tensor& k, const Ten
                                      Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
                                      Tensor& out, cudaStream_t stream, const void* gate = nullptr);
 
+// Parallel query tiles for a single row's chunked small-T width over an INT8-family cache: the
+// tile width (0 when off) whose tiles run as the batch rows of one split-KV launch and one reduce,
+// after one batched append, instead of the serial fused chunks. Opt-in: NINFER_ATTN_PARALLEL_TILES
+// or the device profile's "attn_parallel_tiles".
+[[nodiscard]] std::int32_t causal_attention_parallel_tile_width(std::int32_t q_heads,
+                                                                std::int32_t width,
+                                                                std::int32_t batch_size,
+                                                                KvCacheStorage storage);
+
+// Runs those tiles over keys already in the cache. tile_valid (only with valid_columns) and
+// tile_rows hold one I32 per tile; the partials are sized for tile_width columns, the split
+// capacity of that width at batch = tiles, and tiles batch rows.
+void causal_attention_small_t_tiles_launch(const Tensor& q, const Tensor& positions,
+                                           const Tensor* valid_columns, const Tensor* table_rows,
+                                           float scale, PagedKVBatchLayerView cache,
+                                           CausalAttentionExecutionEnvelope envelope,
+                                           std::int32_t tile_width, Tensor& tile_valid,
+                                           Tensor& tile_rows, Tensor& partial_acc,
+                                           Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                                           cudaStream_t stream, const void* gate = nullptr);
+
 void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& positions, float scale,
                                             const PagedKVLayerView& cache,
                                             CausalAttentionExecutionEnvelope envelope,

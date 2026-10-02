@@ -63,6 +63,8 @@ std::vector<RouteCatalogEntry> build_catalog() {
     add("attn_pv_f16", {"on"});
     add("attn_pack_gqa", {"on"});
     add("attn_prompt_fast", {"on"});
+    // Parallel query tiles for single-row chunked small-T widths, measured on rk8v4.
+    add("attn_parallel_tiles", {"on"});
 
     // Small-T attention launch tiers for 24 query heads over 4 KV heads, per KV coding and query
     // width: the tier list depends on how many 16-row tiles the width's query rows fill.
