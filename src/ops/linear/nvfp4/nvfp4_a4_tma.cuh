@@ -21,12 +21,15 @@
 
 namespace ninfer::ops::detail::unified {
 
-struct alignas(128) Nvfp4A4TmaDescriptors {
+// Passed by value as a __grid_constant__ kernel parameter; see Bf16TmaDescriptors for why the
+// struct states 64-byte alignment (MSVC C2719) instead of 128.
+struct alignas(64) Nvfp4A4TmaDescriptors {
     CUtensorMap a_codes;
     CUtensorMap b_codes;
     CUtensorMap a_scales;
     CUtensorMap b_scales;
 };
+static_assert(alignof(Nvfp4A4TmaDescriptors) % 64 == 0);
 
 inline void nvfp4_check_driver(CUresult status, const char* operation) {
     if (status == CUDA_SUCCESS) { return; }
