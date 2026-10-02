@@ -10,6 +10,7 @@
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/tool_call_parser.h"
 #include "models/qwen3_5/frontend/ngram_sources.h"
+#include "models/qwen3_5/program/prefix/block_keys.h"
 #include "text/unicode.h"
 #include "text/structured_output.h"
 #include <mutex>
@@ -314,6 +315,16 @@ fi::ChatRenderOptions render_options(const PromptOptions& options,
                                    .forced_tool_name          = options.forced_tool_name};
     rendered.cache_markers.assign(cache_markers.begin(), cache_markers.end());
     return rendered;
+}
+
+// The request's live ngram index over its final prompt tokens and tool sources, built on the
+// preparing thread so the Engine worker only moves it into the admitted request.
+void build_ngram_index(PreparedPromptData& prompt) {
+    auto index = std::make_unique<detail::NgramProposer>();
+    index->set_boundaries(prompt.ngram_boundaries);
+    index->ingest(prompt.token_ids);
+    for (const auto& source : prompt.ngram_sources) { index->ingest(source); }
+    prompt.ngram_index = std::move(index);
 }
 
 std::uint32_t checked_token_count(std::size_t count) {
@@ -1236,6 +1247,11 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         impl_->long_anchor_min_spacing_tokens,
         (graft && !is_direct_graft) ? graft_context_slots(*graft) : 0U,
         is_direct_graft ? graft_context_slots(*graft) : 0U);
+    if (impl_->ngram_sources_enabled) {
+        fi::check_preparation_control(control, "ngram index");
+        build_ngram_index(result);
+    }
+    detail::prompt_block_keys(result, result.block_hashes, result.block_extras);
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
@@ -1307,11 +1323,15 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     result.token_ids           = std::move(token_ids);
-    if (impl_->ngram_sources_enabled) { result.ngram_boundaries = impl_->ngram_boundaries; }
+    if (impl_->ngram_sources_enabled) {
+        result.ngram_boundaries = impl_->ngram_boundaries;
+        build_ngram_index(result);
+    }
     if (impl_->ngram_archive_enabled) {
         result.ngram_archive_sources.push_back({result.token_ids, NgramSourceKind::Text});
     }
     assign_text_positions(result);
+    detail::prompt_block_keys(result, result.block_hashes, result.block_extras);
     result.identity.reusable                  = allow_prefix_identity;
     result.context_cache.retention            = runtime::RetentionClass::RecentPrivate;
     result.context_cache.update_session_index = false;

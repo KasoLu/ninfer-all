@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <random>
 #include <set>
@@ -89,12 +90,33 @@ std::vector<NodeRef> insert_sequence(PrefixCacheIndex& index, RecordingBackend& 
 }
 
 SnapshotRef publish_tap(PrefixCacheIndex& index, NodeRef anchor) {
-    const auto slot = index.acquire_device_slot(false);
+    const auto slot = index.acquire_device_slot();
     require(slot.has_value(), "no device slot for a tap");
     const std::uint32_t frontier = (index.node(anchor).depth + 1U) * kBlockTokens;
     const PublishResult result =
         index.publish_snapshot(anchor, frontier, {}, std::nullopt, *slot, SnapshotKind::Tap);
     require(result.created, "tap snapshot not created");
+    index.check_invariants();
+    return result.snapshot;
+}
+
+// Publishes a snapshot at `frontier` of `tokens`, whose full blocks are `path`; a frontier inside
+// a block takes its tail from that block's tokens.
+SnapshotRef publish_at(PrefixCacheIndex& index, RecordingBackend& backend,
+                       const std::vector<NodeRef>& path, const std::vector<TokenId>& tokens,
+                       std::uint32_t frontier, SnapshotKind kind) {
+    const std::uint32_t full = frontier / kBlockTokens;
+    const std::uint32_t tail = frontier % kBlockTokens;
+    const auto slot          = index.acquire_device_slot();
+    require(slot.has_value(), "no device slot for a snapshot");
+    std::optional<std::uint32_t> tail_id;
+    if (tail != 0) { tail_id = backend.allocate(); }
+    const PublishResult result = index.publish_snapshot(
+        full == 0 ? NodeRef{} : path[full - 1], frontier,
+        std::span<const TokenId>(tokens.data() + static_cast<std::size_t>(full) * kBlockTokens,
+                                 tail),
+        tail_id, *slot, kind);
+    require(result.created, "snapshot not created");
     index.check_invariants();
     return result.snapshot;
 }
@@ -204,7 +226,7 @@ void test_collisions_and_tails() {
     prompt.insert(prompt.end(), tail_tokens.begin(), tail_tokens.end());
     prompt.push_back(7);
     prompt.push_back(8);
-    const auto slot             = index.acquire_device_slot(false);
+    const auto slot             = index.acquire_device_slot();
     const std::uint32_t tail_id = backend.allocate();
     const PublishResult endpoint =
         index.publish_snapshot(first.node, 74, tail_tokens, tail_id, *slot, SnapshotKind::Endpoint);
@@ -224,7 +246,7 @@ void test_collisions_and_tails() {
             "a different tail token must not match");
 
     // Duplicate publication frees the new slot and tail and returns the existing snapshot.
-    const auto slot2              = index.acquire_device_slot(false);
+    const auto slot2              = index.acquire_device_slot();
     const std::uint32_t tail_copy = backend.allocate();
     const PublishResult duplicate = index.publish_snapshot(first.node, 74, tail_tokens, tail_copy,
                                                            *slot2, SnapshotKind::Endpoint);
@@ -234,7 +256,7 @@ void test_collisions_and_tails() {
     require(index.stats().free_device_slots == 1, "duplicate staging slot was not freed");
     require_throws(
         [&] {
-            const auto s = index.acquire_device_slot(false);
+            const auto s = index.acquire_device_slot();
             (void)index.publish_snapshot(first.node, 75, tail_tokens, backend.allocate(), *s,
                                          SnapshotKind::Tap);
         },
@@ -366,13 +388,22 @@ void test_host_dead_and_gdsf() {
             "more valuable snapshots keep their host copies");
     require(index.stats().gdsf_inflation >= before, "GDSF inflation must be monotonic");
 
-    // A host-only snapshot chosen by host pressure is removed entirely.
-    const auto slot = index.acquire_device_slot(false);
-    require(slot.has_value() && index.valid(snap_b) &&
+    // Host pressure left a Device-only: it is lost when its slot is taken, so it goes before a
+    // backed owner gives up its Device copy, for a snapshot worth as much.
+    const auto slot = index.acquire_device_slot();
+    require(slot.has_value() && !index.valid(snap_a) && index.valid(snap_b) &&
+                index.snapshot(snap_b).device_slot != kNoId &&
+                index.snapshot(snap_c).device_slot != kNoId,
+            "the Device-only snapshot must lose its slot before a backed one");
+    // With no free or Device-only slot left, the least recently hit backed owner keeps only its
+    // Host copy.
+    const auto backed_slot = index.acquire_device_slot(0.0);
+    require(backed_slot.has_value() && index.valid(snap_b) && index.valid(snap_c) &&
                 (index.snapshot(snap_b).device_slot == kNoId ||
                  index.snapshot(snap_c).device_slot == kNoId),
-            "a backed device slot must be reclaimable");
+            "a backed device slot must be reclaimable whatever the claim");
     index.release_device_slot(*slot);
+    index.release_device_slot(*backed_slot);
     index.release_path(path_c);
     index.check_invariants();
 }
@@ -422,7 +453,7 @@ void test_persistence_roundtrip() {
     const SnapshotRef backed = publish_tap(source, path[1]);
     backup_snapshot(source, backed);
     const auto tail_tokens      = make_tokens(10, 41);
-    const auto slot             = source.acquire_device_slot(false);
+    const auto slot             = source.acquire_device_slot();
     const std::uint32_t tail_id = backend.allocate();
     const PublishResult endpoint =
         source.publish_snapshot(path[2], 202, tail_tokens, tail_id, *slot, SnapshotKind::Endpoint);
@@ -430,7 +461,7 @@ void test_persistence_roundtrip() {
     // A Device-only snapshot on an unbacked path is not persistable.
     const auto other      = make_tokens(64, 42);
     const auto other_path = insert_sequence(source, backend, other);
-    const auto other_slot = source.acquire_device_slot(true);
+    const auto other_slot = source.acquire_device_slot();
     require(other_slot.has_value(), "no slot for an unbacked snapshot");
     (void)source.publish_snapshot(other_path[0], 64, {}, std::nullopt, *other_slot,
                                   SnapshotKind::Tap);
@@ -498,7 +529,7 @@ void test_tail_device_fill() {
     const auto path   = insert_sequence(index, backend, tokens);
     backup_node(index, path[0]);
     const auto tail_tokens      = make_tokens(10, 32);
-    const auto slot             = index.acquire_device_slot(false);
+    const auto slot             = index.acquire_device_slot();
     const std::uint32_t tail_id = backend.allocate();
     const PublishResult endpoint =
         index.publish_snapshot(path[0], 74, tail_tokens, tail_id, *slot, SnapshotKind::Endpoint);
@@ -550,10 +581,10 @@ void test_device_slots() {
     const auto a             = make_tokens(64, 13);
     const auto path_a        = insert_sequence(index, backend, a);
     const SnapshotRef snap_a = publish_tap(index, path_a[0]);
-    require(!index.acquire_device_slot(false).has_value(),
-            "an unbacked slot must not be taken without permission");
+    require(!index.acquire_device_slot(0.0).has_value(),
+            "an unbacked slot must not be taken for a snapshot worth less");
     backup_snapshot(index, snap_a);
-    const auto slot = index.acquire_device_slot(false);
+    const auto slot = index.acquire_device_slot();
     require(slot.has_value(), "a backed slot must be reusable");
     require(index.valid(snap_a) && index.snapshot(snap_a).device_slot == kNoId,
             "the evicted slot's snapshot must survive host-only");
@@ -563,11 +594,187 @@ void test_device_slots() {
     const auto b             = make_tokens(64, 14);
     const auto path_b        = insert_sequence(index, backend, b);
     const SnapshotRef snap_b = publish_tap(index, path_b[0]);
-    const auto forced        = index.acquire_device_slot(true);
+    const auto forced        = index.acquire_device_slot();
     require(forced.has_value() && !index.valid(snap_b), "unbacked slot eviction loses its owner");
     index.release_device_slot(*forced);
     index.release_path(path_a);
     index.release_path(path_b);
+    index.check_invariants();
+}
+
+void test_supersession() {
+    RecordingBackend backend;
+    // 20 slabs: a tail-less image takes 4, an image with a tail 5.
+    PrefixCacheIndex index(small_config(20, 8), backend);
+    const auto tokens = make_tokens(64 * 12 + 1, 30);
+    const auto path   = insert_sequence(index, backend, tokens);
+    const SnapshotRef shared =
+        publish_at(index, backend, path, tokens, 64 * 2, SnapshotKind::Boundary);
+    const SnapshotRef first =
+        publish_at(index, backend, path, tokens, 64 * 3 + 10, SnapshotKind::Endpoint);
+    const SnapshotRef second =
+        publish_at(index, backend, path, tokens, 64 * 7 + 20, SnapshotKind::Endpoint);
+    // A second branch sharing five blocks continues past the boundary differently: from here on
+    // it serves two conversations.
+    std::vector<TokenId> other(tokens.begin(), tokens.begin() + 64 * 5);
+    const auto suffix = make_tokens(64 * 4 + 1, 31);
+    other.insert(other.end(), suffix.begin(), suffix.end());
+    const auto other_path = insert_sequence(index, backend, other);
+    index.supersede(shared);
+    require(!index.snapshot(shared).superseded,
+            "a boundary another conversation continued from must not be superseded");
+    index.supersede(first);
+    require(index.snapshot(first).superseded, "the resumed snapshot must be superseded");
+    index.note_hit(first);
+    require(!index.snapshot(first).superseded, "a hit must retain a superseded snapshot again");
+    // Hits make `first` the most valuable snapshot by GDSF; superseding it must still put it first.
+    for (int hit = 0; hit < 4; ++hit) { index.note_hit(first); }
+    index.supersede(first);
+    index.check_invariants();
+
+    // The second branch hangs below `first`, whose tail lies in a shared block.
+    const SnapshotRef branch =
+        publish_at(index, backend, other_path, other, 64 * 6 + 3, SnapshotKind::Endpoint);
+
+    for (const SnapshotRef snapshot : {shared, first, second, branch}) {
+        backup_snapshot(index, snapshot);
+    }
+    require(index.stats().host_free_slabs == 1, "the Host tier must be nearly full");
+    const SnapshotRef tip = publish_at(index, backend, path, tokens, 64 * 11, SnapshotKind::Tap);
+    backup_snapshot(index, tip);
+    require(!index.valid(first), "the superseded snapshot must be evicted first, entirely");
+    require(index.stats().superseded_evictions == 1 && index.stats().host_snapshot_evictions == 1,
+            "exactly one superseded eviction");
+    require(index.valid(shared) && index.valid(second) && index.valid(branch) && index.valid(tip),
+            "retained snapshots must survive");
+    index.release_path(path);
+    index.release_path(other_path);
+    index.check_invariants();
+}
+
+// Without a Host tier a slot's owner is lost when the slot is taken, so value decides (§9.2): a
+// short request's snapshot must not push out the one a long conversation resumes from, and a
+// snapshot worth less than every owner takes no slot.
+void test_unbacked_slot_values() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(0, 2), backend);
+    const auto long_tokens = make_tokens(64 * 20, 50);
+    const auto long_path   = insert_sequence(index, backend, long_tokens);
+    const SnapshotRef long_end =
+        publish_at(index, backend, long_path, long_tokens, 64 * 20, SnapshotKind::Endpoint);
+    const auto short_tokens = make_tokens(64 * 2, 51);
+    const auto short_path   = insert_sequence(index, backend, short_tokens);
+    const SnapshotRef short_end =
+        publish_at(index, backend, short_path, short_tokens, 64 * 2, SnapshotKind::Endpoint);
+
+    // Another short request's endpoint may take the short endpoint's slot, never the long one's.
+    const auto other      = make_tokens(64 * 2, 52);
+    const auto other_path = insert_sequence(index, backend, other);
+    const auto slot       = index.acquire_device_slot(index.estimate_priority(0, 128, false));
+    require(slot.has_value() && index.valid(long_end) && !index.valid(short_end),
+            "the least valuable unbacked snapshot must lose its slot first");
+    const SnapshotRef other_end =
+        index.publish_snapshot(other_path[1], 128, {}, std::nullopt, *slot, SnapshotKind::Endpoint)
+            .snapshot;
+    require(!index.acquire_device_slot(0.0).has_value() && index.valid(long_end) &&
+                index.valid(other_end),
+            "a snapshot worth less than every owner must not displace one");
+    index.release_path(long_path);
+    index.release_path(short_path);
+    index.release_path(other_path);
+    index.check_invariants();
+}
+
+// A snapshot's Host write only displaces snapshots worth no more than itself (§9.3): a tap just
+// past a conversation's boundary must not push another conversation's boundary out of the Host
+// tier. Rejected, it stays Device-only.
+void test_host_write_admission() {
+    RecordingBackend backend;
+    // 4 slabs: one tail-less image.
+    PrefixCacheIndex index(small_config(4, 4), backend);
+    const auto a      = make_tokens(64 * 8, 56);
+    const auto path_a = insert_sequence(index, backend, a);
+    const SnapshotRef valuable =
+        publish_at(index, backend, path_a, a, 64 * 8, SnapshotKind::Boundary);
+    backup_snapshot(index, valuable);
+    const auto b            = make_tokens(64 * 1, 57);
+    const auto path_b       = insert_sequence(index, backend, b);
+    const SnapshotRef cheap = publish_tap(index, path_b[0]);
+    index.pin_snapshot(cheap);
+    require(!index.begin_snapshot_host_fill(cheap),
+            "a snapshot worth less must not displace a Host snapshot worth more");
+    index.unpin_snapshot(cheap);
+    require(index.snapshot(valuable).host == CopyState::Resident &&
+                index.snapshot(cheap).host == CopyState::Absent,
+            "the rejected snapshot stays Device-only and the valuable one keeps its Host copy");
+    index.release_path(path_a);
+    index.release_path(path_b);
+    index.check_invariants();
+}
+
+// A boundary no other conversation continued from is just its lineage's snapshot: superseded
+// when the lineage moves past it, and retained again by a later hit.
+void test_unshared_boundary() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(20, 4), backend);
+    const auto tokens = make_tokens(64 * 6, 58);
+    const auto path   = insert_sequence(index, backend, tokens);
+    const SnapshotRef boundary =
+        publish_at(index, backend, path, tokens, 64 * 2 + 5, SnapshotKind::Boundary);
+    index.supersede(boundary);
+    require(index.snapshot(boundary).superseded,
+            "a boundary no other conversation shares must be superseded like any snapshot");
+    index.note_hit(boundary);
+    require(!index.snapshot(boundary).superseded, "a hit must retain it again");
+    index.release_path(path);
+    index.check_invariants();
+}
+
+// The production failure: a conversation resuming turn after turn under Host pressure, next to a
+// deep stale conversation. Each turn resumes from the previous turn's endpoint and publishes a
+// deeper one; the new endpoint must always survive to serve the next turn.
+void test_lineage_under_pressure() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(16, 4), backend);
+    const auto stale_tokens = make_tokens(64 * 40 + 1, 40);
+    const auto stale_path   = insert_sequence(index, backend, stale_tokens);
+    const SnapshotRef stale =
+        publish_at(index, backend, stale_path, stale_tokens, 64 * 40 - 7, SnapshotKind::Endpoint);
+    backup_snapshot(index, stale);
+    index.release_path(stale_path);
+
+    const auto tokens = make_tokens(64 * 30 + 1, 41);
+    const auto path   = insert_sequence(index, backend, tokens);
+    // An aligned tap early in the conversation (the Legacy valuation anchored every later
+    // endpoint to it and kept evicting them).
+    SnapshotRef resume = publish_at(index, backend, path, tokens, 64 * 4, SnapshotKind::Tap);
+    backup_snapshot(index, resume);
+    for (std::uint32_t turn = 1; turn <= 8; ++turn) {
+        const std::uint32_t frontier = 64 * 4 + turn * 200 + 13;
+        index.note_hit(resume);
+        const SnapshotRef tip =
+            publish_at(index, backend, path, tokens, frontier, SnapshotKind::Endpoint);
+        index.supersede(resume);
+        backup_snapshot(index, tip);
+        // Other traffic writes to the Host tier before this conversation's next turn arrives (a
+        // short new conversation here): that allocation used to evict the newest endpoint.
+        const auto noise_tokens = make_tokens(64 * 2 + 1, 100 + turn);
+        const auto noise_path   = insert_sequence(index, backend, noise_tokens);
+        backup_snapshot(index, publish_at(index, backend, noise_path, noise_tokens, 64 * 2 - 5,
+                                          SnapshotKind::Endpoint));
+        index.release_path(noise_path);
+        require(index.valid(tip) && index.snapshot(tip).host == CopyState::Resident,
+                "the newest endpoint must keep its Host copy");
+        const std::vector<TokenId> next(tokens.begin(), tokens.begin() + frontier + 50);
+        const auto hashes = block_lookup_hashes(next, {});
+        const MatchResult match =
+            index.match(next, hashes, {}, static_cast<std::uint32_t>(next.size()));
+        require(!match.candidates.empty() && match.candidates.front().snapshot == tip,
+                "the next turn must resume from the newest endpoint");
+        resume = tip;
+    }
+    require(index.stats().superseded_evictions >= 6, "superseded endpoints must make the room");
+    index.release_path(path);
     index.check_invariants();
 }
 
@@ -586,7 +793,7 @@ void test_image_only_host_tier() {
 
     // Endpoint with a tail; its host copy holds the image only.
     const auto tail_tokens      = make_tokens(10, 16);
-    const auto slot             = index.acquire_device_slot(false);
+    const auto slot             = index.acquire_device_slot();
     const std::uint32_t tail_id = backend.allocate();
     const PublishResult endpoint =
         index.publish_snapshot(path_a[0], 74, tail_tokens, tail_id, *slot, SnapshotKind::Endpoint);
@@ -624,6 +831,7 @@ void test_random_stress() {
             prompts.push_back(std::move(tokens));
         }
         std::vector<std::vector<NodeRef>> held;
+        std::vector<SnapshotRef> published_snapshots;
         for (int step = 0; step < 300; ++step) {
             const int op = static_cast<int>(rng() % 6U);
             if (op <= 1 && held.size() < 3) {
@@ -667,10 +875,15 @@ void test_random_stress() {
                         index.unpin_node(result.node);
                     }
                     if (rng() % 3U == 0) {
-                        if (const auto slot = index.acquire_device_slot(rng() % 2U)) {
+                        if (const auto slot = index.acquire_device_slot(
+                                rng() % 2U ? std::numeric_limits<double>::infinity() : 0.0)) {
                             const PublishResult published = index.publish_snapshot(
                                 result.node, (index.node(result.node).depth + 1U) * kBlockTokens,
-                                {}, std::nullopt, *slot, SnapshotKind::Tap);
+                                {}, std::nullopt, *slot,
+                                rng() % 4U == 0 ? SnapshotKind::Boundary : SnapshotKind::Tap);
+                            if (published.created) {
+                                published_snapshots.push_back(published.snapshot);
+                            }
                             if (published.created && rng() % 2U) {
                                 index.pin_snapshot(published.snapshot);
                                 if (index.begin_snapshot_host_fill(published.snapshot)) {
@@ -687,6 +900,16 @@ void test_random_stress() {
                 const std::size_t which = rng() % held.size();
                 index.release_path(held[which]);
                 held.erase(held.begin() + static_cast<std::ptrdiff_t>(which));
+            } else if (op == 4 && !published_snapshots.empty()) {
+                const SnapshotRef snapshot =
+                    published_snapshots[rng() % published_snapshots.size()];
+                if (index.valid(snapshot)) {
+                    if (rng() % 2U) {
+                        index.supersede(snapshot);
+                    } else {
+                        index.note_hit(snapshot);
+                    }
+                }
             } else {
                 (void)index.evict_device_blocks(1 + rng() % 8U);
             }
@@ -739,8 +962,24 @@ void test_tap_planner() {
             "the generation opener must be tapped exactly");
     require(find(taps, 100) && find(taps, 100)->placement == TapPlacement::Exact,
             "a structural hint must be tapped exactly");
+    require(find(taps, 100)->boundary && find(taps, 12345)->boundary &&
+                !find(taps, 30010)->boundary,
+            "structural and explicit taps are boundaries, the generation opener is not");
     require(!find(taps, 30019),
             "the prompt tail next to the generation opener covers nothing and must be dropped");
+    // A protocol-automatic marker is planned like a structural boundary but marks the latest turn,
+    // so its snapshot is supersedable; clustered with a shared boundary it stays shared.
+    const std::vector<TapHint> automatic{{3000, TapHintKind::Automatic},
+                                         {5000, TapHintKind::Automatic},
+                                         {5030, TapHintKind::Structural}};
+    const auto automatic_taps = plan_taps(8000, 0, automatic, {}, {}, config);
+    require(find(automatic_taps, 3000) &&
+                find(automatic_taps, 3000)->placement == TapPlacement::Exact &&
+                !find(automatic_taps, 3000)->boundary,
+            "an automatic marker must be tapped exactly and stay supersedable");
+    require(find(automatic_taps, 5000) && find(automatic_taps, 5000)->boundary &&
+                !find(automatic_taps, 5030),
+            "a cluster keeps its earliest position, shared when any member is");
     // n - 8192 = 21828: the boundary 28 tokens below is within the gap, so the ladder snaps.
     require(find(taps, 21800) && find(taps, 21800)->placement == TapPlacement::Flexible,
             "the ladder must snap to a nearby message boundary and stay flexible");
@@ -804,6 +1043,58 @@ void test_tap_planner() {
     require(plan_taps(1, 0, hints, {}, {}, config).empty(), "no taps for a 1-token prompt");
 }
 
+// A Host tier smaller than a saved one restores whole snapshots with their paths, most valuable
+// first, and never a block no chosen snapshot resumes through.
+void test_restore_plan() {
+    const PrefixIndexConfig config = small_config();
+    // Two lineages sharing blocks 0-1: 0-1-2-3-4 and 0-1-5-6-7-8-9.
+    const std::vector<std::int32_t> parents         = {-1, 0, 1, 2, 3, 1, 5, 6, 7, 8};
+    const std::vector<SavedSnapshotShape> snapshots = {
+        {.anchor = 4, .frontier = 5 * 64, .slabs = 4, .hits = 0},
+        {.anchor = 9, .frontier = 7 * 64 + 10, .slabs = 5, .hits = 5},
+        {.anchor = 1, .frontier = 2 * 64, .slabs = 4, .hits = 0},
+    };
+    const auto chosen_blocks = [](const HostRestorePlan& plan) {
+        std::vector<std::uint32_t> out;
+        for (std::uint32_t index = 0; index < plan.blocks.size(); ++index) {
+            if (plan.blocks[index]) { out.push_back(index); }
+        }
+        return out;
+    };
+
+    const HostRestorePlan all = plan_host_restore(parents, snapshots, 23, config);
+    require(all.slabs == 23 && chosen_blocks(all).size() == parents.size() &&
+                std::all_of(all.snapshots.begin(), all.snapshots.end(), [](bool b) { return b; }),
+            "a tier that holds the whole file must restore all of it");
+
+    // The blocks alone would fill 10 of these 12 slabs and leave no room for any image: the plan
+    // instead takes the most used snapshot and exactly its path.
+    const HostRestorePlan one = plan_host_restore(parents, snapshots, 12, config);
+    require(!one.snapshots[0] && one.snapshots[1] && !one.snapshots[2] && one.slabs == 12,
+            "a small tier must keep the most valuable snapshot");
+    require(chosen_blocks(one) == std::vector<std::uint32_t>{0, 1, 5, 6, 7, 8, 9},
+            "a small tier must restore exactly the kept snapshot's path");
+
+    // Shared path blocks are paid for once, and a snapshot that does not fit is passed over for a
+    // later one that does.
+    const HostRestorePlan two = plan_host_restore(parents, snapshots, 16, config);
+    require(!two.snapshots[0] && two.snapshots[1] && two.snapshots[2] && two.slabs == 16,
+            "a snapshot sharing a kept path must cost only its own slabs");
+
+    // Between otherwise equal snapshots, use decides.
+    const std::vector<std::int32_t> roots        = {-1, -1};
+    const std::vector<SavedSnapshotShape> equals = {
+        {.anchor = 0, .frontier = 64, .slabs = 4, .hits = 0},
+        {.anchor = 1, .frontier = 64, .slabs = 4, .hits = 3},
+    };
+    const HostRestorePlan used = plan_host_restore(roots, equals, 5, config);
+    require(!used.snapshots[0] && used.snapshots[1] && !used.blocks[0] && used.blocks[1],
+            "the more used of two equal snapshots must be kept");
+
+    require_throws([&] { (void)plan_host_restore(std::vector<std::int32_t>{0}, {}, 8, config); },
+                   "a block that is its own parent must be rejected");
+}
+
 } // namespace
 
 int main() {
@@ -815,9 +1106,15 @@ int main() {
         test_backed_before_unbacked();
         test_host_dead_and_gdsf();
         test_device_slots();
+        test_supersession();
+        test_lineage_under_pressure();
+        test_unbacked_slot_values();
+        test_host_write_admission();
+        test_unshared_boundary();
         test_host_only_reattach();
         test_tail_device_fill();
         test_persistence_roundtrip();
+        test_restore_plan();
         test_image_only_host_tier();
         test_random_stress();
         test_tap_planner();

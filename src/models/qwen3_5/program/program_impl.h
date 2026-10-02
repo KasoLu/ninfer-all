@@ -315,6 +315,7 @@ struct HybridPendingTap {
     std::uint32_t frontier = 0;
     StateImageHandle image;
     std::uint32_t slot = 0; // staging device snapshot slot
+    bool boundary      = false;
 };
 
 // Per-lane hybrid bookkeeping for the active sequence.
@@ -337,6 +338,16 @@ struct HybridLaneState {
     std::uint32_t last_capture = 0;
     // Deepest snapshot frontier known on this path (reused or created by this sequence).
     std::uint32_t deepest_snapshot = 0;
+    // The snapshot this sequence resumed from (invalid: root). Once the sequence publishes a
+    // deeper snapshot, its lineage resumes from that one and this one is superseded.
+    runtime::prefix_cache::SnapshotRef resume_snapshot;
+    std::uint32_t resume_frontier = 0;
+    // The newest Tap (not Boundary) this sequence published. A deeper tap of the same prompt
+    // supersedes it: the lineage resumes from the deeper one, and it only serves a request
+    // diverging between them. The endpoint does not, since a next turn whose template re-renders
+    // the reply resumes from the prompt-end tap.
+    runtime::prefix_cache::SnapshotRef tap_snapshot;
+    std::uint32_t tap_frontier = 0;
     // The Host restore this sequence was admitted from (0 without one). Its first prefill pass
     // queues behind the restore's per-layer events; releasing the lane queues behind the whole
     // restore if it may still be landing.
@@ -732,6 +743,12 @@ public:
                                    runtime::CancellationFlagView cancellation);
     [[nodiscard]] std::uint32_t hybrid_reclaim_device_kv(std::uint32_t main_pages,
                                                          std::uint32_t backend_pages);
+    // Prefetch for a waiting request (spec §6.6): blocks whose copy started, absent while a
+    // prefetch or an admission is still in flight.
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const PreparedPromptData& prompt,
+                                                               const RequestBasePlan& base);
+    // Device pages a prefetch could fill now: free ones and host-backed cached ones.
+    [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     // Installs the Engine's calibrated machine model for hybrid admission and eviction.
     void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);
@@ -741,7 +758,8 @@ public:
     }
 
     [[nodiscard]] HybridCachePersistence attach_hybrid_cache_file(const std::filesystem::path& path,
-                                                                  std::string fingerprint);
+                                                                  std::string fingerprint,
+                                                                  const StartupObserver& observer);
 
     [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const {
         return hybrid_shutdown_save_;
@@ -1278,16 +1296,15 @@ private:
     // Builds the lane from the staged, Device-resident source.
     [[nodiscard]] StartResult hybrid_activate(HybridMaterializationTransaction& transaction);
     void hybrid_abort_materialization(HybridMaterializationTransaction& transaction) noexcept;
-    void hybrid_prompt_keys(const PreparedPromptData& prompt, std::vector<std::uint64_t>& hashes,
-                            std::vector<std::uint64_t>& extras) const;
     [[nodiscard]] bool hybrid_make_room(std::uint32_t text_pages, std::uint32_t backend_pages);
     // The backend KV frontier restored with a snapshot at `frontier` (MTP trails by one token).
     [[nodiscard]] std::uint32_t hybrid_backend_frontier(std::uint32_t frontier) const noexcept;
     // Inserts every newly committed full block of the lane's sequence into the tree, then
     // publishes the pending taps those blocks complete.
     void hybrid_publish_blocks(SequenceState& sequence);
-    // Snapshots the lane's committed state at the prefill frontier `frontier`.
-    void hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier);
+    // Snapshots the lane's committed state at the prefill frontier `frontier`; a boundary tap is
+    // published as SnapshotKind::Boundary.
+    void hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier, bool boundary);
     // Realizes the planned taps a completed prefill chunk reached.
     void hybrid_after_prefill_chunk(SequenceState& sequence, std::uint32_t cursor,
                                     std::uint32_t prompt_tokens);
@@ -1297,12 +1314,17 @@ private:
     // Copies a tail bundle into cache-owned pages; absent when no Device page can be freed.
     [[nodiscard]] std::optional<std::uint32_t> hybrid_copy_tail(const HybridBlockPages& source,
                                                                 std::uint32_t columns);
-    // Terminal publication: committed blocks and, when useful, an endpoint snapshot. Then the
-    // lane's sequence is released. Returns false when the lane could not be released strictly.
+    // Terminal publication: committed blocks and, when useful, an endpoint snapshot; the snapshot
+    // the lane resumed from is superseded once a deeper one exists. Then the lane's sequence is
+    // released. Returns false when the lane could not be released strictly.
     [[nodiscard]] bool hybrid_finish_lane(SequenceState& sequence, RequestControl& request,
                                           std::uint32_t lane, bool endpoint) noexcept;
     // Drops the lane's index pins. Safe on any lane state.
     void hybrid_release_lane(std::uint32_t lane) noexcept;
+    // Supersedes the snapshot the sequence resumed from once it snapshots past it at
+    // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3).
+    void hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier);
+    void hybrid_supersede_tap(HybridLaneState& lane, std::uint32_t frontier);
 
     [[nodiscard]] std::optional<AdmissionCandidate>
     inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base,
@@ -1611,6 +1633,8 @@ private:
     [[nodiscard]] std::vector<NgramProposer::Match>
     propose_ngram(std::span<const std::uint32_t> lanes,
                   std::span<const runtime::RoundBudget> budgets);
+    // Moves the prepared prompt's ngram index and archive snapshot into an admitted request.
+    static void take_ngram_index(RequestControl& request, PreparedPromptData& prompt);
     [[nodiscard]] NgramProposer::Match propose_ngram_one(std::uint32_t lane,
                                                          const runtime::RoundBudget& budget);
     static void record_ngram_round(RequestControl& request, const NgramProposer::Match& match,

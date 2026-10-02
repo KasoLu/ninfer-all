@@ -14,6 +14,7 @@
 #include "runtime/engine/slot_spill_guard.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -296,18 +297,29 @@ public:
     ~Impl() noexcept {
         device.bind_to_current_thread_noexcept();
         const bool persists = persists_prefix_cache();
-        if (persists) {
-            runtime::publish_diagnostic(
-                options.diagnostic_observer, DiagnosticLevel::Info, "saving the prefix cache to %s",
-                options.context_cache.hybrid.persistent_file.string().c_str());
-        }
-        // The generation core's orderly stop saves the Host tier before it drops it.
+        stop();
+        // Joins the generation core's orderly stop, which saves the Host tier before dropping it.
         core.emplace<std::monostate>();
         stop_writer();
         try {
             device.synchronize();
         } catch (...) {}
         if (persists) { report_prefix_cache_save(); }
+    }
+
+    void stop() noexcept {
+        if (stop_requested.exchange(true)) { return; }
+        if (persists_prefix_cache()) {
+            runtime::publish_diagnostic(
+                options.diagnostic_observer, DiagnosticLevel::Info, "saving the prefix cache to %s",
+                options.context_cache.hybrid.persistent_file.string().c_str());
+        }
+        std::visit(
+            [](auto& state) {
+                using CoreState = std::remove_cvref_t<decltype(state)>;
+                if constexpr (!std::is_same_v<CoreState, std::monostate>) { state->stop(); }
+            },
+            core);
     }
 
     [[nodiscard]] bool persists_prefix_cache() const noexcept {
@@ -391,6 +403,7 @@ public:
     ModelMetadata model_metadata;
     ModelSamplingDefaults sampling_defaults;
     Core core;
+    std::atomic<bool> stop_requested{false};
     SlotSpillGuard spill_guard;
     std::mutex slot_io_mutex;
 
@@ -811,6 +824,10 @@ bool Engine::is_available() const {
             }
         },
         impl_->core);
+}
+
+void Engine::stop() noexcept {
+    if (impl_ != nullptr) { impl_->stop(); }
 }
 
 void Engine::reset_memory_peaks() noexcept {

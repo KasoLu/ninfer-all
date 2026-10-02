@@ -4,6 +4,7 @@
 #include "runtime/prefix_cache/tap_planner.h"
 
 #include "models/qwen3_5/frontend/frontend.h"
+#include "models/qwen3_5/program/ngram_proposer.h"
 
 #include <array>
 #include <cstddef>
@@ -153,6 +154,13 @@ struct PreparedPromptData {
     std::vector<TokenId> ngram_boundaries;
     std::vector<NgramSourceView> ngram_archive_sources;
     std::shared_ptr<const NgramSnapshot> ngram_snapshot;
+    // The request's live ngram index over token_ids and ngram_sources, present whenever ngram
+    // drafting is enabled. Preparation builds it so admission only moves it into the request.
+    std::unique_ptr<detail::NgramProposer> ngram_index;
+    // Hybrid prefix-cache lookup keys over token_ids (program/prefix/block_keys.h): one chained
+    // hash per full 64-token block and, with media, one cumulative Vision key per block.
+    std::vector<std::uint64_t> block_hashes;
+    std::vector<std::uint64_t> block_extras;
     std::vector<TokenId> token_ids;
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;

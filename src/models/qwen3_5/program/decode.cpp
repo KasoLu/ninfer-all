@@ -233,6 +233,15 @@ ProgramImpl::propose_ngram(std::span<const std::uint32_t> lanes,
     return matches;
 }
 
+void ProgramImpl::take_ngram_index(RequestControl& request, PreparedPromptData& prompt) {
+    if (!prompt.ngram_index) {
+        throw std::logic_error("prepared prompt carries no ngram index while ngram drafting is on");
+    }
+    request.ngram          = std::move(prompt.ngram_index);
+    request.ngram_indexed  = prompt.token_ids.size();
+    request.ngram_snapshot = std::move(prompt.ngram_snapshot);
+}
+
 NgramProposer::Match ProgramImpl::propose_ngram_one(std::uint32_t lane,
                                                     const runtime::RoundBudget& budget) {
     auto& request        = requests[lane];

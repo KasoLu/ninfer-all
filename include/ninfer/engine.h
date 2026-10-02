@@ -124,6 +124,12 @@ public:
 
     void reset_memory_peaks() noexcept;
 
+    // Begins the orderly stop without waiting for it: new work is refused, and queued and active
+    // generation requests end with an Unavailable error within one unit of work. A Generation
+    // Engine then saves its prefix cache file, when configured. Destruction waits for the stop.
+    // Idempotent and callable from any thread.
+    void stop() noexcept;
+
     // Session persistence for one private context-cache catalog cell (slot_states().size()
     // cells). save_slot writes the cell's retained session to `path`; restore_slot rebuilds the
     // cell from a saved file, evicting what it held; erase_slot evicts the cell's session and

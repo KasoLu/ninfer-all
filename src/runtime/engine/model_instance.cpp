@@ -576,15 +576,19 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         if (!file.empty()) {
             const models::qwen3_5::HybridCachePersistence loaded =
                 instance->program->attach_hybrid_cache_file(
-                    file, hybrid_cache_fingerprint(options, signature));
+                    file, hybrid_cache_fingerprint(options, signature), options.startup_observer);
             restore = LoadSummary::PrefixCacheRestore{
-                .attempted = true,
-                .restored  = loaded.ok,
-                .message   = loaded.message,
-                .blocks    = loaded.blocks,
-                .snapshots = loaded.snapshots,
-                .bytes     = loaded.bytes,
-                .seconds   = loaded.seconds,
+                .attempted           = true,
+                .restored            = loaded.ok,
+                .message             = loaded.message,
+                .blocks              = loaded.blocks,
+                .snapshots           = loaded.snapshots,
+                .bytes               = loaded.bytes,
+                .seconds             = loaded.seconds,
+                .saved_blocks        = loaded.saved_blocks,
+                .saved_snapshots     = loaded.saved_snapshots,
+                .required_host_bytes = loaded.required_host_bytes,
+                .host_bytes          = loaded.host_bytes,
             };
         }
     }

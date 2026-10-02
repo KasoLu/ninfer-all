@@ -242,6 +242,11 @@ struct HybridCachePersistence {
     std::uint64_t snapshots = 0;
     std::uint64_t bytes     = 0;
     double seconds          = 0.0;
+    // Load only: what the file holds and needs, against this Host tier.
+    std::uint64_t saved_blocks        = 0;
+    std::uint64_t saved_snapshots     = 0;
+    std::uint64_t required_host_bytes = 0;
+    std::uint64_t host_bytes          = 0;
 };
 
 struct HybridPrefixCacheStats {
@@ -1152,6 +1157,13 @@ public:
     // number of cached blocks released.
     [[nodiscard]] std::uint32_t hybrid_reclaim_device_kv(std::uint32_t main_pages,
                                                          std::uint32_t backend_pages);
+    // Copies Host-only blocks a waiting request resumes from into Device pages the pools can
+    // spare as cache (hybrid-prefix-cache-spec §6.6), so its admission restores less. Returns the
+    // blocks whose copy started; absent while a prefetch or an admission is still in flight.
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const PreparedPrompt& prompt,
+                                                               const RequestBasePlan& base);
+    // Device pages a prefetch could fill now: free ones and host-backed cached ones.
+    [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     // Installs the Engine's calibrated machine model for hybrid admission choice and eviction.
     void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);
@@ -1162,7 +1174,8 @@ public:
     // shutdown_cleanup saves the tier back to it. `fingerprint` names everything the saved bytes
     // depend on.
     [[nodiscard]] HybridCachePersistence attach_hybrid_cache_file(const std::filesystem::path& path,
-                                                                  std::string fingerprint);
+                                                                  std::string fingerprint,
+                                                                  const StartupObserver& observer);
     [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const;
 
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
