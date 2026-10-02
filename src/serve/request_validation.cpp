@@ -140,9 +140,10 @@ std::optional<SamplingParams> parse_post_thinking(const RequestJson& body, doubl
     out.presence_penalty  = ranged("presence_penalty", -2.0, 2.0);
     out.frequency_penalty = ranged("frequency_penalty", -2.0, 2.0);
     out.top_k             = optional_int(object, "top_k");
-    if (out.top_k && (*out.top_k < 0 || *out.top_k > 20)) {
-        bad_request("post_thinking.top_k must be in [0,20]", "post_thinking.top_k");
+    if (out.top_k && *out.top_k < 0) {
+        bad_request("post_thinking.top_k must not be negative", "post_thinking.top_k");
     }
+    if (out.top_k) { out.top_k = clamp_request_top_k(*out.top_k); }
     if (object.contains("seed") && !object.at("seed").is_null()) {
         const RequestJson& seed = object.at("seed");
         if (!seed.is_number_integer()) {

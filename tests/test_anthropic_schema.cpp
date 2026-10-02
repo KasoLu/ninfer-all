@@ -128,10 +128,22 @@ int test_envelope_and_field_policy() {
     body["temperature"] = 1.01;
     failures += check(api_param([&] { (void)parse(body); }) == "temperature",
                       "Anthropic temperature range was not enforced");
+    // top_k above the sampler's 20-candidate domain is clamped, not refused: llama.cpp and Ollama
+    // default to 40. Negative values are still an error.
+    for (const auto& [requested, effective] : {std::pair{40, 20}, std::pair{20, 20}}) {
+        body          = base_request();
+        body["top_k"] = requested;
+        failures += check(parse(body).generation.sampling.top_k == effective,
+                          "top_k above the candidate domain was not clamped to 20");
+    }
     body          = base_request();
-    body["top_k"] = 21;
+    body["top_k"] = -1;
     failures += check(api_param([&] { (void)parse(body); }) == "top_k",
-                      "Engine top_k range was not enforced");
+                      "negative top_k was accepted");
+    body                  = base_request();
+    body["post_thinking"] = Json{{"top_k", 64}};
+    failures += check(parse(body).generation.post_thinking->top_k == 20,
+                      "post_thinking top_k above the candidate domain was not clamped to 20");
     body                     = base_request();
     body["post_thinking"]    = Json{{"temperature", 0.2}, {"top_p", 0.9}};
     const auto post_thinking = parse(body).generation.post_thinking;
@@ -713,6 +725,9 @@ int test_content_and_cache_hints() {
                           translated.context_cache.markers[1].location ==
                               ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
                       "message-part cache boundary was not represented in PromptInput");
+    failures += check(request.allow_engine_automatic_shared_prefixes &&
+                          translated.context_cache.allow_engine_automatic_shared_prefixes,
+                      "automatic cache_control turned off Engine prefix discovery");
 
     body                           = base_request();
     body["messages"][0]["content"] = Json::array(

@@ -191,6 +191,18 @@ requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
 // bounding prompt rendering and the streaming parser.
 inline constexpr std::size_t kMaximumToolNameLength = 256;
 
+// The sampler's candidate domain: each block reduces its vocabulary tile to 20 candidates
+// (kSamplerFastCandidates), and the runtime contract accepts top_k in [1,20]. A request top_k above
+// it is clamped rather than refused: llama.cpp and Ollama default to 40 (Strata caps at 64), and
+// with top_p or min_p active over the full vocabulary the nucleus almost always closes inside 20
+// candidates, so the wider value selects the same token nearly always. The effective value is what
+// reaches the Engine and the request log. Negative values stay errors.
+inline constexpr int kSamplerTopKCap = 20;
+
+[[nodiscard]] constexpr int clamp_request_top_k(int top_k) noexcept {
+    return top_k > kSamplerTopKCap ? kSamplerTopKCap : top_k;
+}
+
 struct GenerationRequest {
     NgramSessionHints ngram_session;
     std::vector<ChatTurn> messages;

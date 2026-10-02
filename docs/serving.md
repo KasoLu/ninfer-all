@@ -585,7 +585,10 @@ The endpoint supports:
   processing without generation; llama.cpp's `-1` ("no limit", the WebUI's default) and omitting
   both apply the [default output limit](#default-output-limit);
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
-- the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
+- the compatible `top_k` and `min_p` (`0..1`) sampler extensions; `top_k` is a non-negative
+  integer, and a value above the sampler's 20-candidate domain is clamped to 20 rather than
+  rejected (llama.cpp and Ollama default to 40), on every endpoint and in `post_thinking`; the
+  request log records the effective value;
 - the `post_thinking` extension object (see [post-thinking sampling](#post-thinking-sampling));
 - up to four non-empty stop strings, applied to both reasoning and answer output;
 - the `ignore_eos` benchmarking extension shared with vLLM, SGLang and llama.cpp: a boolean,
@@ -1262,8 +1265,8 @@ explicitly.
 `max_tokens` is optional for local clients and otherwise uses the
 [default output limit](#default-output-limit); a positive
 value is the complete output budget. `max_tokens:0` is rejected because NInfer does not expose a
-completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k`, and
-`stop_sequences` enter Engine execution. A matched custom stop is returned as
+completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k` (clamped to 20
+like the OpenAI endpoints), and `stop_sequences` enter Engine execution. A matched custom stop is returned as
 `stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
 `model_context_window_exceeded`.
 
@@ -1299,7 +1302,9 @@ or imported conversation.
 Ephemeral `cache_control` on the request, tools, System blocks, and User text/image frontiers is a
 best-effort retention hint. NInfer maps representable breakpoints to exact prompt frontiers, keeps
 the latest markers allowed by the Engine configuration, and ignores TTL and unrepresentable cache
-hints rather than rejecting generation. Reuse still requires exact rendered-token compatibility;
+hints rather than rejecting generation. The Engine's own discovery of repeated prefixes (published
+after their second sighting) stays on beside the request-level automatic `cache_control` boundary,
+as on the OpenAI endpoints. Reuse still requires exact rendered-token compatibility;
 aggregate usage reports verified reused tokens in `cache_read_input_tokens` and leaves cache
 creation unknown. Streaming emits `message_start` after Engine admission commits the prefix
 selection and before transfer/prefill output, so its uncached/cache-read split is already exact;
