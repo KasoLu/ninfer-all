@@ -1453,9 +1453,17 @@ void ProgramImpl::resize_sequence_kv_entitlement(SequenceState& sequence, std::u
         (sequence.kv->backend.has_value() != (backend_pages != 0))) {
         throw std::invalid_argument("KV resize entitlement does not match the sequence bundle");
     }
+    // Both pools or neither: a backend pool that cannot follow returns the text entitlement it
+    // just grew, so the sequence never holds one pool's resize without the accounting for it.
+    const std::uint32_t previous_text = text_kv_addresses->entitlement(sequence.kv->text);
     text_kv_addresses->resize_entitlement(sequence.kv->text, text_pages);
     if (sequence.kv->backend) {
-        backend_kv_addresses->resize_entitlement(*sequence.kv->backend, backend_pages);
+        try {
+            backend_kv_addresses->resize_entitlement(*sequence.kv->backend, backend_pages);
+        } catch (...) {
+            text_kv_addresses->resize_entitlement(sequence.kv->text, previous_text);
+            throw;
+        }
     }
 }
 
@@ -1561,9 +1569,19 @@ void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_
                     : 0U,
         };
     };
-    const auto grow = [&](DeviceKVPages wanted) {
+    bool space_limited = false;
+    const auto grow    = [&](DeviceKVPages wanted) {
         if ((main_thin && wanted.main <= text_pages) ||
             (backend_thin && wanted.backend <= backend_pages)) {
+            return false;
+        }
+        // A saturated pool re-enters this ladder every round until the engine resumes the lease;
+        // a rung that cannot fit is found by arithmetic, not by an exception per rung, and is
+        // applied to both pools or neither.
+        if (!text_kv_addresses->can_resize_entitlement(sequence.kv->text, wanted.main) ||
+            (sequence.kv->backend && !backend_kv_addresses->can_resize_entitlement(
+                                         *sequence.kv->backend, wanted.backend))) {
+            space_limited = true;
             return false;
         }
         resize_sequence_kv_entitlement(sequence, wanted.main, wanted.backend);
@@ -1574,7 +1592,6 @@ void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_
         return true;
     };
     const std::uint32_t page = static_cast<std::uint32_t>(kPagedKVPageSize);
-    bool space_limited       = false;
     for (const std::uint32_t extra_tokens : {kv_lease_growth_margin_tokens(), 2U * page, page}) {
         try {
             if (grow(targets(extra_tokens))) { return; }
