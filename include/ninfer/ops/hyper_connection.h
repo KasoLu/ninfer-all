@@ -27,8 +27,8 @@ namespace ninfer::ops {
  *   mixed[d]  = (1 / n) * sum_c gate[c * hidden + d] * xn[c, d]               BF16 [hidden, tokens]
  *   inject[c] = 2 * sigmoid((inject . xn)[c] / n)                             FP32 [streams, tokens]
  *
- * and the write updates stack[c, d] += y[d] * inject[c] for the block output y (BF16
- * [hidden, tokens]). The oracle evaluates these in FP64 from the represented inputs; `mixed` is
+ * and the write updates stack[c, d] += y[d] * inject[c] for the block output y (BF16 or FP32
+ * [hidden, tokens]; the MoE's output is FP32). The oracle evaluates these in FP64 from the represented inputs; `mixed` is
  * compared after its BF16 store, `inject` and the written stack as FP32. Private arithmetic,
  * including the FP32 intermediates in workspace, is implementation-defined. The shapes this
  * implements are streams 4, hidden 2560 and lowrank 320.

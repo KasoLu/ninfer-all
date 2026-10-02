@@ -152,15 +152,19 @@ __global__ void __launch_bounds__(256)
     }
 }
 
+__device__ __forceinline__ float to_float(float value) { return value; }
+__device__ __forceinline__ float to_float(__nv_bfloat16 value) { return __bfloat162float(value); }
+
+template <typename Output>
 __global__ void __launch_bounds__(256)
-    hc_write_kernel(float* __restrict__ stack, const __nv_bfloat16* __restrict__ y,
+    hc_write_kernel(float* __restrict__ stack, const Output* __restrict__ y,
                     const float* __restrict__ inject_weights, std::int64_t elements) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= elements) { return; }
     const std::int64_t d      = i % kHidden;
     const std::int64_t column = i / kHidden; // t * streams + c
     const std::int64_t t      = column / kStreams;
-    stack[i] += __bfloat162float(y[t * kHidden + d]) * inject_weights[column];
+    stack[i] = fmaf(to_float(y[t * kHidden + d]), inject_weights[column], stack[i]);
 }
 
 void require(bool condition, const char* message) {
@@ -251,18 +255,25 @@ void hyper_connection_write(Tensor& stack, const Tensor& y, const Tensor& inject
             "stack must be contiguous FP32 [2560, 4, tokens]");
     const std::int32_t tokens = stack.ne[2];
     require(tokens > 0, "tokens must be positive");
-    require(y.dtype == DType::BF16 && y.is_contiguous() && y.data != nullptr &&
-                y.ne[0] == kHidden && y.ne[1] == tokens,
-            "y must be contiguous BF16 [2560, tokens]");
+    require((y.dtype == DType::BF16 || y.dtype == DType::FP32) && y.is_contiguous() &&
+                y.data != nullptr && y.ne[0] == kHidden && y.ne[1] == tokens,
+            "y must be contiguous BF16 or FP32 [2560, tokens]");
     require(inject_weights.dtype == DType::FP32 && inject_weights.is_contiguous() &&
                 inject_weights.data != nullptr && inject_weights.ne[0] == kStreams &&
                 inject_weights.ne[1] == tokens,
             "inject weights must be contiguous FP32 [4, tokens]");
     const std::int64_t elements = static_cast<std::int64_t>(kWidth) * tokens;
-    hc_write_kernel<<<static_cast<unsigned>(div_up(elements, std::int64_t{256})), 256, 0,
-                      stream>>>(static_cast<float*>(stack.data),
-                                static_cast<const __nv_bfloat16*>(y.data),
-                                static_cast<const float*>(inject_weights.data), elements);
+    const auto blocks = static_cast<unsigned>(div_up(elements, std::int64_t{256}));
+    if (y.dtype == DType::FP32) {
+        hc_write_kernel<<<blocks, 256, 0, stream>>>(static_cast<float*>(stack.data),
+                                                    static_cast<const float*>(y.data),
+                                                    static_cast<const float*>(inject_weights.data),
+                                                    elements);
+    } else {
+        hc_write_kernel<<<blocks, 256, 0, stream>>>(
+            static_cast<float*>(stack.data), static_cast<const __nv_bfloat16*>(y.data),
+            static_cast<const float*>(inject_weights.data), elements);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

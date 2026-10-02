@@ -176,6 +176,24 @@ int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed) {
         failures += verify_pointwise(label + " write",
                                      std::vector<double>(got_stack.begin(), got_stack.end()),
                                      written, {1.0e-4, 2.0e-5});
+        // And an FP32 block output (the MoE's) on top of it.
+        std::vector<float> y32(y.size());
+        fill_uniform(y32, seed + 6, -4.0f, 4.0f);
+        GuardedDeviceBuffer d_y32(y32.size() * 4);
+        d_y32.copy_from_host(y32.data(), d_y32.bytes());
+        Tensor t_y32(d_y32.data(), DType::FP32, {kHidden, tokens});
+        ops::hyper_connection_write(t_stack, t_y32, t_weights, nullptr);
+        cuda_synchronize();
+        for (std::size_t i = 0; i < written.size(); ++i) {
+            const std::size_t column = i / kHidden, t = column / kStreams;
+            written[i] = double(got_stack[i]) +
+                         double(y32[t * kHidden + i % kHidden]) * expected.inject[column];
+        }
+        const auto got_fp32 = from_device<float>(d_stack.data(), stack.size());
+        failures += verify_pointwise(label + " FP32 write",
+                                     std::vector<double>(got_fp32.begin(), got_fp32.end()),
+                                     written, {1.0e-4, 2.0e-5});
+        failures += d_y32.verify_guards(label.c_str());
     }
     for (auto* buffer : {&d_stack, &d_norm, &d_down, &d_up, &d_inject, &d_mixed, &d_weights, &d_y}) {
         failures += buffer->verify_guards(label.c_str());
