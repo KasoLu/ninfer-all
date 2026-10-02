@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ninfer/ops/rmsnorm_rope.h"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/rmsnorm.cuh"
 
@@ -18,7 +19,7 @@ __device__ __forceinline__ RmsnormRopeD256Head rmsnorm_rope_d256_normalize(
     const __nv_bfloat162* __restrict__ input, const __nv_bfloat162* __restrict__ weight,
     std::int64_t base, int lane) {
     constexpr int kHeadDim   = 256;
-    constexpr float kEpsilon = 1.0e-6F;
+    constexpr float kEpsilon = kRmsnormRopeEpsilon;
     __nv_bfloat162 values[4];
     __nv_bfloat162 weights[4];
     float sum = 0.0F;
