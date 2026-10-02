@@ -241,6 +241,25 @@ state advances only with Engine output commit, and is never restored from a prom
 DFlash/DFlash2 CUDA Graphs contain a host matcher node between draft generation and verification;
 this adds a CPU synchronization point and mask transfers per round. No speedup claim is implied.
 
+## Stop the server
+
+Press Ctrl+C twice to stop the server. The first press only shows a prompt on the console's bottom
+line, beneath the statistics panel: `Press Ctrl+C again within 5 s to save the prefix cache and
+close` (`… to close` without `--prefix-cache-file`). Without an interactive console, the prompt is
+logged as a warning. A second press within those 5 seconds stops the server; otherwise the prompt
+disappears and serving continues. Ctrl+Break (also what a parent process sends with
+`GenerateConsoleCtrlEvent`), closing the console window and `SIGTERM` stop at once.
+
+Stopping refuses new connections, and every running and queued request ends with an HTTP 503
+`service_unavailable` error, or an error event on a stream that has already started. The Engine
+then saves the prefix cache when `--prefix-cache-file` is set, while the bottom line shows
+`Closing: saving the prefix cache | Press Ctrl+C again to exit without saving`. The process exits
+after logging `server stopped` and the save result. One more Ctrl+C during the stop exits at once
+(exit code 130) without saving: an unfinished save stops, its temporary file is deleted, and the
+previous file is kept. Ctrl+C with console text selected only copies the text. Windows ends the
+process about 5 seconds after its console window is closed, so stop with Ctrl+C when a large Host
+tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
+
 ## Endpoints
 
 | Method and path | Behavior |
@@ -1492,7 +1511,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--cache-taps-per-request N` | hybrid: new prefill state snapshots per request (`0..64`) | `8`; `2` without a Host tier |
 | `--cache-tap-ladder N` | hybrid: history-snapshot ladder base G; flexible taps at `prompt − G·2^k` | `max(4096, 2 * prefill-chunk)` |
 | `--cache-tap-min-gap N` | hybrid: minimum tokens between ladder snapshots | `max(1024, prefill-chunk)` |
-| `--prefix-cache-file PATH` | hybrid: at startup, restore the Host tier from `PATH` if the file exists; on clean shutdown (Ctrl+C, Ctrl+Break, or closing the console window), save it there (every Host-backed snapshot and the block path it resumes through). Windows ends a closing console's process about 5 s after the close; a save still running then is abandoned and the previous file kept, so stop large caches with Ctrl+C. `PATH` may be relative (resolved against the launch directory) or absolute, e.g. `--prefix-cache-file "e:\NInfer-Deploy-V3\file.cache"`. Its directory must exist, and the flag needs a Host tier (not `--host-cache-mib 0`). A file written for another artifact, KV format, speculative backend, RoPE scaling or `ninfer-serve` binary is ignored and replaced at shutdown. The startup log reports what was restored. Saving writes up to `--host-cache-mib` of data. | off: nothing is saved or restored |
+| `--prefix-cache-file PATH` | hybrid: at startup, restore the Host tier from `PATH` if the file exists; when the server stops ([Stop the server](#stop-the-server)), save it there once running and queued requests are cancelled (every Host-backed snapshot and the block path it resumes through). A save cut short is abandoned and the previous file kept: one more Ctrl+C during the stop also deletes the unfinished `PATH.tmp`, while Windows ending a closed console's process about 5 s after the close leaves it until the next save, so stop large caches with Ctrl+C. `PATH` may be relative (resolved against the launch directory) or absolute, e.g. `--prefix-cache-file "e:\NInfer-Deploy-V3\file.cache"`. Its directory must exist, and the flag needs a Host tier (not `--host-cache-mib 0`). A file written for another artifact, KV format, speculative backend, RoPE scaling or `ninfer-serve` binary is ignored and replaced at shutdown. The startup log reports what was restored. Saving writes up to `--host-cache-mib` of data. | off: nothing is saved or restored |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |
 | `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |

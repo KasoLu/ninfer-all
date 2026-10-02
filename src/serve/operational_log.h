@@ -75,9 +75,10 @@ public:
     void server_urls(std::string_view host, int port, bool webui) const;
     void server_stopped() const;
     void server_failure(bool serving, std::string_view detail) const;
+    // Writes a record rendered elsewhere, such as the stop policy's (serve/stop_control.h).
+    void write(OperationalRecord record) const;
 
 private:
-    void write(OperationalRecord record) const;
 
     std::shared_ptr<spdlog::logger> logger_;
 };

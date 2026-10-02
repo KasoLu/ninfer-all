@@ -65,6 +65,9 @@ public:
     bool bind();
     void attach(GenerationService& service);
     bool listen();
+    // Closes the listening sockets and stops the attached service's Engine, whose queued and
+    // running requests then fail, so listen() returns within about one unit of Engine work.
+    // Does not block; callable from any thread.
     void stop();
 
     // Serve 503 while the Engine is still loading.

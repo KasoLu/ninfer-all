@@ -1007,6 +1007,7 @@ bool HttpServer::listen() {
 void HttpServer::stop() {
     stats_server_.stop();
     server_.stop();
+    if (service_ != nullptr) { service_->stop(); }
 }
 
 HttpServer::~HttpServer() {
