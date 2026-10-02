@@ -31,7 +31,7 @@ void launch_bf16_a16_gemv(const Bf16A16Operands& p, Output output, Epilogue epil
             throw std::invalid_argument("BF16 GEMV activation exceeds shared memory capacity");
         bytes = p.k * 2;
         if (bytes + static_bytes > 48 * 1024) {
-            configure_cuda_device_once([&] {
+            configure_cuda_device_once([&, kernel] {
                 return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                             max_dynamic);
             });
@@ -107,7 +107,7 @@ void launch_bf16_a16_sliced_k_mma(const Bf16A16Operands& p, Output output, Epilo
         throw std::invalid_argument("BF16 sliced-K requires complete row/K tiles");
     constexpr auto kernel = bf16_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue>;
     const int bytes       = bf16_prepare_shared<Schedule::kSharedBytes, kernel>();
-    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&, kernel](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
         kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.weight, output, epilogue, p.rows,
                                                             p.k, p.tokens, offset);
