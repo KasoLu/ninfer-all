@@ -1822,7 +1822,8 @@ void launch_sparse_moe_prefill_nvfp4(const __nv_bfloat16* input, const SparseMoe
             kernel<<<grid, Schedule::kThreads, nvfp4_w4a4_shared_bytes<Schedule>(kernel), stream>>>(
                     chunk, static_cast<const std::uint8_t*>(weights.shared_gate_up.qdata),
                     static_cast<const std::uint8_t*>(weights.shared_gate_up.scales), tokens, scale,
-                    epilogue, output, Rows{});
+                    epilogue, output, Rows{}, Nvfp4W4a4IdentityTokens{},
+                    Nvfp4W4a4MmaRasterRowFast{});
         };
         if (tokens < kNvfp4SharedSmallTokens) {
             launch(Nvfp4ScheduleTag<Nvfp4SharedGateUpSmallTSchedule>{});
@@ -1847,7 +1848,8 @@ void launch_sparse_moe_prefill_nvfp4(const __nv_bfloat16* input, const SparseMoe
             kernel<<<grid, Schedule::kThreads, nvfp4_w4a4_shared_bytes<Schedule>(kernel), stream>>>(
                 shared_middle, static_cast<const std::uint8_t*>(weights.shared_down.qdata),
                 static_cast<const std::uint8_t*>(weights.shared_down.scales), tokens, scale,
-                epilogue, output);
+                epilogue, output, Nvfp4W4a4IdentityRows{}, Nvfp4W4a4IdentityTokens{},
+                Nvfp4W4a4MmaRasterRowFast{});
         };
         if (tokens < kNvfp4SharedSmallTokens) {
             launch(Nvfp4ScheduleTag<Nvfp4SharedDownSmallTSchedule>{});

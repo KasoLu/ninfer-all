@@ -104,7 +104,7 @@ void launch_nvfp4_a4_mma(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace w
     kernel<<<grid, Schedule::kThreads, nvfp4_w4a4_shared_bytes<Schedule>(kernel), stream>>>(
         activation, static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
-        output);
+        output, Nvfp4W4a4IdentityRows{}, Nvfp4W4a4IdentityTokens{}, Nvfp4W4a4MmaRasterRowFast{});
     CUDA_CHECK(cudaGetLastError());
 #endif
 }

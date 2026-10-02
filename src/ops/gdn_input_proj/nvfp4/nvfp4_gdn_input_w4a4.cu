@@ -35,7 +35,8 @@ void launch_gemm(const Weight& weight, Tensor& qkv, Tensor& z, Nvfp4W4a4Workspac
         activation, static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
         Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),
-                            static_cast<__nv_bfloat16*>(z.data)});
+                            static_cast<__nv_bfloat16*>(z.data)},
+        Nvfp4W4a4IdentityRows{}, Nvfp4W4a4IdentityTokens{}, Nvfp4W4a4MmaRasterRowFast{});
     CUDA_CHECK(cudaGetLastError());
 }
 
