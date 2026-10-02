@@ -155,6 +155,12 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         return StartResult{.sequence = handle};
     } catch (...) {
         if (destination && *destination < max_concurrency) {
+            // Startup may have queued work on any stage's stream before a later publication check
+            // failed. Complete it before returning its buffers, pages or execution row to the
+            // pools; a device that cannot synchronize is past saving and the rethrow reports it.
+            try {
+                device.synchronize();
+            } catch (...) {}
             const std::uint32_t lane = *destination;
             if (active_continuations[lane] < continuation_capacity) {
                 clear_lane_best_effort(active_sequence(lane), requests[lane]);
@@ -777,6 +783,13 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
     }
     SequenceState& state = active_sequence(lane);
     const std::uint32_t continuation_index = active_continuations[lane];
+    // Cancellation can arrive after activation and before the first prefill unit has waited for
+    // its uploads and initialization, or with a chunk still running a step behind the host. Settle
+    // that work on every stage before any branch below releases, salvages or publishes the lane's
+    // pages; a device that cannot synchronize leaves the abort unconsumed for recovery.
+    try {
+        device.synchronize();
+    } catch (...) { return out; }
     if (hybrid_) {
         // The committed state is publishable as an endpoint when no model unit is in flight.
         out.timings     = request.timings;
