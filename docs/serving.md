@@ -272,8 +272,9 @@ without a protocol event. The comment is transport-only: SSE clients ignore it, 
 change generated text, event ordering, usage, stored Responses, or request logs. Anthropic Messages
 follows each comment with the protocol's `ping` event, which clients skip: a client that abandons a
 request whose first event is late does not count comments, so a queued or long-prefilling request
-would otherwise be dropped by it. On Linux, accepted
-connections also use TCP keepalive and a 15-second `TCP_USER_TIMEOUT`; together with the heartbeat,
+would otherwise be dropped by it. Accepted connections also use TCP keepalive and a 15-second
+retransmission limit (`TCP_USER_TIMEOUT` on Linux, `TCP_MAXRTMS` on Windows); together with the
+heartbeat,
 a dead or unacknowledging peer is normally cancelled within about 20 seconds, including while the
 request is waiting or prefilling. A peer whose TCP stack remains connected and acknowledges data
 cannot be distinguished from a reading application; proxies must close their upstream NInfer
