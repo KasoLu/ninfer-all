@@ -135,24 +135,27 @@ std::string render_tool_definition(const ToolDefinition& tool) {
     return Json{{"type", "function"}, {"function", std::move(function)}}.dump();
 }
 
-// Clients carry a wider effort vocabulary than the Qwen templates expose: OpenAI and Claude Code
-// send 'high', pi sends 'minimal' and 'max'. The maintained templates offer three rungs (low,
-// medium, xhigh) and raise on anything else, so the outer values collapse onto the nearest rung
-// rather than failing the request -- rejecting 'high' is what makes Claude Code unusable against a
-// stock Qwen3.8 template (QwenLM/Qwen3.8#217).
+// The wire value passes through unchanged. Templates accept different effort sets (the maintained
+// Qwen3.8 template only low, medium and xhigh) while clients send the standard vocabulary (OpenAI
+// and Claude Code 'high', pi 'minimal' and 'max'); the compiled template probes its accepted set
+// once and renders a rejected effort as the nearest accepted one, so every endpoint, the CLI and
+// chat_template_kwargs share one substitution that follows the selected template.
 ninfer::ReasoningEffort template_reasoning_effort(RequestedReasoningEffort effort) {
     switch (effort) {
     case RequestedReasoningEffort::None:
         return ninfer::ReasoningEffort::None;
     case RequestedReasoningEffort::Minimal:
+        return ninfer::ReasoningEffort::Minimal;
     case RequestedReasoningEffort::Low:
         return ninfer::ReasoningEffort::Low;
     case RequestedReasoningEffort::Medium:
         return ninfer::ReasoningEffort::Medium;
     case RequestedReasoningEffort::High:
+        return ninfer::ReasoningEffort::High;
     case RequestedReasoningEffort::XHigh:
-    case RequestedReasoningEffort::Max:
         return ninfer::ReasoningEffort::XHigh;
+    case RequestedReasoningEffort::Max:
+        return ninfer::ReasoningEffort::Max;
     }
     throw std::logic_error("invalid requested reasoning effort");
 }

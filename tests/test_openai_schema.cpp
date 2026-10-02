@@ -519,7 +519,7 @@ int test_tools() {
         plain["reasoning_effort"] = "high";
         const ResolvedPromptSemantics explicit_effort =
             resolve_prompt_semantics(parse(plain).generation, effort_server);
-        failures += check(explicit_effort.reasoning_effort == ninfer::ReasoningEffort::XHigh,
+        failures += check(explicit_effort.reasoning_effort == ninfer::ReasoningEffort::High,
                           "a request effort overrides the server default effort");
         plain.erase("reasoning_effort");
         plain["enable_thinking"] = false;
@@ -881,25 +881,26 @@ int test_reasoning_and_extensions() {
         check(api_error([&] { (void)parse(body); }).code == "mm_processor_kwargs_not_supported",
               "non-empty media processor kwargs rejected");
 
-    // Request efforts collapse onto the template's three rungs; Claude Code sends 'high'.
+    // Request efforts reach the template unchanged; the compiled template renders one it rejects
+    // as its nearest accepted effort. Claude Code sends 'high', pi 'minimal'.
     body                     = base_request();
     body["reasoning_effort"] = "high";
     ResolvedPromptSemantics resolved = semantics(parse(body).generation);
-    failures += check(resolved.reasoning_effort == ninfer::ReasoningEffort::XHigh &&
+    failures += check(resolved.reasoning_effort == ninfer::ReasoningEffort::High &&
                           resolved.enable_thinking == true,
-                      "request effort high did not select the xhigh rung");
+                      "request effort high did not reach the template unchanged");
     body["reasoning_effort"] = "minimal";
     failures += check(semantics(parse(body).generation).reasoning_effort ==
-                          ninfer::ReasoningEffort::Low,
-                      "request effort minimal did not select the low rung");
+                          ninfer::ReasoningEffort::Minimal,
+                      "request effort minimal did not reach the template unchanged");
 
-    // --default-reasoning-effort fills in for thinking requests that state no effort, collapsed
-    // alike, and is logged as the server's choice rather than the client's.
+    // --default-reasoning-effort fills in for thinking requests that state no effort, and is
+    // logged as the server's choice rather than the client's.
     ServeOptions server;
     server.default_reasoning_effort = RequestedReasoningEffort::Max;
     const GenerationRequest plain   = parse(base_request()).generation;
     resolved                        = resolve_prompt_semantics(plain, server);
-    failures += check(resolved.reasoning_effort == ninfer::ReasoningEffort::XHigh &&
+    failures += check(resolved.reasoning_effort == ninfer::ReasoningEffort::Max &&
                           resolved.enable_thinking == true &&
                           !resolved.requested_reasoning_effort.has_value(),
                       "server effort default did not apply to a request without one");

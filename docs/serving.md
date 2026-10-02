@@ -749,9 +749,18 @@ enforce its budget reports the requested value only. The server does not promise
 emit nonempty content or a tool call after the marker.
 
 For Chat Completions, `reasoning_effort: "none"` requests disabled thinking. The other standard
-values (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`) reach the template on its three rungs:
-`minimal` runs as `low`, `high` and `max` as `xhigh`, so clients such as Claude Code that send
-`high` work against the bundled Qwen templates.
+values (`minimal`, `low`, `medium`, `high`, `xhigh`, `max`) reach the template unchanged.
+
+Templates accept different subsets of those values: the official Qwen3.8 template raises for
+anything but `low`, `medium` and `xhigh`. NInfer renders each value once when the template loads,
+and a request for a value the template rejects renders with the nearest accepted value, a tie
+rounding up: on Qwen3.8, `high` and `max` render as `xhigh` and `minimal` as `low`, so clients such
+as Claude Code that send `high` work against it, while a template that accepts `high` receives it.
+This applies to every endpoint, `chat_template_kwargs.reasoning_effort`,
+`--default-reasoning-effort` and the CLI's `--reasoning-effort`. The values are tried on a
+one-message chat; a template that rejects every value, or cannot render that chat at all (one that
+requires a system message, for example), keeps the request's value and its error. Request logs
+record the effort the client asked for.
 
 `--default-reasoning-effort` sets the effort for requests that name none. It yields to everything
 the request decides: a request effort replaces it, and a request that disables thinking, forces a
@@ -1269,7 +1278,7 @@ signatures belong to the current serve process and are invalid after it restarts
 `display:"omitted"` is rejected because NInfer cannot provide Anthropic's
 encrypted hidden-reasoning restore semantics. `preserve_thinking` remains a NInfer extension for
 closed-turn reasoning history, and `graft` selects a [prompt graft](#prompt-grafts). `output_config.effort` passes its protocol-validated value to the
-selected template. `output_config.format` accepts `{"type":"json_schema","schema":{...}}`, enforced
+selected template, substituting the nearest value the template accepts as described above. `output_config.format` accepts `{"type":"json_schema","schema":{...}}`, enforced
 strictly (see [Structured output](#structured-output)); Count Tokens ignores it.
 
 User-defined, non-strict tools support `name`, `description`, object `input_schema`, and

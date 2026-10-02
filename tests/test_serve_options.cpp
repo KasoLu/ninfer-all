@@ -845,25 +845,24 @@ int main() {
     failures += check(resolve_prompt_semantics(request, configured).preserve_thinking == false,
                       "request preserve-thinking override did not win");
 
-    // Client effort vocabularies are wider than the three rungs the maintained Qwen templates
-    // accept: OpenAI and Claude Code send 'high', pi sends 'minimal' and 'max'. Those collapse
-    // onto the nearest rung rather than making the template raise.
-    const auto collapses = [&](RequestedReasoningEffort wire) {
+    // Client effort vocabularies are wider than the efforts a template may accept: OpenAI and
+    // Claude Code send 'high', pi sends 'minimal' and 'max'. Serving passes each through unchanged;
+    // the compiled template renders an effort it rejects as its nearest accepted one.
+    const auto resolved_effort = [&](RequestedReasoningEffort wire) {
         GenerationRequest aliased = GenerationRequest{};
         aliased.max_tokens        = 1;
         aliased.reasoning_effort  = wire;
         return resolve_prompt_semantics(aliased, defaults).reasoning_effort;
     };
-    failures += check(collapses(RequestedReasoningEffort::Minimal) == ninfer::ReasoningEffort::Low,
-                      "'minimal' did not collapse onto the template's low rung");
-    failures += check(collapses(RequestedReasoningEffort::High) == ninfer::ReasoningEffort::XHigh,
-                      "'high' did not collapse onto the template's xhigh rung");
-    failures += check(collapses(RequestedReasoningEffort::Max) == ninfer::ReasoningEffort::XHigh,
-                      "'max' did not collapse onto the template's xhigh rung");
-    failures += check(collapses(RequestedReasoningEffort::Medium) == ninfer::ReasoningEffort::Medium,
-                      "'medium' did not pass through unchanged");
-    failures += check(collapses(RequestedReasoningEffort::None) == ninfer::ReasoningEffort::None,
-                      "'none' did not pass through unchanged");
+    failures += check(
+        resolved_effort(RequestedReasoningEffort::Minimal) == ninfer::ReasoningEffort::Minimal &&
+            resolved_effort(RequestedReasoningEffort::Low) == ninfer::ReasoningEffort::Low &&
+            resolved_effort(RequestedReasoningEffort::Medium) == ninfer::ReasoningEffort::Medium &&
+            resolved_effort(RequestedReasoningEffort::High) == ninfer::ReasoningEffort::High &&
+            resolved_effort(RequestedReasoningEffort::XHigh) == ninfer::ReasoningEffort::XHigh &&
+            resolved_effort(RequestedReasoningEffort::Max) == ninfer::ReasoningEffort::Max &&
+            resolved_effort(RequestedReasoningEffort::None) == ninfer::ReasoningEffort::None,
+        "a requested effort did not reach the template unchanged");
 
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
