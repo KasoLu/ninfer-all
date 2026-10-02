@@ -4044,13 +4044,13 @@ int run_softmax_attention_nvfp4_tests() {
 // Parallel query tiles (attn_parallel_tiles): widths with an exact tile divisor run one batched
 // append, one multi-tile split-KV launch and one reduce; the rest keep the serial chunks. Both
 // must meet the same oracle, masks, gate and graph replay as the serial route.
-int run_parallel_tile_cases(KvCacheStorage storage) {
+int run_parallel_tile_cases(const CachePlan& plan) {
     const ops::DeviceRouteForce force("attn_parallel_tiles", "on");
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
         for (std::int32_t width : {9, 12, 16, 17, 24, 32, 48, 64}) {
             for (std::int32_t valid : {0, 1, width - 1, width}) {
-                failures += run_batch_case(geometry, storage,
+                failures += run_batch_case(geometry, plan,
                                            {width,
                                             {2048},
                                             {valid},
@@ -4059,7 +4059,7 @@ int run_parallel_tile_cases(KvCacheStorage storage) {
                                             static_cast<std::uint32_t>(2400 + width + valid),
                                             true});
             }
-            failures += run_a1_case(geometry, storage,
+            failures += run_a1_case(geometry, plan,
                                     {.tokens            = width,
                                      .base              = 8192,
                                      .envelope_max      = static_cast<std::uint32_t>(8192 + width),
@@ -4067,7 +4067,7 @@ int run_parallel_tile_cases(KvCacheStorage storage) {
                                      .graph_replay      = true,
                                      .wide_verification = true},
                                     MappingPattern::Fragmented);
-            failures += run_a3_case(geometry, storage,
+            failures += run_a3_case(geometry, plan,
                                     {.tokens            = width,
                                      .base              = 8192,
                                      .envelope_max      = static_cast<std::uint32_t>(8192 + width),
@@ -4089,10 +4089,6 @@ int run_softmax_attention_wide_tests() {
     for (const auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256}) {
         failures += run_wide_copy_cases(storage);
-    }
-    for (const auto storage :
-         {KvCacheStorage::Int8Group64, KvCacheStorage::RotatedInt8KeyInt4ValueGroup64}) {
-        failures += run_parallel_tile_cases(storage);
     }
     for (const auto storage : {KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
         failures += run_case_allowing_arch_skip("causal_softmax_attention wide copy (NVFP4 values)",
@@ -4344,5 +4340,16 @@ int run_softmax_attention_causal_cache_tests() {
     failures += run_batch_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " causal_softmax_attention public-contract correctness\n";
+    return failures == 0 ? 0 : 1;
+}
+
+int run_softmax_attention_parallel_tile_tests() {
+    if (cuda_unavailable()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
+    int failures = 0;
+    for (const CachePlan& plan : {kPlanInt8, kPlanRk8v4}) failures += run_parallel_tile_cases(plan);
+    std::cout << (failures == 0 ? "PASS" : "FAIL") << " parallel query tiles\n";
     return failures == 0 ? 0 : 1;
 }
