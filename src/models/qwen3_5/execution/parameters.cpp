@@ -155,6 +155,8 @@ public:
                                          }),
                             rotated_linear(w.down)};
         integer_route(out.gate_up, QType::Q4_G64_FP16, 34816, 5120);
+        // The Q4 down projection (Q4 imatrix recipes) reaches the same A8 add route as Q5.
+        integer_route(out.down, QType::Q4_G64_FP16, 5120, 17408);
         integer_route(out.down, QType::Q5_G64_FP16, 5120, 17408);
         integer_route(out.gate_up, QType::T2_G128_FP16, 34816, 5120);
         integer_route(out.down, QType::T2_G128_FP16, 5120, 17408);
