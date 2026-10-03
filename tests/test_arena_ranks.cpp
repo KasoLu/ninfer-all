@@ -4,6 +4,7 @@
 // Getting the rollback wrong hands out overlapping workspace, which corrupts silently, so the
 // switching rules are worth pinning down here rather than discovering them in a model.
 #include "core/arena.h"
+#include "cuda_availability.h"
 
 #include <cuda_runtime.h>
 
@@ -33,9 +34,7 @@ void check_throws(Fn&& fn, const char* message) {
     ++failures;
 }
 
-bool cuda_unavailable(cudaError_t err) {
-    return err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver;
-}
+using ninfer::test::cuda_unavailable;
 
 } // namespace
 

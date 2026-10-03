@@ -1,5 +1,6 @@
 #include "core/arena.h"
 #include "core/device.h"
+#include "cuda_availability.h"
 
 #include <cuda_runtime.h>
 
@@ -18,9 +19,7 @@ int fail(const char* message) {
     return 1;
 }
 
-bool cuda_unavailable(cudaError_t err) {
-    return err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver;
-}
+using ninfer::test::cuda_unavailable;
 
 template <typename Exception, typename Fn>
 int expect_throws(Fn&& fn, const char* label) {

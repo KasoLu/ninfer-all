@@ -1,6 +1,7 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "cuda_availability.h"
 
 #include <cuda_runtime.h>
 
@@ -10,9 +11,7 @@
 
 namespace {
 
-bool cuda_unavailable(cudaError_t err) {
-    return err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver;
-}
+using ninfer::test::cuda_unavailable;
 
 int expect_value(void* device, std::uint32_t expected, const char* label) {
     std::uint32_t actual  = 0;

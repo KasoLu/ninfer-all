@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "cuda_availability.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
@@ -28,9 +29,7 @@ void expect(bool condition, std::string_view message) {
     std::cerr << "FAIL: " << message << '\n';
 }
 
-bool cuda_unavailable(cudaError_t error) {
-    return error == cudaErrorNoDevice || error == cudaErrorInsufficientDriver;
-}
+using ninfer::test::cuda_unavailable;
 
 std::vector<std::int32_t> read_block_table(const ninfer::KVExecutionTablePool& tables,
                                            std::int32_t row, std::size_t count) {

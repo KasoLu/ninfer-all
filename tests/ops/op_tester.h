@@ -16,6 +16,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h" // ninfer::DType, ninfer::Tensor (for op call sites)
+#include "cuda_availability.h"
 #include "ops/op_check.h"
 
 #include <cuda_runtime.h>
@@ -107,7 +108,7 @@ inline bool cuda_unavailable() {
     int n               = 0;
     const cudaError_t e = cudaGetDeviceCount(&n);
     if (e == cudaSuccess) { return n == 0; }
-    if (e == cudaErrorNoDevice || e == cudaErrorInsufficientDriver) { return true; }
+    if (cuda_unavailable(e)) { return true; }
     throw std::runtime_error(std::string("cudaGetDeviceCount: ") + cudaGetErrorString(e));
 }
 

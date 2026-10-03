@@ -54,6 +54,12 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+On a machine without a usable CUDA device -- no GPU, an old driver, or only the CUDA toolkit's stub
+`libcuda` (`LD_LIBRARY_PATH` pointing at a directory with `libcuda.so.1` linked to
+`$CUDA_HOME/lib64/stubs/libcuda.so`, as CI does) -- every test that needs a device reports as
+skipped and the host tests still run. A test asks `tests/cuda_availability.h`; one that fails on its
+first CUDA call with the runtime's no-device message is skipped by CTest the same way.
+
 Alternatively, `cmake --preset dev` enables products, tests and benchmarks together.
 After building, `ctest --preset dev` runs the same CTest suite. See
 [Build system](../docs/maintainer/build-system.md) for local interpreter presets.

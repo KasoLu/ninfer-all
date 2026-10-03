@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "cuda_availability.h"
 #include "models/qwen3_5/state/state_image.h"
 
 #include <cuda_runtime.h>
@@ -25,9 +26,7 @@ void expect(bool condition, std::string_view message) {
     std::cerr << "FAIL: " << message << '\n';
 }
 
-bool cuda_unavailable(cudaError_t error) {
-    return error == cudaErrorNoDevice || error == cudaErrorInsufficientDriver;
-}
+using ninfer::test::cuda_unavailable;
 
 struct PlannedPool {
     q36::StateImageDeviceLayout layout;

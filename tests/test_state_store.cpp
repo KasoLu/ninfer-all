@@ -1,5 +1,6 @@
 #include "core/device.h"
 #include "core/linear_attention_state.h"
+#include "cuda_availability.h"
 
 #include <cuda_runtime.h>
 
@@ -37,9 +38,7 @@ int fail(const char* message) {
     return 1;
 }
 
-bool cuda_unavailable(cudaError_t err) {
-    return err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver;
-}
+using ninfer::test::cuda_unavailable;
 
 int expect_size(std::size_t actual, std::size_t expected, const char* label) {
     if (actual == expected) { return 0; }

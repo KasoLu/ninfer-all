@@ -3,6 +3,7 @@
 #include "artifact/views.h"
 #include "core/device.h"
 #include "core/evictable_weight_pool.h"
+#include "cuda_availability.h"
 
 #include <cuda_runtime.h>
 
@@ -369,7 +370,7 @@ int main(int argc, char** argv) {
     try {
         int count         = 0;
         const auto result = cudaGetDeviceCount(&count);
-        if (result == cudaErrorNoDevice || result == cudaErrorInsufficientDriver ||
+        if (ninfer::test::cuda_unavailable(result) ||
             (result == cudaSuccess && count == 0)) {
             return 77;
         }
