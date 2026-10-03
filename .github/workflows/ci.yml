@@ -110,6 +110,9 @@ jobs:
     name: CUDA build and tests (sm_${{ matrix.arch }}, no GPU)
     runs-on: ubuntu-24.04
     timeout-minutes: 350
+    permissions:
+      contents: read
+      statuses: write
     strategy:
       fail-fast: false
       matrix:
@@ -145,12 +148,25 @@ jobs:
       # its ccache and the next run continues from there.
       - name: Build every target
         timeout-minutes: 320
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$CCACHE_HOST_DIR"
           docker run --rm -v "$PWD:/src" -v "$CCACHE_HOST_DIR:/ccache" -w /src \
             -e CCACHE_DIR=/ccache -e CCACHE_MAXSIZE=4G -e NINFER_CUDA_ARCH=${{ matrix.arch }} \
             -e NINFER_BUILD_DIR=/src/build-ci ninfer-toolchain:ci bash -c \
-            'ccache --zero-stats && scripts/build-native.sh configure && scripts/build-native.sh build && ccache --show-stats'
+            'ccache --zero-stats && scripts/build-native.sh configure && scripts/build-native.sh build && ccache --show-stats' \
+            > build-ci.log 2>&1 &
+          build=$!
+          context="build progress (sm_${{ matrix.arch }})"
+          .github/scripts/build-progress.sh "$build" build-ci.log "$context" &
+          tail -n +1 -f build-ci.log --pid="$build" &
+          status=0
+          wait "$build" || status=$?
+          state=success; (( status == 0 )) || state=failure
+          gh api --silent -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state=$state \
+            -f context="$context" -f description="finished, exit $status" || true
+          exit "$status"
       - name: Save ccache
         if: always()
         uses: actions/cache/save@v4
