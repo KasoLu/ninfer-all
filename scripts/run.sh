@@ -325,11 +325,32 @@ base_context="${NINFER_FALLBACK_BASE_CONTEXT:-$CONTEXT}"
 base_chunk="${NINFER_FALLBACK_BASE_CHUNK:-$PREFILL_CHUNK}"
 base_slots="${NINFER_FALLBACK_BASE_SLOTS:-$HOST_STATE_SLOTS}"
 server_log="$(mktemp)"
-trap 'rm -f -- "$server_log"' EXIT
+server_pipe="$server_log.pipe"
+mkfifo -- "$server_pipe"
+trap 'rm -f -- "$server_log" "$server_pipe"' EXIT
+# The server runs as a child rather than in place of this script, so its output can be read back
+# after it exits -- and a child does not get the signals sent to this script. Pass the stop
+# requests on: SIGTERM, which `docker stop` sends to this script (a container runs it as PID 1, and
+# PID 1 ignores a signal it does not handle), and a SIGINT that did not come from a terminal. A
+# terminal's Ctrl+C already reaches the whole process group, the server included; passing it on
+# again would count as the confirming second press.
+tee -- "$server_log" < "$server_pipe" &
+tee_pid=$!
+"$server" "$MODEL" --host "$HOST" --port "$PORT" "${profile_args[@]}" > "$server_pipe" 2>&1 &
+server_pid=$!
+trap 'kill -TERM "$server_pid" 2>/dev/null || true' TERM
+if [[ -t 0 ]]; then
+  trap ':' INT
+else
+  trap 'kill -INT "$server_pid" 2>/dev/null || true' INT
+fi
 set +e
-"$server" "$MODEL" --host "$HOST" --port "$PORT" "${profile_args[@]}" 2>&1 | tee "$server_log"
-status="${PIPESTATUS[0]}"
+wait "$server_pid"; status=$?
+# A handled signal ends the wait early, with the server still stopping; wait until it has.
+while kill -0 "$server_pid" 2>/dev/null; do wait "$server_pid"; status=$?; done
+wait "$tee_pid"
 set -e
+trap - TERM INT
 if (( status != 0 && rung < 5 )) &&
    grep -q -E 'runtime reservation requires|cudaMallocHost failed' "$server_log"; then
   next=$((rung + 1))
@@ -343,6 +364,7 @@ if (( status != 0 && rung < 5 )) &&
   printf '\nNot enough free GPU memory to start at context %s. Retrying at %s (prefill chunk %s, %s host state slots).\n' \
     "$CONTEXT" "$next_context" "$next_chunk" "$next_slots"
   printf 'Set NINFER_CONTEXT to choose your own, or NINFER_FALLBACK=off to fail instead.\n\n'
+  rm -f -- "$server_log" "$server_pipe"
   exec env NINFER_CONTEXT="$next_context" NINFER_PREFILL_CHUNK="$next_chunk" \
     NINFER_HOST_STATE_SLOTS="$next_slots" NINFER_FALLBACK_RUNG="$next" \
     NINFER_FALLBACK_BASE_CONTEXT="$base_context" NINFER_FALLBACK_BASE_CHUNK="$base_chunk" \
