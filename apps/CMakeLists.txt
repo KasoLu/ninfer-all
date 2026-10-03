@@ -1,34 +1,57 @@
-add_executable(ninfer
-  cli/main.cpp
-  cli/options.cpp)
-ninfer_internal_includes(ninfer)
-target_link_libraries(ninfer PRIVATE
-  ninfer_engine
-  ninfer_product_logging
-  ninfer_product_prompt_input)
-ninfer_stamp_build_id(ninfer)
-ninfer_stage_runtime_dlls(ninfer)
+# Every program links the whole kernel image (~0.5 GB per architecture). NINFER_MULTICALL links the
+# four into one executable, ninfer-multicall (cmake/NinferBundles.cmake), with each program name a
+# symlink to it beside it: the container image carries the kernels once instead of four times.
+option(NINFER_MULTICALL
+       "Link ninfer, ninfer-serve, ninfer-calibrate and ninfer-perplexity into one multi-call executable"
+       OFF)
+if(NINFER_MULTICALL)
+  if(WIN32)
+    message(FATAL_ERROR "NINFER_MULTICALL names its programs with symlinks; it is for Linux")
+  endif()
+  include(${PROJECT_SOURCE_DIR}/cmake/NinferBundles.cmake)
+endif()
 
-add_executable(ninfer-serve serve/main.cpp)
-ninfer_internal_includes(ninfer-serve)
-target_link_libraries(ninfer-serve PRIVATE ninfer_serve ninfer_product_logging)
-ninfer_stamp_build_id(ninfer-serve)
-ninfer_stage_runtime_dlls(ninfer-serve)
+# ninfer_app(<name> <bundle program> [BUILD_ID] SOURCES ... LIBRARIES ...): <name> as an executable,
+# or with NINFER_MULTICALL as <bundle program> of ninfer-multicall, run under <name>.
+function(ninfer_app name program)
+  cmake_parse_arguments(PARSE_ARGV 2 arg "BUILD_ID" "" "SOURCES;LIBRARIES")
+  if(NINFER_MULTICALL)
+    ninfer_bundle_program(ninfer-multicall ${program} COMMAND ${name}
+      SOURCES ${arg_SOURCES} LIBRARIES ${arg_LIBRARIES})
+    set(target ${program})
+  else()
+    add_executable(${name} ${arg_SOURCES})
+    target_link_libraries(${name} PRIVATE ${arg_LIBRARIES})
+    ninfer_stage_runtime_dlls(${name})
+    set(target ${name})
+  endif()
+  ninfer_internal_includes(${target})
+  if(arg_BUILD_ID)
+    ninfer_stamp_build_id(${target})
+  endif()
+endfunction()
 
-add_executable(ninfer-calibrate calibrate/main.cpp)
-ninfer_internal_includes(ninfer-calibrate)
-target_link_libraries(ninfer-calibrate PRIVATE ninfer_calibration ninfer_runtime_support)
-ninfer_stage_runtime_dlls(ninfer-calibrate)
+ninfer_app(ninfer ninfer_app_cli BUILD_ID
+  SOURCES cli/main.cpp cli/options.cpp
+  LIBRARIES ninfer_engine ninfer_product_logging ninfer_product_prompt_input)
+ninfer_app(ninfer-serve ninfer_app_serve BUILD_ID
+  SOURCES serve/main.cpp
+  LIBRARIES ninfer_serve ninfer_product_logging)
+ninfer_app(ninfer-calibrate ninfer_app_calibrate
+  SOURCES calibrate/main.cpp
+  LIBRARIES ninfer_calibration ninfer_runtime_support)
+ninfer_app(ninfer-perplexity ninfer_app_perplexity BUILD_ID
+  SOURCES perplexity/main.cpp perplexity/corpus.cpp perplexity/evaluation.cpp
+  LIBRARIES ninfer_engine ninfer_product_logging ninfer::json)
 
-add_executable(ninfer-perplexity
-  perplexity/main.cpp
-  perplexity/corpus.cpp
-  perplexity/evaluation.cpp)
-ninfer_internal_includes(ninfer-perplexity)
-target_link_libraries(ninfer-perplexity PRIVATE
-  ninfer_engine ninfer_product_logging ninfer::json)
-ninfer_stamp_build_id(ninfer-perplexity)
-ninfer_stage_runtime_dlls(ninfer-perplexity)
+if(NINFER_MULTICALL)
+  ninfer_finalize_bundle(ninfer-multicall)
+  foreach(name IN ITEMS ninfer ninfer-serve ninfer-calibrate ninfer-perplexity)
+    add_custom_command(TARGET ninfer-multicall POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E create_symlink ninfer-multicall
+              $<TARGET_FILE_DIR:ninfer-multicall>/${name})
+  endforeach()
+endif()
 
 if(WIN32 AND NINFER_DIRECTSTORAGE)
   foreach(app IN ITEMS ninfer ninfer-serve)

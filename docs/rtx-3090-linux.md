@@ -109,6 +109,7 @@ CMake configure command as `-DNAME=VALUE`.
 | `NINFER_SM120_NATIVE=ON` | on a `120a` build, compiles upstream's native routes instead of the `mma.sync` path (every `120a` build compiles the FP8 A8 and NVFP4 W4A4 units) |
 | `NINFER_PDL=ON` | on a `120a` build of the `mma.sync` path, launches decode-graph kernels as programmatic dependents, so a kernel stages its weights while the one before it finishes (the native routes always do) |
 | `NINFER_TMA_STAGING=ON` | passes the NVFP4 TMA descriptors through device memory with a capturable staging kernel, as Windows builds must, so that path can be tested on Linux (`120a`) |
+| `NINFER_MULTICALL=ON` | Linux: links `ninfer`, `ninfer-serve`, `ninfer-calibrate` and `ninfer-perplexity` into one executable, `apps/ninfer-multicall`, with the four names as symlinks to it, so the kernel image (about 0.5 GB per architecture) is there once instead of four times; the container image is built this way |
 | `NINFER_MEDIA_NATIVE_PNG=ON` | decodes PNG images natively instead of through FFmpeg, as Windows builds do by default, so that decoder can be tested on Linux |
 | `NINFER_D3D12_RESIDENCY=ON` | Windows: offers `--wddm-evictable-budget`, device arenas from a D3D12 heap held resident |
 | `NINFER_DIRECTSTORAGE=ON` | Windows: fetches the DirectStorage 1.3 runtime and offers `--disk-kv-directstorage` for disk-tier restores |
