@@ -266,27 +266,21 @@ build-ninja/apps/ninfer-serve.exe \
 - Compiled graft: `artifacts/grafts/v1_q36_35b_nf4_trained.bin` (sha `e0121206cca8`)
 - Compile verification: bitwise tensor equality, zero logit diff
 
-## run.bat graft integration
+## Launcher graft integration
 
-`scripts/run.bat` now auto-loads trained grafts at server startup. Each model
-key maps to a graft filename; the script looks in the sibling `phantom-kv`
-repo's `artifacts/grafts/` directory by default.
-Compiled grafts are local artifacts and are not stored in this repository.
-
-| Model key           | Graft file                      |
-|---------------------|---------------------------------|
-| `qwen38-27b`        | `v1_q38_nf4_trained.bin`        |
-| `qwen36-35b-a3b`    | `v1_q36_35b_nf4_trained.bin`    |
+Grafts are optional local files; this repository ships none and nothing needs one to build or
+serve. `scripts/run.sh` and `scripts/run.bat` load every `NAME.bin` that has its `NAME.json`
+sidecar in `grafts/<model key>/` (beside `models/`: the repository root in a checkout, the archive
+root in a release) as `--graft NAME=<file>`; no directory or an empty one serves without grafts.
+Copy a compiled graft there under the name requests will use, for example
+`grafts/qwen38-27b/v1.bin` with `grafts/qwen38-27b/v1.json`.
 
 Overrides:
-- `NINFER_GRAFT_DIR=<path>` — custom graft directory
-- `NINFER_GRAFTS=off` — disable graft loading entirely
-
-If the graft file doesn't exist, the server starts without it (no error).
-The graft is loaded as `v1` and selected per request. To make it apply to every
-request that names no graft, set `NINFER_DEFAULT_GRAFT=on` (passes
-`--default-graft v1`); a request can still opt out with `"graft": ""`. It has no
-effect when no graft was loaded.
+- `NINFER_GRAFT_DIR=<path>` — look in this directory instead
+- `NINFER_GRAFTS=off` — load no grafts
+- `NINFER_DEFAULT_GRAFT=NAME` — apply that loaded graft to every request that names none
+  (`--default-graft NAME`; a request opts out with `"graft": ""`); a name that did not load stops
+  the launcher
 
 ### Dependencies
 

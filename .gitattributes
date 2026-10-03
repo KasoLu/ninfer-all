@@ -27,5 +27,3 @@
 # would check them out with CRLF and change every rendered prompt.
 *.jinja text eol=lf
 tests/fixtures/** text eol=lf
-
-# Prompt graft assets are stored through Git LFS.
