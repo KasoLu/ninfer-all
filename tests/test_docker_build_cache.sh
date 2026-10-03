@@ -20,7 +20,7 @@ sed -e "s/id=ninfer-build,/id=$cache_id,/" \
     "$repo/Dockerfile" > "$test_dir/Dockerfile"
 cp "$test_dir/Dockerfile" "$context/Dockerfile"
 # The build stage drives the real build and staging scripts; the fixture project stands in for
-# NInfer behind them, so the four staged binaries are fixture executables.
+# NInfer behind them, so the staged multi-call executable is a fixture executable.
 mkdir -p "$context/scripts" "$context/docker" "$test_dir/scripts"
 cp "$repo/scripts/build-native.sh" "$test_dir/scripts/build-native.sh"
 cp "$repo/scripts/build-native.sh" "$context/scripts/build-native.sh"
@@ -31,11 +31,8 @@ cmake_minimum_required(VERSION 3.28)
 project(build_cache_check LANGUAGES CXX)
 include(defaults.cmake)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/apps")
-add_executable(ninfer main.cpp)
-target_compile_definitions(ninfer PRIVATE CACHED_DEFAULT=${CACHED_DEFAULT})
-add_executable(ninfer-serve other.cpp)
-add_executable(ninfer-perplexity other.cpp)
-add_executable(ninfer-calibrate other.cpp)
+add_executable(ninfer-multicall main.cpp other.cpp)
+target_compile_definitions(ninfer-multicall PRIVATE CACHED_DEFAULT=${CACHED_DEFAULT})
 EOF
 printf 'set(CACHED_DEFAULT 0 CACHE STRING "Fixture default")\n' > "$context/defaults.cmake"
 cat > "$context/main.cpp" <<'EOF'
@@ -47,7 +44,7 @@ static_assert(RECIPE_FLAG == EXPECTED_FLAG, "stale compiler flags");
 static_assert(CACHED_DEFAULT == EXPECTED_DEFAULT, "stale CMake default");
 int main() { return 0; }
 EOF
-printf 'int main() { return 0; }\n' > "$context/other.cpp"
+printf 'int other() { return 0; }\n' > "$context/other.cpp"
 
 expect() {
     printf '#define EXPECTED_FLAG %s\n#define EXPECTED_DEFAULT %s\n' "$1" "$2" \
@@ -85,7 +82,7 @@ grep -q 'ninja: no work to do' "$test_dir/non-code-edit.log"
 
 printf '\nstatic_assert(true, "ordinary source edit");\n' >> "$context/main.cpp"
 build source-edit
-# Exactly one translation unit should rebuild; the other executables are unchanged.
+# Exactly one translation unit should rebuild; the other one is unchanged.
 test "$(grep -c 'Building CXX object' "$test_dir/source-edit.log")" -eq 1
 
 printf 'set(CACHED_DEFAULT 1 CACHE STRING "Fixture default")\n' > "$context/defaults.cmake"
