@@ -4,12 +4,14 @@
 #
 #   run <model> [profile]     scripts/run.sh: the measured serving profiles (default: run qwen38-27b)
 #   download <model>          scripts/download-model.sh into /models
-#   ninfer | serve | perplexity | calibrate [args]   the binary itself
+#   ninfer | serve | perplexity | calibrate [args]   the binary itself; serve listens on
+#                             NINFER_HOST:NINFER_PORT unless --host/--port are given
 #   anything else             executed as given
 #
 # NINFER_IMAGE_ARCH=sm86|sm120a skips detection.
 set -euo pipefail
 home=/opt/ninfer
+: "${NINFER_HOST:=0.0.0.0}" "${NINFER_PORT:=8080}"
 
 select_arch() {
   if [[ -n "${NINFER_IMAGE_ARCH:-}" ]]; then
@@ -51,7 +53,12 @@ case "$command" in
     exec env NINFER_SERVER="$bin/ninfer-serve" NINFER_GRAFT_DIR="$graft_dir" \
       "$home/run.sh" "$model" "${@:2}" ;;
   ninfer) exec "$bin/ninfer" "$@" ;;
-  serve) exec "$bin/ninfer-serve" "$@" ;;
+  serve)
+    # ninfer-serve binds 127.0.0.1 by default, which nothing outside the container reaches.
+    listen=()
+    [[ " $* " == *" --host "* ]] || listen+=(--host "$NINFER_HOST")
+    [[ " $* " == *" --port "* ]] || listen+=(--port "$NINFER_PORT")
+    exec "$bin/ninfer-serve" "$@" ${listen[@]+"${listen[@]}"} ;;
   perplexity) exec "$bin/ninfer-perplexity" "$@" ;;
   calibrate) exec "$bin/ninfer-calibrate" "$@" ;;
   *) exec "$command" "$@" ;;

@@ -352,6 +352,45 @@ From other forks:
 The [maintainer map](docs/maintainer/consolidated-line.md) lists each change with the files it
 touches and the tests that cover it.
 
+## Docker
+
+`ghcr.io/iamwavecut/ninfer-all:latest` is built from every master commit that passes CI, on CUDA
+13.4 and Ubuntu 26.04. It carries two builds and starts the one that matches the GPU: `sm_86` for the
+RTX 30 series (compute capability 8.6), which also runs the RTX 40 series (8.9), and `sm_120a` for the
+RTX 50 series and the RTX PRO 6000 Blackwell (12.0). The host needs an NVIDIA driver of the CUDA 13
+branch (580 or newer) and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+Other tags: `sha-<commit>` for every published commit, and the `VERSION` of the newest one.
+
+```bash
+docker pull ghcr.io/iamwavecut/ninfer-all:latest
+# The model goes to ./models (19 GiB for the 27B).
+docker run --rm -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all download qwen38-27b
+# Serve it with the measured `tuned` profile on http://localhost:8080/v1.
+docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
+  -v "$PWD/models:/models" -v ninfer-cache:/cache \
+  ghcr.io/iamwavecut/ninfer-all run qwen38-27b
+```
+
+Or with [compose.yaml](compose.yaml), which wires the GPU, the port and the volumes:
+
+```bash
+docker compose run --rm ninfer download qwen38-27b
+docker compose up -d
+```
+
+The container's command chooses what runs:
+
+| command | runs |
+|---|---|
+| `run <model> [profile]` (default `run qwen38-27b`) | `scripts/run.sh`: the launcher profiles, with the same `NINFER_*` overrides (`-e NINFER_SPEC=mtp`, `-e NINFER_CONTEXT=131072`, ...) |
+| `download <model>` | `scripts/download-model.sh` into `/models` |
+| `serve`, `ninfer`, `perplexity`, `calibrate` `[args]` | that binary, for any artifact and flags: `serve /models/my.ninfer --max-context 65536 ...` |
+
+Volumes: `/models` holds artifacts, `/cache` the device profile the engine measures on first start,
+and `/grafts/<model>/` optional [prompt grafts](docs/serving.md#prompt-grafts). The server listens on
+port 8080. `NINFER_IMAGE_ARCH=sm86|sm120a` overrides the GPU detection. `docker build -t ninfer .`
+builds the same image from source (`--build-arg ARCHS=86` for one architecture).
+
 ## Running
 
 Download an artifact from the table below and point `ninfer-serve` at it. The server speaks the
