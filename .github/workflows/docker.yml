@@ -46,6 +46,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
           tags="$image:sha-${SHA:0:12}"
           head="$(gh api "repos/$GITHUB_REPOSITORY/commits/master" --jq .sha)"
           if [[ "$head" == "$SHA" ]]; then
@@ -72,5 +73,8 @@ jobs:
             org.opencontainers.image.revision=${{ env.SHA }}
             org.opencontainers.image.description=NInfer: Qwen3.5/3.6/3.8 inference server for RTX 30, 40 and 50 GPUs
             org.opencontainers.image.licenses=Apache-2.0
-          cache-from: type=gha,scope=runtime
-          cache-to: type=gha,scope=runtime,mode=max
+          # The layers below the binaries (Ubuntu and the libraries) come back from the last
+          # published image through its inline cache. An Actions layer cache would hold the
+          # binaries as well and evict the CI's ccache from the repository's 10 GB budget.
+          cache-from: type=registry,ref=${{ steps.tags.outputs.image }}:latest
+          cache-to: type=inline

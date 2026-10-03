@@ -11,14 +11,22 @@
 # program still runs in its own process, one per CTest entry, so exit codes (77 = skip), global
 # state and CUDA context are exactly as they were for a standalone executable.
 #
+# A bundle started under one of its program names -- a symlink named after the program -- runs that
+# program with its arguments unchanged. apps/ uses that multi-call form for the container image, so
+# the kernel image is there once instead of once per program.
+#
 # A program's sources must not define non-internal symbols that another program in the same bundle
 # also defines; keep helpers in an anonymous namespace (the link fails loudly if not).
 
 # Declare `name` as a program in `bundle`. The OBJECT library `name` accepts ordinary target_*
-# calls afterwards; its link libraries are collected when the bundle is finalized.
+# calls afterwards; its link libraries are collected when the bundle is finalized. COMMAND is the
+# name the program runs under when it differs from the target, which must be an identifier.
 function(ninfer_bundle_program bundle name)
-  cmake_parse_arguments(PARSE_ARGV 2 arg "" "" "SOURCES;LIBRARIES")
+  cmake_parse_arguments(PARSE_ARGV 2 arg "" "COMMAND" "SOURCES;LIBRARIES")
   add_library(${name} OBJECT ${arg_SOURCES})
+  if(arg_COMMAND)
+    set_property(TARGET ${name} PROPERTY NINFER_BUNDLE_COMMAND "${arg_COMMAND}")
+  endif()
   target_link_libraries(${name} PRIVATE ${arg_LIBRARIES})
   target_compile_definitions(${name} PRIVATE main=ninfer_bundle_entry_${name})
   # A renamed main loses main's implicit `return 0`, so falling off its end returns garbage and a
@@ -59,6 +67,10 @@ function(ninfer_finalize_bundle bundle)
     get_target_property(source_dir ${program} SOURCE_DIR)
     set(found_main OFF)
     foreach(source IN LISTS sources)
+      # Headers among the sources may be generated at build time (the build-id stamp).
+      if(NOT source MATCHES "\\.(c|cc|cpp|cxx|cu)$")
+        continue()
+      endif()
       if(NOT IS_ABSOLUTE "${source}")
         set(source "${source_dir}/${source}")
       endif()
@@ -75,8 +87,12 @@ function(ninfer_finalize_bundle bundle)
     if(NOT found_main)
       message(FATAL_ERROR "bundle program ${program} defines no recognizable main")
     endif()
+    get_target_property(command ${program} NINFER_BUNDLE_COMMAND)
+    if(NOT command)
+      set(command ${program})
+    endif()
     string(APPEND declarations "int ninfer_bundle_entry_${program}(${signature});\n")
-    string(APPEND entries "    {\"${program}\", ${call}},\n")
+    string(APPEND entries "    {\"${command}\", ${call}},\n")
 
     get_target_property(program_libraries ${program} LINK_LIBRARIES)
     if(program_libraries)
