@@ -13,6 +13,7 @@
 #include "core/device.h"
 #include "core/host_kv_arena.h"
 #include "core/paged_kv_cache.h"
+#include "cuda_availability.h"
 
 #include <cuda_runtime.h>
 
@@ -30,9 +31,7 @@
 
 namespace {
 
-bool cuda_unavailable(cudaError_t err) {
-    return err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver;
-}
+using ninfer::test::cuda_unavailable;
 
 int expect(bool condition, const std::string& label) {
     if (condition) { return 0; }

@@ -5,6 +5,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/evictable_weight_pool.h"
+#include "cuda_availability.h"
 
 #include <cuda_runtime.h>
 
@@ -17,9 +18,7 @@
 
 namespace {
 
-bool cuda_unavailable(cudaError_t err) {
-    return err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver;
-}
+using ninfer::test::cuda_unavailable;
 
 int expect(bool condition, const char* label) {
     if (condition) { return 0; }

@@ -95,6 +95,10 @@ int main() {
     using namespace ninfer;
     using namespace ninfer::test::linear_swiglu;
 
+    if (!cuda_available()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
     try {
         constexpr std::array<std::int32_t, 4> kA16Cases{1, 4, 8, 16};
         // 511 and 513 straddle the ragged floor: the first still reaches the composition, the

@@ -6,40 +6,28 @@ NInfer-3090 v0.6.1 publishes a Linux x64 archive built for this exact SM86 targe
 Do not change `CMAKE_CUDA_ARCHITECTURES` to `89`.
 The RTX 4090 fork uses Ada-specific schedules that do not apply to the RTX 3090.
 
-## Container build
+## Container image
 
-The repository Dockerfile gives the shortest build path on Bazzite and other Linux distributions.
-It uses Ubuntu 24.04, CUDA 13.1, GCC 13, Ninja, FFmpeg, and curl.
-
-Install Docker and the NVIDIA Container Toolkit first.
-Then make sure that Docker can access the GPU:
-
-```bash
-docker run --rm --gpus all nvidia/cuda:13.1.2-runtime-ubuntu24.04 nvidia-smi
-```
-
-Build the image from the repository root:
+The published image, `ghcr.io/iamwavecut/ninfer-all:latest`, is the shortest path on Bazzite and
+other Linux distributions: CUDA 13.4 on Ubuntu 26.04, with an `sm_86` build that it starts on this
+card. It needs a driver of the CUDA 13 branch (580 or newer) and the NVIDIA Container Toolkit; make
+sure that Docker can access the GPU first:
 
 ```bash
-docker build --tag ninfer-3090:sm86 .
+docker run --rm --gpus all nvidia/cuda:13.4.2-base-ubuntu26.04 nvidia-smi
 ```
 
-Run the Qwen3.8 server with a model directory from the host:
+Download and serve the Qwen3.8 model with the measured `tuned` profile:
 
 ```bash
-docker run --rm --gpus all \
-  --publish 8080:8080 \
-  --volume "$PWD/models:/workspace/models:ro" \
-  ninfer-3090:sm86 \
-  ninfer-serve models/qwen3_8_27b.ninfer \
-  --host 0.0.0.0 --port 8080 \
-  --max-context 65536 --kv-capacity 65536 \
-  --max-concurrency 1 --max-pending-requests 16 --pending-timeout-ms 600000 \
-  --prefill-chunk 1024 --kv-dtype int8 \
-  --spec mtp --draft-tokens 3 --lm-head-draft
+docker run --rm -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all download qwen38-27b
+docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
+  -v "$PWD/models:/models" ghcr.io/iamwavecut/ninfer-all run qwen38-27b
 ```
 
-The API is available at `http://127.0.0.1:8080/v1`.
+The API is available at `http://127.0.0.1:8080/v1`. `docker build --build-arg ARCHS=86 -t ninfer .`
+builds the same image from source for this card alone; the [README](../README.md#docker) covers the
+container's commands, volumes and compose file.
 
 ## Native Ubuntu 24.04 build
 

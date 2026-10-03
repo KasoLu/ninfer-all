@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <exception>
 
 @NINFER_BUNDLE_DECLARATIONS@
 namespace {
@@ -28,7 +29,18 @@ int main(int argc, char** argv) {
         return argc < 2 ? 2 : 0;
     }
     for (const Program& program : programs) {
-        if (std::strcmp(argv[1], program.name) == 0) { return program.entry(argc - 1, argv + 1); }
+        if (std::strcmp(argv[1], program.name) != 0) { continue; }
+        // An exception that escapes a program fails it with its message through an ordinary exit
+        // rather than std::terminate: CTest judges an exited process by its output (a test that
+        // found no usable CUDA device is skipped, tests/CMakeLists.txt), an aborted one not at all.
+        try {
+            return program.entry(argc - 1, argv + 1);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "%s: uncaught exception: %s\n", argv[1], error.what());
+        } catch (...) {
+            std::fprintf(stderr, "%s: uncaught exception of an unknown type\n", argv[1]);
+        }
+        return 1;
     }
     std::fprintf(stderr, "@NINFER_BUNDLE_NAME@: unknown program '%s'; --list shows them\n", argv[1]);
     return 2;

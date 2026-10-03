@@ -749,6 +749,13 @@ bool ProgramImpl::salvage_continuation(SequenceState& state, RequestControl& req
             state.dflash_context_frontier < frontier) {
             return false;
         }
+        // The next request reuses this endpoint under MTP only with the tail hidden state and the
+        // MTP KV up to frontier - 1 (request_plan.cpp). A prefill cut before its last chunk has no
+        // tail hidden state, so the conversation resumes from its last captured checkpoint.
+        if (speculative_backend == SpeculativeBackend::Mtp &&
+            (!state.tail_hidden_valid || state.mtp_kv_valid + 1 < frontier)) {
+            return false;
+        }
     } else if (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Finishable) {
         frontier = state.execution_frontier;
         if (frontier < kSalvageMinFrontier || state.text_kv_valid != frontier) { return false; }

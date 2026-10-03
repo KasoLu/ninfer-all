@@ -6,6 +6,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "cuda_availability.h"
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -19,9 +20,7 @@
 
 namespace {
 
-bool cuda_unavailable(cudaError_t err) {
-    return err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver;
-}
+using ninfer::test::cuda_unavailable;
 
 void cu_check(CUresult result, const char* expr) {
     if (result == CUDA_SUCCESS) { return; }

@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "cuda_availability.h"
 
 #include <cuda_runtime.h>
 
@@ -15,9 +16,7 @@ int fail(const char* message) {
     return 1;
 }
 
-bool cuda_unavailable(cudaError_t err) {
-    return err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver;
-}
+using ninfer::test::cuda_unavailable;
 
 int expect_throws_device(int device_id) {
     try {

@@ -1,5 +1,6 @@
 #include "guarded_main.h"
 #include "core/device.h"
+#include "cuda_availability.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/program.h"
@@ -26,7 +27,7 @@ int run() {
     try {
         int devices       = 0;
         const auto status = cudaGetDeviceCount(&devices);
-        if (status == cudaErrorNoDevice || status == cudaErrorInsufficientDriver ||
+        if (ninfer::test::cuda_unavailable(status) ||
             (status == cudaSuccess && devices == 0)) {
             return 77;
         }

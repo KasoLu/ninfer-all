@@ -24,6 +24,10 @@ int main() {
     using namespace ninfer;
     using namespace ninfer::test::linear_swiglu;
 
+    if (!cuda_available()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
     try {
         // One public numerical case begins each materially distinct Q8 implementation interval;
         // selected endpoints exercise exact-T and predicated tails without inspecting selectors.

@@ -8,6 +8,10 @@ int main() {
     using namespace ninfer;
     using namespace ninfer::test::linear_swiglu;
 
+    if (!cuda_available()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
     try {
         // AllowA8Int is permissive: the integer route covers token counts that are positive
         // multiples of 128 and the resolver falls back to A16 for the rest. These cases straddle
