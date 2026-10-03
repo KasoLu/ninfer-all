@@ -50,8 +50,6 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
     throw std::invalid_argument("linear_swiglu test: unknown activation compute profile");
 }
 
-bool cuda_available() { return !test::cuda_unavailable(); }
-
 std::size_t checked_elements(std::int32_t first, std::int32_t second, const char* label) {
     if (first <= 0 || second <= 0) {
         throw std::invalid_argument(std::string("linear_swiglu test: invalid ") + label);
@@ -251,16 +249,13 @@ void validate_profile(const Profile& profile) {
 
 } // namespace
 
+bool cuda_available() { return !test::cuda_unavailable(); }
+
 int run_profile(std::string_view label, const Profile& profile,
                 std::span<const std::int32_t> token_cases,
                 std::span<const std::int32_t> graph_cases) {
     validate_profile(profile);
     if (token_cases.empty()) { throw std::invalid_argument("linear_swiglu test: no token cases"); }
-    if (!cuda_available()) {
-        std::cout << "SKIP: no usable CUDA device\n";
-        return 77;
-    }
-
     for (std::size_t index = 0; index < token_cases.size(); ++index) {
         if (token_cases[index] <= 0 ||
             (index != 0 && token_cases[index] <= token_cases[index - 1])) {

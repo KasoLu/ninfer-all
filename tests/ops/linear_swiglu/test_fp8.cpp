@@ -77,6 +77,10 @@ int main() {
     using namespace ninfer;
     using namespace ninfer::test::linear_swiglu;
 
+    if (!cuda_available()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
     try {
         constexpr std::array kA16Cases{1,  2,  4,  5,  8,  9,  16,  17,  24,  25,
                                        32, 33, 64, 65, 96, 97, 128, 129, 1024};

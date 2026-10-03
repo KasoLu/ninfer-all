@@ -27,6 +27,10 @@ struct Profile {
     ActivationCompute activation_compute;
 };
 
+// A program checks this first and skips (exit 77) without a device: run_profile returns a count
+// of failures, which a skip would be misread as.
+bool cuda_available();
+
 int run_profile(std::string_view label, const Profile& profile,
                 std::span<const std::int32_t> token_cases,
                 std::span<const std::int32_t> graph_cases = {});

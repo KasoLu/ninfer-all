@@ -9,6 +9,10 @@ int main() {
     using namespace ninfer;
     using namespace ninfer::test::linear_swiglu;
 
+    if (!cuda_available()) {
+        std::cout << "SKIP: no usable CUDA device\n";
+        return 77;
+    }
     try {
         // Public numerical cases straddle each registered Q4 implementation interval. They make
         // no assertion about the private route selected for any T.
