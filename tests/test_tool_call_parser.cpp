@@ -3,6 +3,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
@@ -247,9 +248,7 @@ int test_unrepresentable_parameter_delimiters_are_reported() {
     const auto contract = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
     const std::string unmatched_open =
         tool_call("bash", {{"command", "echo '<parameter=unterminated>'"}});
-    // Only a closer that runs on into ordinary text can be value text.
-    const std::string closer_before_structure =
-        tool_call("bash", {{"command", "echo\n</parameter>\n</function>\ntail"}});
+    // A closer that runs into a reasoning tag is a broken call, not payload.
     const std::string closer_before_other_markup =
         tool_call("bash", {{"command", "git status\n</parameter>\n<think>\nNo output."}});
 
@@ -257,9 +256,6 @@ int test_unrepresentable_parameter_delimiters_are_reported() {
     failures += check_reported(unmatched_open, contract,
                                ninfer::ToolCallParseFallbackReason::MalformedStructure, "bash",
                                "unbalanced nested parameter open was silently repaired");
-    failures += check_reported(closer_before_structure, contract,
-                               ninfer::ToolCallParseFallbackReason::MalformedStructure, "bash",
-                               "structurally ambiguous parameter close was guessed");
     failures += check_reported(closer_before_other_markup, contract,
                                ninfer::ToolCallParseFallbackReason::MalformedStructure, "bash",
                                "markup after a parameter close was folded into the value");
@@ -293,6 +289,80 @@ int test_quoted_parameter_close_stays_in_value() {
     failures +=
         check_reported(truncated, contract, ninfer::ToolCallParseFallbackReason::MalformedStructure,
                        "agent", "truncated value with quoted closers was accepted");
+    return failures;
+}
+
+// A Write/Edit payload may contain the parser's own markup as literal text: a file about tool calls,
+// a chat template, or HTML after a closer. A closer is structure only where the call can go on
+// after it, so such a payload stays byte-identical instead of closing the value early and turning
+// the whole call into text.
+int test_literal_closers_in_large_value() {
+    const auto contract = output_contract_for(
+        "write_file", Json{{"path", Json{{"type", "string"}}}, {"content", Json{{"type", "string"}}}});
+
+    std::string content;
+    const std::string body =
+        "line\n</parameter>\nmid\n</parameter><div class=\"x\">\n</parameter>\n</function>\nend\n";
+    while (content.size() < 50000) { content += body; }
+    content += "tail\n</parameter>\n</function>\n";
+
+    const std::string text = "<tool_call>\n<function=write_file>\n"
+                             "<parameter=path>\n/tmp/out.txt\n</parameter>\n"
+                             "<parameter=content>\n" +
+                             content +
+                             "\n</parameter>\n"
+                             "</function>\n</tool_call>";
+
+    int failures      = 0;
+    const auto parsed = fi::parse_qwen_tool_call_output(text, 64, *contract);
+    failures += check(parsed.is_tool_call_response && parsed.tool_calls.size() == 1 &&
+                          parsed.content.empty() && !parsed.diagnostics.recovered &&
+                          parsed.diagnostics.fallback_reason ==
+                              ninfer::ToolCallParseFallbackReason::None,
+                      "literal closers in a large value broke the call");
+    std::string arguments;
+    if (parsed.tool_calls.size() == 1 && parsed.tool_calls.front().name == "write_file") {
+        arguments       = parsed.tool_calls.front().arguments_json;
+        const Json args = Json::parse(arguments);
+        failures += check(args.at("path") == "/tmp/out.txt" && args.at("content") == content,
+                          "literal closers changed the written content");
+    }
+
+    // Chunked delivery must not change the outcome.
+    for (const std::size_t chunk : {std::size_t{1}, std::size_t{7}}) {
+        fi::ToolCallOutputDecoder decoder(contract, 64);
+        std::string visible;
+        for (std::size_t pos = 0; pos < text.size(); pos += chunk) {
+            visible += decoder.feed(std::string_view(text).substr(pos, chunk));
+        }
+        const auto terminal = decoder.finish();
+        failures += check(visible.empty() && terminal.content.empty() &&
+                              terminal.tool_calls.size() == 1 &&
+                              terminal.tool_calls.front().arguments_json == arguments,
+                          "chunked delivery changed a call with literal closers");
+    }
+
+    // A closer whose function close runs on into text is value text as well.
+    const auto bash             = contract_for("bash", Json{{"command", Json{{"type", "string"}}}});
+    const std::string command   = "echo\n</parameter>\n</function>\ntail";
+    const auto function_in_text = fi::parse_qwen_tool_call_output(
+        tool_call("bash", {{"command", command}}), 64, bash);
+    failures += check(function_in_text.is_tool_call_response &&
+                          function_in_text.tool_calls.size() == 1 &&
+                          function_in_text.tool_calls.front().name == "bash" &&
+                          Json::parse(function_in_text.tool_calls.front().arguments_json)
+                                  .at("command") == command,
+                      "a closer before a function close that runs into text ended the value");
+
+    // A value cut inside a parameter name has no name/value boundary to recover: no call is
+    // invented for it.
+    const std::string cut = "<tool_call>\n<function=write_file>\n"
+                            "<parameter=path>\n/tmp/out.txt\n</parameter>\n"
+                            "<parameter=conte";
+    const auto cut_parsed = fi::parse_qwen_tool_call_output(cut, 64, *contract);
+    failures += check(std::none_of(cut_parsed.tool_calls.begin(), cut_parsed.tool_calls.end(),
+                                   [](const auto& call) { return call.name == "write_file"; }),
+                      "a cut parameter name produced a write_file call");
     return failures;
 }
 
@@ -1434,6 +1504,7 @@ int main() {
     failures += test_string_values_preserve_embedded_tool_markup();
     failures += test_unrepresentable_parameter_delimiters_are_reported();
     failures += test_quoted_parameter_close_stays_in_value();
+    failures += test_literal_closers_in_large_value();
     failures += test_declared_json_types();
     failures += test_boolean_boundary();
     failures += test_exact_integer_boundary();

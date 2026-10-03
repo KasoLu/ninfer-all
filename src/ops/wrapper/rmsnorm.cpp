@@ -48,7 +48,7 @@ void require_same_shape(const Tensor& a, const Tensor& b, const char* b_label) {
 namespace {
 
 void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_offset,
-                  const Tensor* z, Tensor& out, cudaStream_t stream) {
+                  const Tensor* z, bool sigmoid_gate, Tensor& out, cudaStream_t stream) {
     if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || out.dtype != DType::BF16 ||
         (z != nullptr && z->dtype != DType::BF16)) {
         throw std::invalid_argument("rmsnorm: x/weight/z/out must be BF16");
@@ -83,19 +83,19 @@ void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_of
         throw std::invalid_argument("rmsnorm: x/weight/z/out data must be non-null");
     }
 
-    detail::rmsnorm_launch(x, weight, eps, unit_offset, z, out, stream);
+    detail::rmsnorm_launch(x, weight, eps, unit_offset, z, sigmoid_gate, out, stream);
 }
 
 } // namespace
 
 void rmsnorm(const Tensor& x, const Tensor& weight, float eps, bool unit_offset, Tensor& out,
              cudaStream_t stream) {
-    rmsnorm_impl(x, weight, eps, unit_offset, nullptr, out, stream);
+    rmsnorm_impl(x, weight, eps, unit_offset, nullptr, false, out, stream);
 }
 
-void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps, Tensor& out,
-                   cudaStream_t stream) {
-    rmsnorm_impl(x, weight, eps, false, &z, out, stream);
+void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, GateActivation gate,
+                   float eps, Tensor& out, cudaStream_t stream) {
+    rmsnorm_impl(x, weight, eps, false, &z, gate == GateActivation::Sigmoid, out, stream);
 }
 
 } // namespace ninfer::ops

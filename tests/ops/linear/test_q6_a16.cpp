@@ -1,3 +1,4 @@
+#include "ops/common/device_route.h"
 #include "ops/linear/common/route_table.h"
 #include "ops/linear/linear_test_common.h"
 
@@ -64,6 +65,29 @@ int q6_a16_conformance() {
                           {1152, 1536, 197U, Comparison::SampledRows, false, kVisionLarge});
     return failures;
 }
+
+// The vocabulary head's profile-routed schedules, forced over their whole width domains so the
+// GEMV (T=1..2) and the small-T MMA's one-, two- and four-tile variants (T=1..32) are qualified
+// whatever the installed profile routes.
+int q6_head_routed_schedules() {
+    int failures = 0;
+    {
+        const ninfer::ops::DeviceRouteForce force("q6_head/248320x5120", "gemv");
+        constexpr std::array kGemv{a16(1), a16(2), graph(1), graph(2)};
+        failures += run_shape("Q6_A16 head gemv", ActivationCompute::A16, make_q6_g64_fp16_weight,
+                              {248320, 5120, 211U, Comparison::SampledRows, false, kGemv});
+    }
+    {
+        const ninfer::ops::DeviceRouteForce force("q6_head/248320x5120", "small_t");
+        constexpr std::array kSmallT{a16(1),  a16(2),   a16(3),   a16(4),    a16(7),   a16(8),
+                                     a16(9),  a16(15),  a16(16),  a16(17),   a16(24),  a16(31),
+                                     a16(32), graph(4), graph(8), graph(16), graph(32)};
+        failures +=
+            run_shape("Q6_A16 head small-T", ActivationCompute::A16, make_q6_g64_fp16_weight,
+                      {248320, 5120, 223U, Comparison::SampledRows, false, kSmallT});
+    }
+    return failures;
+}
 } // namespace
 
 int main() {
@@ -82,6 +106,9 @@ int main() {
             failures += table_failures;
         }
         ninfer::ops::detail::force_linear_route_table(std::nullopt);
+        const int head_failures = q6_head_routed_schedules();
+        std::cout << (head_failures == 0 ? "OK" : "FAIL") << " Q6_A16 head routed schedules\n";
+        failures += head_failures;
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "Q6_A16 Linear: " << error.what() << '\n';

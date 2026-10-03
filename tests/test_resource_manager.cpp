@@ -344,8 +344,13 @@ struct FakeAdmissionCandidate {
     std::uint32_t shared_source_id          = 0;
     std::uint32_t shared_source_content_key = 0;
     std::uint32_t shared_source_frontier    = 0;
+    std::optional<std::uint32_t> graft_slot;
 
     [[nodiscard]] const RequestPlanSummary& summary() const noexcept { return value; }
+
+    [[nodiscard]] std::optional<std::uint32_t> graft_shared_slot() const noexcept {
+        return graft_slot;
+    }
 
     [[nodiscard]] const ninfer::runtime::IdentityMaterializationAssessment&
     identity_assessment() const noexcept {
@@ -718,12 +723,32 @@ public:
         return base.isolated_feasible;
     }
 
+    // Tokens a prompt shares with an owner's ledger: matched_tokens[id] when the content keys
+    // agree, else zero.
+    [[nodiscard]] std::uint32_t matched_prefix_tokens(const FakeContinuationHandle& owner,
+                                                      const FakePreparedPrompt& prompt) const {
+        const auto found = matched_tokens.find(owner.id);
+        return found == matched_tokens.end() || owner.content_key != prompt.content_key
+                   ? 0U
+                   : found->second;
+    }
+    [[nodiscard]] std::uint32_t matched_prefix_tokens(const FakeSharedPrefixHandle& owner,
+                                                      const FakePreparedPrompt& prompt) const {
+        const auto found = matched_tokens.find(owner.id);
+        return found == matched_tokens.end() || (owner.content_key != prompt.content_key &&
+                                                 owner.content_key != prompt.prefix_key)
+                   ? 0U
+                   : found->second;
+    }
+    std::map<std::uint32_t, std::uint32_t> matched_tokens;
+
     [[nodiscard]] std::optional<FakeAdmissionCandidate>
     inspect_admission(const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base, LaneId,
                       const FakeContinuationHandle* source,
                       const FakeSharedPrefixHandle* shared_source,
                       std::optional<CheckpointRef> checkpoint, bool must_retain_source) {
         ++admission_inspections;
+        if (!admission_boundary_ready) { return std::nullopt; }
         if (source != nullptr) {
             inspected_private_sources.push_back(source->id);
             if (source->content_key != prompt.content_key || !checkpoint) { return std::nullopt; }
@@ -968,6 +993,7 @@ public:
         require(pending_plan_.has_value(), "fake materialization plan disappeared");
         const FakeResourcePlan& plan = *pending_plan_;
         FakeMaterializationResult result;
+        result.transfer_observations = transfer_observations;
         result.status = (abort_progress || cancellation.requested())
                             ? ContextTransactionStatus::Aborted
                             : ContextTransactionStatus::Published;
@@ -1258,6 +1284,7 @@ public:
     bool ladder_feasibility_mode                         = false;
     std::uint32_t min_feasible_sacrifice                 = 0;
     bool abort_start                                     = false;
+    bool admission_boundary_ready                        = true;
     bool abort_progress                                  = false;
     bool malform_last_private_victim                     = false;
     bool malform_last_capture_private_victim             = false;
@@ -1282,6 +1309,7 @@ public:
     FakeCaptureAssessment capture_assessment;
     FakeContinuationSummary capture_summary;
     FakePhysicalUsage usage;
+    std::vector<ContextTransferObservation> transfer_observations;
 
     std::uint64_t admission_inspections       = 0;
     std::uint64_t pressure_planning_sessions  = 0;
@@ -2602,6 +2630,7 @@ void test_feasible_identity_expands_when_pressure_can_remove_copy() {
     candidate.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Feasible;
     candidate.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
     candidate.identity.assessment_digest = 17;
+    candidate.value.reusable_prompt_tokens = 12;
 
     const std::array<Planner::CandidateInput, 1> candidates{
         Planner::CandidateInput{.candidate               = &candidate,
@@ -2646,6 +2675,7 @@ void test_feasible_identity_expands_when_pressure_can_remove_copy() {
 
     require(result && result->diagnostics.predicted_now_ns == 100'000'000 &&
                 result->diagnostics.selected_degradation_units == 1 &&
+                result->diagnostics.best_reuse_prompt_tokens == 12 &&
                 program.pressure_planning_sessions == 1 && !program.seal_attempts.empty() &&
                 program.seal_attempts.back() == std::vector<std::uint64_t>{1009},
             "feasible identity suppressed a cheaper complete pressure target");
@@ -2660,6 +2690,7 @@ void test_dominating_identity_does_not_build_pressure_graph() {
     candidate.identity.physical_status   = ninfer::runtime::MaterializationPhysicalStatus::Feasible;
     candidate.identity.source_mode       = PrivateSourceMode::ConsumeToActive;
     candidate.identity.assessment_digest = 23;
+    candidate.value.reusable_prompt_tokens = 40;
     const std::array<Planner::CandidateInput, 1> candidates{
         Planner::CandidateInput{.candidate               = &candidate,
                                 .id                      = PlanningCandidateId{.value = 0},
@@ -2683,7 +2714,8 @@ void test_dominating_identity_does_not_build_pressure_graph() {
                                pressure_inputs, logical_goal, Planner::Clock::now());
     require(result &&
                 result->diagnostics.stop_reason == ninfer::MaterializationStopReason::NoPressure &&
-                !pressure_inputs_built && program.pressure_planning_sessions == 0,
+                result->diagnostics.best_reuse_prompt_tokens == 40 && !pressure_inputs_built &&
+                program.pressure_planning_sessions == 0,
             "dominating identity eagerly constructed the pressure graph");
 }
 
@@ -2720,6 +2752,62 @@ void test_root_lifecycle_and_prefix_reuse() {
             "selected endpoint did not reach the sealed Program plan");
     require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
             "failed start did not roll back its logical source claim");
+}
+
+// A branch anchor is placed at the deepest token match a catalogued owner offers, only where the
+// owner's restorable checkpoints end at least kBranchAnchorMinimumGainTokens below it.
+void test_branch_anchor_frontier_follows_the_deepest_unrestorable_match() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest first = start_active(manager, program, 7, make_base(7), 1);
+    (void)finish_active(manager, program, first, 16);
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "terminal continuation was not catalogued");
+    const FakePreparedPrompt prompt{7};
+    require(!manager.branch_anchor_frontier(program, prompt),
+            "an owner with no measured match produced a branch anchor");
+    program.matched_tokens[first.sequence.id] = 16 + ninfer::runtime::kBranchAnchorMinimumGainTokens - 1;
+    require(!manager.branch_anchor_frontier(program, prompt),
+            "a match within the minimum gain of the endpoint produced a branch anchor");
+    program.matched_tokens[first.sequence.id] = 4096;
+    const auto anchor = manager.branch_anchor_frontier(program, prompt);
+    require(anchor && *anchor == 4096, "the deepest unrestorable match was not anchored");
+    require(!manager.branch_anchor_frontier(program, FakePreparedPrompt{8}),
+            "a prompt of other content produced a branch anchor");
+}
+
+void test_state_transfer_statistics_use_payload_bytes() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    using ninfer::runtime::ContextResourceClass;
+    using ninfer::runtime::ContextTransferDirection;
+    program.transfer_observations = {
+        {.resource   = ContextResourceClass::State,
+         .direction  = ContextTransferDirection::DeviceToHost,
+         .units      = 2,
+         .work       = {.payload_bytes = 8192},
+         .elapsed_ns = 1000},
+        {.resource   = ContextResourceClass::State,
+         .direction  = ContextTransferDirection::HostToDevice,
+         .units      = 1,
+         .work       = {.payload_bytes = 4096},
+         .elapsed_ns = 2000},
+        {.resource   = ContextResourceClass::State,
+         .direction  = ContextTransferDirection::DeviceToDevice,
+         .units      = 1,
+         .work       = {.payload_bytes = 4096},
+         .elapsed_ns = 3000},
+    };
+    const auto active = start_active(manager, program, 7, make_base(7), 1);
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.state_d2h_count == 1 && stats.state_h2d_count == 1 &&
+                stats.state_d2d_count == 1,
+            "state transfer counts must count operations, not images or bytes");
+    require(stats.state_d2h_bytes == 8192 && stats.state_h2d_bytes == 4096 &&
+                stats.state_d2d_bytes == 4096,
+            "state transfer byte counters reported image counts instead of payloads");
+    (void)finish_active(manager, program, active);
 }
 
 void test_stale_revision_is_retryable() {
@@ -2863,6 +2951,141 @@ void test_aborted_source_selection_does_not_create_hit_history() {
     require(program.started_action_ids.size() == 1 &&
                 program.started_action_ids.front() == 2000U + first.sequence.id,
             "aborted source selection incorrectly biased later retention policy");
+}
+
+// Retention depth was one in production: A reuses, B (another conversation) takes one turn, A
+// misses. The reuse hit was recorded on A's observation and then cleared on the consume path, and
+// the republished endpoint's frontier had moved so the exact-ref lookup rebuilt the observation
+// from zero anyway. The frontier must advance between A's two publications here, as it does on
+// every real turn.
+void test_republished_owner_keeps_reuse_history() {
+    constexpr std::uint32_t republish_frontier = 20;
+    FakeManager manager                        = make_manager(1, 2);
+    FakeProgram program;
+    // A into slot 0, B into slot 1: the private catalog is full.
+    const ActiveRequest a1 = start_active(manager, program, 61, make_base(61), 1);
+    (void)finish_active(manager, program, a1, 16);
+    const ActiveRequest b1 = start_active(manager, program, 62, make_base(62), 2);
+    (void)finish_active(manager, program, b1, republish_frontier);
+
+    // A reuses its own endpoint: consume, then republish into the same cell.
+    const ActiveRequest a2 = start_active(manager, program, 61, make_base(61), 3);
+    require(program.started_source_mode == PrivateSourceMode::ConsumeToActive,
+            "reuse of an owner's own endpoint was not a consume");
+    (void)finish_active(manager, program, a2, republish_frontier);
+
+    // A cold third conversation needs a slot: the never-reused B must be the victim.
+    program.required_pressure_actions = 1;
+    program.require_evictions         = true;
+    auto pressure = manager.inspect(program, FakePreparedPrompt{63}, make_base(63), 4);
+    require(pressure.choice.has_value(), "cold admission under a full catalog found no plan");
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*pressure.choice),
+                                          FakePreparedPrompt{63}, {});
+    require(program.started_action_ids.size() == 1,
+            "cold admission under a full catalog did not evict exactly one owner");
+    const std::uint64_t action = program.started_action_ids.front();
+    require(action != 2000U + a2.sequence.id,
+            "planner evicted the owner that reused one request ago (retention depth one)");
+    require(action == 2000U + b1.sequence.id, "planner did not evict the never-reused owner");
+}
+
+// Reuse of a private checkpoint consumes it by default. A read-only request would move the only
+// copy into a lane that gives nothing back, and a request that declares an explicit boundary at
+// the reused frontier means that prefix to stay published; both retain instead.
+void test_read_only_and_declared_boundary_reuse_retain_the_source() {
+    FakeManager manager = make_manager(1, 3);
+    FakeProgram program;
+    const ActiveRequest owner = start_active(manager, program, 61, make_base(61), 1);
+    (void)finish_active(manager, program, owner, 16);
+
+    FakeRequestBasePlan read_only        = make_base(61);
+    read_only.value.publish_continuation = false;
+    const ActiveRequest reader           = start_active(manager, program, 61, read_only, 2);
+    require(program.started_source_mode == PrivateSourceMode::Retain,
+            "a read-only request consumed the checkpoint it reused");
+    (void)finish_active(manager, program, reader, 16);
+
+    FakeRequestBasePlan declared = make_base(61);
+    declared.cache.opportunities.push_back(FakeContextCache::Opportunity{
+        .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+        .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .frontier = 16,
+    });
+    const ActiveRequest publisher = start_active(manager, program, 61, declared, 3);
+    require(program.started_source_mode == PrivateSourceMode::Retain,
+            "a request declaring an explicit boundary at the reused frontier consumed it");
+    (void)finish_active(manager, program, publisher, 16);
+
+    const ActiveRequest plain = start_active(manager, program, 61, make_base(61), 4);
+    require(program.started_source_mode == PrivateSourceMode::ConsumeToActive,
+            "an ordinary same-content request no longer consumes its own endpoint");
+    (void)finish_active(manager, program, plain, 16);
+}
+
+// A read-only request that the Program releases at finish leaves the catalog exactly as it was:
+// the source still catalogued and reusable at its frontier, no entry of its own.
+void test_read_only_request_leaves_the_catalog_unchanged() {
+    FakeManager manager = make_manager(1, 3);
+    FakeProgram program;
+    const ActiveRequest owner = start_active(manager, program, 61, make_base(61), 1);
+    (void)finish_active(manager, program, owner, 16);
+    const auto catalogued = [&] {
+        std::uint32_t count = 0;
+        for (std::uint32_t slot = 0; slot < 3; ++slot) {
+            count += manager.catalog_state(slot) == FakeManager::CatalogState::Catalogued ? 1U : 0U;
+        }
+        return count;
+    };
+    require(catalogued() == 1, "the publishing owner was not catalogued");
+
+    FakeRequestBasePlan read_only        = make_base(61);
+    read_only.value.publish_continuation = false;
+    const ActiveRequest reader           = start_active(manager, program, 61, read_only, 2);
+    require(program.started_source_mode == PrivateSourceMode::Retain,
+            "a read-only request consumed the checkpoint it reused");
+    program.finish_release          = true;
+    const FakeFinishResult released = finish_active(manager, program, reader, 16);
+    program.finish_release          = false;
+    require(released.disposition == FinishDisposition::Released,
+            "the fake did not release the read-only request");
+    require(catalogued() == 1 && manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "a read-only request changed the catalog");
+    require(manager.lane_state(reader.lane) == ninfer::runtime::LogicalLaneState::Free,
+            "the read-only lane did not return to Free");
+
+    auto again = manager.inspect(program, FakePreparedPrompt{61}, make_base(61), 3);
+    require(again.readiness == Readiness::Ready && again.choice &&
+                again.choice->summary().reusable_prompt_tokens == 16,
+            "the source was not reusable after a read-only request finished");
+}
+
+void test_admission_waits_for_program_boundary() {
+    FakeManager manager = make_manager(2, 3);
+    FakeProgram program;
+    const ActiveRequest active   = start_active(manager, program, 9, make_base(9), 1);
+    const auto starts            = program.start_calls;
+    const auto planning_sessions = program.pressure_planning_sessions;
+
+    // An active lane can have an unfinished StateImage fork even with a free destination lane and
+    // enough physical capacity. Pressure cannot complete that state transition.
+    program.admission_boundary_ready = false;
+    auto blocked = manager.inspect(program, FakePreparedPrompt{77}, make_base(77), 2);
+    require(blocked.readiness == Readiness::TemporarilyBlocked && !blocked.choice,
+            "unfinished Program boundary was treated as infeasibility or a fatal root error");
+    require(program.start_calls == starts &&
+                program.pressure_planning_sessions == planning_sessions &&
+                program.started_action_ids.empty() && program.released_continuations.empty() &&
+                program.abort_calls == 0,
+            "blocked admission changed active ownership or started pressure planning");
+
+    program.admission_boundary_ready = true;
+    const ActiveRequest admitted     = start_active(manager, program, 77, make_base(77), 3);
+    require(admitted.lane != active.lane && program.start_calls == starts + 1,
+            "settled Program boundary did not admit the waiting request on the free lane");
+    (void)finish_active(manager, program, admitted);
+    (void)finish_active(manager, program, active);
+    require(program.finish_calls == 2, "retry admission damaged the already active request");
 }
 
 void test_retained_source_is_protected_until_terminal() {
@@ -4875,8 +5098,14 @@ void test_automatic_reclaim_spares_the_prefix_the_capture_extends() {
     require(program.released_shared_prefix_keys.empty(),
             "an automatic reclaim released the shared prefix its own capture extends");
     (void)finish_active(manager, program, active);
-    require_shared_reuse(manager, program, 71, 4, true,
-                         "the extended shared prefix lost reuse to its own conversation");
+    // The extending request publishes no continuation, so it retained the private checkpoint it
+    // resumed from instead of consuming it; the conversation's next request resumes there, at
+    // least as deep as the shared prefix, and the shared prefix itself was never released.
+    require(program.released_shared_prefix_keys.empty(),
+            "the extended shared prefix was released when its conversation finished");
+    auto next = manager.inspect(program, FakePreparedPrompt{71}, make_base(71), 4);
+    require(next.choice.has_value() && next.choice->summary().reusable_prompt_tokens >= 64,
+            "the extended shared prefix lost reuse to its own conversation");
 }
 
 } // namespace
@@ -5116,6 +5345,9 @@ void test_value_weights_rank_private_victims_by_rebuild_cost() {
 
 int main() {
     TimerResolution timer_resolution;
+    run_test("state transfer payload statistics", test_state_transfer_statistics_use_payload_bytes);
+    run_test("branch anchor at the deepest unrestorable match",
+             test_branch_anchor_frontier_follows_the_deepest_unrestorable_match);
     run_test("independent complete-target oracle",
              test_complete_search_against_small_exhaustive_oracle);
     run_test("publication-only construction",
@@ -5151,7 +5383,13 @@ int main() {
              test_uncommitted_pressure_acknowledgement_is_not_degradation);
     run_test("aborted source is not a hit",
              test_aborted_source_selection_does_not_create_hit_history);
+    run_test("republished owner keeps reuse history", test_republished_owner_keeps_reuse_history);
+    run_test("read-only and declared-boundary reuse retain the source",
+             test_read_only_and_declared_boundary_reuse_retain_the_source);
+    run_test("read-only request leaves the catalog unchanged",
+             test_read_only_request_leaves_the_catalog_unchanged);
     run_test("retained source protection", test_retained_source_is_protected_until_terminal);
+    run_test("admission waits for Program boundary", test_admission_waits_for_program_boundary);
     run_test("session publication order", test_session_publication_order_controls_tied_source);
     run_test("canonical pressure", test_canonical_pressure_starts_with_disposable_owner);
     run_test("all preserving pressure alternatives",

@@ -95,6 +95,19 @@ public:
         bool current_session_binding = false;
     };
 
+    // Candidates are built before planning, so this is the reuse that was on the table rather
+    // than what the search chose. Pressure targets are eviction alternatives, not reuse
+    // candidates, and must not feed this figure.
+    [[nodiscard]] static std::uint32_t
+    best_offered_reuse(std::span<const CandidateInput> candidates) noexcept {
+        std::uint32_t best = 0;
+        for (const CandidateInput& input : candidates) {
+            if (input.candidate == nullptr) { continue; }
+            best = std::max(best, input.candidate->summary().reusable_prompt_tokens);
+        }
+        return best;
+    }
+
     struct LogicalGoal {
         std::uint32_t publication_slot = std::numeric_limits<std::uint32_t>::max();
     };
@@ -267,6 +280,7 @@ public:
                                                     ? MaterializationSearchPhase::Setup
                                                     : MaterializationSearchPhase::None;
                 diagnostics.search_boundary_limited = needs_optional_search && time_exhausted;
+                diagnostics.best_reuse_prompt_tokens = best_offered_reuse(candidates);
                 Result result;
                 result.plan             = std::move(*sealed);
                 result.candidate        = candidates[identity_best->candidate_index].id;
@@ -963,7 +977,11 @@ public:
             const PressureTargetAssessment& assessment = assessed.assessment();
             if (assessment.candidate != candidates[incumbent.candidate_index].id ||
                 assessment.physical_status != MaterializationPhysicalStatus::Feasible) {
-                throw std::logic_error("selected identity target lost exact feasibility");
+                // A concurrent transition took the target's room between search and seal. Like
+                // the seal fallback below, that is a transient resource race, not a broken
+                // invariant: this admission yields no choice now and is re-planned on a later
+                // scheduling pass instead of failing every request through the worker loop.
+                return std::nullopt;
             }
             incumbent.assessed.emplace(std::move(assessed));
         }
@@ -1013,6 +1031,7 @@ public:
         MaterializationDiagnostics diagnostics = make_diagnostics(
             incumbent.cost, targets_evaluated, projection_work, planning_started, search_elapsed_ns,
             stop_reason, budget_exhausted, incumbent.degradation_units, incumbent.root_maximal);
+        diagnostics.best_reuse_prompt_tokens = best_offered_reuse(candidates);
 
         diagnostics.initial_predicted_total_ns = initial_cost_ns;
         diagnostics.first_improvement_ns       = first_improvement_ns;

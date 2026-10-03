@@ -1,9 +1,10 @@
 // A focused regression test for the Windows-only NVFP4 W4A4 TMA descriptor-staging race.
 //
 // The Windows staging path stores the over-aligned CUtensorMap descriptor struct into one
-// persistent device buffer that every launch reuses (core/tma_descriptor_staging.cuh). A launch
-// that reads another launch's descriptors (staged too early, too late, or a stale tensor map in
-// the TMA proxy) computes against a foreign weight. This harness fires the TMA route
+// persistent device buffer that every eager launch reuses, and gives each launch captured into a
+// CUDA Graph a device copy of its own (core/tma_descriptor_staging.cuh). A launch that reads
+// another launch's descriptors (staged too early, too late, or a stale tensor map in the TMA
+// proxy) computes against a foreign weight. This harness fires the TMA route
 // back-to-back (no inter-launch sync) with distinct weights and compares every launch against an
 // isolated (synced) reference: any divergence means a launch read a stale or foreign descriptor.
 // It covers both staging sites: the plain Linear TMA (launch_tma) and the fused LinearSwiGLU TMA.
@@ -90,8 +91,8 @@ int run_staging_race(std::string_view label, std::int32_t launches, std::int32_t
 
     // Captured: each launch is captured into its own graph, more eager launches than any
     // host-side staging state holds follow, and every graph then replays right after a foreign
-    // launch has restaged the shared descriptor buffer. A replay must use the descriptors it was
-    // captured with, whatever the host and the buffer held since.
+    // eager launch has restaged the shared descriptor buffer. A replay must use the descriptors
+    // it was captured with, whatever the host and the eager buffer held since.
     cudaStream_t stream = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "create capture stream");
     std::vector<DecodeGraphDefinition> definitions(launches);

@@ -4,6 +4,7 @@
 // compiled table.
 
 #include "calibration/device_calibration.h"
+#include "calibration/route_catalog.h"
 #include "core/device.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/device_profile.h"
@@ -27,8 +28,10 @@ namespace {
         "          [--no-ternary] [--no-groupwise] [--no-attention]\n"
         "          [--no-linear-attention] [--only PREFIX] [--detail] [--quiet]\n"
         "  Times every route a device profile can steer on this GPU and stores the profile\n"
-        "  at PATH (default: $NINFER_DEVICE_PROFILES, else the user cache). --only limits\n"
-        "  it to the route keys starting with PREFIX; --detail logs every candidate.\n",
+        "  at PATH (default: $NINFER_DEVICE_PROFILES, else the user cache), stamped with\n"
+        "  this build's route catalog. --only limits it to the route keys starting with\n"
+        "  PREFIX (the stored entry keeps the other keys it measured before); --detail logs\n"
+        "  every candidate; --print writes the stored entry to stdout.\n",
         program);
     std::exit(code);
 }
@@ -84,17 +87,22 @@ int main(int argc, char** argv) {
         if (!quiet) {
             options.log = [](const std::string& line) { std::fprintf(stderr, "%s\n", line.c_str()); };
         }
-        ninfer::ops::DeviceRouteProfile profile = ninfer::calibration::calibrate_device_routes(options);
-        profile.hardware_class = ninfer::runtime::context_cost_hardware_class(
+        ninfer::runtime::DeviceProfileEntry entry = ninfer::runtime::calibrated_device_profile_entry(
+            ninfer::calibration::calibrate_device_routes(options),
+            ninfer::calibration::calibration_route_catalog_digest());
+        entry.profile.hardware_class = ninfer::runtime::context_cost_hardware_class(
             properties.name, properties.major, properties.minor);
-        profile.origin = std::string("ninfer-calibrate on ") + properties.name;
+        entry.profile.origin = std::string("ninfer-calibrate on ") + properties.name;
         const std::filesystem::path path =
             out.empty() ? ninfer::runtime::default_device_profile_path() : out;
-        ninfer::runtime::upsert_device_route_profile_atomic(path, profile);
-        std::fprintf(stderr, "stored %zu routed keys for %s (%d SMs) in %s\n", profile.routes.size(),
-                     profile.hardware_class.c_str(), profile.multiprocessors, path.string().c_str());
+        const ninfer::runtime::DeviceProfileEntry stored =
+            ninfer::runtime::upsert_device_route_profile_atomic(path, entry);
+        std::fprintf(stderr, "stored %zu measured keys for %s (%d SMs, route catalog %s) in %s\n",
+                     stored.profile.routes.size(), stored.profile.hardware_class.c_str(),
+                     stored.profile.multiprocessors, stored.calibration->route_catalog.c_str(),
+                     path.string().c_str());
         if (print) {
-            std::fputs(ninfer::runtime::serialize_device_route_profiles({profile}).c_str(), stdout);
+            std::fputs(ninfer::runtime::serialize_device_route_profiles({stored}).c_str(), stdout);
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "ninfer-calibrate: %s\n", error.what());

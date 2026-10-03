@@ -207,8 +207,70 @@ detail::PhysicalResources positive_difference(detail::PhysicalResources value,
 
 } // namespace
 
+KVEntitlementShape ProgramImpl::kv_entitlement_shape() const noexcept {
+    return KVEntitlementShape{
+        .capacity = capacity, .draft_window = draft_window, .backend = speculative_backend};
+}
+
+std::uint32_t ProgramImpl::concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept {
+    // A Device KV lease holds a bounded window of the output, not the whole budget, so lanes do
+    // not compete for the pool up front: the remaining context stays the budget.
+    if (context_cache.kv_lease_growth) {
+        return prompt_tokens == 0 || prompt_tokens > capacity ? 0U
+                                                              : capacity - prompt_tokens + 1U;
+    }
+    // Each lane's fair share of every pool admission reserves from, at the pools' fixed physical
+    // extent: an overlay Vision window's transient loan is not a reason to shrink the budget.
+    const std::uint32_t main_share = decoder->text_kv.page_pool().capacity_pages() / max_concurrency;
+    const qwen3_5::PagedKVCache* backend = backend_kv_cache();
+    const std::uint32_t backend_share =
+        backend != nullptr ? backend->page_pool().capacity_pages() / max_concurrency : 0U;
+    return detail::concurrent_output_budget(kv_entitlement_shape(), main_share, backend_share,
+                                            prompt_tokens);
+}
+
+namespace {
+
+std::uint32_t shared_token_prefix(std::span<const TokenId> prompt, std::span<const TokenId> stored) {
+    const std::size_t limit = std::min(prompt.size(), stored.size());
+    std::size_t shared      = 0;
+    while (shared < limit && prompt[shared] == stored[shared]) { ++shared; }
+    return static_cast<std::uint32_t>(shared);
+}
+
+} // namespace
+
+std::uint32_t ProgramImpl::matched_prefix_tokens(const ContinuationHandle& owner,
+                                                 const PreparedPromptData& prompt) const {
+    if (!valid_continuation(owner)) { return 0; }
+    const SequenceState& sequence = continuation_states[ContractAccess::index(owner)];
+    const std::uint32_t tokens    = shared_token_prefix(prompt.token_ids, sequence.ledger);
+    // Same tokens are not the same history when an earlier turn re-rendered (a stripped
+    // reasoning block, media at another place): the identity chain has to agree as well.
+    if (tokens == 0 || !qwen3_5::detail::prefix_matches(prompt, sequence.ledger,
+                                                        sequence.prefix_identity, tokens)) {
+        return 0;
+    }
+    return tokens;
+}
+
+std::uint32_t ProgramImpl::matched_prefix_tokens(const SharedPrefixHandle& owner,
+                                                 const PreparedPromptData& prompt) const {
+    if (!valid_shared_prefix(owner)) { return 0; }
+    const SharedPrefixState& shared = shared_prefix_states[ContractAccess::index(owner)];
+    if (!shared.identity || shared.identity->prefix_identity() == nullptr) { return 0; }
+    const std::uint32_t tokens = shared_token_prefix(prompt.token_ids, shared.identity->ledger());
+    if (tokens == 0 || !qwen3_5::detail::prefix_matches(prompt, shared.identity->ledger(),
+                                                        *shared.identity->prefix_identity(),
+                                                        tokens)) {
+        return 0;
+    }
+    return tokens;
+}
+
 RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
-                                          const runtime::ResolvedExecutionOptions& options) {
+                                          const runtime::ResolvedExecutionOptions& options,
+                                          std::optional<std::uint32_t> branch_anchor) {
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
     if (prompt.token_ids.size() > capacity) {
         throw std::invalid_argument("prompt exceeds configured context capacity");
@@ -259,19 +321,12 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
     base->summary.publish_continuation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
     if (!context_cache.kv_lease_growth) {
-        const std::uint32_t reserved_context_tokens =
-            base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
-                                               ? 0U
-                                               : base->summary.effective_output_tokens - 1U);
-        base->text_kv_page_entitlement = kv_pages_for_tokens(reserved_context_tokens);
-        if (speculative_backend == SpeculativeBackend::Mtp) {
-            const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                capacity,
-                static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
-            base->backend_kv_page_entitlement = kv_pages_for_tokens(mtp_tokens);
-        } else if (speculative_backend == SpeculativeBackend::DFlash) {
-            base->backend_kv_page_entitlement = kv_pages_for_tokens(reserved_context_tokens);
-        }
+        // One formula with concurrent_output_budget (planning/output_budget.h).
+        const KVPageEntitlement entitlement =
+            kv_page_entitlement(kv_entitlement_shape(), base->summary.prompt_tokens,
+                                base->summary.effective_output_tokens);
+        base->text_kv_page_entitlement    = entitlement.main_pages;
+        base->backend_kv_page_entitlement = entitlement.backend_pages;
     } else {
         // The lease covers a bounded window of the remaining output, not the whole client budget:
         // a client that asks for far more output than it uses would otherwise hold the cache out
@@ -387,6 +442,12 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                         opportunity.kind == PromptCacheMarkerKind::PrivateLongAnchor,
                         opportunity.evidence);
         }
+        // The branch anchor joins through the plan's own capture list, so it is merged, ordered,
+        // given an identity and priced like a client marker. A capture added after the plan is
+        // sealed has no identity, and the Engine refuses it.
+        if (branch_anchor && *branch_anchor != 0 && *branch_anchor < base->summary.prompt_tokens) {
+            add_capture(*branch_anchor, 0, std::nullopt, false, true, SharedCandidateEvidence::None);
+        }
         std::sort(base->capture_groups.begin(), base->capture_groups.end(),
                   [](const CaptureGroup& left, const CaptureGroup& right) {
                       return std::tie(left.frontier, left.input_order) <
@@ -469,7 +530,8 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
 std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base_plan,
     const SequenceState* source, const SharedPrefixState* shared_source,
-    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source) {
+    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
+    bool is_graft) {
     if (lane >= max_concurrency) { throw std::out_of_range("request lane is out of range"); }
     const RequestControl& request = requests[lane];
     if (request.lifecycle != Lifecycle::Empty) {
@@ -495,22 +557,35 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     if (shared_source != nullptr) {
         const runtime::CheckpointRef selected = *checkpoint;
         plan->selected_checkpoint             = selected;
-        if (selected.kind != runtime::CheckpointKind::SharedStablePrefix || selected.ordinal != 0 ||
-            selected.frontier == 0 || selected.frontier != shared_source->frontier ||
-            !shared_source->identity || !shared_source->kv ||
-            !state_store->valid(shared_source->state)) {
-            throw std::logic_error("catalog shared-prefix summary disagrees with Program state");
+        if (is_graft) {
+            if (selected.kind != runtime::CheckpointKind::SharedStablePrefix ||
+                selected.ordinal != 0 || selected.frontier == 0 ||
+                selected.frontier != shared_source->frontier || !shared_source->kv ||
+                !state_store->valid(shared_source->state)) {
+                throw std::logic_error("graft shared-prefix state is invalid");
+            }
+            plan->reuse       = ReusePath::SharedStablePrefix;
+            plan->reuse_base  = selected.frontier;
+            plan->source_mode = runtime::PrivateSourceMode::Retain;
+        } else {
+            if (selected.kind != runtime::CheckpointKind::SharedStablePrefix ||
+                selected.ordinal != 0 || selected.frontier == 0 ||
+                selected.frontier != shared_source->frontier || !shared_source->identity ||
+                !shared_source->kv || !state_store->valid(shared_source->state)) {
+                throw std::logic_error(
+                    "catalog shared-prefix summary disagrees with Program state");
+            }
+            if (!base.allow_prefix_reuse || !prompt.identity.reusable) { return std::nullopt; }
+            const auto* shared_identity = shared_source->identity->prefix_identity();
+            if (shared_identity == nullptr ||
+                !qwen3_5::detail::prefix_matches(prompt, shared_source->identity->ledger(),
+                                                 *shared_identity, selected.frontier)) {
+                return std::nullopt;
+            }
+            plan->reuse       = ReusePath::SharedStablePrefix;
+            plan->reuse_base  = selected.frontier;
+            plan->source_mode = runtime::PrivateSourceMode::Retain;
         }
-        if (!base.allow_prefix_reuse || !prompt.identity.reusable) { return std::nullopt; }
-        const auto* shared_identity = shared_source->identity->prefix_identity();
-        if (shared_identity == nullptr ||
-            !qwen3_5::detail::prefix_matches(prompt, shared_source->identity->ledger(),
-                                             *shared_identity, selected.frontier)) {
-            return std::nullopt;
-        }
-        plan->reuse              = ReusePath::SharedStablePrefix;
-        plan->reuse_base         = selected.frontier;
-        plan->source_mode = runtime::PrivateSourceMode::Retain;
     } else if (source != nullptr) {
         const runtime::CheckpointRef selected = *checkpoint;
         plan->selected_checkpoint             = selected;
@@ -652,6 +727,9 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                     continue;
                 }
                 unique.push_back(state);
+                // An anchor another owner also references is not part of this lineage's
+                // exclusive entitlement, exactly as in the rewrite-restore branch below.
+                if (!state_exclusive_to_sequence(*source, state)) { continue; }
                 const StateReplicaResidency residency = state_store->residency(state);
                 if (residency == StateReplicaResidency::DeviceOnly ||
                     residency == StateReplicaResidency::Both) {

@@ -8,9 +8,15 @@
 
 namespace ninfer::ops::detail {
 
+// apply_scaled follows the contract in ops/linear/common/epilogue.cuh.
 struct Nvfp4IdentityEpilogue {
     __device__ __forceinline__ float apply(std::int32_t, std::int32_t, float value) const {
         return value;
+    }
+
+    __device__ __forceinline__ float apply_scaled(std::int32_t, std::int32_t, float value,
+                                                  float scale) const {
+        return value * scale;
     }
 };
 

@@ -210,6 +210,11 @@ OperationalRecord render_request_start(const RequestLogContext& context) {
         out << requested_effort_name(context);
         if (context.thinking_budget) {
             out << ", budget " << product::format_pretty_count(*context.thinking_budget);
+            if (context.effective_thinking_budget &&
+                *context.effective_thinking_budget != *context.thinking_budget) {
+                out << " (effective "
+                    << product::format_pretty_count(*context.effective_thinking_budget) << ")";
+            }
         }
     } else {
         out << "off";
@@ -316,10 +321,16 @@ OperationalRecord render_request_done(const RequestLogContext& context,
                 << product::format_pretty_count(metrics.ngram_archive.sources) << " sources";
         }
     }
-    if (outcome.thinking.configured_budget) {
+    if (outcome.thinking.requested_budget) {
         out << " | thinking "
             << product::format_pretty_count(outcome.thinking.model_thinking_tokens) << '/'
-            << product::format_pretty_count(*outcome.thinking.configured_budget);
+            << product::format_pretty_count(
+                   outcome.thinking.effective_budget.value_or(*outcome.thinking.requested_budget));
+        if (outcome.thinking.effective_budget &&
+            *outcome.thinking.effective_budget != *outcome.thinking.requested_budget) {
+            out << " (requested "
+                << product::format_pretty_count(*outcome.thinking.requested_budget) << ")";
+        }
         if (outcome.thinking.injected_tokens != 0) {
             out << ", control " << product::format_pretty_count(outcome.thinking.injected_tokens);
         }
@@ -447,6 +458,53 @@ void OperationalLog::write(OperationalRecord record) const {
         logger_->error("{}", message);
         return;
     }
+}
+
+void OperationalLog::slot_saved(std::uint32_t slot, std::string_view filename,
+                                const ninfer::SlotSaveResult& result) const {
+    std::ostringstream out;
+    out << "slot save | slot " << slot << " | " << product::format_pretty_text(filename) << " | "
+        << result.tokens << " tokens | " << product::format_pretty_bytes(result.bytes)
+        << " | session " << result.session_digest << " | " << std::fixed
+        << std::setprecision(2) << result.seconds << " s";
+    write({.severity = OperationalSeverity::Info, .message = out.str()});
+}
+
+void OperationalLog::slot_restored(std::uint32_t slot, std::string_view filename,
+                                   const ninfer::SlotRestoreResult& result) const {
+    std::ostringstream out;
+    out << "slot restore | slot " << slot << " | " << product::format_pretty_text(filename)
+        << " | " << result.tokens << " tokens | " << product::format_pretty_bytes(result.bytes)
+        << " | session " << result.session_digest << " | " << std::fixed
+        << std::setprecision(2) << result.seconds << " s";
+    write({.severity = OperationalSeverity::Info, .message = out.str()});
+}
+
+void OperationalLog::slot_erased(std::uint32_t slot, std::uint32_t tokens) const {
+    write({.severity = OperationalSeverity::Info,
+           .message  = "slot erase | slot " + std::to_string(slot) + " | " +
+                      std::to_string(tokens) + " tokens"});
+}
+
+void OperationalLog::slot_auto_save(const ninfer::SlotAutoSaveEvent& event) const {
+    std::ostringstream out;
+    out << "slot auto-save | " << product::format_pretty_text(event.path) << " | "
+        << event.tokens << " tokens";
+    if (!event.error.empty()) {
+        out << " | failed: " << event.error;
+        write({.severity = OperationalSeverity::Warning, .message = out.str()});
+        return;
+    }
+    if (event.superseded) {
+        out << " | skipped: superseded by an explicit save, restore or erase";
+    } else if (event.skipped_behind_tokens) {
+        out << " | skipped: the file holds a deeper snapshot of " << *event.skipped_behind_tokens
+            << " tokens";
+    } else {
+        out << " | " << product::format_pretty_bytes(event.bytes) << " | " << std::fixed
+            << std::setprecision(2) << event.seconds << " s";
+    }
+    write({.severity = OperationalSeverity::Info, .message = out.str()});
 }
 
 void OperationalLog::request_start(const RequestLogContext& context) const {

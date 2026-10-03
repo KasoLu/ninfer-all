@@ -4,9 +4,11 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -20,21 +22,28 @@ namespace ninfer {
 // returned by stage() and makes each tensor map visible to the TMA (tensormap) proxy with a
 // fence.proxy.tensormap acquire before its first cp.async.bulk.tensor.
 //
-// MSVC does pass the same bytes as an 8-byte-aligned word array, so stage() launches a one-block
-// kernel that takes the words by value and stores them into one persistent device buffer.
-// Kernel parameters are copied when the launch is issued, and into the graph node when the
-// stream is being captured, so an eager launch never reads host memory the host may since have
-// rewritten, a captured launch replays exactly the descriptors it was captured with, and the
-// host never waits for the GPU. The staging kernel and the TMA kernel that reads the buffer are
-// ordinary stream-ordered launches, so a launch's descriptors are stored only after the previous
-// TMA kernel on the stream has finished reading them.
+// An eager launch: MSVC does pass the same bytes as an 8-byte-aligned word array, so stage()
+// launches a one-block kernel that takes the words by value and stores them into one persistent
+// device buffer. Kernel parameters are copied when the launch is issued, so the launch never
+// reads host memory the host may since have rewritten, and the host never waits for the GPU. The
+// staging kernel and the TMA kernel that reads the buffer are ordinary stream-ordered launches,
+// so a launch's descriptors are stored only after the previous TMA kernel on the stream has
+// finished reading them.
+//
+// A launch being captured into a CUDA Graph: its descriptors never change across replays, so
+// they are copied once, while capturing, into a device copy of their own that is never
+// rewritten, and the graph carries no staging kernel. (A staging kernel in a decode graph runs
+// on every replay: on an RTX 5090 the FP8 TMA decode route's 72 launches per round cost about
+// 65 us of each 18-23 ms DFlash2 round; Ian Ranson, W47 d0abd0cbf.) Copies are keyed by device
+// and descriptor bytes, so a graph captured again over the same workspace reuses them.
 //
 // Invariants, documented here because this is the single staging site:
-//   - one stream per device: every staged launch on a device runs on that device's compute
+//   - one stream per device: every eager staged launch on a device runs on that device's compute
 //     stream, so its persistent buffer orders against itself in-stream; each device of a
-//     pipeline has its own buffer;
-//   - allocation outside capture rules: the first stage() on a device allocates its buffer, in
-//     relaxed capture mode when a capture is open;
+//     pipeline has its own buffer and its own captured copies;
+//   - allocation and copies outside the graph: buffers are allocated, and captured descriptors
+//     copied, in relaxed capture mode by synchronous calls, so a route first reached while a
+//     decode graph is being captured still works and the copy has landed before any replay;
 //   - nothing is freed: the device buffers are reclaimed at process exit.
 namespace tma_staging_detail {
 
@@ -73,7 +82,12 @@ class TmaDescriptorStaging {
     // Stages the descriptors for the next launch on `stream` and returns the device pointer
     // the kernel must read them from.
     Descriptor* stage(const Descriptor& descriptors, cudaStream_t stream) {
-        Descriptor* const buffer = current_device_buffer();
+        int device = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+        if (capture == cudaStreamCaptureStatusActive) { return captured(device, descriptors); }
+        Descriptor* const buffer = eager_buffer(device);
         tma_staging_detail::DescriptorWords<kWords> words;
         std::memcpy(words.words, &descriptors, sizeof(Descriptor));
         tma_staging_detail::store_descriptor_words<kWords>
@@ -83,29 +97,70 @@ class TmaDescriptorStaging {
     }
 
   private:
-    static constexpr std::size_t kWords = sizeof(Descriptor) / sizeof(std::uint64_t);
+    static constexpr std::size_t kWords         = sizeof(Descriptor) / sizeof(std::uint64_t);
+    static constexpr std::size_t kCapturedChunk = 256;
+    using Key = std::pair<int, std::array<std::uint64_t, kWords>>;
 
-    Descriptor* current_device_buffer() {
+    struct DeviceChunks {
         int device = 0;
-        CUDA_CHECK(cudaGetDevice(&device));
+        std::vector<Descriptor*> chunks;
+        std::size_t used = kCapturedChunk;
+    };
+
+    // cudaMalloc is not a stream operation; relaxed mode lets it run while this thread captures,
+    // so it never lands in (or aborts) a graph.
+    static Descriptor* allocate(std::size_t count) {
+        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+        CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
+        void* allocation         = nullptr;
+        const cudaError_t status = cudaMalloc(&allocation, count * sizeof(Descriptor));
+        CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
+        CUDA_CHECK(status);
+        return static_cast<Descriptor*>(allocation);
+    }
+
+    Descriptor* eager_buffer(int device) {
         const std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& [owner, buffer] : buffers_) {
             if (owner == device) { return buffer; }
         }
-        // cudaMalloc is not capturable; relaxed mode admits it when the first launch on this
-        // device is being captured.
+        buffers_.emplace_back(device, allocate(1));
+        return buffers_.back().second;
+    }
+
+    // The device copy a captured launch reads, written now by a synchronous copy (which the
+    // relaxed capture mode admits) and never again.
+    Descriptor* captured(int device, const Descriptor& descriptors) {
+        Key key{device, {}};
+        std::memcpy(key.second.data(), &descriptors, sizeof(Descriptor));
+        const std::lock_guard<std::mutex> lock(mutex_);
+        if (const auto found = captured_.find(key); found != captured_.end()) {
+            return found->second;
+        }
+        DeviceChunks* pool = nullptr;
+        for (DeviceChunks& candidate : pools_) {
+            if (candidate.device == device) { pool = &candidate; }
+        }
+        if (pool == nullptr) { pool = &pools_.emplace_back(DeviceChunks{device, {}, kCapturedChunk}); }
+        if (pool->used == kCapturedChunk) {
+            pool->chunks.push_back(allocate(kCapturedChunk));
+            pool->used = 0;
+        }
+        Descriptor* const slot     = pool->chunks.back() + pool->used++;
         cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
         CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
-        void* allocation         = nullptr;
-        const cudaError_t status = cudaMalloc(&allocation, sizeof(Descriptor));
+        const cudaError_t status =
+            cudaMemcpy(slot, &descriptors, sizeof(Descriptor), cudaMemcpyHostToDevice);
         CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&mode));
         CUDA_CHECK(status);
-        buffers_.emplace_back(device, static_cast<Descriptor*>(allocation));
-        return buffers_.back().second;
+        captured_.emplace(key, slot);
+        return slot;
     }
 
     std::mutex mutex_;
     std::vector<std::pair<int, Descriptor*>> buffers_;
+    std::vector<DeviceChunks> pools_;
+    std::map<Key, Descriptor*> captured_;
 };
 
 } // namespace ninfer

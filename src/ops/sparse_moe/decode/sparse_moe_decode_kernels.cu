@@ -179,13 +179,6 @@ struct Q8Codec {
             weights[item] = static_cast<float>(code) * scale;
         }
     }
-
-
-    __device__ static __forceinline__ void
-    load_pair(const std::uint8_t* codes, const std::uint8_t* high, const std::uint8_t* scales,
-              std::int64_t group_index, int lane, float& w0, float& w1) {
-        Q8ScalarDecodeAtom::load_pair(codes, high, scales, group_index, lane, w0, w1);
-    }
 };
 
 // The divisors of an NVFP4 plane assembled from separately quantised matrices, one per

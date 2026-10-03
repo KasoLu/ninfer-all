@@ -26,7 +26,7 @@ namespace ninfer::models::qwen3_5::execution {
 namespace {
 
 DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
-    if (!state.execution.io.dflash_decode || state.dflash_host_ingress == nullptr) {
+    if (!state.execution.io.dflash_decode) {
         throw std::logic_error("DFlash prefill controls are unavailable");
     }
     return dflash_feature_sink(
@@ -35,7 +35,12 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
             Tensor count = frame.append_counts.slice(0, 0, 1);
             Tensor lane  = frame.state_destination_slots.slice(0, 0, 1);
             Tensor row   = frame.dflash_kv_table_rows.slice(0, 0, 1);
+            // Target execution and draft append use the same chunk bindings: decode rounds and
+            // other lanes' prefills rewrite frame row 0 between steps, and a checkpoint may fork
+            // the destination slot between chunks of one step.
             ops::set_i32_scalar(count, features.ne[1], state.execution.device.stream);
+            ops::set_i32_scalar(lane, state.state_destination_slot, state.execution.device.stream);
+            ops::set_i32_scalar(row, state.dflash_kv_table_row, state.execution.device.stream);
             const auto exact = static_cast<std::uint32_t>(features.ne[1]);
             dflash_append_context(state, features, positions, count, lane, row, {exact, exact});
             (void)rewrite_checkpoint;
@@ -78,7 +83,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
-    card.set_layer_ready(state.layer_ready);
+    if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
@@ -106,7 +111,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
-    card.set_layer_ready(state.layer_ready);
+    if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
         return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, vision,
@@ -270,8 +275,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             const bool shared_source_ready =
                 transaction.has_shared_source &&
                 transaction.shared_source_index < shared_prefix_capacity &&
-                shared_prefix_slots[transaction.shared_source_index].role ==
-                    SharedPrefixSlotRole::Catalogued;
+                is_live_shared_prefix_role(
+                    shared_prefix_slots[transaction.shared_source_index].role);
             if (private_source_ready == shared_source_ready ||
                 transaction.reserved_state_count != state_slots || state_slots == 0 ||
                 !transaction.root_text_address || !transaction.text_prefix_fork ||
@@ -697,7 +702,6 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             if (!dflash || !io.dflash_decode || (backend_kv_cache() && !sequence.kv->backend)) {
                 throw std::logic_error("DFlash prefill state is incomplete");
             }
-            upload_dflash_prefill_controls(sequence);
         }
 
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
@@ -904,6 +908,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                          device.stream);
         }
 
+        // A terminal DFlash row appends its context through the pinned DFlash ingress, which the
+        // next round's submission rewrites; only that path needs the host to wait here.
+        bool host_ingress_in_flight = false;
         if (is_masked_draft_backend(speculative_backend)) {
             std::array<std::uint32_t, kMaximumConcurrency> append_lanes{};
             std::array<std::uint32_t, kMaximumConcurrency> append_starts{};
@@ -922,12 +929,20 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     std::span<const std::uint32_t>(append_lanes.data(), append_size),
                     std::span<const std::uint32_t>(append_starts.data(), append_size),
                     std::span<const std::uint32_t>(append_counts.data(), append_size));
+                host_ingress_in_flight = true;
             }
         }
 
-        timing.begin_wait();
-        device.synchronize();
-        timing.end_wait();
+        if (host_ingress_in_flight) {
+            timing.begin_wait();
+            device.synchronize();
+            timing.end_wait();
+        } else {
+            // Every later consumer of the folded state is ordered behind the fold on this stream,
+            // and the host reads nothing the fold writes. Submit it now so it overlaps the next
+            // round's host preparation instead of waiting for that submission.
+            device.flush();
+        }
         work.reset();
     } catch (...) {
         try {
@@ -1102,7 +1117,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             selectors.source,
             selectors.destination,
             staged.initial_mtp_extent,
-            dflash_host_ingress};
+            0};
         const auto public_tokens =
             static_cast<std::size_t>(dimension(parameters.model.resources().public_token_count));
         if (request.first_token_top_logprobs != 0) {
@@ -1112,7 +1127,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             schedule_state.first_token_logits = first_token_logits_host->data();
         }
         // The first pass after a Host restore waits for each layer's copies (hybrid spec §6.5).
-        schedule_state.layer_ready = hybrid_take_restore_layers(sequence.lane);
+        // The chunk function takes the events itself: they are a view into the landing batch, and
+        // the KV commits between chunks (the MTP bridge's among them) poll the cache, which frees
+        // a batch that has landed. A landed batch yields no events; its copies are complete.
+        schedule_state.take_layer_ready = [this, lane = sequence.lane] {
+            return hybrid_take_restore_layers(lane);
+        };
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -1149,9 +1169,6 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                                     : workspace_plan.text_prefill);
             if (is_masked_draft_backend(speculative_backend)) {
                 mark_workspace_usage(workspace_plan.dflash_context);
-                // Decode rounds and other prefills rewrite the shared DFlash frame controls
-                // between steps; this step's feature sink reads its lane from row 0.
-                upload_dflash_prefill_controls(sequence);
             }
             std::uint32_t remaining          = nominal;
             std::uint32_t final_chunk_tokens = 0;
@@ -1161,6 +1178,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 selectors                             = state_selectors(sequence);
                 schedule_state.state_source_slot      = selectors.source;
                 schedule_state.state_destination_slot = selectors.destination;
+                schedule_state.dflash_kv_table_row =
+                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
+                                         : 0;
                 const std::optional<std::uint32_t> hybrid_split = next_hybrid_split();
                 if (staged.next_capture < staged.capture_groups.size() || hybrid_taps_left()) {
                     rewrite_capture_hidden =
@@ -1214,7 +1234,6 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
                 timing.include(result.timing);
                 timing.resume_post();
-                schedule_state.layer_ready = {};
                 if (result.processed_tokens == 0 || result.processed_tokens > remaining) {
                     throw std::logic_error("ordinary prefill chunk made invalid progress");
                 }

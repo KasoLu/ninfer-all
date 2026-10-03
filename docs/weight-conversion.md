@@ -55,6 +55,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_27b` | Q4/Q5 projections, Q6 vocabulary weights | None |
 | `qwen3_8_27b` | Q4/Q5 projections, Q8 vocabulary weights | None |
 | `qwen3_8_27b_q6` | Q4/Q5 projections, Q6 MLP gate/up, Q8 vocabulary weights | None |
+| `qwen3_8_27b_imatrix` | `grouped_search` with signed scales; Q4/Q5 projections, Q4 mixer outputs and MLP down in layers 36-63, Q4 embedding, Q6 head | `imatrix` |
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_35b_a3b_nvfp4` | Imported NVFP4 routed and shared experts, Q8 projection weights, Q8/Q6 vocabulary weights | `quantized` |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
@@ -91,6 +92,33 @@ The FFN evaluates a Q6 gate/up pair through its existing materialized decomposit
 `linear` op followed by `silu_mul`) rather than the fused `linear_swiglu` op, which has no Q6
 variant. That decomposition costs nothing measurable: forcing the fused Q4 route through the same
 decomposition moves the corpus perplexity from 1.524538 to 1.524618.
+
+`qwen3_8_27b_imatrix` spends fewer bytes per decoded token than `qwen3_8_27b` and recovers the
+quality with the importance-weighted `grouped_search` (described under
+[Formats, methods and activation precision](#formats-methods-and-activation-precision)). It needs an
+importance matrix from llama.cpp's `llama-imatrix`; Unsloth publishes one for Qwen3.8-27B
+(`imatrix_unsloth.gguf`). Import it, then convert:
+
+```bash
+python3 -m tools.convert.imatrix --gguf imatrix_unsloth.gguf \
+  --config /path/to/Qwen3.8-27B/config.json --out qwen3_8_27b.imatrix.safetensors
+python3 -m tools.convert \
+  --model /path/to/Qwen3.8-27B \
+  --recipe qwen3_8_27b_imatrix \
+  --source imatrix=qwen3_8_27b.imatrix.safetensors \
+  --source dflash2=/path/to/Qwen3.8-27B-DFlash2 \
+  --components text,vision,mtp,dflash2 \
+  --resource chat_template.jinja=tools/chat_templates/qwen3_8.jinja \
+  --proposal \
+  --name qwen3.8-27b \
+  --out models/qwen3_8_27b_imatrix.ninfer
+```
+
+The artifact is 17.7 GiB against 19.0 GiB for upstream's `qwen3_8_27b` artifact. On the source
+fork's RTX 3090 it measured a mean KLD of 0.0318 against 0.0376 for that artifact, relative to a
+Q8_0 reference over the [held-out corpus](perplexity.md#held-out-corpus), and a 0.9% lower
+`ninfer-ppl-1m` perplexity; those numbers mix the layout change with the encoder change. Loading it
+needs the Q4 `linear_add` route at 5120x17408 for the MLP down projection.
 
 For a Qwen3.8-27B NVFP4/FP8 artifact with DFlash2:
 
@@ -261,12 +289,33 @@ The converter currently writes these formats:
 | Format | Built-in method for floating-point input | Import of already encoded input |
 |---|---|---|
 | `bf16`, `fp32`, `int32` | `cast_direct` | Direct words through the source reader |
-| `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax` | Supply a custom method/source if needed |
+| `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax`, `grouped_search` | Supply a custom method/source if needed |
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
 | `nvfp4` | Supply a custom quantizer | `import_encoded` |
 
-`grouped_absmax` stores one FP16 scale per group and signed integer codes. `fp8_row_maxabs` first
-rounds input values to BF16, then produces E4M3FN codes and one BF16 multiplier per row.
+`grouped_absmax` stores one FP16 scale per group and signed integer codes. `grouped_search` stores
+the same words but picks each group's scale from about seventy candidates by the rounding error
+weighted with an activation importance matrix, and never does worse than `grouped_absmax` under
+that error. Its parameters are `imatrix` (a file written by `tools.convert.imatrix`) and
+`negative_scales` (default false), which admits signed scales that map a group's largest positive
+value onto the most negative code:
+
+```bash
+python3 -m tools.convert.imatrix --gguf imatrix.gguf \
+  --config /path/to/Qwen3.8-27B/config.json --out qwen3_8_27b.imatrix.safetensors
+```
+
+```python
+recipe.assign(name, format="q4_g64_fp16", method="grouped_search",
+              parameters={"imatrix": "qwen3_8_27b.imatrix.safetensors", "negative_scales": True})
+```
+
+The importance file comes from a llama.cpp `llama-imatrix` run over calibration text. Parameters it
+does not cover (the embedding, the output head, MTP and draft components) are searched with equal
+channel weights. The search runs on `--device`; a CUDA device is much faster than the CPU.
+
+`fp8_row_maxabs` first rounds input values to BF16, then produces E4M3FN codes and one BF16
+multiplier per row.
 `import_encoded` preserves compatible code and scale words, including NVFP4's matrix weight divisor.
 It does not dequantize and requantize them.
 

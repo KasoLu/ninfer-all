@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/tma_descriptor_staging.cuh"
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
@@ -21,12 +22,25 @@
 
 namespace ninfer::ops::detail::unified {
 
-struct alignas(128) Nvfp4A4TmaDescriptors {
+// Passed by value as a __grid_constant__ kernel parameter; see Bf16TmaDescriptors for why the
+// struct states 64-byte alignment (MSVC C2719) instead of 128.
+struct alignas(64) Nvfp4A4TmaDescriptors {
     CUtensorMap a_codes;
     CUtensorMap b_codes;
     CUtensorMap a_scales;
     CUtensorMap b_scales;
 };
+static_assert(alignof(Nvfp4A4TmaDescriptors) % 64 == 0);
+
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+// The single staged-descriptor (Windows) staging for Nvfp4A4TmaDescriptors, shared by every A4 TMA launch
+// route (linear, attention and GDN input projections, linear-add, LinearSwiGLU). See
+// core/tma_descriptor_staging.cuh for the invariants its device buffer relies on.
+inline TmaDescriptorStaging<Nvfp4A4TmaDescriptors>& nvfp4_a4_tma_descriptor_staging() {
+    static TmaDescriptorStaging<Nvfp4A4TmaDescriptors> staging;
+    return staging;
+}
+#endif
 
 inline void nvfp4_check_driver(CUresult status, const char* operation) {
     if (status == CUDA_SUCCESS) { return; }
@@ -142,9 +156,21 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
 template <class Schedule, class Epilogue, class OutputPolicy, class Rows>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_tma_kernel(
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+    // MSVC cannot pass the over-aligned (alignas(128)) CUtensorMap struct by value as a
+    // __grid_constant__ parameter (C2719), so on Windows the descriptors are pointer-passed from
+    // the staging buffer. The epilogue and output stay ordinary by-value parameters: a
+    // grid-constant struct holding a sub-8-byte member mis-packs under MSVC.
+    const Nvfp4A4TmaDescriptors* descriptors_pointer, float alpha, const Epilogue epilogue,
+    const OutputPolicy output,
+#else
     const __grid_constant__ Nvfp4A4TmaDescriptors descriptors, float alpha,
     const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output,
+#endif
     int token_count, int output_rows, int input_rows, int token_offset) {
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+    const Nvfp4A4TmaDescriptors& descriptors = *descriptors_pointer;
+#endif
     const int K               = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     constexpr int branches    = Rows::kPaired ? 2 : 1;
     constexpr int loaded_rows = Schedule::kBlockRows / branches;
@@ -176,6 +202,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
             asm volatile("setmaxnreg.dec.sync.aligned.u32 40;" : : : "memory");
         }
         if (threadIdx.x == 0) {
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+            // A staged tensor map was written through the generic proxy; each 128-byte map needs
+            // its own acquire for the TMA (tensormap) proxy before its first use.
+            acquire_staged_tensor_map(&descriptors.a_codes);
+            acquire_staged_tensor_map(&descriptors.b_codes);
+            acquire_staged_tensor_map(&descriptors.a_scales);
+            acquire_staged_tensor_map(&descriptors.b_scales);
+#endif
 #pragma unroll 1
             for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
                 const int stage                 = k_tile % Schedule::kStages;
@@ -340,15 +374,18 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
 #pragma unroll
             for (int mr = 0; mr < Schedule::kMmaRows; ++mr) {
                 const int row = warp_n * Schedule::kWarpRows + mr * 8 + ac;
-                float a = accumulators[mt][mr][0] * alpha, b = accumulators[mt][mr][1] * alpha;
-                float c = accumulators[mt][mr][2] * alpha, d = accumulators[mt][mr][3] * alpha;
+                float a = 0.0F, b = 0.0F, c = 0.0F, d = 0.0F;
                 if (token_begin + t0 < token_count) {
-                    a = epilogue.apply(row_begin + row, token_begin + t0, a);
-                    b = epilogue.apply(row_begin + row + 1, token_begin + t0, b);
+                    a = epilogue.apply_scaled(row_begin + row, token_begin + t0,
+                                              accumulators[mt][mr][0], alpha);
+                    b = epilogue.apply_scaled(row_begin + row + 1, token_begin + t0,
+                                              accumulators[mt][mr][1], alpha);
                 }
                 if (token_begin + t1 < token_count) {
-                    c = epilogue.apply(row_begin + row, token_begin + t1, c);
-                    d = epilogue.apply(row_begin + row + 1, token_begin + t1, d);
+                    c = epilogue.apply_scaled(row_begin + row, token_begin + t1,
+                                              accumulators[mt][mr][2], alpha);
+                    d = epilogue.apply_scaled(row_begin + row + 1, token_begin + t1,
+                                              accumulators[mt][mr][3], alpha);
                 }
                 *reinterpret_cast<__nv_bfloat162*>(tile + t0 * stride + row) =
                     __floats2bfloat162_rn(a, b);
@@ -391,13 +428,23 @@ void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue e
     if (!aligned(p.x) || !aligned(p.codes) || !aligned(p.scales) || !aligned(p.x_scales))
         throw std::invalid_argument("NVFP4 TMA operands require 16-byte alignment");
     const auto descriptors = make_nvfp4_a4_tma_descriptors<Schedule, Rows>(p);
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+    // Staged once: every token-slice launch below reads the same copy, in stream order.
+    const Nvfp4A4TmaDescriptors* staged =
+        nvfp4_a4_tma_descriptor_staging().stage(descriptors, stream);
+#endif
     constexpr int bytes    = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
     constexpr auto kernel  = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>;
     (void)nvfp4_prepare_shared<bytes, kernel, true>();
-    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&, kernel](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(staged, p.alpha, epilogue, output,
+                                                            offset + count, p.rows, p.k, offset);
+#else
         kernel<<<grid, Schedule::kThreads, bytes, stream>>>(descriptors, p.alpha, epilogue, output,
                                                             offset + count, p.rows, p.k, offset);
+#endif
         CUDA_CHECK(cudaGetLastError());
     });
 }

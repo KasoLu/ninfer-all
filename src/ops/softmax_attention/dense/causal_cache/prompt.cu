@@ -2,6 +2,7 @@
 // positions then launch causal attention over absolute cached history.
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
+#include "ops/common/device_multiprocessors.h"
 #include "ops/common/device_route.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/append/launch.h"
@@ -49,13 +50,7 @@ bool prompt_pack_gqa() {
 // so a launch costs about (waves) x (one CTA's sweep). A four-warp CTA sweeps in about 0.72 of an
 // eight-warp CTA's time (measured on RTX 5090 at 64K context) but covers half the rows.
 bool causal_attention_prompt_i8_fast_prefers_narrow(std::int32_t tokens, std::int32_t q_heads) {
-    static const int multiprocessors = [] {
-        int device = 0;
-        int count  = 0;
-        CUDA_CHECK(cudaGetDevice(&device));
-        CUDA_CHECK(cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device));
-        return count;
-    }();
+    const int multiprocessors = current_device_multiprocessors(170);
     const auto waves = [&](int rows) {
         return div_up(div_up(tokens, rows) * q_heads, multiprocessors);
     };
@@ -229,7 +224,8 @@ bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested)
                            storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
                            storage == KvCacheStorage::RotatedLloyd4KeyInt4Value ||
                            storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8 ||
-                           storage == KvCacheStorage::RotatedE8RootKeyInt4Value;
+                           storage == KvCacheStorage::RotatedE8RootKeyInt4Value ||
+                           storage == KvCacheStorage::Nvfp4Group16;
     if (!supported) { return false; }
     if (requested) { return true; }
     static const int forced = [] {

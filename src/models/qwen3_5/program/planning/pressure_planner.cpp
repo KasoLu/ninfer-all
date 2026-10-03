@@ -498,9 +498,23 @@ void PressurePlanningSessionImpl::rank_victims_by_rebuild_cost(CandidateOptions&
             const SequenceState& sequence =
                 program->continuation_states[PlanningContractAccess::index(*owner.private_handle)];
             const qwen3_5::ContinuationSummary summary = program->continuation_summary(sequence);
-            if (summary.endpoint) {
-                planning_saturating_add(cost, summary.endpoint->rebuild_work.tokens);
-                planning_saturating_add(cost, summary.endpoint->rebuild_work.attention_pairs);
+            // Price the most valuable restorable checkpoint the victim holds, not the endpoint
+            // alone: a victim whose only restorable checkpoint is a rewrite or a long anchor was
+            // priced at zero, the lowest weight, so eviction treated it as free to drop.
+            const qwen3_5::CheckpointSummary* best = nullptr;
+            const auto consider = [&best](const qwen3_5::CheckpointSummary& candidate) {
+                if (best == nullptr || candidate.rebuild_work.tokens > best->rebuild_work.tokens) {
+                    best = &candidate;
+                }
+            };
+            if (summary.endpoint) { consider(*summary.endpoint); }
+            if (summary.rewrite) { consider(*summary.rewrite); }
+            for (const qwen3_5::CheckpointSummary& anchor : summary.long_anchors) {
+                consider(anchor);
+            }
+            if (best != nullptr) {
+                planning_saturating_add(cost, best->rebuild_work.tokens);
+                planning_saturating_add(cost, best->rebuild_work.attention_pairs);
             }
         }
         rebuild_cost.push_back(cost);

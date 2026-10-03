@@ -1,0 +1,30 @@
+#pragma once
+
+#include "core/paged_kv_cache.h"
+#include "core/tensor.h"
+
+#include <cuda_runtime.h> // cudaStream_t
+
+#include <cstdint>
+
+namespace ninfer::ops {
+
+/**
+ * Qwen3.8-Flash-Next's sparse attention for one sequence: query p attends only to the 4-token
+ * blocks its indexer selected (qsa_indexer_select) and to its own incomplete block, positions
+ * 4 floor((p + 1) / 4) .. p:
+ *
+ *   out[h] = sum_{j in S_p} softmax_j(scale * q[h] . k[kv(h), j]) v[kv(h), j],   kv(h) = h / 12
+ *
+ * `q` is BF16 [256, 24, tokens] (normalised and rotated) for the consecutive positions
+ * `first_position` ..; `selected` I32 [512, tokens] and `counts` I32 [tokens] are the indexer's
+ * blocks; `cache` is the sequence's BF16 paged KV layer (2 heads of 256) holding every selected
+ * and tail position; `out` is BF16 [256, 24, tokens]. The oracle evaluates the softmax and the
+ * weighted sum in FP64 from the represented cache and queries; the output is compared after its
+ * BF16 store. No workspace or state.
+ */
+void sparse_softmax_attention(const Tensor& q, std::int32_t first_position, const Tensor& selected,
+                              const Tensor& counts, const PagedKVLayerView& cache, float scale,
+                              Tensor& out, cudaStream_t stream);
+
+} // namespace ninfer::ops

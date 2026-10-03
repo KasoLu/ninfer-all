@@ -313,6 +313,13 @@ public:
                                 std::span<const DeviceKVPageHandle> destination,
                                 const HostKVPageLayout& layout, std::size_t plane_begin,
                                 std::size_t plane_end, RankStreams streams) const;
+    // The same copies against caller-owned memory laid out by `host`, for images that do not live
+    // in a Host KV arena (session snapshots). `host` must describe this pool's geometry.
+    void copy_to_host(std::span<const DeviceKVPageHandle> source, std::byte* destination,
+                      const HostKVPageLayout& host, RankStreams streams = {}) const;
+    void copy_from_host(const std::byte* source, const HostKVPageLayout& host,
+                        std::span<const DeviceKVPageHandle> destination,
+                        RankStreams streams = {}) const;
 
 private:
     friend class DeviceKVPageLease;
@@ -426,6 +433,7 @@ public:
     // A single copy on rank 0.
     KVExecutionTablePool(DeviceSpan backing, const KVExecutionTableLayout& layout,
                          const DeviceKVPagePool& pages);
+    ~KVExecutionTablePool();
 
     KVExecutionTablePool(const KVExecutionTablePool&)            = delete;
     KVExecutionTablePool& operator=(const KVExecutionTablePool&) = delete;
@@ -455,10 +463,30 @@ public:
 private:
     friend class KVExecutionRowLease;
 
+    // A publication's H2D copy reads its row's pinned shadow slice when the copy's stream reaches
+    // it, not when it is enqueued. A fence records, per row and per copy, the entries the queued
+    // copies still read, so a later publication - by the same owner or by the next owner of a
+    // released row - waits for them before rewriting any of those entries. Disjoint entries are
+    // written without waiting. The event belongs to the device of the copy it fences.
+    struct RowFence {
+        cudaEvent_t event   = nullptr;
+        cudaStream_t stream = nullptr;
+        std::uint32_t begin = 0;
+        std::uint32_t end   = 0;
+    };
+
     [[nodiscard]] bool valid_handle(KVExecutionRowHandle handle) const noexcept;
     bool release_row(std::int32_t row, std::uint32_t generation) noexcept;
+    // Resolves one stream per copy, so a missing rank fails before any shadow entry changes.
+    [[nodiscard]] std::vector<cudaStream_t> resolve_streams(RankStreams streams) const;
+    [[nodiscard]] RowFence& fence(std::int32_t row, std::size_t replica) noexcept;
+    [[nodiscard]] std::int32_t* writable_shadow(KVExecutionRowHandle row,
+                                                std::uint32_t logical_begin, std::size_t count,
+                                                std::span<const cudaStream_t> streams);
     void publish_indices(KVExecutionRowHandle row, std::uint32_t logical_begin,
-                         std::span<const std::int32_t> indices, RankStreams streams);
+                         std::span<const std::int32_t> indices,
+                         std::span<const cudaStream_t> streams);
+    void destroy_fences() noexcept;
     [[nodiscard]] const Tensor& replica(std::size_t rank) const;
 
     KVExecutionTableSpec spec_;
@@ -468,6 +496,8 @@ private:
     PinnedHostBuffer host_shadow_;
     std::vector<bool> row_in_use_;
     std::vector<std::uint32_t> row_generations_;
+    // Row-major: row r's fence for copy c is at r * replicas_.size() + c.
+    std::vector<RowFence> row_fences_;
 };
 
 } // namespace ninfer

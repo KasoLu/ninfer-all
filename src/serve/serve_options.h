@@ -13,9 +13,6 @@
 
 namespace ninfer::serve {
 
-// Protocol default when the client omits max_tokens. Engine independently
-// clamps the request to its effective context capacity.
-inline constexpr int kDefaultMaxTokens                    = 8192;
 inline constexpr std::size_t kDefaultMaxRequestBytes      = 384ULL << 20;
 inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
 inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
@@ -102,15 +99,27 @@ struct ServeOptions {
     // --lenient-assistant-history: Responses input whose assistant content or reasoning follows
     // function_call Items joins that run's turn instead of failing with invalid_assistant_history.
     bool lenient_assistant_history = false;
+    // Directory for /slots session files; empty disables slot save/restore.
+    std::filesystem::path slot_save_path;
+    // Spill an involuntarily evicted session back to the slot file it was last saved to or
+    // restored from. Requires slot_save_path.
+    bool auto_save_evicted = false;
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;
+    // --graft NAME=PATH, repeatable: phantom-kv grafts a request may select with "graft": NAME.
+    std::vector<GraftSource> grafts;
+    // --default-graft NAME: graft applied to a request that states none ("graft": "" opts out).
+    // Empty means no default; otherwise it names an entry of `grafts`.
+    std::string default_graft;
     std::optional<std::uint32_t> default_thinking_budget;
     // Effort for requests that name none; a request that disables thinking is left alone.
     std::optional<RequestedReasoningEffort> default_reasoning_effort;
     // End-of-thinking message fed to the model when it hits the thinking budget; empty
     // preserves the model's built-in control suffix.
     std::string thinking_budget_message;
-    int default_max_tokens = kDefaultMaxTokens;
+    // Output limit for a request that omits one. Unset means the Engine's concurrent lane budget:
+    // see request_limits().
+    std::optional<int> default_max_tokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     // --log-colours on|off: on colours the console log's levels and statistics, off keeps it plain;
     // unset colours the levels on a console only.
@@ -152,6 +161,18 @@ struct ServeOptions {
     // while parsing; this is provenance only and never affects execution.
     std::vector<std::string> startup_argv;
 };
+
+// Parse-time limits. A request that omits max_tokens / max_completion_tokens / max_output_tokens
+// gets --default-max-tokens when set; otherwise GenerationService asks the Engine for the largest
+// budget that still lets every configured lane be admitted at once (the remaining context with one
+// lane).
+[[nodiscard]] inline RequestLimits request_limits(const ServeOptions& options) noexcept {
+    return RequestLimits{.default_max_tokens        = options.default_max_tokens,
+                         .max_context               = static_cast<int>(options.max_context),
+                         .first_token_logprobs      = options.first_token_logprobs,
+                         .assistant_prefill         = options.assistant_prefill,
+                         .lenient_assistant_history = options.lenient_assistant_history};
+}
 
 ServeOptions parse_serve_options(int argc, char** argv);
 std::string resolve_public_model_id(const ServeOptions& options,

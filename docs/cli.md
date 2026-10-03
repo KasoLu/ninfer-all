@@ -22,7 +22,8 @@ the shared Main Text KV pool follows the example's 32,768-token `--max-context`.
 
 Answer content is streamed to stdout. Reasoning, model loading (including the registered target and
 canonical `weights_id`), timings, throughput, GPU memory, and speculative-decoding statistics are
-written to stderr, so stdout can be redirected independently:
+written to stderr, so stdout can be redirected independently. FFmpeg's media-decoding messages are
+records prefixed `media |`: FFmpeg errors are warnings and everything milder is `debug`.
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
@@ -43,7 +44,8 @@ Changes to the file take effect after restarting NInfer:
 
 Omitted thinking and effort options use the selected template's defaults. `--no-thinking` or
 `--reasoning-effort none` requests disabled thinking; other effort values cannot be combined with
-`--no-thinking`. The template interprets the selected effort. `--greedy` selects exact argmax
+`--no-thinking`. The template interprets the selected effort; a value the template rejects renders
+as the nearest one it accepts (see [serving](serving.md)). `--greedy` selects exact argmax
 decoding independently.
 
 `--thinking-budget N` places a positive upper bound on accepted model-origin tokens while the
@@ -52,15 +54,21 @@ boundary, Engine appends [Qwen's canonical early-close guidance](https://github.
 and `</think>` to the same resident sequence without sampling, publishes the guidance through the
 reasoning stream, then resumes ordinary generation from the updated context. A natural thinking
 close, stop condition, cancellation, or total output/context limit at the boundary takes priority
-and suppresses this insertion. The option cannot be combined with `--no-thinking`, but it can be
-combined with `--reasoning-effort`.
+and suppresses this insertion. The option cannot be combined with `--no-thinking` or
+`--reasoning-effort none`, which both disable thinking, but it can be combined with any other
+`--reasoning-effort`.
 
 `--max-new` counts every committed generated token, including internally inserted control tokens.
-When the effective output capacity extends beyond the thinking budget, it must have room for the
-complete tokenizer-derived control suffix plus one post-close model token; an undersized request is
-rejected rather than truncating the suffix. Normal output sends the inserted guidance to stderr as
-reasoning. `--print-token-ids` includes the inserted IDs, while `--raw-output` preserves the raw
-control representation.
+The inserted suffix is never truncated, and a request is never rejected for lacking room for it.
+When the output capacity left after the budget cannot hold the complete tokenizer-derived control
+suffix plus one post-close model token, Engine lowers the effective budget so both fit. When the
+whole capacity is no larger than that, the budget cannot be enforced, so thinking runs to the
+`--max-new` limit and may end inside the reasoning. The run summary prints `effective thinking
+budget` when it differs from the requested one, and nothing extra when the budget is unenforced; the
+exact rule is in [Chat Completions](serving.md#openai-chat-completions).
+
+Normal output sends the inserted guidance to stderr as reasoning. `--print-token-ids` includes the
+inserted IDs, while `--raw-output` preserves the raw control representation.
 
 For example, this allows at most 512 model-origin thinking tokens while retaining enough total
 output capacity for the inserted suffix and the answer:
@@ -157,10 +165,10 @@ long-decode, and long-context inputs.
 
 ## Speculative decoding
 
-Speculative decoding is disabled by default. Select MTP with one to five draft positions, or the
-35B-A3B DFlash or Qwen3.8-27B DFlash2 backend with one to fifteen. Both masked-draft backends
-may be combined with `--vision`.
-`--lm-head-draft` selects the optimized proposal head and requires a selected backend:
+Speculative decoding is disabled by default. Select MTP, the 35B-A3B DFlash or the Qwen3.8-27B
+DFlash2 backend with one to fifteen draft positions. Only one backend can be enabled per Engine, and
+`--lm-head-draft` selects the optimized proposal head and requires a selected backend. Both
+masked-draft backends may be combined with `--vision`:
 
 ```bash
 ./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
@@ -183,44 +191,33 @@ For DFlash:
 ```
 
 For Qwen3.8-27B artifacts containing the DFlash2 companion weights, select
-`--spec dflash2 --draft-tokens 4`, optionally with `--lm-head-draft` and `--vision`.
-DFlash2 accepts every draft count from 1 through 15. Seven is the checkpoint recommendation and
-what `docs/performance.md` was measured with, but **four is faster on this hardware** — measured
-on the RTX 3090, 27B, INT8 KV, greedy, generating 256 tokens of ordinary prose, mean of three
-runs:
+`--spec dflash2 --draft-tokens 7`, optionally with `--lm-head-draft` and `--vision`; this is what
+the launchers pass. DFlash2 accepts every draft count from 1 through 15. Both `groupwise-int` and
+`nvfp4` artifacts use the same Engine route, including CUDA Graph, concurrent requests, sampling
+penalties, and prefix reuse. An artifact without the companion weights reports a missing DFlash2
+component when selected. Vision, MTP and DFlash follow the same rule: their weights are required
+only when that component is enabled at startup.
 
-| `--draft-tokens` | decode | vs no speculation |
-|---:|---:|---:|
-| (none) | 37.7 tok/s | — |
-| 1 | 49.7 | +31.7% |
-| 2 | 56.4 | +49.5% |
-| 3 | 58.4 | +54.9% |
-| **4** | **59.1** | **+56.5%** |
-| 5 | 57.2 | +51.5% |
-| 6 | 48.4 | +28.3% |
-| 7 | 48.2 | +27.7% |
-| 8 | 47.6 | +26.2% |
-| 10 | 42.4 | +12.4% |
-| 12 | 40.6 | +7.6% |
+### Choosing a draft count
 
-Seven costs 18.4% against four, which is the same fact as four being 22.6% faster than seven — only
-the denominator differs. There is a distinct cliff between five and six — 57.2 to 48.4 —
-which looks like a block-geometry boundary rather than an acceptance effect, since acceptance is
-still rising there. `--lm-head-draft` is within noise of unset for DFlash2 at every count and can
-be left off.
+The draft count is a trade on what the output looks like. Each round verifies K+1 columns and runs
+K draft-head steps whether or not the drafts survive, so a larger K pays only where the head keeps
+guessing right.
 
-For reference on the same measurement, MTP3 with the draft head reaches 62.4 tok/s (+65.3%), so
-MTP remains the faster backend on text — but by 5% at DFlash2's best draft count, not the 36% that
-seven implies.
-Both `groupwise-int` and `nvfp4` artifacts use the same Engine route, including CUDA Graph,
-concurrent requests, sampling penalties, and prefix reuse. An artifact without the companion
-weights reports a missing DFlash2 component when selected. Vision, MTP and DFlash follow the same
-rule: their weights are required only when that component is enabled at startup.
+- **MTP:** three is the default. It is best or within 2% on prose, and larger counts lose up to 38%
+  there. When the output mostly reproduces the input -- refactoring, renaming, applying an edit and
+  returning the whole file -- 11 to 15 is up to 1.85x faster than three, and for a coding assistant
+  that mostly writes new code seven is about 10% faster. `--lookup-ngram` adds nothing on top of
+  MTP there, because the head already copies.
+- **DFlash2:** seven is the checkpoint recommendation and the best mean on this card. The best K
+  still depends on the workload, so a deployment serving one kind of work should sweep its own.
+  `--lm-head-draft` is within noise of unset for DFlash2 at every count and can be left off.
+- **DFlash:** seven forms the measured block length eight; fifteen uses the maximum supported block
+  length sixteen.
 
-Only one speculative backend can be enabled per Engine. The published [performance results](performance.md)
-use MTP with three draft tokens and DFlash with seven draft tokens (block length eight), both with
-the optimized proposal head. DFlash accepts one to fifteen draft tokens; seven forms the measured
-block length eight, while fifteen uses the maximum supported block length sixteen.
+The tables and sweeps are in [performance](performance.md#choosing-the-draft-count-rtx-3090-qwen38-27b).
+The published [performance results](performance.md) use MTP with three draft tokens and DFlash with
+seven, both with the optimized proposal head.
 
 ## Common options
 

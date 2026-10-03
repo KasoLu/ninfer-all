@@ -14,6 +14,7 @@ int run_softmax_attention_rk2v4_e8_tests();
 int run_softmax_attention_plain_and_packed_tests();
 int run_softmax_attention_context_tests();
 int run_softmax_attention_wide_tests();
+int run_softmax_attention_parallel_tile_tests();
 
 namespace {
 
@@ -39,6 +40,8 @@ int run_guarded(const char* what, int (*suite)()) {
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--wide-only")
         return run_guarded("wide", run_softmax_attention_wide_tests);
+    if (argc == 2 && std::string_view(argv[1]) == "--parallel-tiles-only")
+        return run_guarded("parallel tiles", run_softmax_attention_parallel_tile_tests);
     if (argc == 2 && std::string_view(argv[1]) == "--dflash2-only")
         return run_guarded("dflash2", run_softmax_attention_dflash2_tests);
     if (argc == 2 && std::string_view(argv[1]) == "--int8-prompt-only")
@@ -69,7 +72,7 @@ int main(int argc, char** argv) {
     if (argc != 1) {
         std::cerr << "usage: ninfer_softmax_attention_test "
                      "[--dflash2-only|--nvfp4-only|--k8v4-only|--rk4v4-e8-only|--rk2v4-e8-only|"
-                     "--int8-prompt-only|--pack-gqa-only|--wide-only]\n";
+                     "--int8-prompt-only|--pack-gqa-only|--wide-only|--parallel-tiles-only]\n";
         return 2;
     }
     const int causal = run_guarded("causal cache", run_softmax_attention_causal_cache_tests);

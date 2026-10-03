@@ -2,6 +2,9 @@
 # include root. It proves that the public product headers stand alone.
 add_executable(ninfer_public_api_test "${CMAKE_CURRENT_LIST_DIR}/../test_public_api.cpp")
 target_include_directories(ninfer_public_api_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+# It links the public Engine, as a consumer does, for the out-of-line definitions the options
+# own (PrefixCacheSaveControl).
+target_link_libraries(ninfer_public_api_test PRIVATE ninfer::engine)
 add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
 
 ninfer_add_test(ninfer_wide_math_test
@@ -69,13 +72,19 @@ foreach(mode flags IN ZIP_LISTS sync_modes sync_flags)
   set_tests_properties(ninfer_device_sync_${mode}_test PROPERTIES
     ENVIRONMENT "NINFER_CUDA_SYNC=${mode}" SKIP_RETURN_CODE 77)
 endforeach()
-foreach(mode IN ITEMS invalid empty)
-  add_test(NAME ninfer_device_sync_${mode}_test COMMAND ${device_test_command} --invalid-sync)
-endforeach()
+add_test(NAME ninfer_device_sync_invalid_test COMMAND ${device_test_command} --invalid-sync)
 set_tests_properties(ninfer_device_sync_invalid_test PROPERTIES
   ENVIRONMENT "NINFER_CUDA_SYNC=invalid")
-set_tests_properties(ninfer_device_sync_empty_test PROPERTIES
-  ENVIRONMENT "NINFER_CUDA_SYNC=")
+
+# A present-but-empty NINFER_CUDA_SYNC is only reachable through CTest's ENVIRONMENT property on
+# POSIX. On Windows, CTest sets test-process environment variables the way `_putenv` /
+# SetEnvironmentVariable does: an empty value deletes the variable, so the child sees it unset
+# rather than empty-and-invalid. There is no Windows-side way to express "set to empty" here.
+if(NOT WIN32)
+  add_test(NAME ninfer_device_sync_empty_test COMMAND ${device_test_command} --invalid-sync)
+  set_tests_properties(ninfer_device_sync_empty_test PROPERTIES
+    ENVIRONMENT "NINFER_CUDA_SYNC=")
+endif()
 
 ninfer_add_test(ninfer_decode_graph_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_decode_graph.cpp"
   LIBRARIES ninfer_core)

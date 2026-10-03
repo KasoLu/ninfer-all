@@ -2,6 +2,7 @@
 #include <stdexcept>
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/nvfp4/nvfp4_a16_gemv.cuh"
@@ -84,7 +85,7 @@ void launch_nvfp4_a16_sliced_k_mma(const Nvfp4A16Operands& p, Output output, Epi
             "NVFP4 sliced-K requires complete row/K tiles and matching tokens");
     constexpr auto kernel = nvfp4_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>;
     const int bytes       = nvfp4_prepare_shared<Schedule::kSharedBytes, kernel>();
-    for_each_token_slice(p.tokens, capacity, [&](int offset, int count) {
+    for_each_token_slice(p.tokens, capacity, [&, kernel](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, capacity));
         kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset);
         CUDA_CHECK(cudaGetLastError());
@@ -93,7 +94,8 @@ void launch_nvfp4_a16_sliced_k_mma(const Nvfp4A16Operands& p, Output output, Epi
 
 template <class Schedule, class Output, class Epilogue, class Rows = Nvfp4IdentityRows>
 void launch_nvfp4_a4_mma(const Nvfp4A4Operands& p, Output output, Epilogue epilogue,
-                         cudaStream_t stream, Rows rows = {}) {
+                         cudaStream_t stream, Rows rows = {},
+                         pdl::Dependency dependency = pdl::Dependency::Serialized) {
 #if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_NVFP4)
     // The A4 MMA emits mma.sync...kind::mxf4nvf4.block_scale, which sm_8x does not have; A4 is
     // never admitted there (see nvfp4_sm86_stubs.cpp).
@@ -102,6 +104,7 @@ void launch_nvfp4_a4_mma(const Nvfp4A4Operands& p, Output output, Epilogue epilo
     (void)epilogue;
     (void)stream;
     (void)rows;
+    (void)dependency;
     throw std::runtime_error("NVFP4 A4 execution requires an sm_100a or sm_120a GPU");
 #else
     validate_nvfp4_operands<Schedule>(p);
@@ -117,10 +120,11 @@ void launch_nvfp4_a4_mma(const Nvfp4A4Operands& p, Output output, Epilogue epilo
             constexpr auto kernel = nvfp4_a4_mma_kernel<Schedule, Full, Epilogue, Output, Rows>;
             const int bytes =
                 nvfp4_prepare_shared<nvfp4_mma_shared_bytes<Schedule, Epilogue>, kernel>();
-            kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.x_scales, p.codes, p.scales,
-                                                                p.rows, p.k, p.alpha, output,
-                                                                epilogue, rows, offset, count);
-            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(pdl::launch_with(
+                dependency,
+                {grid, dim3(Schedule::kThreads), static_cast<std::size_t>(bytes), stream}, kernel,
+                p.x, p.x_scales, p.codes, p.scales, p.rows, p.k, p.alpha, output, epilogue, rows,
+                offset, count));
         };
         if (count % Schedule::kBlockTokens == 0)
             launch.template operator()<true>();

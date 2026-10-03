@@ -5,6 +5,13 @@ set(ninfer_op_tests
   silu_mul
   residual_add
   sigmoid_mul
+  hyper_connection
+  ple_inject
+  ngram_rows
+  qsa_indexer
+  sparse_attention
+  moe_route
+  moe_experts
   rmsnorm
   rmsnorm_pack_tail
   gated_rmsnorm
@@ -209,8 +216,12 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
 
 add_test(NAME ninfer_softmax_attention_wide_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --wide-only)
+add_test(NAME ninfer_softmax_attention_parallel_tiles_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --parallel-tiles-only)
 set_tests_properties(ninfer_softmax_attention_wide_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600 RUN_SERIAL TRUE)
+set_tests_properties(ninfer_softmax_attention_parallel_tiles_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
 add_test(NAME ninfer_sparse_moe_wide_test
   COMMAND ninfer_tests ninfer_sparse_moe_test --wide-only)

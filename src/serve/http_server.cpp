@@ -1,4 +1,5 @@
 #include "serve/http_server.h"
+#include "serve/slot_files.h"
 
 #include "product/logging/logging.h"
 #include "serve/anthropic_messages.h"
@@ -42,7 +43,9 @@ void write_exception(httplib::Response& res, const std::exception& ex) {
     write_openai_error(res, error);
 }
 
-bool is_anthropic_path(std::string_view path) { return path.starts_with("/v1/messages"); }
+bool is_anthropic_path(std::string_view path) {
+    return canonical_api_path(path).starts_with("/v1/messages");
+}
 
 bool is_openai_path(std::string_view path) {
     return path.starts_with("/v1/") && !is_anthropic_path(path);
@@ -121,6 +124,7 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.pressure_maximal_fallback_selections !=
                report.previous.pressure_maximal_fallback_selections ||
            report.current.historical_fork_hits != report.previous.historical_fork_hits ||
+           report.current.engine_recoveries != report.previous.engine_recoveries ||
            report.current.device_state_occupied_slots !=
                report.previous.device_state_occupied_slots ||
            report.current.host_state_occupied_slots != report.previous.host_state_occupied_slots ||
@@ -146,7 +150,8 @@ bool report_has_activity(const ThroughputReport& report) {
            report.current.host_work.device_wait_ns != report.previous.host_work.device_wait_ns;
 }
 
-const char* endpoint_name(std::string_view path) noexcept {
+const char* endpoint_name(std::string_view request_path) noexcept {
+    const std::string_view path = canonical_api_path(request_path);
     if (path == "/v1/chat/completions") { return "openai_chat_completions"; }
     if (path == "/v1/responses") { return "openai_responses"; }
     if (path == "/v1/responses/input_tokens") { return "openai_responses_input_tokens"; }
@@ -154,6 +159,7 @@ const char* endpoint_name(std::string_view path) noexcept {
     if (path == "/v1/messages/count_tokens") { return "anthropic_count_tokens"; }
     if (path == "/v1/load") { return "load"; }
     if (path == "/stats") { return "stats"; }
+    if (path == "/slots" || path.starts_with("/slots/")) { return "slots"; }
     return "http_route";
 }
 
@@ -192,19 +198,29 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
         error.code    = "request_too_large";
         error.message = "request body exceeds the configured payload limit of " +
                         std::to_string(options.max_request_bytes) + " bytes";
-    } else if (response.status == 404 && request.path.rfind("/v1/messages", 0) == 0) {
+    } else if (response.status == 404 && is_anthropic_path(request.path)) {
         error.status  = 404;
         error.code    = "not_found";
         error.message = "requested Anthropic resource was not found";
     } else {
         return httplib::Server::HandlerResponse::Unhandled;
     }
-    if (request.path.rfind("/v1/messages", 0) == 0) {
+    if (is_anthropic_path(request.path)) {
         write_anthropic_error(response, error, new_anthropic_request_id());
     } else {
         write_openai_error(response, error);
     }
     return httplib::Server::HandlerResponse::Handled;
+}
+
+std::string api_route_pattern(std::string_view endpoint) {
+    return "(?:/v1)?/v1" + std::string(endpoint);
+}
+
+std::string_view canonical_api_path(std::string_view path) noexcept {
+    constexpr std::string_view kVersion = "/v1";
+    if (path.starts_with("/v1/v1/")) { path.remove_prefix(kVersion.size()); }
+    return path;
 }
 
 bool matches_bearer_credential(std::string_view authorization, std::string_view api_key) noexcept {
@@ -301,6 +317,7 @@ void HttpServer::record_request_start(const RequestLogContext& context) {
 
 void HttpServer::record_request_rejected(const RequestRejectionLogContext& context) {
     request_jsonl_.write_request_rejected(context);
+    metrics_.record_rejection();
     operational_log_.request_rejected(context);
     if (console_stats_) {
         console_stats_->request_rejected(
@@ -311,14 +328,15 @@ void HttpServer::record_request_rejected(const RequestRejectionLogContext& conte
 void HttpServer::record_request_done(const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
     request_jsonl_.write_request_done(context, outcome);
+    metrics_.record_done(outcome);
     operational_log_.request_done(context, outcome);
-    metrics_.record(outcome);
     if (console_stats_) { console_stats_->request_done(outcome); }
 }
 
 void HttpServer::record_request_failure(const RequestLogContext& context,
                                         const RequestFailure& failure) {
     request_jsonl_.write_request_error(context, failure.machine_message);
+    metrics_.record_failure();
     operational_log_.request_failure(context, failure);
     if (console_stats_) { console_stats_->request_failure(failure); }
 }
@@ -394,7 +412,7 @@ httplib::Server::HandlerResponse HttpServer::pre_route(const httplib::Request& r
         // Weight load plus warmup measured ~10s on the 27B and longer on the 35B. Two seconds
         // is a polite poll interval rather than a promise about when readiness arrives.
         res.set_header("Retry-After", "2");
-        if (req.path.rfind("/v1/messages", 0) == 0) {
+        if (is_anthropic_path(req.path)) {
             write_anthropic_error(res, error, new_anthropic_request_id());
         } else {
             write_openai_error(res, error);
@@ -422,7 +440,7 @@ httplib::Server::HandlerResponse HttpServer::pre_route(const httplib::Request& r
         error.code    = "invalid_api_key";
         error.message = "missing or invalid API key";
         // Render the 401 in the shape the target endpoint speaks.
-        if (req.path.rfind("/v1/messages", 0) == 0) {
+        if (is_anthropic_path(req.path)) {
             write_anthropic_error(res, error, new_anthropic_request_id());
         } else {
             write_openai_error(res, error);
@@ -473,7 +491,7 @@ void HttpServer::register_routes() {
                         make_request_failure(RequestFailurePhase::Http, e.error()),
                         response_request_id(res));
                 }
-                if (req.path.rfind("/v1/messages", 0) == 0) {
+                if (is_anthropic_path(req.path)) {
                     write_anthropic_error(res, e.error(), new_anthropic_request_id());
                 } else {
                     write_openai_error(res, e.error());
@@ -483,7 +501,7 @@ void HttpServer::register_routes() {
                     endpoint_name(req.path),
                     make_internal_request_failure(RequestFailurePhase::Http, e.what()),
                     response_request_id(res));
-                if (req.path.rfind("/v1/messages", 0) == 0) {
+                if (is_anthropic_path(req.path)) {
                     ApiError error;
                     error.status  = 500;
                     error.message = e.what();
@@ -500,7 +518,7 @@ void HttpServer::register_routes() {
                 error.status  = 500;
                 error.type    = "internal_error";
                 error.message = "unknown error";
-                if (req.path.rfind("/v1/messages", 0) == 0) {
+                if (is_anthropic_path(req.path)) {
                     write_anthropic_error(res, error, new_anthropic_request_id());
                 } else {
                     write_openai_error(res, error);
@@ -510,9 +528,10 @@ void HttpServer::register_routes() {
 
     server_.Get("/health",
                 [this](const httplib::Request&, httplib::Response& res) { handle_health(res); });
-    server_.Get("/v1/load", [this](const httplib::Request& req, httplib::Response& res) {
-        handle_load(req, res);
-    });
+    server_.Get(api_route_pattern("/load"),
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_load(req, res);
+                });
     server_.Get("/metrics", [this](const httplib::Request& req, httplib::Response& res) {
         handle_metrics(req, res);
     });
@@ -522,6 +541,9 @@ void HttpServer::register_routes() {
     server_.Get("/slots", [this](const httplib::Request& req, httplib::Response& res) {
         handle_slots(req, res);
     });
+    server_.Post(R"(/slots/(\d+))", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_slot_action(req, res);
+    });
     server_.Get("/props", [this](const httplib::Request& req, httplib::Response& res) {
         handle_props(req, res);
     });
@@ -530,50 +552,54 @@ void HttpServer::register_routes() {
             res.set_content(make_api_index(public_model_id_).dump(), "application/json");
         });
     }
-    server_.Get("/v1/models", [this](const httplib::Request& req, httplib::Response& res) {
-        handle_models(req, res);
-    });
-    server_.Get(R"(/v1/models/(.+))", [this](const httplib::Request& req, httplib::Response& res) {
-        handle_model(req, res);
-    });
-    server_.Post("/v1/chat/completions",
+    server_.Get(api_route_pattern("/models"),
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_models(req, res);
+                });
+    server_.Get(api_route_pattern(R"(/models/(.+))"),
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_model(req, res);
+                });
+    server_.Post(api_route_pattern("/chat/completions"),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_chat_completions(req, res);
                  });
-    server_.Post("/v1/responses", [this](const httplib::Request& req, httplib::Response& res) {
-        handle_responses(req, res);
-    });
-    server_.Post("/v1/responses/input_tokens",
+    server_.Post(api_route_pattern("/responses"),
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_responses(req, res);
+                 });
+    server_.Post(api_route_pattern("/responses/input_tokens"),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_input_tokens(req, res);
                  });
-    server_.Post("/v1/responses/compact",
+    server_.Post(api_route_pattern("/responses/compact"),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_compact(req, res);
                  });
-    server_.Post(R"(/v1/responses/([^/]+)/cancel)",
+    server_.Post(api_route_pattern(R"(/responses/([^/]+)/cancel)"),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_cancel(req, res);
                  });
-    server_.Get(R"(/v1/responses/([^/]+)/input_items)",
+    server_.Get(api_route_pattern(R"(/responses/([^/]+)/input_items)"),
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_response_input_items(req, res);
                 });
-    server_.Get(R"(/v1/responses/([^/]+))",
+    server_.Get(api_route_pattern(R"(/responses/([^/]+))"),
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_response_get(req, res);
                 });
-    server_.Delete(R"(/v1/responses/([^/]+))",
+    server_.Delete(api_route_pattern(R"(/responses/([^/]+))"),
                    [this](const httplib::Request& req, httplib::Response& res) {
                        handle_response_delete(req, res);
                    });
-    server_.Post("/v1/messages/count_tokens",
+    server_.Post(api_route_pattern("/messages/count_tokens"),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_count_tokens(req, res);
                  });
-    server_.Post("/v1/messages", [this](const httplib::Request& req, httplib::Response& res) {
-        handle_messages(req, res);
-    });
+    server_.Post(api_route_pattern("/messages"),
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_messages(req, res);
+                 });
     if (options_.webui_mcp_proxy) {
         const auto relay = [](const httplib::Request& req, httplib::Response& res) {
             relay_mcp_proxy(req, res);
@@ -620,6 +646,138 @@ void HttpServer::handle_webui(const httplib::Request& req, httplib::Response& re
     }
     res.set_content(reinterpret_cast<const char*>(asset->bytes.data()), asset->bytes.size(),
                     std::string(asset->content_type));
+}
+
+// llama.cpp-shaped slot listing: one entry per private context-cache catalog cell. A cell an
+// active request will publish into reports that request's prompt and reused tokens; a retained
+// cell reports the session depth as both, with its session digest and restorable checkpoints.
+void HttpServer::handle_slots(const httplib::Request&, httplib::Response& res) const {
+    const bool speculative = options_.speculative.backend != ninfer::SpeculativeBackend::None;
+    const std::vector<ninfer::SlotState> states = service_->slot_states();
+    nlohmann::json slots                        = nlohmann::json::array();
+    for (std::size_t index = 0; index < states.size(); ++index) {
+        const ninfer::SlotState& state = states[index];
+        nlohmann::json checkpoints     = nlohmann::json::array();
+        for (const ninfer::SlotCheckpoint& checkpoint : state.checkpoints) {
+            checkpoints.push_back({{"frontier", checkpoint.frontier},
+                                   {"session_digest", checkpoint.session_digest}});
+        }
+        slots.push_back({{"id", index},
+                         {"is_processing", state.processing},
+                         {"retained", state.retained},
+                         {"session_digest", state.session_digest},
+                         {"checkpoints", std::move(checkpoints)},
+                         {"n_ctx", options_.max_context},
+                         {"n_prompt_tokens", state.prompt_tokens},
+                         {"n_prompt_tokens_cache", state.cached_tokens},
+                         {"speculative", speculative}});
+    }
+    res.set_header("Cache-Control", "no-store");
+    res.set_content(slots.dump(), "application/json");
+}
+
+// llama.cpp-shaped session persistence: POST /slots/{id}?action=save|restore|erase with
+// {"filename": NAME} for save and restore and an optional {"if_digest": DIGEST} precondition on
+// save and erase. Enabled only by --slot-save-path; names are confined to that directory.
+void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Response& res) {
+    const auto fail = [&res](int status, std::string code, std::string message) {
+        ApiError error;
+        error.status  = status;
+        error.type    = status >= 500 ? "server_error" : "invalid_request_error";
+        error.code    = std::move(code);
+        error.message = std::move(message);
+        write_openai_error(res, error);
+    };
+    if (options_.slot_save_path.empty()) {
+        fail(501, "slot_persistence_disabled",
+             "this server was started without --slot-save-path; slot save/restore is disabled");
+        return;
+    }
+    const std::string id_text = req.matches.size() > 1 ? req.matches[1].str() : std::string();
+    unsigned long long parsed = 0;
+    try {
+        parsed = std::stoull(id_text);
+    } catch (const std::exception&) {
+        fail(400, "invalid_slot", "slot id is not a number");
+        return;
+    }
+    // Range-checked before narrowing, so an id past 2^32 is refused rather than wrapped.
+    const std::size_t slot_count = service_->slot_states().size();
+    if (parsed >= slot_count) {
+        fail(400, "invalid_slot",
+             "slot " + id_text + " is outside this server's " + std::to_string(slot_count) +
+                 " slots");
+        return;
+    }
+    const auto slot = static_cast<std::uint32_t>(parsed);
+    const std::string action = req.get_param_value("action");
+
+    std::string filename;
+    std::string if_digest;
+    try {
+        const nlohmann::json body =
+            req.body.empty() ? nlohmann::json::object() : nlohmann::json::parse(req.body);
+        if (!body.is_object()) { throw std::invalid_argument("body is not an object"); }
+        filename  = body.value("filename", std::string());
+        if_digest = body.value("if_digest", std::string());
+    } catch (const std::exception&) {
+        fail(400, "invalid_request",
+             "request body must be a JSON object with string filename and if_digest");
+        return;
+    }
+
+    try {
+        if (action == "erase") {
+            const std::uint32_t erased = service_->slot_erase(slot, if_digest);
+            operational_log_.slot_erased(slot, erased);
+            res.set_content(nlohmann::json{{"id_slot", slot}, {"n_erased", erased}}.dump(),
+                            "application/json");
+            return;
+        }
+        if (action != "save" && action != "restore") {
+            fail(400, "invalid_action", "action must be save, restore, or erase");
+            return;
+        }
+        const std::optional<std::string> sanitized = sanitize_slot_filename(filename);
+        if (!sanitized) {
+            fail(400, "invalid_filename",
+                 "filename must be 1-" + std::to_string(kSlotFilenameMaxBytes) +
+                     " characters of [A-Za-z0-9._-], must not start or end with a dot, and "
+                     "must not name a device");
+            return;
+        }
+        const std::string path = (options_.slot_save_path / *sanitized).string();
+        if (action == "save") {
+            const ninfer::SlotSaveResult saved = service_->slot_save(slot, path, if_digest);
+            operational_log_.slot_saved(slot, *sanitized, saved);
+            res.set_content(nlohmann::json{{"id_slot", slot},
+                                           {"filename", *sanitized},
+                                           {"n_saved", saved.tokens},
+                                           {"n_written", saved.bytes},
+                                           {"session_digest", saved.session_digest},
+                                           {"timings", {{"save_ms", saved.seconds * 1000.0}}}}
+                                .dump(),
+                            "application/json");
+        } else {
+            const ninfer::SlotRestoreResult restored = service_->slot_restore(slot, path);
+            operational_log_.slot_restored(slot, *sanitized, restored);
+            res.set_content(
+                nlohmann::json{{"id_slot", slot},
+                               {"filename", *sanitized},
+                               {"n_restored", restored.tokens},
+                               {"n_read", restored.bytes},
+                               {"session_digest", restored.session_digest},
+                               {"timings", {{"restore_ms", restored.seconds * 1000.0}}}}
+                    .dump(),
+                "application/json");
+        }
+    } catch (const ninfer::RequestError& busy) {
+        fail(409, "slot_busy", busy.what());
+    } catch (const ninfer::SlotSessionMismatch& mismatch) {
+        fail(409, "slot_session_mismatch", mismatch.what());
+    } catch (const std::invalid_argument& rejected) {
+        fail(400, "slot_" + action + "_failed", rejected.what());
+    }
 }
 
 LoadSample HttpServer::load_sample() const {
@@ -678,31 +836,17 @@ void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res)
                     "text/plain; version=0.0.4; charset=utf-8");
 }
 
-// llama.cpp-shaped lane table. The Engine publishes how many lanes are running, not which request
-// holds which lane, so the first `running` entries read as processing.
-void HttpServer::handle_slots(const httplib::Request&, httplib::Response& res) const {
-    const std::uint32_t running = service_->runtime_stats().running_requests;
-    const bool speculative      = options_.speculative.backend != ninfer::SpeculativeBackend::None;
-    nlohmann::json slots        = nlohmann::json::array();
-    for (std::uint32_t lane = 0; lane < load_capacity_.max_concurrency; ++lane) {
-        slots.push_back({{"id", lane},
-                         {"n_ctx", load_capacity_.max_context},
-                         {"speculative", speculative},
-                         {"is_processing", lane < running}});
-    }
-    res.set_header("Cache-Control", "no-store");
-    res.set_content(slots.dump(), "application/json");
-}
-
 void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) const {
     const ninfer::SamplingPreset preset = service_->sampling_defaults().for_mode(
         options_.enable_thinking == false ? ninfer::SamplingMode::NonThinking
                                           : ninfer::SamplingMode::Thinking);
     const ninfer::SamplingOverrides& overrides = options_.sampling_overrides;
+    // llama.cpp's -1 means "no fixed cap": without --default-max-tokens each request's budget is
+    // derived from its prompt and the lane share, so no single number applies.
+    const int n_predict   = options_.default_max_tokens.value_or(-1);
     nlohmann::json params = {
-        {"n_predict", options_.default_max_tokens == kUnboundedOutputTokens
-                          ? -1
-                          : options_.default_max_tokens},
+        {"n_predict", n_predict},
+        {"max_tokens", n_predict},
         {"temperature", options_.greedy ? 0.0F : overrides.temperature.value_or(preset.temperature)},
         {"top_k", overrides.top_k.value_or(preset.top_k)},
         {"top_p", overrides.top_p.value_or(preset.top_p)},
@@ -729,11 +873,15 @@ void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) c
     res.set_content(props.dump(), "application/json");
 }
 
+ModelDescription HttpServer::model_description() const {
+    return ModelDescription{.id            = public_model_id_,
+                            .max_model_len = options_.max_context,
+                            .vision        = service_->engine_options().enable_vision,
+                            .metadata      = model_metadata_};
+}
+
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_models_list(public_model_id_, unix_time_now(), options_.max_context,
-                                     options_.enable_vision,
-                                     model_metadata_),
-                    "application/json");
+    res.set_content(make_models_list(model_description(), unix_time_now()), "application/json");
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
@@ -747,10 +895,7 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         write_openai_error(res, error);
         return;
     }
-    res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context,
-                                      options_.enable_vision,
-                                      model_metadata_),
-                    "application/json");
+    res.set_content(make_model_object(model_description(), unix_time_now()), "application/json");
 }
 
 bool HttpServer::bind() {
@@ -862,6 +1007,7 @@ bool HttpServer::listen() {
 void HttpServer::stop() {
     stats_server_.stop();
     server_.stop();
+    if (service_ != nullptr) { service_->stop(); }
 }
 
 HttpServer::~HttpServer() {

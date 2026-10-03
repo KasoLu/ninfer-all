@@ -74,6 +74,18 @@ int verify_route_family(ops::AttentionHeadGeometry attention, KvCacheStorage sto
     return route_family(attention, storage, verify_window + 1U, target);
 }
 
+// The node sequence of a call: its route family and how many small-T launches it makes. Past
+// eight columns the chunked route's chunk width depends on the envelope (INT8 at 9 or 10 columns
+// over more than 4096 keys), so the family alone does not fix the nodes.
+int launch_shape(ops::AttentionHeadGeometry attention, KvCacheStorage storage,
+                 std::uint32_t columns, std::uint32_t target) {
+    const ops::CausalAttentionExecutionEnvelope envelope{1U, std::max(target, 1U), false,
+                                                         columns > 16U};
+    const int launches = ops::causal_softmax_attention_small_t_launches(
+        attention, storage, envelope, 1, static_cast<std::int32_t>(columns));
+    return route_family(attention, storage, columns, target) * 256 + launches;
+}
+
 // Largest target that still takes the route of the smallest one, or zero when the route does
 // not change up to `capacity`. The route flips at most once as the target grows (prompt below a
 // storage's cutoff, small-T or chunked small-T above), so bisection finds the flip.
@@ -152,31 +164,22 @@ std::vector<GraphExecutionProfile> mtp_graph_profiles(std::uint32_t capacity,
     ends.erase(std::unique(ends.begin(), ends.end()), ends.end());
 
     std::vector<GraphExecutionProfile> profiles = graph_profiles_through(capacity - 1, ends);
-    // Past eight verify columns the small-T attention runs in chunks whose launches change with the
-    // window in more places than the route flip, and an in-place update across them fails at
-    // startup (MTP with 10 or 15 drafts). Those widths give every profile its own executable, as
-    // DFlash2 does.
-    constexpr std::uint32_t kSmallTColumns = 8;
-    if (verify_window + 1U > kSmallTColumns) {
-        for (std::size_t index = 0; index < profiles.size(); ++index) {
-            profiles[index].topology_class = static_cast<std::uint32_t>(index);
-        }
-        return profiles;
-    }
-    // Otherwise profiles share an executable when every attention call they capture takes the same
-    // route: the target verify and the MTP batch (verify_window + 1 columns up to max + V + 1) and
-    // each autoregressive draft step (one column up to max + V + 2 + step), the envelopes
-    // mtp_causal_attention_envelopes gives them.
+    // Profiles share an executable when every attention call they capture launches the same node
+    // sequence: the target verify and the MTP batch (verify_window + 1 columns up to
+    // max + V + 1) and each autoregressive draft step (one column up to max + V + 2 + step), the
+    // envelopes mtp_causal_attention_envelopes gives them. Past eight verify columns the small-T
+    // attention runs in chunks whose count can change with the window, which the launch shape
+    // carries; an in-place update across a changed count fails at startup.
     const auto visible = [capacity](std::uint64_t value) {
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(capacity, value));
     };
     std::vector<std::vector<int>> signatures;
     for (GraphExecutionProfile& profile : profiles) {
-        std::vector<int> signature{verify_route_family(
-            attention, storage, verify_window,
+        std::vector<int> signature{launch_shape(
+            attention, storage, verify_window + 1U,
             visible(static_cast<std::uint64_t>(profile.max) + verify_window + 1ULL))};
         for (std::uint32_t step = 0; step + 1 < draft_window; ++step) {
-            signature.push_back(route_family(
+            signature.push_back(launch_shape(
                 attention, storage, 1U,
                 visible(static_cast<std::uint64_t>(profile.max) + verify_window + step + 2ULL)));
         }

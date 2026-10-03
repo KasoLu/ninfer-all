@@ -106,7 +106,7 @@ inline const DeviceSpecs& device_specs() {
     return specs;
 }
 
-inline std::uint16_t f32_to_bf16(float f) {
+__host__ __device__ inline std::uint16_t f32_to_bf16(float f) {
     std::uint32_t u;
     std::memcpy(&u, &f, 4);
     const std::uint32_t lsb = (u >> 16) & 1u;
@@ -114,13 +114,93 @@ inline std::uint16_t f32_to_bf16(float f) {
     return std::uint16_t(u >> 16);
 }
 
-// Device bf16 buffer filled with a small varied ramp (avoids all-zero special
-// paths; exact values are irrelevant to bandwidth). Returns an owning DeviceBuffer.
-inline DeviceBuffer make_bf16(std::size_t n) {
-    std::vector<std::uint16_t> h(n);
-    for (std::size_t i = 0; i < n; ++i) h[i] = f32_to_bf16(0.5f - float(i % 251) / 250.0f);
+namespace detail {
+
+__host__ __device__ inline std::uint32_t bench_fixture_hash32(std::uint32_t x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    return x ^ (x >> 16);
+}
+
+// A short repeating ramp is L2- and compression-friendly in a way real activations are not, which
+// can make a GEMM/attention schedule look faster on the bench than it is in the Engine. Every
+// element gets its own hash of (index, seed) instead, so no window of the buffer repeats.
+static __global__ void fill_bf16_uniform_kernel(std::uint16_t* values, std::size_t count,
+                                                std::uint32_t seed) {
+    const auto stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (auto i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += stride) {
+        const std::uint32_t bits = bench_fixture_hash32(static_cast<std::uint32_t>(i) ^ seed);
+        const float u = static_cast<float>(bits >> 8) * (1.0f / 16777216.0f) - 0.5f;
+        values[i]     = f32_to_bf16(u);
+    }
+}
+
+static __global__ void fill_f32_uniform_kernel(float* values, std::size_t count, std::uint32_t seed,
+                                               float low, float high) {
+    const auto stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (auto i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += stride) {
+        const std::uint32_t bits = bench_fixture_hash32(static_cast<std::uint32_t>(i) ^ seed);
+        values[i] = low + (high - low) * (static_cast<float>(bits >> 8) * (1.0f / 16777216.0f));
+    }
+}
+
+inline constexpr int kEvictionBlocks  = 1024;
+inline constexpr int kEvictionThreads = 256;
+
+// Reads every 16-byte vector of the eviction buffer. The store is guarded by a value the XOR of
+// arbitrary contents practically never reaches, so the loads cannot be elided and nothing is
+// written: the evicted lines leave L2 clean. The sink may alias the input.
+static __global__ void read_eviction_buffer_kernel(const uint4* input, std::size_t vectors,
+                                                   uint4* sink) {
+    uint4 value{};
+    for (auto i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < vectors;
+         i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+        const uint4 loaded = input[i];
+        value.x ^= loaded.x;
+        value.y ^= loaded.y;
+        value.z ^= loaded.z;
+        value.w ^= loaded.w;
+    }
+    if (value.x == 0x9e3779b9u && value.y == 0x7f4a7c15u && value.z == 0x85ebca6bu &&
+        value.w == 0xc2b2ae35u) {
+        sink[blockIdx.x] = value;
+    }
+}
+
+} // namespace detail
+
+// Device FP32 buffer of pseudo-random values in [low, high), varied by element index and `seed`.
+inline DeviceBuffer make_f32(std::size_t n, std::uint32_t seed, float low = -0.5f,
+                             float high = 0.5f) {
+    DeviceBuffer d(n * sizeof(float));
+    if (n != 0) {
+        constexpr int block = 256;
+        const int grid = static_cast<int>(std::min<std::size_t>(4096, (n + block - 1) / block));
+        detail::fill_f32_uniform_kernel<<<grid, block>>>(static_cast<float*>(d.p), n, seed, low,
+                                                         high);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    return d;
+}
+
+// Device bf16 buffer filled with pseudo-random values in [-0.5, 0.5), varied by element index and
+// `seed` (avoids all-zero special paths; exact values are otherwise irrelevant to bandwidth or
+// timing). Returns an owning DeviceBuffer.
+inline DeviceBuffer make_bf16(std::size_t n, std::uint32_t seed = 0x9e3779b9u) {
     DeviceBuffer d(n * 2);
-    d.copy_from_host(h.data(), d.bytes);
+    if (n != 0) {
+        constexpr int block = 256;
+        const int grid = static_cast<int>(std::min<std::size_t>(4096, (n + block - 1) / block));
+        detail::fill_bf16_uniform_kernel<<<grid, block>>>(static_cast<std::uint16_t*>(d.p), n,
+                                                          seed);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
     return d;
 }
 
@@ -255,8 +335,16 @@ inline ColdTiming measure_graph(const TimedGraph& graph, cudaStream_t stream, in
     return summarize_timings(std::move(samples));
 }
 
+// Evicts L2 before a cold sample by READING the caller's eviction buffer. Writing it (a memset)
+// left an L2-sized dirty working set whose write-back DRAM traffic was charged to the next
+// measured Op; reads leave only clean lines to drop. The buffer's contents are irrelevant.
 inline void flush_l2(DeviceBuffer& flush, cudaStream_t stream) {
-    CUDA_CHECK(cudaMemsetAsync(flush.p, 0xa5, flush.bytes, stream));
+    const std::size_t vectors = flush.bytes / sizeof(uint4);
+    if (vectors == 0) { return; }
+    detail::read_eviction_buffer_kernel<<<detail::kEvictionBlocks, detail::kEvictionThreads, 0,
+                                          stream>>>(static_cast<const uint4*>(flush.p), vectors,
+                                                    static_cast<uint4*>(flush.p));
+    CUDA_CHECK(cudaGetLastError());
 }
 
 template <class Launch>

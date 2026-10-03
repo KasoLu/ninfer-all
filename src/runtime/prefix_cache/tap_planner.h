@@ -12,7 +12,11 @@ enum class TapHintKind : std::uint8_t {
     Explicit,         // client-named breakpoint (explicit-evidence protocol / PromptInput marker)
     GenerationOpener, // start of the final assistant generation opener
     Structural,       // end of tools, end of the leading System/Developer block
-    MessageBoundary,  // any message boundary; used to snap ladder taps
+    // A protocol-automatic marker (OpenAI default prompt caching, Anthropic request-level
+    // cache_control). Planned like a structural boundary, but it marks the conversation's latest
+    // turn rather than a prefix conversations share, so its snapshot can be superseded.
+    Automatic,
+    MessageBoundary, // any message boundary; used to snap ladder taps
 };
 
 struct TapHint {
@@ -40,6 +44,10 @@ enum class TapPlacement : std::uint8_t {
 struct PlannedTap {
     std::uint32_t position = 0;
     TapPlacement placement = TapPlacement::Exact;
+    // A boundary later prompts may share across conversations (a client breakpoint or a
+    // structural boundary): its snapshot is published as SnapshotKind::Boundary, superseded only
+    // while no other conversation has continued from it.
+    bool boundary = false;
 
     [[nodiscard]] friend bool operator==(PlannedTap, PlannedTap) noexcept = default;
 };

@@ -367,6 +367,72 @@ with the eight prompts of syv-ai/qwen38-27b-rtx3090's `bench/prompts_real.jsonl`
 theirs and is not vendored here). `--concurrency 8` gives the C8 row. Both report decode as
 C × 1000 / mean TPOT from the server's own request log.
 
+### Integer-activation MLP at decode (`--mlp-a8-decode`, opt-in)
+
+Qwen3.8-27B on `sm_86`, off by default. The MLP gate_up projection already runs its full prefill
+tiles through the s8 tensor cores; this flag extends that to the widths a cohort round decodes at,
+quantising activations to s8 with one scale per (token, 64-k group) and feeding
+`mma.m16n8k32.s8.s8.s32`. It buys a little speed and costs a little fidelity.
+
+**The Op, paired against the BF16 small-T kernel inside one sitting** (the card drifts several
+percent between sittings, so only the pairing is meaningful), cold, median of 15:
+
+| columns | 8 | 12 | 16 | 20 | 24 | 28 | 32 |
+|---|---|---|---|---|---|---|---|
+| run 1 | +10.7% | -5.8% | -3.4% | -4.8% | -4.8% | -5.0% | -4.5% |
+| run 2 | +7.5% | +4.3% | -0.7% | -5.9% | -6.1% | -4.0% | -6.4% |
+
+It wins from sixteen columns up and loses at eight, so the route is admitted for 16..32 columns
+only and every narrower width stays on the BF16 kernel. A cohort round reaches those widths through
+concurrency: eight lanes verifying four MTP columns each is thirty-two.
+
+**End to end it is worth about a percent.** Eight concurrent thinking-off chat requests, MTP3,
+INT8 KV, greedy, four interleaved repetitions: 431.5 tok/s by default against **437.0 tok/s**
+(+1.28%) with the flag. That is the expected size: gate_up is roughly a quarter of a C8 round, so
+four to six percent off it arrives as one percent overall. The flag won three of the four paired
+repetitions and tied the fourth, against a spread of about 1.7% within the unflagged arm alone.
+
+**What it costs.** Output changes -- this is a lossy trade, not a free one. Against an FP64 oracle
+the Op measures 0.0080 to 0.0371 relative L2 across 2..32 columns, inside the 0.04 allowance the
+integer-activation path is held to everywhere else in the tree. Perplexity cannot see this trade at
+all: the route is admitted only in the verify phase, and scoring runs the prefill phase, so
+`ninfer-perplexity` reports the same score with and without the flag. Judge it on the oracle bound
+and on your own outputs. It does nothing for single-stream use, where one request decodes one
+column per step, far below the sixteen the route needs.
+
+### Earlier baselines (v0.9.1, a different RTX 3090 host)
+
+Measured before the small-T kernels and before the cuBLAS prefill route, on a different host from
+the sections above; compare within a table, not across sections. Qwen3.8-27B, INT8 KV, ReplaySSM,
+MTP3, CUDA Graphs.
+
+**Long-output cohort.** Every request generated 1,024 tokens from a 29-34-token prompt with an
+8,192-token per-request context, so each sequence reached roughly 1,053-1,058 tokens. This is a
+long-output/decode benchmark, not an 8K-prompt test. C1 used an 8,192-token shared KV pool; C2-C8
+used 16,384 tokens so every requested output could be admitted simultaneously.
+
+| Cohort | Total output | End-to-end throughput | Decode throughput | MTP acceptance | Mean TTFT | Peak VRAM |
+|---:|---:|---:|---:|---:|---:|---:|
+| C1 | 1,024 tokens | **77.84 tok/s** | **78.71 tok/s** | 71.27% | 133 ms | 19,475 MiB |
+| C2 | 2,048 tokens | **94.75 tok/s** | **96.04 tok/s** | 62.17% | 225 ms | 19,919 MiB |
+| C4 | 4,096 tokens | **136.43 tok/s** | **139.91 tok/s** | 66.15% | 420 ms | 20,247 MiB |
+| C8 | 8,192 tokens | **240.34 tok/s** | **250.26 tok/s** | 69.74% | 866 ms | 20,903 MiB |
+
+**Prompt processing.** 4,362 fresh input tokens per request, 512-token prefill chunks, prefix reuse
+disabled, 16 generated tokens so the run measures prefill rather than decode.
+
+| Cohort | Total fresh input | Aggregate prefill | Active-prefill speed | Mean TTFT | Peak VRAM |
+|---:|---:|---:|---:|---:|---:|
+| C1 | 4,362 tokens | **861.51 tok/s** | 893.98 tok/s | 4,893 ms | 19,114 MiB |
+| C2 | 8,724 tokens | **853.86 tok/s** | 883.95 tok/s | 7,478 ms | 19,697 MiB |
+| C4 | 17,448 tokens | **847.26 tok/s** | 874.49 tok/s | 12,692 ms | 20,894 MiB |
+| C8 | 34,896 tokens | **844.10 tok/s** | 870.94 tok/s | 23,028 ms | 23,207 MiB |
+
+`Aggregate prefill` is total fresh input divided by the complete request-wave time, the user-facing
+number. NInfer processes one long prefill at a time: cohort batching accelerates decode but does not
+multiply prompt ingestion, so C1-C8 stay near 844-862 input tok/s while queued requests raise mean
+TTFT. `Active-prefill speed` excludes queue waiting.
+
 ### Recommended configurations (RTX 3090, Qwen3.8-27B)
 
 Every flag below is measured elsewhere in this file or in
@@ -445,28 +511,78 @@ picks K=15, which loses on real generation.
 costs about 65K tokens of context on this card -- 130K against 200K, both verified by loading -- so
 the choice between it and MTP3 is a speed/context trade, not a free upgrade.
 
+### Choosing the draft count (RTX 3090, Qwen3.8-27B)
+
+The MTP draft count is a trade on what the output looks like. Each round verifies K+1 columns and
+runs K draft-head steps whether or not the drafts survive, so a larger K pays only where the head
+keeps guessing right. Measured on the RTX 3090, Qwen3.8-27B, `rk4v4` KV, `--lm-head-draft
+--lm-head-q6 --embedding-q4 --gdn-state-fp16`, greedy, 512 generated tokens, one stream (decode
+tok/s; tokens emitted per round in parentheses):
+
+| `--draft-tokens` | edit code (copies the prompt) | write new code | explain a concept | short story |
+|---:|---:|---:|---:|---:|
+| (none) | 47.3 | 47.5 | 47.5 | 47.6 |
+| **3** | 141.9 (3.9) | 118.2 (3.3) | 102.1 (2.8) | 77.1 (2.1) |
+| 5 | 177.7 (5.7) | 124.8 (4.0) | 95.6 (3.1) | 75.1 (2.4) |
+| 7 | 226.0 (7.4) | 130.6 (4.3) | 103.9 (3.4) | 67.7 (2.2) |
+| 9 | 226.4 (8.8) | 129.9 (5.0) | 91.3 (3.5) | 56.3 (2.2) |
+| 11 | 244.4 (10.4) | | | |
+| 15 | 262.6 (12.5) | 114.7 (5.4) | 75.1 (3.5) | 47.6 (2.2) |
+
+Three stays the default: it is best or within 2% on prose, and larger counts lose up to 38% there.
+When the output mostly reproduces the input -- refactoring, renaming, applying an edit and
+returning the whole file -- the draft head predicts it almost perfectly and every extra position is
+nearly free, so 11 to 15 is up to 1.85x faster than three. For a coding assistant that mostly
+writes new code, seven is about 10% faster than three. `--lookup-ngram` adds nothing on top of MTP
+there: the head already copies (K=15 with and without `--lookup-ngram 8`: 262.4 and 262.6 tok/s,
+the same tokens per round). For comparison, DFlash2 at its default seven is still faster at one
+stream on the same runs (268.5 tok/s editing code, 115.7 explaining); MTP is the backend that fits
+the full context and a second lane. Draft counts of eight and above add a second CUDA Graph
+topology class on the 27B (its wide verify moves between the prompt and chunked attention routes),
+which reserves about 64 MiB more per lane.
+
+DFlash2 accepts every draft count from 1 through 15. Seven is the checkpoint recommendation and the
+best mean on this card; the sweep behind it is in
+[Choosing a speculative backend by concurrency](#choosing-a-speculative-backend-by-concurrency-rtx-3090-qwen38-27b).
+DFlash2's `--lm-head-draft` is within noise of unset at every count and can be left off.
+
 ### Choosing a KV format (RTX 3090, Qwen3.8-27B)
 
 All seven SM86 KV formats, measured on Qwen3.8-27B.
 
 | KV profile | Bytes/token | KV at 2,048 tokens | Perplexity | vs `bf16` | Decode at 32K depth |
 |---|---:|---:|---:|---:|---:|
-| `bf16` | 65,536 | 128.00 MiB | 4.343225 | — | 32.50 tok/s |
-| `int8` | 33,792 | 66.00 MiB | 4.343263 | +0.0009% | **33.86 tok/s** |
-| `fp8` | 33,024 | 64.50 MiB | 4.347181 | +0.0911% | 30.13 tok/s |
-| `rk8v4` | 26,112 | 51.00 MiB | 4.346811 | +0.0826% | 33.54 tok/s |
-| `k8v4` | 25,728 | 50.25 MiB | 4.347596 | +0.1006% | 28.61 tok/s |
-| `nvfp4` | **18,432** | **36.00 MiB** | 4.358924 | +0.3615% | 29.62 tok/s |
-| `rk4v4` | 17,920 | 35.00 MiB | 4.352432 | +0.214% vs `int8` | ≈ `rk8v4` |
+| `bf16` | 65,536 | 128.00 MiB | 4.342517 | — | 31.93 tok/s |
+| `int8` | 33,792 | 66.00 MiB | 4.342425 | −0.0021% | **33.63 tok/s** |
+| `fp8` | 33,024 | 64.50 MiB | 4.344724 | +0.0508% | 30.34 tok/s |
+| `rk8v4` | 26,112 | 51.00 MiB | 4.346413 | +0.0897% | 33.17 tok/s |
+| `k8v4` | 25,728 | 50.25 MiB | 4.347258 | +0.1092% | 28.90 tok/s |
+| `nvfp4` | 18,432 | 36.00 MiB | 4.352201 | +0.2229% | 29.86 tok/s |
+| `rk4v4` | **17,920** | **35.00 MiB** | 4.352432 | +0.214% vs `int8` | ≈ `rk8v4` |
 
 Perplexity is `ninfer-perplexity` on the fixed `ninfer-ppl-1m-v1` corpus, `--quick`, context/stride
 4096/2048, 261,167 scored tokens. Decode is 128 timed steps on top of a 32,768-token prefill, no
-speculation; attention re-reads the whole cache each step, so a format's cost only shows at depth.
+speculation, mean of two independent runs; attention re-reads the whole cache each step, so a
+format's cost only shows at depth. These are the September 2026 re-measurements after the fix for
+a data race in the quantized attention kernels, which had corrupted every prefill output column
+except the last and inflated the perplexity of `fp8`, `nvfp4` and `k8v4` (greedy generation was
+unaffected). An earlier revision of this table carried the pre-fix scores, including `nvfp4` at
++0.36%.
 The `rk4v4` row comes from a later session and build (2026-09-23), where `int8` measured 4.343155,
 `rk8v4` 4.347943 and `nvfp4` 4.353589, and `rk4v4` decoded within ±1% of `rk8v4` at 4K-32K; its
 figures are stated against those rather than this table's. See the README's
 [`rk4v4` section](../README.md#lloyd-max-4-bit-keys-rk4v4).
 See [the README](../README.md#choosing-a-kv-format) for the fuller writeup and recommendations.
+
+**Not built: `rk2v4-e8` (2-bit E8 root keys).** The sibling RTX 4090 forks ship an `rk2v4-e8` mode:
+keys as one E8 root index, a 4-bit log radius and a 4-bit axis correction per 8 dimensions, about
+216 B per head and token here against `rk4v4`'s 280. Simulated on this build by passing `int8`'s
+rotated keys through that fork's encoder and decoder (`absmax/7` G64 scale) and storing the decoded
+keys as INT8, with values left at INT8, the same quick protocol measured **4.476942 against
+4.343155 (+3.08%)**, with every domain between +2.2% and +3.9% (2026-09-29). That is the keys
+alone, about fourteen times `rk4v4`'s whole +0.214%, and it agrees with the rule `rk4v4` found that
+any 3-bit key coding costs +0.7% or more. `rk4v4` already reaches the model's native 262,144-token
+context on the 27B, so the extra headroom does not pay for the quality.
 
 ## Published coverage
 
@@ -514,7 +630,7 @@ and [Qwen3.8 DFlash2 outcomes](performance/qwen3.8-27b.md#dflash2-completion-out
 - [Serving benchmark runners](../tools/bench/README.md#serving-corpus-benchmark): usage and local report files.
 - [Engine and Op benchmarks](../bench/README.md): their separate measurement scopes and commands.
 - [Capability evaluation](../eval/README.md): evaluation workflow; published scores live in the
-  [model cards](README.md#model-artifacts), with a [README summary](../README.md#evaluation).
+  [model cards](README.md#model-artifacts).
 - [Perplexity](perplexity.md): offline causal-scoring measurement and comparison rules.
 
 Model pages are the detailed result authority. README and model-card performance tables are

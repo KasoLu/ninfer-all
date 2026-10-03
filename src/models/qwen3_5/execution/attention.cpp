@@ -29,11 +29,16 @@ void require_rope_axes(const Tensor& positions, const RopeConfig& config) {
 // 256 tokens and loses by up to 22 % at 1024. The bound sits a doubling below the crossover
 // because the two geometries cross at different widths. The Op itself is valid at any width; this
 // is a dispatch choice, and both branches are the same arithmetic bit for bit.
+//
+// The fused Op compiles in RoPE theta 1e7 and RMSNorm epsilon 1e-6; a model with any other
+// constant takes the three calls.
 constexpr std::int32_t kFusedTextQkNormRopeMaximumTokens = 256;
 
 bool fused_text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
-                             const AttentionConfig& attention, std::int32_t tokens) {
+                             const AttentionConfig& attention, float rms_norm_eps,
+                             std::int32_t tokens) {
     return positions.ne[1] == 1 && tokens <= kFusedTextQkNormRopeMaximumTokens &&
+           ops::rmsnorm_rope_constants_match(rope.rope_theta, rms_norm_eps) &&
            attention.head_dim == 256 && rope.rotary_dim == 64 &&
            ((attention.num_attention_heads == 16 && attention.num_key_value_heads == 2) ||
             (attention.num_attention_heads == 24 && attention.num_key_value_heads == 4));
@@ -105,7 +110,7 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
     require_rope_axes(positions, rope);
     // The fused Op rotates unscaled positions at the unscaled frequencies, so YaRN or position
     // interpolation keeps the three separate calls.
-    if (!yarn.active() && fused_text_qk_norm_rope(positions, rope, attention, query.ne[2])) {
+    if (!yarn.active() && fused_text_qk_norm_rope(positions, rope, attention, rms_norm_eps, query.ne[2])) {
         ops::rmsnorm_rope(positions, q_norm_weight, k_norm_weight, query, key, normalized_query,
                           normalized_key, stream);
         return;

@@ -160,6 +160,12 @@ refuse_flag '27B overrides' "$recorded" '--vision'
 expect_flags '27B default slots' "$(record slots32 -- qwen38-27b)" '--host-state-slots 32'
 expect_flags '27B slots override' "$(record slots8 NINFER_HOST_STATE_SLOTS=8 -- qwen38-27b)" '--host-state-slots 8'
 
+# NINFER_CHAT_TEMPLATE forwards straight to --chat-template, and is absent when unset.
+expect_flags '27B chat template override' \
+  "$(record chat_template NINFER_CHAT_TEMPLATE="$tmp/custom.jinja" -- qwen38-27b)" \
+  "--chat-template $tmp/custom.jinja"
+refuse_flag '27B no chat template override' "$(record no_chat_template -- qwen38-27b)" '--chat-template'
+
 # The banner reports what is being served: an explicit vision residency shows up in it, not the
 # default. (The stub server prints nothing, so stdout here is the launcher's own.)
 banner="$(clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$tmp/unused.args" \
@@ -169,14 +175,16 @@ banner="$(clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$tmp/unu
   exit 1
 }
 
-# The reference profiles are fixed and minimal: no cache tuning, no vision.
+# The reference profiles are fixed and minimal: no vision, and only c8 sizes its context cache,
+# per lane (two retained conversations and two host states per lane, one device state per lane).
 recorded="$(record int8 -- qwen38-27b int8)"
 expect_flags '27B int8' "$recorded" '--max-context 65536' '--max-concurrency 1' '--kv-dtype int8' \
   '--spec mtp --draft-tokens 3 --lm-head-draft'
 refuse_flag '27B int8' "$recorded" '--vision'
 recorded="$(record c8 -- qwen38-27b c8)"
 expect_flags '27B c8' "$recorded" '--max-concurrency 8' '--max-context 8192' '--kv-capacity 16384' \
-  '--kv-dtype int8' '--spec mtp --draft-tokens 3 --lm-head-draft'
+  '--kv-dtype int8' '--spec mtp --draft-tokens 3 --lm-head-draft' \
+  '--max-private-continuations 16' '--device-state-slots 8' '--host-state-slots 16'
 refuse_flag '27B c8' "$recorded" '--auto-prefix-grid'
 
 # Qwen3.6-35B-A3B `tuned`: MoE, so no cuBLAS route and no Q4 embedding; its own draft head flags.
@@ -252,6 +260,12 @@ expect_eq 'NINFER_FALLBACK=off' "$(field --max-context)" '262144 '
 # Only a memory refusal steps down. Any other startup failure is not something a smaller context fixes.
 attempts 1000 NINFER_TEST_FAILURE='FATAL server failed during startup | artifact is corrupt'
 expect_eq 'other failures do not retry' "$(field --max-context)" '262144 '
+
+# NINFER_CHAT_TEMPLATE plays no part in the step-down math, but it must still ride along on every
+# retry -- a value set once should not silently drop off a later rung.
+attempts 1000 NINFER_CHAT_TEMPLATE="$tmp/custom.jinja"
+expect_eq 'chat template rides every rung' "$(field --chat-template)" \
+  "$tmp/custom.jinja $tmp/custom.jinja $tmp/custom.jinja $tmp/custom.jinja $tmp/custom.jinja $tmp/custom.jinja "
 
 # The reference profiles are fixed shapes and never step down.
 ladder_log="$tmp/ladder.fixed.log"; : > "$ladder_log"
@@ -350,20 +364,25 @@ if [[ -n "${NINFER_TEST_FAKE_SIZE:-}" ]]; then
 fi
 CURL
 chmod +x "$tmp/bin/curl"
-# download-model.sh prefers aria2c when it is on PATH, as it is on hosted runners; its stub writes the
-# same payload to -d/-o so no case reaches the network.
+# download-model.sh prefers aria2c over curl when aria2c is on PATH, and GitHub's hosted runner
+# image ships aria2c -- so without a stub here, every case below that reaches the fetch branch
+# would download the real multi-GB artifact from Hugging Face instead of exercising the fixture,
+# which is what made this suite take minutes instead of seconds. -d/-o mirror aria2c's own flags
+# (see download-model.sh's invocation), not curl's --output.
 cat > "$tmp/bin/aria2c" <<'ARIA2C'
 #!/usr/bin/env bash
+dir='.' out=''
 while (( $# )); do
   case "$1" in
     -d) dir="$2"; shift 2 ;;
-    -o) name="$2"; shift 2 ;;
+    -o) out="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
-: > "$dir/$name"
+output="$dir/$out"
+: > "$output"
 if [[ -n "${NINFER_TEST_FAKE_SIZE:-}" ]]; then
-  truncate -s "$NINFER_TEST_FAKE_SIZE" "$dir/$name"
+  truncate -s "$NINFER_TEST_FAKE_SIZE" "$output"
 fi
 ARIA2C
 chmod +x "$tmp/bin/aria2c"
@@ -413,7 +432,8 @@ for key in "${models[@]}"; do
 done
 
 # A model name is required and must be one of the pinned ones. Neither case may touch the network or
-# the models directory: exit 2 with a usage message that names every model, before any curl runs.
+# the models directory: exit 2 with a usage message that names every model, before any curl or
+# aria2c runs.
 # The models directory it is pointed at does not exist, so creating it would be caught below.
 for bad in '' 'qwen38-27' 'qwen3_8_27b'; do
   if [[ -z "$bad" ]]; then bad_args=(); else bad_args=("$bad"); fi
@@ -436,12 +456,13 @@ for bad in '' 'qwen38-27' 'qwen3_8_27b'; do
   fi
 done
 
-# An artifact that already verifies is left alone: no download, not even an attempted one. The
-# fetchers in this directory fail every call, so a script that fetched again would exit non-zero.
+# An artifact that already verifies is left alone: no download, not even an attempted one. Both
+# stubs in this directory fail every call, so a script that fetched again -- via either path --
+# would exit non-zero instead of quietly reaching the real network.
 mkdir -- "$tmp/failing-curl"
 printf '#!/usr/bin/env bash\nexit 22\n' > "$tmp/failing-curl/curl"
+chmod +x "$tmp/failing-curl/curl"
 cp -- "$tmp/failing-curl/curl" "$tmp/failing-curl/aria2c"
-chmod +x "$tmp/failing-curl/curl" "$tmp/failing-curl/aria2c"
 for key in "${models[@]}"; do
   model="$(artifact_of "$key")"
   size="$(expected_size_of "$key")"

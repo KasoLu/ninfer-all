@@ -1,10 +1,16 @@
 #include "guarded_main.h"
+#include "speculative_graft.h"
 #include "ninfer/engine.h"
+#include "runtime/engine/worker_fault.h"
 
 #include <chrono>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <mutex>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -684,8 +690,13 @@ int exercise_host_restore(const char* artifact) {
     ninfer::ChatMessage assistant;
     assistant.role              = ninfer::ChatRole::Assistant;
     assistant.reasoning_content = retained.reasoning;
-    assistant.parts.push_back(ninfer::MessagePart{
-        .kind = ninfer::MessagePartKind::Text, .text = retained.content, .media = {}});
+    // The replayed reply diverges from its first generated token on purpose. Qwen3.8's template
+    // re-renders a non-thinking reply token for token, so a replay that keeps the generated tokens
+    // as its prefix correctly reuses the whole endpoint and never reaches the turn-closure
+    // checkpoint this scenario restores from Host.
+    assistant.parts.push_back(ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+                                                  .text  = "Edited reply. " + retained.content,
+                                                  .media = {}});
     continuation.messages.push_back(std::move(assistant));
     ninfer::ChatMessage followup;
     followup.role = ninfer::ChatRole::User;
@@ -1299,6 +1310,593 @@ int exercise_shared_rewrite_materialization(const char* artifact) {
                   << after_third.historical_fork_hits << '\n';
         return 1;
     }
+    return 0;
+}
+
+// A consumed private endpoint whose long anchor aliases a StateImage another owner also holds
+// must not count that image in its active entitlement. Two conversations share a system prompt and
+// each places an explicit long anchor on the system boundary, where it aliases the structural
+// shared-prefix image; one lane with one spare Device state slot forces anchors onto the Host.
+// Counting the shared anchor made start_request's actual-vs-expected invariant throw (or the
+// state reservation raise bad_alloc) and latched the Engine within a few turns.
+int exercise_shared_anchor_entitlement(const char* artifact) {
+    ninfer::EngineOptions options;
+    options.artifact_path                        = artifact;
+    options.max_context                          = 1024;
+    options.kv_capacity                          = ninfer::KvCapacityPolicy::explicit_capacity(1024);
+    options.prefill_chunk                        = 256;
+    options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens             = 3;
+    options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
+    options.max_concurrency                      = 1;
+    options.max_pending_requests                 = 1;
+    options.context_cache.device_state_slots     = 1;
+    options.context_cache.host_state_slots       = 4;
+    options.context_cache.host_kv_capacity_bytes = std::size_t{64} << 20U;
+    options.context_cache.max_private_continuations         = 2;
+    options.context_cache.max_shared_prefixes               = 4;
+    options.context_cache.max_long_anchors_per_continuation = 2;
+    ninfer::Engine engine(std::move(options));
+
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    std::string system =
+        "You are a careful engineering assistant. Follow the house style: short sentences, units "
+        "on every number, and name the assumption behind every estimate.";
+    for (int line = 0; line < 12; ++line) {
+        system += " Rule " + std::to_string(line) +
+                  ": prefer measured figures to recalled ones, and say which you used.";
+    }
+    const auto conversation = [&](const std::vector<std::string>& turns) {
+        ninfer::PromptInput prompt;
+        ninfer::ChatMessage head;
+        head.role = ninfer::ChatRole::System;
+        head.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = system, .media = {}});
+        prompt.messages.push_back(std::move(head));
+        for (std::size_t index = 0; index < turns.size(); ++index) {
+            ninfer::ChatMessage message;
+            message.role = index % 2 == 0 ? ninfer::ChatRole::User : ninfer::ChatRole::Assistant;
+            message.parts.push_back(ninfer::MessagePart{
+                .kind = ninfer::MessagePartKind::Text, .text = turns[index], .media = {}});
+            prompt.messages.push_back(std::move(message));
+        }
+        prompt.options.enable_thinking = false;
+        prompt.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+            .after_message_count = 1,
+            .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+            .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+        });
+        return prompt;
+    };
+
+    std::array<std::vector<std::string>, 2> turns{
+        std::vector<std::string>{"Plan a three-day walking route through the lake district."},
+        std::vector<std::string>{"Summarise the trade-offs between paged and contiguous KV."}};
+    std::uint32_t reused_requests = 0;
+    for (std::uint32_t round = 0; round < 5; ++round) {
+        for (std::size_t lineage = 0; lineage < turns.size(); ++lineage) {
+            const ninfer::GenerationResult result =
+                engine.generate(engine.prepare(conversation(turns[lineage])), request);
+            if (result.generated_token_ids.size() != 1) {
+                std::cerr << "shared-anchor request generated no token: round=" << round
+                          << " lineage=" << lineage << "\n";
+                return 1;
+            }
+            if (result.reused_prompt_tokens != 0) { ++reused_requests; }
+            turns[lineage].push_back("Answer " + std::to_string(round) + " for lineage " +
+                                     std::to_string(lineage) + ", with enough detail to fill a page.");
+            turns[lineage].push_back("Continue with part " + std::to_string(round + 1) + ".");
+        }
+    }
+    const ninfer::RuntimeStats stats = engine.runtime_stats();
+    if (!engine.is_available() || reused_requests == 0 || stats.state_d2h_count == 0) {
+        std::cerr << "shared-anchor scenario did not exercise reuse under Host pressure: reused="
+                  << reused_requests << " state_d2h=" << stats.state_d2h_count << "\n";
+        return 1;
+    }
+    return 0;
+}
+
+ninfer::EngineOptions automatic_anchor_engine_options(const char* artifact,
+                                                      std::uint32_t device_state_slots,
+                                                      std::uint32_t host_state_slots,
+                                                      std::uint32_t shared_prefixes,
+                                                      bool automatic_anchors) {
+    ninfer::EngineOptions options;
+    options.artifact_path                        = artifact;
+    options.max_context                          = 1024;
+    options.kv_capacity                          = ninfer::KvCapacityPolicy::explicit_capacity(1024);
+    options.prefill_chunk                        = 256;
+    options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens             = 3;
+    options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
+    options.max_concurrency                      = 1;
+    options.max_pending_requests                 = 1;
+    options.context_cache.device_state_slots     = device_state_slots;
+    options.context_cache.host_state_slots       = host_state_slots;
+    options.context_cache.host_kv_capacity_bytes = std::size_t{64} << 20U;
+    options.context_cache.max_private_continuations         = 2;
+    options.context_cache.max_shared_prefixes               = shared_prefixes;
+    // Every boundary of these short turns joins the grid: no spacing, and room for an anchor at
+    // each of the last interior boundaries.
+    options.context_cache.max_long_anchors_per_continuation = 4;
+    options.context_cache.automatic_long_anchors            = automatic_anchors;
+    options.context_cache.long_anchor_min_spacing_tokens    = 0;
+    return options;
+}
+
+// Turns alternate User/Assistant; with `leading_system` the first turn is the System message and
+// the alternation starts after it.
+ninfer::PromptInput automatic_anchor_conversation(const std::vector<std::string>& turns,
+                                                  bool leading_system = false) {
+    ninfer::PromptInput prompt;
+    for (std::size_t index = 0; index < turns.size(); ++index) {
+        ninfer::ChatMessage message;
+        const std::size_t turn = leading_system ? index - 1U : index;
+        message.role           = leading_system && index == 0 ? ninfer::ChatRole::System
+                                 : turn % 2 == 0              ? ninfer::ChatRole::User
+                                                              : ninfer::ChatRole::Assistant;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = turns[index], .media = {}});
+        prompt.messages.push_back(std::move(message));
+    }
+    prompt.options.enable_thinking = false;
+    return prompt;
+}
+
+// Chat Completions and Anthropic requests carry no PrivateLongAnchor marker; with
+// --auto-long-anchors the Engine places anchors at message boundaries itself. An edit below the rewrite checkpoint must then restore
+// at the anchor under the edit; with automatic anchors off the same edit has no such candidate.
+// A second phase interleaves two growing conversations behind one common system prompt on one lane
+// with a one-slot Device state pool and shared prefixes enabled. The automatic anchor after the
+// system message then lands on the structural shared-prefix frontier and aliases its StateImage,
+// anchors are demoted to Host, and a consumed endpoint carries an anchor another owner also
+// references - the shape that latched the engine through a miscounted active entitlement.
+int exercise_automatic_private_anchors(const char* artifact) {
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    const std::vector<std::string> original{
+        "Describe the layout of a small workshop with a bench, a lathe and a drill press.",
+        "The bench runs along the north wall, the lathe sits under the window and the drill "
+        "press stands by the door.",
+        "Where should the dust extractor go so it reaches all three machines?",
+        "Put it in the north-east corner with a manifold running to each machine.",
+        "How long should the ducting be?"};
+    std::vector<std::string> edited = original;
+    edited[3] = "Mount it on the ceiling above the lathe and drop hoses to each machine.";
+
+    const auto edit_reuse = [&](bool automatic_anchors, ninfer::GenerationResult& out) {
+        ninfer::Engine engine(automatic_anchor_engine_options(artifact, 4, 4, 0, automatic_anchors));
+        const ninfer::GenerationResult first =
+            engine.generate(engine.prepare(automatic_anchor_conversation(original)), request);
+        if (first.generated_token_ids.size() != 1) { return false; }
+        out = engine.generate(engine.prepare(automatic_anchor_conversation(edited)), request);
+        return out.generated_token_ids.size() == 1;
+    };
+    ninfer::GenerationResult anchored;
+    ninfer::GenerationResult control;
+    if (!edit_reuse(true, anchored) || !edit_reuse(false, control)) {
+        std::cerr << "automatic-anchor conversation did not generate\n";
+        return 1;
+    }
+    if (anchored.prefix_reuse_path != ninfer::PrefixReusePath::PrivateLongAnchor ||
+        anchored.reused_prompt_tokens == 0 ||
+        anchored.reused_prompt_tokens >= anchored.prompt.prompt_tokens ||
+        control.reused_prompt_tokens >= anchored.reused_prompt_tokens) {
+        std::cerr << "automatic long anchor did not restore below the edit: anchored_path="
+                  << static_cast<int>(anchored.prefix_reuse_path)
+                  << " anchored_reused=" << anchored.reused_prompt_tokens
+                  << " control_path=" << static_cast<int>(control.prefix_reuse_path)
+                  << " control_reused=" << control.reused_prompt_tokens
+                  << " prompt=" << anchored.prompt.prompt_tokens << '\n';
+        return 1;
+    }
+
+    ninfer::Engine engine(automatic_anchor_engine_options(artifact, 1, 4, 4, true));
+    std::string system =
+        "You are a careful engineering assistant. Follow the house style: short sentences, units "
+        "on every number, and name the assumption behind every estimate.";
+    for (int line = 0; line < 12; ++line) {
+        system += " Rule " + std::to_string(line) +
+                  ": prefer measured figures to recalled ones, and say which you used.";
+    }
+    std::array<std::vector<std::string>, 2> conversations{
+        std::vector<std::string>{system,
+                                 "Plan a three-day walking route through the lake district."},
+        std::vector<std::string>{system,
+                                 "Summarise the trade-offs between paged and contiguous KV."}};
+    for (std::uint32_t round = 0; round < 5; ++round) {
+        for (std::size_t lineage = 0; lineage < conversations.size(); ++lineage) {
+            std::vector<std::string>& turns = conversations[lineage];
+            const ninfer::GenerationResult result = engine.generate(
+                engine.prepare(automatic_anchor_conversation(turns, true)), request);
+            if (result.generated_token_ids.size() != 1 || !engine.is_available()) {
+                std::cerr << "interleaved automatic-anchor conversation failed: round=" << round
+                          << " lineage=" << lineage << '\n';
+                return 1;
+            }
+            turns.push_back("Answer " + std::to_string(round) + " for lineage " +
+                            std::to_string(lineage) + ", with enough detail to fill a page.");
+            turns.push_back("Continue with part " + std::to_string(round + 1) + ".");
+        }
+    }
+    return 0;
+}
+
+ninfer::EngineOptions slot_engine_options(const char* artifact, bool auto_save,
+                                           std::vector<ninfer::SlotAutoSaveEvent>* events,
+                                           std::mutex* events_mutex) {
+    ninfer::EngineOptions options;
+    options.artifact_path                        = artifact;
+    options.max_context                          = 1024;
+    options.kv_capacity                          = ninfer::KvCapacityPolicy::explicit_capacity(1024);
+    options.prefill_chunk                        = 256;
+    options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens             = 3;
+    options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
+    options.max_concurrency                      = 1;
+    options.max_pending_requests                 = 1;
+    options.context_cache.device_state_slots     = 2;
+    options.context_cache.host_state_slots       = 2;
+    options.context_cache.host_kv_capacity_bytes = std::size_t{64} << 20U;
+    // One private cell, so every unrelated conversation evicts the retained one.
+    options.context_cache.max_private_continuations         = 1;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 2;
+    options.slot_auto_save.enabled                          = auto_save;
+    if (events != nullptr) {
+        options.slot_auto_save.listener = [events, events_mutex](const ninfer::SlotAutoSaveEvent& e) {
+            std::scoped_lock lock(*events_mutex);
+            events->push_back(e);
+        };
+    }
+    return options;
+}
+
+ninfer::PromptInput slot_conversation(const std::vector<std::string>& turns) {
+    ninfer::PromptInput prompt;
+    for (std::size_t index = 0; index < turns.size(); ++index) {
+        ninfer::ChatMessage message;
+        message.role = index % 2 == 0 ? ninfer::ChatRole::User : ninfer::ChatRole::Assistant;
+        message.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = turns[index], .media = {}});
+        prompt.messages.push_back(std::move(message));
+    }
+    prompt.options.enable_thinking = false;
+    return prompt;
+}
+
+// A saved session restored into a fresh Engine must behave exactly like the warm session it was
+// saved from: the continuation reuses the restored prefix, and greedy output matches a control
+// Engine that never evicted it token for token. Digest preconditions, corrupt files, and the
+// auto-save spill on involuntary eviction are checked on the same artifact.
+int exercise_slot_persistence(const char* artifact) {
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / "ninfer-slot-persistence-test";
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+    const std::string file = (directory / "session.bin").string();
+
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 12;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    const std::vector<std::string> first{
+        "List three uses for a lathe in a small workshop, one line each."};
+    const auto second_turn = [&](const ninfer::GenerationResult& reply) {
+        std::vector<std::string> turns = first;
+        turns.push_back(reply.content);
+        turns.push_back("Which of those needs the most care with tool speed?");
+        return turns;
+    };
+
+    // Control: the warm session continues without ever leaving the device.
+    std::vector<ninfer::TokenId> control_tokens;
+    {
+        ninfer::Engine control(slot_engine_options(artifact, false, nullptr, nullptr));
+        const ninfer::GenerationResult reply =
+            control.generate(control.prepare(slot_conversation(first)), request);
+        const ninfer::GenerationResult next =
+            control.generate(control.prepare(slot_conversation(second_turn(reply))), request);
+        control_tokens = next.generated_token_ids;
+        if (next.reused_prompt_tokens == 0) {
+            std::cerr << "control continuation did not reuse its warm session\n";
+            return 1;
+        }
+    }
+
+    std::mutex events_mutex;
+    std::vector<ninfer::SlotAutoSaveEvent> events;
+    std::string saved_digest;
+    std::uint32_t saved_tokens = 0;
+    std::vector<std::string> continued;
+    {
+        ninfer::Engine engine(slot_engine_options(artifact, true, &events, &events_mutex));
+        const ninfer::GenerationResult reply =
+            engine.generate(engine.prepare(slot_conversation(first)), request);
+        if (reply.slot < 0 || reply.session_digest.size() != 16) {
+            std::cerr << "retained session reported no slot identity: slot=" << reply.slot << '\n';
+            return 1;
+        }
+        const auto states = engine.slot_states();
+        if (states.size() != 1 || !states[0].retained ||
+            states[0].session_digest != reply.session_digest || states[0].checkpoints.empty() ||
+            states[0].checkpoints.back().frontier + 1U != states[0].prompt_tokens) {
+            std::cerr << "slot listing does not describe the retained session\n";
+            return 1;
+        }
+        bool mismatch_refused = false;
+        try {
+            (void)engine.save_slot(static_cast<std::uint32_t>(reply.slot), file,
+                                   "0000000000000000");
+        } catch (const ninfer::SlotSessionMismatch&) { mismatch_refused = true; }
+        if (!mismatch_refused) {
+            std::cerr << "save accepted a mismatched if_digest\n";
+            return 1;
+        }
+        const ninfer::SlotSaveResult saved = engine.save_slot(
+            static_cast<std::uint32_t>(reply.slot), file, reply.session_digest);
+        if (saved.session_digest != reply.session_digest || saved.tokens != states[0].prompt_tokens ||
+            saved.bytes == 0 || std::filesystem::file_size(file) != saved.bytes) {
+            std::cerr << "save reported an inconsistent snapshot\n";
+            return 1;
+        }
+        saved_digest = saved.session_digest;
+        saved_tokens = saved.tokens;
+        continued    = second_turn(reply);
+
+        // Grow the bound session one turn, then let an unrelated conversation evict it: the
+        // auto-save must write the deeper session back to the bound file.
+        const ninfer::GenerationResult grown =
+            engine.generate(engine.prepare(slot_conversation(continued)), request);
+        (void)engine.generate(
+            engine.prepare(slot_conversation({"Name a hardwood that turns well on a lathe."})),
+            request);
+        const ninfer::SlotRestoreResult reread = engine.restore_slot(0, file);
+        std::scoped_lock lock(events_mutex);
+        if (events.size() != 1 || !events[0].error.empty() || events[0].skipped_behind_tokens ||
+            events[0].tokens <= saved_tokens || reread.session_digest != grown.session_digest ||
+            reread.tokens != events[0].tokens) {
+            std::cerr << "eviction did not auto-save the grown session: events=" << events.size()
+                      << " spilled=" << (events.empty() ? 0U : events[0].tokens)
+                      << " saved=" << saved_tokens << '\n';
+            return 1;
+        }
+    }
+
+    // Restore the explicit first-turn snapshot into a fresh Engine and continue it.
+    const std::string first_file = (directory / "first.bin").string();
+    {
+        ninfer::Engine writer(slot_engine_options(artifact, false, nullptr, nullptr));
+        const ninfer::GenerationResult reply =
+            writer.generate(writer.prepare(slot_conversation(first)), request);
+        const ninfer::SlotSaveResult saved =
+            writer.save_slot(static_cast<std::uint32_t>(reply.slot), first_file);
+        if (saved.session_digest != saved_digest) {
+            std::cerr << "the same first turn produced a different session digest\n";
+            return 1;
+        }
+    }
+    ninfer::Engine engine(slot_engine_options(artifact, false, nullptr, nullptr));
+    {
+        std::ofstream corrupt((directory / "corrupt.bin").string(), std::ios::binary);
+        corrupt << "not a snapshot";
+    }
+    bool corrupt_refused = false;
+    try {
+        (void)engine.restore_slot(0, (directory / "corrupt.bin").string());
+    } catch (const std::invalid_argument&) { corrupt_refused = true; }
+    if (!corrupt_refused) {
+        std::cerr << "restore accepted a corrupt snapshot\n";
+        return 1;
+    }
+    const ninfer::SlotRestoreResult restored = engine.restore_slot(0, first_file);
+    if (restored.session_digest != saved_digest || restored.tokens != saved_tokens) {
+        std::cerr << "restore did not reproduce the saved session\n";
+        return 1;
+    }
+    const ninfer::GenerationResult next =
+        engine.generate(engine.prepare(slot_conversation(continued)), request);
+    if (next.reused_prompt_tokens == 0 || next.generated_token_ids != control_tokens) {
+        std::cerr << "restored continuation diverged from the warm control: reused="
+                  << next.reused_prompt_tokens << " tokens=" << next.generated_token_ids.size()
+                  << "/" << control_tokens.size() << '\n';
+        return 1;
+    }
+    bool erase_refused = false;
+    try {
+        (void)engine.erase_slot(0, "0000000000000000");
+    } catch (const ninfer::SlotSessionMismatch&) { erase_refused = true; }
+    const std::uint32_t erased = engine.erase_slot(0, next.session_digest);
+    if (!erase_refused || erased == 0 || engine.slot_states()[0].retained) {
+        std::cerr << "erase did not honor its digest precondition or leave the slot vacant\n";
+        return 1;
+    }
+    std::filesystem::remove_all(directory);
+    return 0;
+}
+
+// A host-side failure in the worker must fail only the request it touched, keep the FIFO queue,
+// and leave the Engine serving; the third consecutive failure latches it. Failures are armed
+// through the worker-fault seam and thrown after a prefill unit has executed, so each recovery
+// releases a lane holding live KV pages and state. The conversations share a system prompt and
+// place long anchors on it under Host pressure, so the cache the recovery clears is non-trivial.
+// With NINFER_TEST_GRAFT set, the startup-pinned graft the recovery also releases must be
+// reinstalled: a grafted request after the failures starts from the graft, as before them.
+int exercise_worker_failure_recovery(const char* artifact) {
+    ninfer::EngineOptions options;
+    options.artifact_path                        = artifact;
+    options.max_context                          = 1024;
+    options.kv_capacity                          = ninfer::KvCapacityPolicy::explicit_capacity(1024);
+    options.prefill_chunk                        = 256;
+    options.speculative.backend                  = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens             = 3;
+    options.speculative.proposal_head            = ninfer::ProposalHead::Optimized;
+    options.max_concurrency                      = 1;
+    options.max_pending_requests                 = 1;
+    options.context_cache.device_state_slots     = 1;
+    options.context_cache.host_state_slots       = 4;
+    options.context_cache.host_kv_capacity_bytes = std::size_t{64} << 20U;
+    options.context_cache.max_private_continuations         = 2;
+    options.context_cache.max_shared_prefixes               = 4;
+    options.context_cache.max_long_anchors_per_continuation = 2;
+    // The armed failure is an invariant failure; recovering from it is opt-in.
+    options.recover_invariant_failures = true;
+    ninfer::test::add_test_graft(options);
+    ninfer::Engine engine(std::move(options));
+
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 1;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    const auto grafted = [&]() -> std::optional<ninfer::GenerationResult> {
+        if (!ninfer::test::graft_configured()) { return std::nullopt; }
+        ninfer::PromptInput input;
+        input.messages.push_back(ninfer::ChatMessage{
+            .role = ninfer::ChatRole::User, .parts = {ninfer::MessagePart{.text = "Who are you?"}}});
+        input.options.graft = "g";
+        ninfer::RequestOptions graft_request = request;
+        graft_request.execution.requested_output_tokens = 8;
+        return engine.generate(engine.prepare(std::move(input)), graft_request);
+    };
+    const std::optional<ninfer::GenerationResult> graft_before = grafted();
+    if (graft_before && graft_before->reused_prompt_tokens == 0) {
+        std::cerr << "grafted request did not start from the graft\n";
+        return 1;
+    }
+
+    std::string system =
+        "You are a careful engineering assistant. Follow the house style: short sentences, units "
+        "on every number, and name the assumption behind every estimate.";
+    for (int line = 0; line < 12; ++line) {
+        system += " Rule " + std::to_string(line) +
+                  ": prefer measured figures to recalled ones, and say which you used.";
+    }
+    const auto conversation = [&](const std::vector<std::string>& turns) {
+        ninfer::PromptInput prompt;
+        ninfer::ChatMessage head;
+        head.role = ninfer::ChatRole::System;
+        head.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = system, .media = {}});
+        prompt.messages.push_back(std::move(head));
+        for (std::size_t index = 0; index < turns.size(); ++index) {
+            ninfer::ChatMessage message;
+            message.role = index % 2 == 0 ? ninfer::ChatRole::User : ninfer::ChatRole::Assistant;
+            message.parts.push_back(ninfer::MessagePart{
+                .kind = ninfer::MessagePartKind::Text, .text = turns[index], .media = {}});
+            prompt.messages.push_back(std::move(message));
+        }
+        prompt.options.enable_thinking = false;
+        prompt.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+            .after_message_count = 1,
+            .kind                = ninfer::PromptCacheMarkerKind::PrivateLongAnchor,
+            .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+        });
+        return prompt;
+    };
+
+    enum class Outcome { Served, Failed, Unavailable, Malformed };
+    const auto wait_for = [](ninfer::GenerationHandle& handle) {
+        try {
+            const ninfer::GenerationResult result = handle.wait();
+            return result.generated_token_ids.size() == 1 ? Outcome::Served : Outcome::Malformed;
+        } catch (const ninfer::RequestError& error) {
+            return error.kind() == ninfer::RequestErrorKind::Unavailable ? Outcome::Unavailable
+                                                                         : Outcome::Failed;
+        } catch (const std::exception&) { return Outcome::Failed; }
+    };
+
+    std::array<std::vector<std::string>, 2> turns{
+        std::vector<std::string>{"Plan a three-day walking route through the lake district."},
+        std::vector<std::string>{"Summarise the trade-offs between paged and contiguous KV."}};
+    const auto grow = [&](std::uint32_t round) {
+        for (std::size_t lineage = 0; lineage < turns.size(); ++lineage) {
+            turns[lineage].push_back("Answer " + std::to_string(round) + " for lineage " +
+                                     std::to_string(lineage) + ", with enough detail to fill a page.");
+            turns[lineage].push_back("Continue with part " + std::to_string(round + 1) + ".");
+        }
+    };
+
+    // Recovery: one failure per round, with the second conversation queued behind it. The rounds
+    // outnumber the consecutive-failure limit and still recover, because each successful unit of
+    // the served request resets the streak.
+    constexpr std::uint32_t kConsecutiveRecoveries = 8; // EngineCore::kOomMaxRecoveries
+    constexpr std::uint32_t kRecoveryRounds        = kConsecutiveRecoveries + 1U;
+    for (std::uint32_t round = 0; round < kRecoveryRounds; ++round) {
+        ninfer::runtime::arm_worker_failures(1);
+        ninfer::GenerationHandle first =
+            engine.submit(engine.prepare(conversation(turns[0])), request);
+        ninfer::GenerationHandle second =
+            engine.submit(engine.prepare(conversation(turns[1])), request);
+        const Outcome first_outcome  = wait_for(first);
+        const Outcome second_outcome = wait_for(second);
+        if (first_outcome != Outcome::Failed || second_outcome != Outcome::Served ||
+            !engine.is_available()) {
+            ninfer::runtime::arm_worker_failures(0);
+            std::cerr << "worker-recovery round " << round
+                      << ": first=" << static_cast<int>(first_outcome)
+                      << " second=" << static_cast<int>(second_outcome)
+                      << " available=" << engine.is_available() << "\n";
+            return 1;
+        }
+        grow(round);
+    }
+    const std::uint64_t recoveries = engine.runtime_stats().engine_recoveries;
+    if (recoveries != kRecoveryRounds) {
+        std::cerr << "worker recovery accounting is inconsistent: recoveries=" << recoveries
+                  << "\n";
+        return 1;
+    }
+    if (graft_before) {
+        const std::optional<ninfer::GenerationResult> graft_after = grafted();
+        if (graft_after->reused_prompt_tokens != graft_before->reused_prompt_tokens ||
+            graft_after->generated_token_ids != graft_before->generated_token_ids) {
+            std::cerr << "the pinned graft was not reinstalled by recovery: reused before="
+                      << graft_before->reused_prompt_tokens
+                      << " after=" << graft_after->reused_prompt_tokens << "\n";
+            return 1;
+        }
+    }
+
+    // Latch: consecutive failures with no successful unit between them. The first
+    // kConsecutiveRecoveries recover; the next latches, and the Engine then refuses work.
+    ninfer::runtime::arm_worker_failures(kConsecutiveRecoveries + 1U);
+    std::array<Outcome, kConsecutiveRecoveries + 1U> streak{};
+    for (std::size_t index = 0; index < streak.size(); ++index) {
+        ninfer::GenerationHandle handle =
+            engine.submit(engine.prepare(conversation(turns[index % 2])), request);
+        streak[index] = wait_for(handle);
+    }
+    ninfer::runtime::arm_worker_failures(0);
+    const std::uint64_t streak_recoveries = engine.runtime_stats().engine_recoveries - recoveries;
+    bool recovered_prefix = true;
+    for (std::size_t index = 0; index < kConsecutiveRecoveries; ++index) {
+        recovered_prefix = recovered_prefix && streak[index] == Outcome::Failed;
+    }
+    if (!recovered_prefix || streak.back() == Outcome::Served ||
+        streak_recoveries != kConsecutiveRecoveries || engine.is_available()) {
+        std::cerr << "consecutive worker failures did not latch after the recovery limit: last="
+                  << static_cast<int>(streak.back()) << " recoveries=" << streak_recoveries
+                  << " available=" << engine.is_available() << "\n";
+        return 1;
+    }
+    std::cout << "worker-failure-recovery: recoveries=" << recoveries
+              << " queued_served=" << kRecoveryRounds
+              << " latched_after=" << (kConsecutiveRecoveries + 1U)
+              << " graft_reinstalled=" << (graft_before ? "yes" : "not configured") << "\n";
     return 0;
 }
 
@@ -3469,6 +4067,14 @@ int run() {
             result = exercise_review_shared_reclaim_lru(artifact);
         } else if (scenario == "review-anchor-spacing") {
             result = exercise_review_anchor_spacing(artifact);
+        } else if (scenario == "shared-anchor-entitlement") {
+            result = exercise_shared_anchor_entitlement(artifact);
+        } else if (scenario == "automatic-private-anchors") {
+            result = exercise_automatic_private_anchors(artifact);
+        } else if (scenario == "slot-persistence") {
+            result = exercise_slot_persistence(artifact);
+        } else if (scenario == "worker-failure-recovery") {
+            result = exercise_worker_failure_recovery(artifact);
         } else {
             throw std::invalid_argument("unknown prefix integration scenario");
         }

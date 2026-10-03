@@ -267,15 +267,21 @@ int main() {
                       "server argv did not retain the redaction marker");
 
     GenerationRequest request;
-    request.max_tokens = 4096;
+    // A derived budget: the parse-time context bound is replaced by what was actually submitted.
+    request.max_tokens           = 65536;
+    request.derive_output_budget = true;
     request.messages.resize(2);
     request.messages.front().content.push_back(ContentPart{.kind = ContentKind::Image});
 
     PreparedRequest prepared;
+    prepared.requested_output_tokens                   = 4096;
     prepared.enable_thinking                           = true;
     prepared.thinking_budget                           = 256;
+    prepared.effective_thinking_budget                 = 256;
     prepared.reasoning_effort                          = ninfer::ReasoningEffort::XHigh;
+    prepared.requested_reasoning_effort                = RequestedReasoningEffort::XHigh;
     prepared.preserve_thinking                         = true;
+    prepared.requested_preserve_thinking               = true;
     prepared.sampling.temperature                      = 0.6F;
     prepared.sampling.top_p                            = 0.95F;
     prepared.sampling.top_k                            = 20;
@@ -323,9 +329,34 @@ int main() {
                       "resolved thinking mode missing");
     failures += check(started.at("request").at("thinking_budget") == 256,
                       "resolved thinking budget missing");
+    failures += check(started.at("request").at("effective_thinking_budget") == 256,
+                      "resolved effective thinking budget missing");
     failures += check(started.at("request").at("requested_reasoning_effort") == "xhigh" &&
                           !started.at("request").contains("resolved_reasoning_effort"),
                       "requested and resolved reasoning effort are not distinguished");
+
+    // A request that stated neither effort nor preserve_thinking but got the server
+    // --reasoning-effort/--preserve-thinking defaults applied still resolves
+    // prepared.reasoning_effort/preserve_thinking (the template and Responses state need concrete
+    // values to run with), so the start record must read the separate requested_* fields, or a
+    // server policy gets logged as if the client had asked for it.
+    PreparedRequest server_defaulted;
+    server_defaulted.requested_output_tokens = prepared.requested_output_tokens;
+    server_defaulted.enable_thinking         = prepared.enable_thinking;
+    server_defaulted.thinking_budget         = prepared.thinking_budget;
+    server_defaulted.effective_thinking_budget = prepared.effective_thinking_budget;
+    server_defaulted.reasoning_effort        = prepared.reasoning_effort;
+    server_defaulted.preserve_thinking       = prepared.preserve_thinking;
+    // requested_reasoning_effort and requested_preserve_thinking stay unset: the resolved values
+    // above came from the server default, not a client choice.
+    const RequestLogContext defaulted_context =
+        make_request_log_context(9, "openai_chat_completions", request, metadata, server_defaulted);
+    const Json defaulted_started =
+        Json::parse(format_request_start_json("serve-test", 2000, defaulted_context));
+    failures += check(defaulted_started.at("request").at("requested_reasoning_effort").is_null(),
+                      "a server-defaulted reasoning effort was logged as client-requested");
+    failures += check(defaulted_started.at("request").at("preserve_thinking").is_null(),
+                      "a server-defaulted preserve_thinking was logged as client-requested");
     failures += check(started.at("request").at("preserve_thinking") == true &&
                           started.at("request").at("preserve_thinking_semantic_change") == true,
                       "resolved preserve-thinking metadata missing");
@@ -444,8 +475,10 @@ int main() {
                           .search_renewals            = 1,
                           .search_discovery_used      = true,
                           .search_overshoot_ns        = 0,
+                          .best_reuse_prompt_tokens   = 4096,
     };
-    outcome.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
+    outcome.thinking = ninfer::ThinkingBudgetStats{.requested_budget      = 256,
+                                                   .effective_budget      = 256,
                                                    .model_thinking_tokens = 256,
                                                    .injected_tokens       = 19,
                                                    .applied               = true};
@@ -455,7 +488,8 @@ int main() {
                           done.at("materialization").at("first_improvement_ns") == 2000 &&
                           done.at("materialization").at("search_granted_ns") == 8000 &&
                           done.at("materialization").at("search_renewals") == 1 &&
-                          done.at("materialization").at("search_discovery_used") == true,
+                          done.at("materialization").at("search_discovery_used") == true &&
+                          done.at("materialization").at("best_reuse_prompt_tokens") == 4096,
                       "materialization search quality or cumulative budget diagnostics missing");
     failures +=
         check(done.at("result").at("finish_reason") == "output_limit", "finish reason missing");
@@ -465,6 +499,7 @@ int main() {
     failures += check(done.at("result").at("prefix_reuse_path") == "private_turn_closure",
                       "prefix reuse path missing");
     failures += check(done.at("result").at("thinking_budget") == 256 &&
+                          done.at("result").at("effective_thinking_budget") == 256 &&
                           done.at("result").at("model_thinking_tokens") == 256 &&
                           done.at("result").at("thinking_control_tokens") == 19 &&
                           done.at("result").at("thinking_control_applied") == true,
@@ -585,6 +620,13 @@ int main() {
         check(internal_failure.severity == OperationalSeverity::Error &&
                   internal_failure.message.find("sentinel-internal-detail") == std::string::npos,
               "operational internal failure severity or data policy mismatch");
+    const OperationalRecord internal_failure_tagged = render_request_failure(
+        context,
+        make_internal_request_failure(RequestFailurePhase::Http, "sentinel-internal-detail"));
+    failures += check(
+        internal_failure_tagged.message.find("internal error http") != std::string::npos &&
+            internal_failure_tagged.message.find("sentinel-internal-detail") == std::string::npos,
+        "internal failure should render a phase-derived error code without the raw machine message");
     const OperationalRecord disconnected = render_request_failure(
         context, make_client_disconnected_failure(RequestFailurePhase::Transport));
     failures += check(disconnected.severity == OperationalSeverity::Info &&
@@ -600,6 +642,7 @@ int main() {
     throughput.decode_row_rounds                        = 18;
     throughput.previous.root_selections                 = 2;
     throughput.previous.state_h2d_bytes                 = 100;
+    throughput.previous.engine_recoveries               = 1;
     throughput.current.running_requests                 = 2;
     throughput.current.prefilling_requests              = 1;
     throughput.current.decode_ready_requests            = 1;
@@ -626,6 +669,7 @@ int main() {
     throughput.current.pressure_searches                = 1;
     throughput.previous.salvaged_continuations          = 1;
     throughput.current.salvaged_continuations           = 3;
+    throughput.current.engine_recoveries                = 3;
     throughput.current.host_work                        = {
                                .engine_boundary_ns            = 1000000,
                                .program_submit_ns             = 2000000,
@@ -683,6 +727,10 @@ int main() {
                           throughput_json.at("scheduler").at("capture_pending") == 1 &&
                           throughput_json.at("scheduler").at("terminal_pending") == 1,
                       "context scheduler gauges missing");
+    failures += check(throughput_json.at("engine_recoveries") == 2 &&
+                          !throughput_json.at("context_cache").contains("engine_recoveries"),
+                      "engine_recoveries must be a top-level interval delta, not nested under "
+                      "context_cache");
     failures += check(
         std::abs(throughput_json.at("host_work").at("elapsed_seconds").at("total").get<double>() -
                  0.015) < 1.0e-15 &&
@@ -818,6 +866,82 @@ int main() {
                           second[1].at("event") == "request_start",
                       "request log rotation did not keep the newest copies with server_start");
     remove_rotated();
+    // Requested and effective thinking budgets in the request and operational logs. The values come
+    // from the engine (see test_effective_thinking_budget); here only the rendering is checked.
+    {
+        GenerationRequest request;
+        request.max_tokens = 520;
+        request.messages.resize(1);
+        const RequestLogMetadata metadata{
+            .model                  = "qwen3.6-27b",
+            .stream                 = false,
+            .output_tokens_explicit = true,
+        };
+
+        // Lowered at the boundary: both budgets are shown, in every log.
+        PreparedRequest lowered;
+        lowered.requested_output_tokens   = 520;
+        lowered.enable_thinking           = true;
+        lowered.thinking_budget           = 512;
+        lowered.effective_thinking_budget = 494;
+        const RequestLogContext lowered_ctx =
+            make_request_log_context(11, "openai_chat_completions", request, metadata, lowered);
+        failures += check(render_request_start(lowered_ctx).message.find(
+                              "budget 512 (effective 494)") != std::string::npos,
+                          "operational start log did not show requested and effective budgets");
+        const Json lowered_start =
+            Json::parse(format_request_start_json("serve-test", 2101, lowered_ctx));
+        failures += check(lowered_start.at("request").at("thinking_budget") == 512 &&
+                              lowered_start.at("request").at("effective_thinking_budget") == 494,
+                          "start JSON log did not report requested and effective budgets");
+
+        GenerationOutcome lowered_outcome;
+        lowered_outcome.prompt_tokens     = 100;
+        lowered_outcome.completion_tokens = 520;
+        lowered_outcome.finish_reason     = ninfer::FinishReason::OutputLimit;
+        lowered_outcome.thinking          = ninfer::ThinkingBudgetStats{
+                     .requested_budget      = 512,
+                     .effective_budget      = 494,
+                     .model_thinking_tokens = 494,
+                     .injected_tokens       = 27,
+                     .applied               = true,
+        };
+        failures += check(render_request_done(lowered_ctx, lowered_outcome)
+                                  .message.find("thinking 494/494 (requested 512), control 27") !=
+                              std::string::npos,
+                          "operational done log did not show requested and effective budgets");
+        const Json lowered_done = Json::parse(
+            format_request_done_json("serve-test", 3101, lowered_ctx, lowered_outcome));
+        failures += check(lowered_done.at("result").at("thinking_budget") == 512 &&
+                              lowered_done.at("result").at("effective_thinking_budget") == 494,
+                          "done JSON log did not report requested and effective budgets");
+
+        // Early close unavailable: the cap is not enforced, so no effective budget is reported.
+        PreparedRequest unbounded;
+        unbounded.requested_output_tokens = 20;
+        unbounded.enable_thinking         = true;
+        unbounded.thinking_budget         = 10;
+        const RequestLogContext unbounded_ctx =
+            make_request_log_context(12, "openai_chat_completions", request, metadata, unbounded);
+        GenerationOutcome unbounded_outcome;
+        unbounded_outcome.finish_reason = ninfer::FinishReason::OutputLimit;
+        unbounded_outcome.thinking      = ninfer::ThinkingBudgetStats{
+                 .requested_budget      = 10,
+                 .model_thinking_tokens = 20,
+        };
+        const std::string unbounded_done =
+            render_request_done(unbounded_ctx, unbounded_outcome).message;
+        failures += check(unbounded_done.find("thinking 20/10") != std::string::npos &&
+                              unbounded_done.find("effective") == std::string::npos,
+                          "operational done log showed an effective budget for an unenforced cap");
+        const Json unbounded_done_json = Json::parse(
+            format_request_done_json("serve-test", 3102, unbounded_ctx, unbounded_outcome));
+        failures += check(
+            unbounded_done_json.at("result").at("thinking_budget") == 10 &&
+                unbounded_done_json.at("result").at("effective_thinking_budget").is_null(),
+            "done JSON log invented an effective budget for an unenforced cap");
+    }
+
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

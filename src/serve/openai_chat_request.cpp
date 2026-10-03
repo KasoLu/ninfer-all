@@ -4,6 +4,7 @@
 #include "serve/request_validation.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <optional>
@@ -967,15 +968,21 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
         limit = optional_int(body, "max_tokens");
         param = "max_tokens";
     }
-    if (limit) {
-        // -1 is llama.cpp's "no limit", which its WebUI sends by default.
+    if (limit && *limit == -1) {
+        // llama.cpp's "no limit", which its WebUI sends by default: the largest budget that still
+        // lets every lane hold such a request at once (the remaining context with one lane),
+        // whatever --default-max-tokens says. A whole-context reservation would serialize them.
+        output.generation.max_tokens           = limits.max_context;
+        output.generation.derive_output_budget = true;
+        output.output_tokens_explicit          = true;
+    } else if (limit) {
         if (*limit < -1) {
             bad_request(std::string(param) + " must be nonnegative, or -1 for no limit", param);
         }
-        output.generation.max_tokens  = *limit == -1 ? kUnboundedOutputTokens : *limit;
+        output.generation.max_tokens  = *limit;
         output.output_tokens_explicit = true;
     } else {
-        output.generation.max_tokens = limits.default_max_tokens;
+        apply_default_output_limit(output.generation, limits);
     }
 }
 
@@ -992,11 +999,11 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
         output.generation.structured_output =
             parse_structured_output(body.at("response_format"), true, "response_format");
     }
-    // One model is resident, so an omitted model means that one; llama.cpp's WebUI omits it.
-    if (body.contains("model")) {
-        if (!body.at("model").is_string() || body.at("model").get<std::string>().empty()) {
-            bad_request("model must be a non-empty string", "model");
-        }
+    // One model is resident, so an omitted, null or empty model means that one: llama.cpp's
+    // WebUI omits it or sends "". The HTTP layer substitutes the served model. A model that is
+    // present but not a string is still a malformed request.
+    if (body.contains("model") && !body.at("model").is_null()) {
+        if (!body.at("model").is_string()) { bad_request("model must be a string", "model"); }
         output.model = body.at("model").get<std::string>();
     }
 
@@ -1019,6 +1026,8 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     output.generation.enable_thinking           = template_options.enable_thinking;
     output.generation.preserve_thinking         = template_options.preserve_thinking;
     output.generation.chat_template_kwargs_json = template_options.kwargs_json;
+    output.generation.graft                     = parse_graft_field(body);
+    output.generation.thinking_budget           = parse_thinking_budget_field(body);
     apply_openai_prompt_cache_policy(output.generation, cache_policy);
     return output;
 }

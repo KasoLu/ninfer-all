@@ -16,6 +16,14 @@
 #include <string>
 #include <vector>
 
+// The A8 workspace contracts describe the parts that run FP8 A8 (its TMA split-K partials are
+// sized there); an sm_8x build never admits A8 and does not carry those schedules.
+#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8)
+constexpr bool kA8Executable = false;
+#else
+constexpr bool kA8Executable = true;
+#endif
+
 namespace {
 
 using namespace ninfer;
@@ -115,8 +123,12 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
     if (!wide_only) {
         for (int columns : {63, 64, 65, 127, 128, 129, 1024})
             invocations.push_back({columns, ops::LinearPolicy::A16Only});
+        // Upstream's TMA split-K boundaries for the A8 routes.
+        for (int columns : {17, 18, 191, 192, 193, 255, 256, 257, 383, 384, 385, 511, 512, 513,
+                            767, 768, 769, 1023, 1025})
+            invocations.push_back({columns, ops::LinearPolicy::AllowA8});
     }
-    const std::int32_t kMaximumTokens = wide_only ? 64 : 1024;
+    const std::int32_t kMaximumTokens = wide_only ? 64 : 1025;
     quantized_weight::PackedWeight host_weight =
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, n, k, seed);
     const std::vector<std::int32_t> rows = sampled_indices(n);
@@ -141,7 +153,15 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         const std::size_t capacity = ops::linear_add_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16, n, k, invocation.policy, invocation.tokens,
             invocation.tokens);
-        WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
+        GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
+        WorkspaceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 256)});
+        const bool replay_changed_input =
+            invocation.tokens == 4 || invocation.tokens == 128 ||
+            ((invocation.tokens == 32 || invocation.tokens == 64) &&
+             invocation.policy == ops::LinearPolicy::A16Only) ||
+            (invocation.policy == ops::LinearPolicy::AllowA8 &&
+             (invocation.tokens == 193 || invocation.tokens == 257 || invocation.tokens == 512 ||
+              invocation.tokens == 513 || invocation.tokens == 1025));
         try {
             ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr);
             cuda_check(cudaDeviceSynchronize(), "synchronize FP8 linear_add");
@@ -152,8 +172,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
             continue;
         }
 
-        if (invocation.tokens == 128 || ((invocation.tokens == 32 || invocation.tokens == 64) &&
-                                         invocation.policy == ops::LinearPolicy::A16Only)) {
+        if (replay_changed_input) {
             cudaStream_t stream;
             cudaGraph_t graph;
             cudaGraphExec_t executable;
@@ -162,7 +181,13 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
             ops::linear_add(x, weight, residual, invocation.policy, workspace, stream);
             CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
             CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+            auto negative_activation = activation;
+            for (auto& value : negative_activation) value ^= 0x8000;
             for (int replay = 0; replay < 2; ++replay) {
+                const auto& input = replay ? negative_activation : activation;
+                CUDA_CHECK(cudaMemcpyAsync(device_activation.data(), input.data(),
+                                           device_activation.bytes(), cudaMemcpyHostToDevice,
+                                           stream));
                 CUDA_CHECK(cudaMemcpyAsync(output.data(), initial_residual.data(), output.bytes(),
                                            cudaMemcpyHostToDevice, stream));
                 CUDA_CHECK(cudaGraphLaunch(executable, stream));
@@ -171,6 +196,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
             CUDA_CHECK(cudaGraphExecDestroy(executable));
             CUDA_CHECK(cudaGraphDestroy(graph));
             CUDA_CHECK(cudaStreamDestroy(stream));
+            device_activation.copy_from_host(activation.data(), device_activation.bytes());
         }
 
         const bool a8 =
@@ -183,6 +209,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
             ++failures;
         }
         failures += output.verify_guards(label);
+        failures += scratch.verify_guards(label);
 
         std::vector<std::uint16_t> actual_bits(output_words);
         output.copy_to_host(actual_bits.data(), output.bytes());
@@ -205,7 +232,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
                 }
                 const std::size_t index = static_cast<std::size_t>(token) * n + row;
                 actual.push_back(static_cast<double>(bf16_to_f32(actual_bits[index])));
-                expected.push_back(sum + static_cast<double>(bf16_to_f32(initial_residual[index])));
+                expected.push_back((replay_changed_input ? -sum : sum) +
+                                   static_cast<double>(bf16_to_f32(initial_residual[index])));
             }
         }
         failures += verify_reduction(label, actual, expected, a8 ? kA8Tolerance : kA16Tolerance);
@@ -232,8 +260,8 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         QType::FP8_E4M3FN_ROW_BF16, n, k, ops::LinearPolicy::AllowA8, 1, 1024);
     const std::size_t exact_1024 = ops::linear_add_workspace_capacity_bytes(
         QType::FP8_E4M3FN_ROW_BF16, n, k, ops::LinearPolicy::AllowA8, 1024, 1024);
-    if (a16_interval != 0 || pre_boundary != 0 || hot_interval != exact_48 ||
-        through_1024 != exact_1024 || exact_1024 <= exact_48) {
+    if (kA8Executable && (a16_interval != 0 || pre_boundary != 0 || hot_interval != exact_48 ||
+                          through_1024 != exact_1024 || exact_1024 <= exact_48)) {
         std::cerr << "FP8 linear_add [" << n << ',' << k
                   << "]: workspace interval contract mismatch\n";
         ++failures;

@@ -19,6 +19,9 @@ foreach(check lifecycle archive thinking stop_chat concurrent)
   set_tests_properties(ninfer_ngram_${check}_real PROPERTIES SKIP_RETURN_CODE 77)
 endforeach()
 
+ninfer_add_test(ninfer_shared_slot_release_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_shared_slot_release.cpp")
+
 ninfer_add_test(ninfer_qwen3_5_loading_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loading_real.cpp"
   LIBRARIES ninfer_model_loading)
@@ -46,6 +49,10 @@ ninfer_add_test(ninfer_qwen3_5_chat_template_media_positions_test
   NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine ninfer_core ninfer::json)
 
+ninfer_add_test(ninfer_qwen3_5_graft_loader_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_graft_loader.cpp"
+  LIBRARIES ninfer_engine ninfer_core ninfer::json)
+
 ninfer_add_test(ninfer_qwen3_5_runtime_mechanisms_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_runtime_mechanisms.cpp"
   LIBRARIES ninfer_engine ninfer_core)
@@ -68,6 +75,14 @@ ninfer_add_test(ninfer_qwen3_5_context_store_test
 
 set_tests_properties(
   ninfer_qwen3_5_context_store_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_qwen3_5_dflash_prefill_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_dflash_prefill_real.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_model_loading ninfer_core)
+
+set_tests_properties(
+  ninfer_qwen3_5_dflash_prefill_real_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_qwen3_5_prefix_real_test
@@ -163,6 +178,11 @@ set_tests_properties(
 ninfer_add_test(ninfer_qwen3_5_mtp_graph_profiles_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_graph_profiles.cpp"
   LIBRARIES ninfer_model_runtime ninfer_ops)
+
+ninfer_add_test(ninfer_qwen3_5_text_qk_norm_rope_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_text_qk_norm_rope.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_ops ninfer_core)
+set_tests_properties(ninfer_qwen3_5_text_qk_norm_rope_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_qwen3_5_mlp_a8_decode_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mlp_a8_decode_wiring.cpp"

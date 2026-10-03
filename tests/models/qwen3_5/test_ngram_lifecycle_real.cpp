@@ -349,6 +349,11 @@ int main(int argc, char** argv) {
                     cancelled.generated_token_ids.size() < 512 &&
                     (ngram_k == 0 || ngram_rounds(cancelled) > 0),
                 "stream cancellation did not interrupt an ngram request");
+        // Every cancellation path frees the lane and publishes statistics before waking the
+        // caller, so the snapshot taken as generate() returns already shows the lane free.
+        const ninfer::RuntimeStats after_cancel = engine.runtime_stats();
+        require(after_cancel.running_requests == 0 && after_cancel.terminal_pending_requests == 0,
+                "runtime statistics still counted the cancelled request after generate returned");
         const auto recovered = engine.generate(engine.prepare_tokens(prompt), request(256, false));
         require(recovered.generated_token_ids == retained.generated_token_ids,
                 "cancelled request contaminated subsequent fresh generation");

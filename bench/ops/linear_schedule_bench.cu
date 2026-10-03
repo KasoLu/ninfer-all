@@ -28,6 +28,8 @@
 #include "ops/linear/q4/q4_simt_launch.cuh"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q5/q5_ksplit_launch.cuh"
+#include "ops/linear/q6/q6_dispatch.h"
+#include "ops/linear/q6/q6_launch.h"
 #include "ops/linear/q8/q8_dispatch.h"
 #include "ops/linear/q8/q8_ksplit_launch.cuh"
 #include "ops/linear/q8/q8_shapes.h"
@@ -219,6 +221,29 @@ std::vector<Candidate<detail::Q8Launch>> q8_candidates() {
     };
 }
 
+// The 248320x5120 Q6 vocabulary head: the profile-routed GEMV and small-T MMA against the legacy
+// SIMT/MMA routes and the unified sliced-K kernels the route tables choose at the same widths.
+std::vector<Candidate<detail::Q6Launch>> q6_head_candidates() {
+    return {
+        {"gemv_t1", detail::launch_q6_a16_rowsplit_gemv_t1, 1},
+        {"gemv_t2", detail::launch_q6_a16_rowsplit_gemv_t2, 2},
+        {"small_t_c8", detail::launch_q6_a16_small_t_c8, 8},
+        {"small_t_c16", detail::launch_q6_a16_small_t_c16, 16},
+        {"small_t_c32", detail::launch_q6_a16_small_t_c32, 32},
+        {"simt_r8_t4", detail::launch_q6_a16_simt_r8_t4_cg, 4},
+        {"simt_r8_t5", detail::launch_q6_a16_simt_r8_t5_cg, 5},
+        {"simt_r8_t6", detail::launch_q6_a16_simt_r8_t6_cg, 6},
+        {"simt_r8_t7", detail::launch_q6_a16_simt_r8_t7_cg, 7},
+        {"sliced_r16_t8", detail::launch_q6_a16_sliced_r16_t8_w4_s2, 8},
+        {"sliced_r32_t16", detail::launch_q6_a16_sliced_r32_t16_w4_s2, 16},
+        {"sliced_r32_t32", detail::launch_q6_a16_sliced_r32_t32_w4_s1, 32},
+        {"mma_r64_t16", detail::launch_q6_a16_mma_r64_t16_k128, 16},
+        {"mma_r64_t24", detail::launch_q6_a16_mma_r64_t24_k128, 24},
+        {"mma_r64_t32", detail::launch_q6_a16_mma_r64_t32_k128, 32},
+        {"mma_r64_t48", detail::launch_q6_a16_mma_r64_t48_k128, 48},
+    };
+}
+
 // --- the sweep ---------------------------------------------------------------------------------
 
 template <class Launch>
@@ -227,7 +252,7 @@ void run(QType qtype, std::int32_t n, std::int32_t k,
          const ninfer::bench::SweepOptions& base) {
     const std::int32_t max_tokens = *std::max_element(base.tokens.begin(), base.tokens.end());
     ninfer::bench::PackedQuantizedWeight packed =
-        ninfer::bench::make_row_split_weight(qtype, n, k, k, {0x31, 0xa5, 0x3c00});
+        ninfer::bench::make_row_split_weight(qtype, n, k, k);
     ninfer::DeviceBuffer input(static_cast<std::size_t>(k) * max_tokens * 2);
     ninfer::DeviceBuffer output(static_cast<std::size_t>(n) * max_tokens * 2);
 
@@ -247,6 +272,7 @@ void run(QType qtype, std::int32_t n, std::int32_t k,
 
     const std::string title = std::string(qtype == QType::Q4_G64_FP16   ? "q4"
                                           : qtype == QType::Q5_G64_FP16 ? "q5"
+                                          : qtype == QType::Q6_G64_FP16 ? "q6"
                                                                         : "q8") +
                               " linear n=" + std::to_string(n) + " k=" + std::to_string(k);
     ninfer::bench::SweepOptions options = base;
@@ -299,6 +325,12 @@ void sweep_q8(const ninfer::bench::SweepOptions& base) {
         base);
 }
 
+void sweep_q6_head(const ninfer::bench::SweepOptions& base) {
+    run<detail::Q6Launch>(
+        QType::Q6_G64_FP16, 248320, 5120, q6_head_candidates(),
+        +[](std::int32_t t) { return detail::select_q6_a16_launch(248320, 5120, t); }, base);
+}
+
 const Shape kShapes[] = {
     {"q4:1024x5120", sweep_q4<1024, 5120>},
     {"q4:4096x5120", sweep_q4<4096, 5120>},
@@ -312,6 +344,7 @@ const Shape kShapes[] = {
     {"q5:7168x5120", sweep_q5<7168, 5120, 4>},
     {"q5:5120x6144", sweep_q5<5120, 6144, 2>},
     {"q5:5120x17408", sweep_q5<5120, 17408, 2>},
+    {"q6:248320x5120", sweep_q6_head},
     {"q8:5120x25600", sweep_q8<detail::Q8N5120K25600>},
     {"q8:2048x16384", sweep_q8<detail::Q8N2048K16384>},
     {"q8:5120x6144", sweep_q8<detail::Q8N5120K6144>},

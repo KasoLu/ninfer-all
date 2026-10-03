@@ -388,9 +388,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const std::int32_t narrowest_drafts =
         *std::min_element(round_widths.begin(), round_widths.end()) - 1;
     const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
-    // Prefill chunks of 17 to 64 rows may take the chunked small-T route over a long context.
+    // Prefill chunks of 17 to 64 rows may take the chunked small-T route over a long context, and
+    // wider ones run the selected prompt kernel, whose fast NVFP4 form may split keys into
+    // workspace (see execution/text.cpp).
     const ops::CausalAttentionExecutionEnvelope prefill_envelope{
-        .min_visible_keys = 1, .max_visible_keys = plan.capacity, .small_prefill = true};
+        .min_visible_keys   = 1,
+        .max_visible_keys   = plan.capacity,
+        .fast_prompt_kernel = plan.fast_prefill_kernel,
+        .small_prefill      = true};
     const ops::CausalAttentionExecutionEnvelope verify_envelope{.min_visible_keys = 1,
                                                                 .max_visible_keys = plan.capacity,
                                                                 .wide_verification =
@@ -1335,7 +1340,7 @@ std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
 
 std::unique_ptr<qwen3_5::detail::SequencePlannerImpl>
 make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContext& device,
-                           const EngineOptions& options) {
+                           const EngineOptions& options, std::uint32_t resident_main_pages) {
     validate_target_options(parameters, device, options);
     SequencePlanningInputs inputs{
         .parameters                 = &parameters,
@@ -1360,11 +1365,21 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .structured_output          = options.structured_output,
         .device                     = options.device,
         .context_cache              = options.context_cache,
+        .resident_main_pages        = resident_main_pages,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
-    const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
-    const auto maximum_pages          = static_cast<std::uint32_t>(
-        maximum_main_page_groups(inputs.max_concurrency, logical_pages, inputs.context_cache));
+    // Injected graft prefixes hold their Main pages for good, on top of what requests use.
+    const std::uint64_t minimum_pages64 =
+        static_cast<std::uint64_t>(std::max(logical_pages, inputs.max_concurrency)) +
+        resident_main_pages;
+    const std::uint64_t maximum_pages64 =
+        maximum_main_page_groups(inputs.max_concurrency, logical_pages, inputs.context_cache) +
+        resident_main_pages;
+    if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::overflow_error("maximum Main KV page count exceeds uint32");
+    }
+    const auto minimum_pages = static_cast<std::uint32_t>(minimum_pages64);
+    const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
 
     auto planner     = std::make_unique<qwen3_5::detail::SequencePlannerImpl>();
     planner->inputs  = inputs;
@@ -1375,6 +1390,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
           .maximum_main_page_groups             = maximum_pages,
           .minimum_device_reservation_bytes     = planner->minimum->device_reservation_bytes,
           .bytes_per_additional_main_page_group = 0,
+          .resident_main_pages                  = resident_main_pages,
     };
     for (const std::size_t bytes : planner->minimum->extra_rank_reservation_bytes) {
         planner->curve.extra_ranks.push_back({.minimum_device_reservation_bytes = bytes});

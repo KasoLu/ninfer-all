@@ -17,7 +17,9 @@ constexpr int kLargeBlock               = 256;
 constexpr int kFullChunkBlock           = 192;
 constexpr int kSmallBlock               = 128;
 constexpr int kDefaultChunkTargetTokens = 1024;
-// RTX 5090 has 170 SMs and admits six of these 256-thread CTAs per SM.
+// RTX 5090 has 170 SMs and admits six of these 256-thread CTAs per SM. On the 3090 one such wave
+// would end at 492 tokens, but the 256-thread block measured equal or faster than the 192-thread
+// one all the way to 1020 there (27B Q24/KV4, T=400..1020, op bench), so the bound was kept.
 constexpr int kLargeBlockWaveCapacity = 1020;
 
 template <RopeKernelMode Mode>
@@ -101,6 +103,16 @@ bool launch_fixed_pair(const Tensor& positions, int rotary_dim, float theta, Ten
             }
             if (axes == 3) {
                 launch_fixed<RopeKernelMode::TextMrope, 24, 4>(positions, &q, &k, stream);
+                return true;
+            }
+        }
+        if (q.ne[1] == 24 && k.ne[1] == 2) {
+            if (axes == 1) {
+                launch_fixed<RopeKernelMode::Text1D, 24, 2>(positions, &q, &k, stream);
+                return true;
+            }
+            if (axes == 3) {
+                launch_fixed<RopeKernelMode::TextMrope, 24, 2>(positions, &q, &k, stream);
                 return true;
             }
         }

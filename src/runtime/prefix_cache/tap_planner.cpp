@@ -17,6 +17,8 @@ enum class Priority : std::uint8_t {
 struct Candidate {
     std::uint32_t position = 0;
     Priority priority      = Priority::Ladder;
+    // Explicit and structural boundaries that later prompts share across conversations.
+    bool shared = false;
 };
 
 // Moves a position out of any exclusion to the exclusion start, repeatedly.
@@ -54,13 +56,16 @@ std::vector<PlannedTap> plan_taps(std::uint32_t prompt_tokens, std::uint32_t bas
     for (const TapHint& hint : hints) {
         switch (hint.kind) {
         case TapHintKind::Explicit:
-            candidates.push_back({hint.position, Priority::Explicit});
+            candidates.push_back({hint.position, Priority::Explicit, true});
             break;
         case TapHintKind::GenerationOpener:
             candidates.push_back({hint.position, Priority::GenerationOpener});
             break;
         case TapHintKind::Structural:
-            candidates.push_back({hint.position, Priority::Structural});
+            candidates.push_back({hint.position, Priority::Structural, true});
+            break;
+        case TapHintKind::Automatic:
+            candidates.push_back({hint.position, Priority::Structural, false});
             break;
         case TapHintKind::MessageBoundary:
             boundaries.push_back(hint.position);
@@ -104,12 +109,15 @@ std::vector<PlannedTap> plan_taps(std::uint32_t prompt_tokens, std::uint32_t bas
             return candidates[left].position < candidates[right].position;
         });
         std::vector<bool> dropped(candidates.size(), false);
-        std::optional<std::uint32_t> kept;
+        std::optional<std::size_t> kept;
         for (const std::size_t index : semantic) {
-            if (kept && candidates[index].position - *kept < kMinimumTapSeparation) {
+            if (kept &&
+                candidates[index].position - candidates[*kept].position < kMinimumTapSeparation) {
                 dropped[index] = true;
+                // The kept snapshot serves the dropped boundary's prompts too.
+                candidates[*kept].shared = candidates[*kept].shared || candidates[index].shared;
             } else {
-                kept = candidates[index].position;
+                kept = index;
             }
         }
         std::vector<Candidate> clustered;
@@ -171,6 +179,7 @@ std::vector<PlannedTap> plan_taps(std::uint32_t prompt_tokens, std::uint32_t bas
         accepted.push_back(PlannedTap{
             .position  = position,
             .placement = flexible ? TapPlacement::Flexible : TapPlacement::Exact,
+            .boundary  = candidate.shared,
         });
     }
     std::sort(accepted.begin(), accepted.end(),

@@ -157,8 +157,8 @@ int main(int argc, char** argv) {
         DeviceBuffer flush(kFlushBytes);
         DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(kHidden) * max_t);
         DeviceBuffer output(static_cast<std::size_t>(kOutputRows) * max_t * sizeof(std::uint16_t));
-        bench::PackedQuantizedWeight packed = bench::make_row_split_weight(
-            QType::Q4_G64_FP16, kGateUpRows, kHidden, kHidden, {0x31, 0xa5, 0x3c00});
+        bench::PackedQuantizedWeight packed =
+            bench::make_row_split_weight(QType::Q4_G64_FP16, kGateUpRows, kHidden, kHidden);
         const std::size_t workspace_capacity = ops::linear_swiglu_workspace_capacity_bytes(
             QType::Q4_G64_FP16, kGateUpRows, kHidden, min_t, max_t);
         WorkspaceArena workspace(std::max<std::size_t>(workspace_capacity, 256));

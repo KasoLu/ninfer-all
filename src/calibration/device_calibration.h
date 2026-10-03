@@ -1,7 +1,9 @@
 #pragma once
 
 // Device calibration: measures every route family a device profile can steer on the current GPU
-// and returns the bands where a schedule other than the compiled one wins.
+// (the route catalog, calibration/route_catalog.h) and returns, for each key it measured, the
+// bands of the schedule that won: a candidate where one beat the compiled route, the compiled
+// route (an empty schedule) elsewhere.
 //
 // Each family is timed through the same dispatch an inference call uses, with the family's route
 // forced to one candidate at a time (ops::DeviceRouteForce), on synthetic weights of the registered

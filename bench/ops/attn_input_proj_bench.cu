@@ -369,10 +369,10 @@ void run_q4q5(const Options& options, DeviceBuffer& flush, cudaStream_t stream,
     constexpr std::int32_t kv_rows     = 1024;
     constexpr std::int32_t parent_rows = q_rows + kv_rows;
     const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
-    bench::PackedQuantizedWeight qk = bench::make_row_split_weight(
-        QType::Q4_G64_FP16, parent_rows, hidden, hidden, {0x31, 0x00, 0x3c00});
-    bench::PackedQuantizedWeight gv = bench::make_row_split_weight(
-        QType::Q5_G64_FP16, parent_rows, hidden, hidden, {0x31, 0xa5, 0x3c00});
+    bench::PackedQuantizedWeight qk =
+        bench::make_row_split_weight(QType::Q4_G64_FP16, parent_rows, hidden, hidden);
+    bench::PackedQuantizedWeight gv =
+        bench::make_row_split_weight(QType::Q5_G64_FP16, parent_rows, hidden, hidden);
     vary_groupwise(qk);
     vary_groupwise(gv);
     DeviceBuffer input = varied_input(static_cast<std::size_t>(hidden) * max_tokens);
@@ -476,8 +476,8 @@ void run_q8_qkv(const Options& options, const char* label, std::int32_t hidden, 
     constexpr std::int32_t kv_rows     = 1024;
     constexpr std::int32_t parent_rows = 6144;
     const std::int32_t max_tokens = *std::max_element(options.tokens.begin(), options.tokens.end());
-    bench::PackedQuantizedWeight weight = bench::make_row_split_weight(
-        QType::Q8_G32_FP16, parent_rows, hidden, hidden, {0x31, 0x00, 0x3c00});
+    bench::PackedQuantizedWeight weight =
+        bench::make_row_split_weight(QType::Q8_G32_FP16, parent_rows, hidden, hidden);
     DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(hidden) * max_tokens);
     DeviceBuffer q(static_cast<std::size_t>(q_rows) * max_tokens * 2);
     DeviceBuffer k(static_cast<std::size_t>(kv_rows) * max_tokens * 2);
@@ -571,8 +571,7 @@ int main(int argc, char** argv) {
 
         if (selected(options.format, Format::Q4Q5)) { run_q4q5(options, flush, stream, results); }
         if (selected(options.format, Format::Q8Qgkv)) {
-            auto weight = bench::make_row_split_weight(QType::Q8_G32_FP16, 9216, 2048, 2048,
-                                                       {0x31, 0x00, 0x3c00});
+            auto weight = bench::make_row_split_weight(QType::Q8_G32_FP16, 9216, 2048, 2048);
             run_four_output(options, "q8-qgkv", QType::Q8_G32_FP16, ops::LinearPolicy::A16Only,
                             true, 2048, 4096, 512, 9216, weight, flush, stream, results);
         }

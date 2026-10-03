@@ -1,5 +1,6 @@
 #include "runtime/engine/model_instance.h"
 #include "calibration/device_calibration.h"
+#include "calibration/route_catalog.h"
 #include "core/arena.h"
 #include "ops/common/device_route.h"
 #include "runtime/engine/context_cache/context_cost.h"
@@ -7,7 +8,9 @@
 #include "runtime/engine/diagnostics.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
+#include "core/paged_kv_cache.h"
 #include "core/startup.h"
+#include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
 
@@ -201,6 +204,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     case EnginePurpose::Generation:
         break;
     case EnginePurpose::CausalScoring:
+        if (!options.grafts.empty()) {
+            throw std::invalid_argument("a CausalScoring Engine takes no prompt grafts");
+        }
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
         options.prefill_chunk        = 1024;
@@ -235,6 +241,17 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("ngram draft widths above 15 require engine concurrency one");
     }
     const std::uint32_t concurrency = options.max_concurrency;
+    // Injected grafts stay resident for the life of the Engine, each in a StateImage and a
+    // shared-prefix slot of its own, so the pools grow by that many beyond what requests use.
+    const std::uint32_t direct_grafts = models::qwen3_5::count_direct_grafts(options.grafts);
+    if (!cache.enabled && direct_grafts != 0) {
+        throw std::invalid_argument(
+            "direct grafts are held in the context cache, which is disabled");
+    }
+    if (cache.enabled && cache.mode == ContextCacheMode::Hybrid && direct_grafts != 0) {
+        // A direct graft lives in a pinned Legacy shared-prefix slot; the hybrid tree has none.
+        throw std::invalid_argument("direct grafts require the legacy context cache");
+    }
     if (cache.enabled && cache.mode == ContextCacheMode::Hybrid) {
         if (cache.device_state_slots || cache.max_private_continuations ||
             cache.max_shared_prefixes || cache.max_long_anchors_per_continuation) {
@@ -244,11 +261,11 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         }
         if (cache.rolling_retention || cache.release_diverged_checkpoints ||
             cache.thorough_admission_search || cache.recency_eviction || cache.value_aware_demote ||
-            cache.automatic_long_anchors || !cache.disk_kv_path.empty()) {
+            cache.automatic_long_anchors || cache.branch_anchors || !cache.disk_kv_path.empty()) {
             throw std::invalid_argument(
                 "the hybrid prefix cache does not accept Legacy cache policies (rolling retention, "
                 "diverged-checkpoint release, thorough admission search, recency eviction, "
-                "value-aware demotion, automatic long anchors, disk tier)");
+                "value-aware demotion, automatic long anchors, branch anchors, disk tier)");
         }
         // One pinned Host slab pool serves blocks and snapshots alike; its size is the only
         // capacity a deployment has to choose (docs/maintainer/hybrid-prefix-cache-spec.md §5.4).
@@ -321,15 +338,17 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         cache.value_aware_demote           = false;
         cache.kv_lease_growth              = false;
         cache.automatic_long_anchors       = false;
+        cache.branch_anchors               = false;
         return options;
     }
 
-    cache.device_state_slots            = cache.device_state_slots.value_or(concurrency);
+    cache.device_state_slots = cache.device_state_slots.value_or(concurrency) + direct_grafts;
     const std::uint64_t default_private = 2ULL * concurrency;
     cache.max_private_continuations =
         cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));
     cache.max_shared_prefixes = cache.max_shared_prefixes.value_or(std::max(
-        concurrency, static_cast<std::uint32_t>(kMaximumPreparedPromptCacheCandidatesPerRequest)));
+        concurrency, static_cast<std::uint32_t>(kMaximumPreparedPromptCacheCandidatesPerRequest))) +
+                                direct_grafts;
     cache.max_long_anchors_per_continuation =
         cache.max_long_anchors_per_continuation.value_or(cache.automatic_long_anchors ? 4U : 2U);
     cache.max_cache_markers_per_request     = cache.max_cache_markers_per_request.value_or(4U);
@@ -377,16 +396,24 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
                    ? options.context_cache.max_long_anchors_per_continuation.value_or(0U)
                    : 0U,
            .long_anchor_min_spacing_tokens =
-               options.context_cache.long_anchor_min_spacing_tokens})),
+               options.context_cache.long_anchor_min_spacing_tokens,
+           .grafts = models::qwen3_5::load_prompt_grafts(options.grafts, model->config().text)})),
       capacity(options.max_context) {}
 
 ModelInstance::~ModelInstance() = default;
+
+void ModelInstance::inject_pinned_grafts() {
+    for (const auto& graft : frontend.grafts()) {
+        if (graft.kind != models::qwen3_5::GraftKind::PrefillKV) { program->inject_graft(graft); }
+    }
+}
 
 namespace {
 
 // Installs each rank's GPU route profile before any Op runs (see EngineOptions::device_profile).
 // A device with no measured profile is calibrated once, in this process, before the weights claim
-// its memory; the result goes to the profile file for the next start.
+// its memory; the result goes to the profile file for the next start. The installed profile is the
+// calibrated entry layered over the compiled table's (runtime/engine/device_profile.h).
 void install_device_route_profile_on(const EngineOptions& options, int device) {
     if (options.device_profile == "off") {
         ops::install_device_route_profile(device, nullptr);
@@ -403,10 +430,15 @@ void install_device_route_profile_on(const EngineOptions& options, int device) {
     const std::filesystem::path path = options.device_profile_path.empty()
                                            ? default_device_profile_path()
                                            : options.device_profile_path;
+    const std::string& route_catalog = calibration::calibration_route_catalog_digest();
     std::optional<ops::DeviceRouteProfile> profile;
     if (!calibrate) {
         try {
-            profile = find_device_route_profile(hardware_class, multiprocessors, path);
+            profile = find_device_route_profile(
+                hardware_class, multiprocessors, path, route_catalog, [&](const std::string& line) {
+                    publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning, "%s",
+                                       line.c_str());
+                });
         } catch (const std::exception& error) {
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
                                "device profile %s ignored: %s", path.string().c_str(),
@@ -422,16 +454,21 @@ void install_device_route_profile_on(const EngineOptions& options, int device) {
         CUDA_CHECK(cudaSetDevice(device));
         ops::install_device_route_profile(device, nullptr);
         calibration::CalibrationOptions calibration_options;
-        profile = calibration::calibrate_device_routes(calibration_options);
+        DeviceProfileEntry entry = calibrated_device_profile_entry(
+            calibration::calibrate_device_routes(calibration_options), route_catalog);
         CUDA_CHECK(cudaSetDevice(previous));
-        profile->hardware_class = hardware_class;
+        entry.profile.hardware_class = hardware_class;
         try {
-            upsert_device_route_profile_atomic(path, *profile);
+            entry = upsert_device_route_profile_atomic(path, entry);
         } catch (const std::exception& error) {
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
                                "device profile not saved to %s: %s", path.string().c_str(),
                                error.what());
         }
+        // Keys calibration does not measure (the unified/* switches of the other formats) keep
+        // the compiled table's routes.
+        const auto compiled = compiled_device_route_profile(hardware_class, multiprocessors);
+        profile = compiled ? layer_device_route_profiles(entry.profile, *compiled) : entry.profile;
     }
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                        "device profile %s: %zu routed keys (%s)", hardware_class.c_str(),
@@ -490,9 +527,18 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                 context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
+    // Each injected graft keeps its text KV pages for good; the pool grows by that many so a
+    // request can still use all the capacity that was asked for.
+    std::uint32_t graft_main_pages = 0;
+    for (const auto& graft : instance->frontend.grafts()) {
+        if (graft.kind != models::qwen3_5::GraftKind::PrefillKV) {
+            const auto page_tokens = static_cast<std::uint32_t>(kPagedKVPageSize);
+            graft_main_pages += (graft.n_slots + page_tokens - 1U) / page_tokens;
+        }
+    }
     auto planner = models::qwen3_5::make_sequence_planner(
         instance->parameters, device,
-        artifact_scoped_disk_tier(options, instance->model->info().artifact_id));
+        artifact_scoped_disk_tier(options, instance->model->info().artifact_id), graft_main_pages);
     const std::vector<std::size_t> free_by_rank =
         free_bytes_by_rank(device, options.wddm_evictable_budget,
                            instance->model->storage_stats().device_capacity_bytes);
@@ -531,18 +577,23 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         if (!file.empty()) {
             const models::qwen3_5::HybridCachePersistence loaded =
                 instance->program->attach_hybrid_cache_file(
-                    file, hybrid_cache_fingerprint(options, signature));
+                    file, hybrid_cache_fingerprint(options, signature), options.startup_observer);
             restore = LoadSummary::PrefixCacheRestore{
-                .attempted = true,
-                .restored  = loaded.ok,
-                .message   = loaded.message,
-                .blocks    = loaded.blocks,
-                .snapshots = loaded.snapshots,
-                .bytes     = loaded.bytes,
-                .seconds   = loaded.seconds,
+                .attempted           = true,
+                .restored            = loaded.ok,
+                .message             = loaded.message,
+                .blocks              = loaded.blocks,
+                .snapshots           = loaded.snapshots,
+                .bytes               = loaded.bytes,
+                .seconds             = loaded.seconds,
+                .saved_blocks        = loaded.saved_blocks,
+                .saved_snapshots     = loaded.saved_snapshots,
+                .required_host_bytes = loaded.required_host_bytes,
+                .host_bytes          = loaded.host_bytes,
             };
         }
     }
+    instance->inject_pinned_grafts();
     device.synchronize();
     program.complete();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();

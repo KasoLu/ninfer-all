@@ -1,4 +1,5 @@
 #include "ninfer/engine.h"
+#include "speculative_graft.h"
 #include "speculative_page_boundary.h"
 
 #include <algorithm>
@@ -91,15 +92,33 @@ int main(int argc, char** argv) {
         options.speculative.draft_tokens             = k;
         options.speculative.proposal_head =
             optimized ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full;
+        ninfer::test::add_test_graft(options);
         ninfer::Engine engine(options);
         const auto prompt = engine.tokenize_text("Count from one to twenty: one, two, three,");
         ninfer::test::speculative_page_boundary(engine);
+        ninfer::test::speculative_graft(engine, ninfer::SpeculativeBackend::DFlash2,
+                                        std::min(batch, 4U));
         const auto first = engine.generate(engine.prepare_tokens(prompt), request(24));
         valid(first, 24);
         const auto& reference = first.generated_token_ids;
         require(first.speculative.accepted_tokens != 0, "real draft fixture accepted no proposal");
         const auto penalized = engine.generate(engine.prepare_tokens(prompt), penalty);
         valid(penalized, 24);
+
+        // The forced thinking-control suffix runs through prefill and the DFlash feature sink.
+        ninfer::PromptInput thinking_prompt;
+        thinking_prompt.options.enable_thinking = true;
+        thinking_prompt.messages.push_back({
+            .role  = ninfer::ChatRole::User,
+            .parts = {{.kind = ninfer::MessagePartKind::Text,
+                       .text = "Explain why there are infinitely many prime numbers."}},
+        });
+        auto thinking_request                      = request(64);
+        thinking_request.execution.thinking.budget = 1;
+        const auto forced = engine.generate(engine.prepare(thinking_prompt), thinking_request);
+        valid(forced, 64);
+        require(forced.thinking.applied && forced.thinking.injected_tokens != 0,
+                "DFlash2 did not commit the forced thinking-control suffix");
 
 
         // All rows share a known target prefix, while their budgets force P=0, partial and full W.

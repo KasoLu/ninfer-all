@@ -1599,6 +1599,15 @@ public:
         snapshot.owner_ = nullptr;
     }
 
+    // Whether resize_entitlement(handle, entitlement) would find its pages, changing nothing.
+    [[nodiscard]] bool can_resize_entitlement(KVAddressSpaceHandle handle,
+                                              std::uint32_t entitlement) const {
+        const Address& address = require_active(handle);
+        return entitlement >= address.page_count && entitlement <= page_capacity_ &&
+               pages_->physical_pool().can_resize_reservation(address.reservation,
+                                                              entitlement - address.page_count);
+    }
+
     void resize_entitlement(KVAddressSpaceHandle handle, std::uint32_t entitlement) {
         Address& address = require_active(handle);
         if (entitlement < address.page_count) {

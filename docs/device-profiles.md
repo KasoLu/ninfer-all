@@ -8,10 +8,12 @@ part: its SM count sets how many CTAs fill a wave, its memory system sets where 
 latency-bound, and a schedule that is best on an RTX 5090 can be several times slower on an RTX 3090.
 
 A device route profile records, for one GPU model, the schedule each operation takes per width band
-where a measurement found a faster one than the compiled table. The engine installs it before any
-operation runs; operations without an entry keep their compiled route.
+as a measurement found it. The engine installs it before any operation runs; operations without an
+entry keep their compiled route.
 
 ## Where profiles come from
+
+Up to three layers answer, per route key:
 
 1. **Your profile file.** `$NINFER_DEVICE_PROFILES`, else `$XDG_CACHE_HOME/ninfer/device-profiles.json`,
    else `~/.cache/ninfer/device-profiles.json` (`%LOCALAPPDATA%\ninfer\device-profiles.json` on
@@ -20,16 +22,50 @@ operation runs; operations without an entry keep their compiled route.
    Blackwell ship inside the binary (`src/runtime/engine/device_profiles.json`). The PRO 6000's
    Workstation (600 W), Max-Q (300 W) and Server editions report different names, so each has its
    own entry.
-3. **Calibration at first start.** A GPU with neither is calibrated once when the engine starts,
-   before the weights are loaded. This takes 20 to 40 seconds, and the result is written to the
-   profile file for later starts.
+3. **The compiled route** of each operation, for a key neither names.
+
+For a key both the file and the built-in table name, the file's bands answer up to their last width
+and the built-in bands past it. A key the file does not name keeps its built-in bands, so calibrating
+an RTX 3090, 4090 or 5090 replaces the keys calibration measures and keeps every other built-in key
+(the `unified/*` switches calibration does not measure, below). A key calibration measured and found
+the compiled route best is stored with an empty schedule, which overrides a built-in choice for it.
+
+A GPU with neither a file entry nor a built-in one is calibrated once when the engine starts, before
+the weights are loaded. This takes 20 to 40 seconds, and the result is written to the profile file
+for later starts.
 
 An entry applies only to the same hardware class (the GPU name and compute capability) and the same
 SM count, so a laptop part that shares a desktop part's name but not its SM count is calibrated on its
 own. With several GPUs (`--devices`), every distinct device gets its own profile.
 
 `--device-profile auto` (the default) follows the order above, `--device-profile calibrate` measures
-again and replaces the stored entry, and `--device-profile off` uses the compiled tables only.
+again and stores the result over the file's entry, and `--device-profile off` uses the compiled
+tables only.
+
+## Stale and outdated profiles
+
+Each calibrated entry records its provenance in a `calibration` block:
+
+```json
+{"hardware_class": "nvidia-geforce-rtx-3090-sm86", "multiprocessors": 82, "origin": "ninfer-calibrate on NVIDIA GeForce RTX 3090",
+ "calibration": {"route_catalog": "33f546be871d5bec", "ninfer_build": "v0.12.0-41-gabcdef0",
+                 "cuda_driver": 12080, "cuda_runtime": 12080, "date": "2026-10-02T09:30:00Z"},
+ "routes": {"...": [[32, "r16c8"]]}}
+```
+
+`route_catalog` is a digest of every route key calibration measures and of the candidate schedules
+it times for each (`src/calibration/route_catalog.cpp`). When a new build adds, renames or drops a
+key or a schedule, its digest changes, and an entry of the profile file measured against another
+digest is not applied: the engine logs a warning naming both digests and the build that measured
+the entry, and the built-in profile (or, for a GPU without one, a fresh calibration at start)
+takes its place. `--device-profile calibrate` or `ninfer-calibrate` measures it again. An entry in
+the file without a `calibration` block is ignored the same way. The built-in table is compiled with
+the binary and is not checked.
+
+The file's format is `ninfer.device-route-profiles` with `schema_version` 2. A file of another
+version is not read: the engine logs that it was written by another build and asks for a
+recalibration, which replaces a file of an older version as a whole (its entries are unusable by
+this build). A file of a newer version is left untouched.
 
 ## Calibrating by hand
 
@@ -38,10 +74,12 @@ ninfer-calibrate --print > my-gpu.json
 ```
 
 `ninfer-calibrate` measures every route family on the current GPU (`--device N`) and stores the profile
-where the engine looks for it (`--out PATH` elsewhere). `--detail` logs every candidate's time,
-`--only PREFIX` limits the run to route keys with that prefix, and `--no-ternary`, `--no-groupwise`,
-`--no-attention` and `--no-linear-attention` skip whole families. Close other GPU work first: the measurement assumes an idle
-device.
+where the engine looks for it (`--out PATH` elsewhere); `--print` writes the stored entry, with its
+`calibration` block, to stdout. `--detail` logs every candidate's time, `--only PREFIX` limits the
+run to route keys with that prefix, and `--no-ternary`, `--no-groupwise`, `--no-attention` and
+`--no-linear-attention` skip whole families. A limited run replaces only the keys it measured: the
+stored entry keeps the others when it was measured against the same route catalog, and is replaced
+whole otherwise. Close other GPU work first: the measurement assumes an idle device.
 
 Each candidate is timed through the same dispatch an inference call uses, on synthetic weights and
 caches of the registered model shapes, with the L2 cache flushed before every sample, as the median
@@ -60,8 +98,11 @@ survives a second interleaved measurement, and its output matches the compiled r
 | `attn_pv_f16` | FP16 accumulation of the probability-times-value product per key tile | a 1024-token prompt chunk at 32K and a decode step at 131K |
 | `attn_pack_gqa` | the standard INT8 prompt kernel with each KV head's query heads packed into its tiles (PackGQA) | a 1024-token prompt chunk at 32K and 131K |
 | `attn_prompt_fast` | the fast prompt-attention kernel (rows kept in registers, FP16 PV per tile) | a wave-aligned prompt chunk at 32K and 131K |
+| `attn_parallel_tiles` | single-row chunked small-T attention over an INT8-family cache as parallel query tiles (one batched append, one split-KV launch over every tile, one reduce) instead of serial fused chunks; widths without an exact 2-8 column tile divisor stay serial; `NINFER_ATTN_PARALLEL_TILES=0\|1` overrides | 16 and 32 verify columns at 32K and 131K |
+| `q4_linear_add/5120x<k>` | the small-T Q4 residual projections (`small_t_c8`, `small_t_c16`, `small_t_c32`) for the attention or GDN output (k = 6144) and the MLP down (k = 17408) of a Q4-output artifact | widths 1 to 32 |
+| `q6_head/248320x5120` | the Q6 vocabulary head's per-row GEMV (`gemv`, widths 1 and 2) or small-T MMA (`small_t`, widths up to 32) | widths 1 to 32 |
 | `unified/q4_q5_attn_input`, `unified/q4_q5_gdn_input`, `unified/q4_linear_swiglu`, `unified/q4_linear_add`, `unified/q5_linear_add/5120x<k>` | upstream's routes for the fused groupwise projections over the unified Linear templates (`unified`) instead of this line's own | the model shapes, widths 1 to 64 (the small-T launches only where those are all the switch covers) |
-| `unified/q4_linear_topk`, `unified/q8_*`, `unified/fp8_*`, `unified/nvfp4_*`, `unified/bf16_*`, `unified/context_kv_materialize` | the same switch for the Q4 top-k head, the Q8 fused projections (attention and GDN inputs, LinearAdd, pair, SwiGLU, top-k, grouped convolution, context-KV materialization), the FP8 and NVFP4 fused projections (attention and GDN inputs with their conv forms, LinearAdd, SwiGLU, the FP8 top-k), and the BF16 attention input and LinearAdd | not calibrated: the built-in RTX 3090, 4090 and 5090 profiles carry the widths where each Op's benchmark ran faster on the unified routes over two rounds per table (at least 3 % over the geometric mean, no case more than 3 % slower); elsewhere a profile or `NINFER_LINEAR_ROUTES` sets them |
+| `unified/q4_linear_topk`, `unified/q8_*`, `unified/fp8_*`, `unified/nvfp4_*`, `unified/bf16_*`, `unified/context_kv_materialize` | the same switch for the Q4 top-k head, the Q8 fused projections (attention and GDN inputs, LinearAdd, pair, SwiGLU, top-k, grouped convolution, context-KV materialization), the FP8 and NVFP4 fused projections (attention and GDN inputs with their conv forms, LinearAdd, SwiGLU, the FP8 top-k), and the BF16 attention input and LinearAdd | not calibrated: the built-in RTX 3090, 4090 and 5090 profiles carry the widths where each Op's benchmark ran faster on the unified routes over two rounds per table (at least 3 % over the geometric mean, no case more than 3 % slower), and keep them under a calibrated file entry; elsewhere a hand-edited profile entry or `NINFER_LINEAR_ROUTES` sets them |
 | `gdn_two_stage/h<value heads>` | the two-stage GDN prefill (fused Q/K normalization and control preparation, then one FP32-state recurrence that also writes the output) instead of the WY/state-passing/output pipeline | prompts of 16 to 8192 tokens, 48 and 32 value heads |
 
 `NINFER_SMALLT_PV_F16`, `NINFER_PROMPT_PV_F16`, `NINFER_PROMPT_PACK_GQA`, `NINFER_PROMPT_FAST` and

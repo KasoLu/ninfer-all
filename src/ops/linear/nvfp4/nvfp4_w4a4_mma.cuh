@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/device.h"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
@@ -12,6 +13,7 @@
 #include <type_traits>
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops::detail {
@@ -98,6 +100,20 @@ struct Nvfp4W4a4SharedStorage {
     alignas(16)
         std::uint8_t b_scales[Schedule::kStages][Schedule::kBlockN * Schedule::kK64PerStage * 4];
 };
+
+// The dynamic shared memory a launch of `kernel` over `Schedule` passes; the first call per
+// device opts the kernel in above 48 KiB where the schedule needs it.
+template <class Schedule, class Kernel>
+std::size_t nvfp4_w4a4_shared_bytes(Kernel kernel) {
+    constexpr std::size_t bytes = sizeof(Nvfp4W4a4SharedStorage<Schedule>);
+    if constexpr (bytes > 48 * 1024) {
+        configure_cuda_device_once([&] {
+            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(bytes));
+        });
+    }
+    return bytes;
+}
 
 template <class Schedule>
 __device__ __forceinline__ int nvfp4_w4a4_swizzled_byte(int row, int logical_byte) {
@@ -248,7 +264,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     static_assert(!PairRows || (Schedule::kBlockN % 2) == 0);
     static_assert(!PairRows || ((Geometry::kOutputRows / 2) % (Schedule::kBlockN / 2)) == 0);
 
-    __shared__ Nvfp4W4a4SharedStorage<Schedule> shared;
+    // Dynamic: the larger schedules exceed the 48 KiB of static shared memory a kernel may declare
+    // (64x128 with two stages takes 54 KiB); launches size it with nvfp4_w4a4_shared_bytes().
+    extern __shared__ __align__(16) std::uint8_t nvfp4_w4a4_dynamic_shared[];
+    auto& shared = *reinterpret_cast<Nvfp4W4a4SharedStorage<Schedule>*>(nvfp4_w4a4_dynamic_shared);
     // A routed launch reads its work list, token map and expert rows from buffers a producer
     // writes, so as a programmatic dependent it waits before anything else. A dense launch reads
     // only its block index and immutable weights ahead of the wait.
@@ -417,17 +436,22 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
             auto* destination1 = reinterpret_cast<__nv_bfloat162*>(
                 shared_output + (token1 - token_begin) * kOutputStride + local_row0);
             const int parent_row1 = row_policy.weight_row(row_begin, local_row0 + 1);
-            float value00         = accumulators[mma_m][mma_n][0] * alpha;
-            float value01         = accumulators[mma_m][mma_n][1] * alpha;
-            float value10         = accumulators[mma_m][mma_n][2] * alpha;
-            float value11         = accumulators[mma_m][mma_n][3] * alpha;
+            // A padded token keeps its scaled value, which a pair-completing output policy reads.
+            float value00 = accumulators[mma_m][mma_n][0], value01 = accumulators[mma_m][mma_n][1];
+            float value10 = accumulators[mma_m][mma_n][2], value11 = accumulators[mma_m][mma_n][3];
             if (token0 < active) {
-                value00 = epilogue.apply(parent_row0, token0, value00);
-                value01 = epilogue.apply(parent_row1, token0, value01);
+                value00 = epilogue.apply_scaled(parent_row0, token0, value00, alpha);
+                value01 = epilogue.apply_scaled(parent_row1, token0, value01, alpha);
+            } else {
+                value00 *= alpha;
+                value01 *= alpha;
             }
             if (token1 < active) {
-                value10 = epilogue.apply(parent_row0, token1, value10);
-                value11 = epilogue.apply(parent_row1, token1, value11);
+                value10 = epilogue.apply_scaled(parent_row0, token1, value10, alpha);
+                value11 = epilogue.apply_scaled(parent_row1, token1, value11, alpha);
+            } else {
+                value10 *= alpha;
+                value11 *= alpha;
             }
             *destination0 = __floats2bfloat162_rn(value00, value01);
             *destination1 = __floats2bfloat162_rn(value10, value11);

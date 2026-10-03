@@ -31,8 +31,10 @@ std::size_t fp8_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k, 
         min_tokens, max_tokens,
         [](std::int32_t width) { return linear_route_table(LinearRouteFamily::Fp8, width); },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) -> std::size_t {
-            const bool a8 = resolve_shape(n, k, policy, table).uses_a8(first, last);
-            return allows_a8(policy) && a8 ? fp8_a8_workspace_capacity_bytes(last, k) : 0;
+            const auto& shape = resolve_shape(n, k, policy, table);
+            if (!allows_a8(policy) || !shape.uses_a8(first, last)) { return 0; }
+            return fp8_a8_workspace_capacity_bytes(
+                last, k, shape.partial_capacity_bytes ? shape.partial_capacity_bytes(last) : 0);
         });
 }
 
@@ -47,7 +49,9 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
     if (workspace == nullptr)
         throw std::invalid_argument("fp8 A8 linear requires caller workspace");
     auto scope         = workspace->scope();
-    const auto scratch = allocate_fp8_a8_workspace(*workspace, x.ne[1], weight.k);
+    const auto scratch = allocate_fp8_a8_workspace(
+        *workspace, x.ne[1], weight.k,
+        shape.partial_capacity_bytes ? shape.partial_capacity_bytes(x.ne[1]) : 0);
     shape.a8(x, weight, out, scratch, stream);
 }
 } // namespace ninfer::ops::detail

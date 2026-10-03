@@ -159,6 +159,7 @@ enum class StartupPhase : std::uint8_t {
     HostStatePin,
     HostKvPin,
     CudaGraphPrepare,
+    PrefixCacheLoad,
     EngineFinalize,
 };
 
@@ -223,6 +224,37 @@ enum class ContextCacheMode : std::uint8_t {
 // max_concurrency, prefill_chunk and whether a Host tier exists (host_cache_budget_bytes, default
 // kDefaultHybridHostCacheBytes, 0 disables it), and Engine::options() reports the effective
 // values. Legacy-only fields of ContextCacheOptions are rejected in Hybrid mode.
+// Abandons the Host tier save of a stopping Engine (HybridPrefixCacheOptions::persistent_file)
+// from any thread, also while the Engine is being destroyed. Copies share one state: the product
+// keeps a copy from the options it passes, beyond the Engine's lifetime.
+class PrefixCacheSaveControl {
+public:
+    enum class Abandon : std::uint8_t {
+        // Nothing replaced the previous file; a save in progress deleted its unfinished file.
+        Unsaved,
+        // The save had already completed.
+        Saved,
+        // The save did not stop within the timeout; its unfinished file may remain.
+        StillWriting,
+    };
+
+    PrefixCacheSaveControl();
+
+    // Stops a save in progress, or one not begun yet, from replacing the previous file. Waits at
+    // most `timeout` for a save in progress to stop and delete its unfinished file.
+    Abandon abandon(std::chrono::milliseconds timeout) const noexcept;
+
+    // The Engine's side. A save writes only after begin() returns true, polls abandoned() while
+    // it writes, and then calls end() with whether it replaced the file.
+    [[nodiscard]] bool begin() const noexcept;
+    [[nodiscard]] bool abandoned() const noexcept;
+    void end(bool saved) const noexcept;
+
+private:
+    struct State;
+    std::shared_ptr<State> state_;
+};
+
 struct HybridPrefixCacheOptions {
     // Device StateImage slots holding inactive snapshots (and tap/endpoint staging). Total Device
     // StateImage capacity is max_concurrency + device_snapshot_slots. Default: one per request
@@ -242,6 +274,32 @@ struct HybridPrefixCacheOptions {
     // state formats and `persistent_identity` (the product binary's build). Empty disables it.
     std::filesystem::path persistent_file;
     std::string persistent_identity;
+    // Lets the product abandon the save at shutdown (ninfer-serve: Ctrl+C during the stop).
+    PrefixCacheSaveControl persistent_save;
+};
+
+// One spill of an involuntarily evicted session to its slot file, reported from the writer thread.
+struct SlotAutoSaveEvent {
+    std::string path;
+    std::uint32_t tokens = 0;
+    std::uint64_t bytes  = 0;
+    double seconds       = 0.0;
+    // Empty on success.
+    std::string error;
+    // Set when the spill was skipped because the file already holds a deeper snapshot of the
+    // session; the value is that depth.
+    std::optional<std::uint32_t> skipped_behind_tokens;
+    // Set when the spill was skipped because an explicit save, restore or erase of the path
+    // happened after it was queued.
+    bool superseded = false;
+};
+
+struct SlotAutoSaveOptions {
+    // Before an involuntary eviction destroys a retained session that was last saved to or
+    // restored from a slot file, snapshot it and write it back to that file off-thread.
+    bool enabled = false;
+    // Called on the writer thread after each spill. Exceptions are ignored.
+    std::function<void(const SlotAutoSaveEvent& event)> listener;
 };
 
 struct ContextCacheOptions {
@@ -329,6 +387,13 @@ struct ContextCacheOptions {
     // prompt end (gap k >= spacing * 2^k), so the grid is sparse near the end and still reaches
     // deep history. Zero anchors every one of the last L message boundaries.
     std::uint32_t long_anchor_min_spacing_tokens = 1024;
+    // Branch anchors: before a request is planned, the engine finds the deepest point at which its
+    // prompt matches a retained continuation or shared prefix token for token, and when no
+    // checkpoint of that owner lies at or near that depth, the request captures a private long
+    // anchor there, so the next request that diverges at the same point resumes from it instead of
+    // from an older checkpoint. Costs a scan of the catalog per planned request and, where it
+    // fires, a prefill split and a StateImage. Off by default.
+    bool branch_anchors = false;
 };
 
 struct ContextCostOptions {
@@ -342,6 +407,16 @@ enum class VisionResidency : std::uint8_t {
     Resident, // fixed Vision GPU allocations for the process lifetime
     Overlay,  // tower host-pinned; each image borrows device memory inside a bounded window
     Cpu,      // tower decoded to FP32 host memory and run on CPU threads; no device Vision memory
+};
+
+// A phantom-kv prompt graft: a hidden conversation prefix (e.g. a system turn plus an assistant
+// acknowledgement) that sits in front of every request selecting it. `path` names the safetensors
+// container; its metadata sidecar is the same path with a .json extension. The graft's tokens occupy
+// positions [0, n) and the request's own rendered prompt starts at position n, exactly as if the
+// hidden turn had been sent as text. They count toward max_context and the reported prompt tokens.
+struct GraftSource {
+    std::string name;
+    std::filesystem::path path;
 };
 
 struct EngineOptions {
@@ -458,14 +533,19 @@ struct EngineOptions {
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     // Per-GPU route profile (ops/common/device_route.h). "auto" installs the profile measured for
-    // this device -- from device_profile_path, then from the table compiled into the binary -- and
-    // calibrates a device that has none once, storing the result at device_profile_path; "off"
-    // keeps the compiled routes; "calibrate" measures anew. An empty path selects the user cache
+    // this device -- per route key, the entry at device_profile_path over the table compiled into
+    // the binary; an entry measured against another route catalog is skipped -- and calibrates a
+    // device that has neither once, storing the result at device_profile_path; "off" keeps the
+    // compiled routes; "calibrate" measures anew. An empty path selects the user cache
     // ($NINFER_DEVICE_PROFILES, else $XDG_CACHE_HOME or ~/.cache, /ninfer/device-profiles.json).
     std::string device_profile = "auto";
     std::filesystem::path device_profile_path;
+    // Prompt grafts a request may select by name through PromptOptions::graft. Each is loaded and
+    // validated against the resident model at construction.
+    std::vector<GraftSource> grafts;
     StartupObserver startup_observer;
     DiagnosticObserver diagnostic_observer;
+    SlotAutoSaveOptions slot_auto_save;
 };
 
 enum class SamplingMode : std::uint8_t {
@@ -542,6 +622,11 @@ struct ThinkingControlOptions {
     // Omitted means unlimited. Injected target-control tokens consume the total output budget but
     // not this model-origin budget.
     std::optional<std::uint32_t> budget;
+    // Effective thinking budget derived from capacity and control requirements.
+    // When omitted, defaults to budget.
+    std::optional<std::uint32_t> effective_budget;
+    // Whether canonical early-close guidance and control tokens can be inserted.
+    bool early_close_available = true;
 };
 
 enum class StructuredOutputKind : std::uint8_t { None, JsonObject, JsonSchema };
@@ -549,6 +634,10 @@ enum class StructuredOutputKind : std::uint8_t { None, JsonObject, JsonSchema };
 struct StructuredOutputOptions {
     StructuredOutputKind kind = StructuredOutputKind::None;
     std::string schema; // JSON Schema for JsonSchema, otherwise empty
+    // JsonSchema only. When true, object schemas without additionalProperties (or
+    // unevaluatedProperties) admit only their declared properties, following the OpenAI/Anthropic
+    // strict structured-output convention. When false, standard JSON Schema defaults apply.
+    bool strict = false;
 };
 
 inline constexpr std::uint32_t kMaximumFirstTokenTopLogprobs = 20;
@@ -758,6 +847,9 @@ struct PromptOptions {
     // Function the caller selected. Its call opener is appended to the generation prompt, so the
     // answer can only continue inside that call. Requires a new assistant turn with thinking off.
     std::string forced_tool_name;
+    // Name of an EngineOptions::grafts entry to place in front of the rendered prompt; empty for
+    // none. The rendered prompt should carry no system turn of its own: the graft already holds one.
+    std::string graft;
 };
 
 enum class CacheRetentionHint : std::uint8_t {
@@ -861,7 +953,6 @@ private:
 
 enum class RequestErrorKind : std::uint8_t {
     ContextLengthExceeded,
-    ThinkingBudgetCapacityInsufficient,
     MediaBudgetExceeded,
     InvalidMedia,
     Overloaded,
@@ -1071,7 +1162,8 @@ struct SpeculativeStats {
 };
 
 struct ThinkingBudgetStats {
-    std::optional<std::uint32_t> configured_budget;
+    std::optional<std::uint32_t> requested_budget;
+    std::optional<std::uint32_t> effective_budget;
     // Model-origin tokens accepted while capped thinking remained open.
     std::uint32_t model_thinking_tokens = 0;
     // Complete tokenizer-derived target-control suffix committed by Engine.
@@ -1173,6 +1265,10 @@ struct MaterializationDiagnostics {
     std::uint64_t search_overshoot_ns            = 0;
     MaterializationSearchPhase search_stop_phase = MaterializationSearchPhase::None;
     bool search_boundary_limited                 = false;
+    // The most prompt reuse any admission candidate offered, independent of the plan that won.
+    // Beside a root plan, 0 points at prefix matching (nothing was on the table); a large value
+    // points at the planner's pricing.
+    std::uint32_t best_reuse_prompt_tokens = 0;
 
     // Hybrid prefix cache admission. `cached_prefix_tokens` is the longest prompt prefix held as
     // cached KV blocks whether or not it was reusable: reuse also needs a state snapshot inside
@@ -1225,6 +1321,10 @@ struct GenerationResult {
     std::uint32_t reused_prompt_tokens = 0;
     PrefixReusePath prefix_reuse_path  = PrefixReusePath::Root;
     MaterializationDiagnostics materialization;
+    // The private catalog cell the finished session was retained in and its session digest, or
+    // -1 and empty when the session was not retained.
+    std::int32_t slot = -1;
+    std::string session_digest;
     GenerationTimings timings;
     GenerationEngineTiming engine_timing;
     SpeculativeStats speculative;
@@ -1331,6 +1431,10 @@ struct RuntimeStats {
     std::uint64_t computed_prefill_tokens = 0;
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
     std::uint64_t committed_decode_tokens = 0;
+    // Execution time of prefill units and decode rounds (host submission, device wait and host
+    // post-processing). Advances per unit, so a scraper sees rates move during a long request.
+    double prefill_seconds_total = 0.0;
+    double decode_seconds_total  = 0.0;
     // Decode batch executions and the sum of their batch sizes.
     std::uint64_t decode_rounds             = 0;
     std::uint64_t decode_row_rounds         = 0;
@@ -1455,6 +1559,9 @@ struct RuntimeStats {
     std::uint64_t hybrid_host_snapshot_evictions = 0;
     std::uint64_t hybrid_host_dead_reclaims      = 0;
     std::uint64_t hybrid_unbacked_node_losses    = 0;
+    // Host-side failures the worker survived by failing the in-flight requests and clearing the
+    // context cache instead of latching the Engine unavailable.
+    std::uint64_t engine_recoveries = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {
@@ -1500,6 +1607,48 @@ struct ModelMetadata {
     std::uint64_t weight_bytes   = 0; // Encoded weight payload bytes (meta size).
 };
 
+// Session persistence. A slot is one private context-cache catalog cell; a retained session in it
+// can be saved to a file and a saved file restored into it. Session digests are FNV-1a 64 over the
+// token ledger as 16 lowercase hex characters.
+struct SlotCheckpoint {
+    std::uint32_t frontier = 0;
+    std::string session_digest;
+};
+
+struct SlotState {
+    // An active request will publish into this cell.
+    bool processing = false;
+    // The cell holds a retained session.
+    bool retained = false;
+    // Retained: the session depth. Processing: the request's prompt tokens.
+    std::uint32_t prompt_tokens = 0;
+    // Retained: the session depth. Processing: the prompt tokens reused from the cache.
+    std::uint32_t cached_tokens = 0;
+    std::string session_digest;
+    // Restorable checkpoints of a retained session, ascending by frontier.
+    std::vector<SlotCheckpoint> checkpoints;
+};
+
+struct SlotSaveResult {
+    std::uint32_t tokens = 0;
+    std::uint64_t bytes  = 0;
+    double seconds       = 0.0;
+    std::string session_digest;
+};
+
+struct SlotRestoreResult {
+    std::uint32_t tokens = 0;
+    std::uint64_t bytes  = 0;
+    double seconds       = 0.0;
+    std::string session_digest;
+};
+
+// A slot operation's expected session digest did not match the slot's resident session.
+class SlotSessionMismatch final : public std::invalid_argument {
+public:
+    using std::invalid_argument::invalid_argument;
+};
+
 struct LoadSummary {
     std::string architecture;
     std::string model_name;
@@ -1527,6 +1676,12 @@ struct LoadSummary {
         std::uint64_t snapshots = 0;
         std::uint64_t bytes     = 0;
         double seconds          = 0.0;
+        // What the file holds and the Host tier bytes all of it takes, against this Engine's
+        // tier. When the tier is smaller, only the snapshots it values most were restored.
+        std::uint64_t saved_blocks        = 0;
+        std::uint64_t saved_snapshots     = 0;
+        std::uint64_t required_host_bytes = 0;
+        std::uint64_t host_bytes          = 0;
     } prefix_cache;
 };
 

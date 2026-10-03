@@ -75,6 +75,26 @@ launch_consumer(const LaunchConfig& launch, void (*kernel)(KernelArgs...), CallA
     return cudaLaunchKernelEx(&config, kernel, std::forward<CallArgs>(args)...);
 }
 
+// How a launch orders against the kernel before it on the stream, for launchers shared by call
+// sites that differ: Programmatic is launch_consumer(), Serialized an ordinary launch. Whether a
+// consumer pays depends on its neighbours - a dependent launched early packs onto the SMs its
+// producer leaves free - so each call site picks the one that measured faster.
+enum class Dependency : unsigned char { Serialized, Programmatic };
+
+template <class... KernelArgs, class... CallArgs>
+[[nodiscard]] inline cudaError_t launch_with(Dependency dependency, const LaunchConfig& launch,
+                                             void (*kernel)(KernelArgs...), CallArgs&&... args) {
+    if (dependency == Dependency::Programmatic) {
+        return launch_consumer(launch, kernel, std::forward<CallArgs>(args)...);
+    }
+    cudaLaunchConfig_t config{};
+    config.gridDim          = launch.grid;
+    config.blockDim         = launch.block;
+    config.dynamicSmemBytes = launch.dynamic_smem_bytes;
+    config.stream           = launch.stream;
+    return cudaLaunchKernelEx(&config, kernel, std::forward<CallArgs>(args)...);
+}
+
 // Every producer CTA must call this at least once or exit. This enables dependent scheduling but
 // does not make producer writes visible to the consumer.
 __device__ __forceinline__ void trigger_dependents() {

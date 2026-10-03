@@ -124,7 +124,7 @@ int test_request_envelope_and_sampling() {
     failures +=
         check(options(parse(post_thinking).generation).execution.post_thinking_sampling.has_value(),
               "an empty post_thinking object selects the preset");
-    for (const Json& bad : {Json(0.2), Json{{"temperature", 2.5}}, Json{{"top_k", 21}},
+    for (const Json& bad : {Json(0.2), Json{{"temperature", 2.5}}, Json{{"top_k", -1}},
                             Json{{"stop", "x"}}, Json{{"seed", 1.5}}}) {
         post_thinking["post_thinking"] = bad;
         failures +=
@@ -159,6 +159,28 @@ int test_request_envelope_and_sampling() {
                   !defaults.timings_per_token && !defaults.return_progress &&
                   defaults.generation.max_tokens == limits().default_max_tokens,
               "protocol defaults remain outside GenerationRequest");
+    failures += check(!defaults.generation.derive_output_budget,
+                      "a --default-max-tokens cap was marked for derivation");
+    const RequestLimits derived{.max_context = 4096};
+    const OpenAIChatRequest derived_omitted = parse_chat_completion_request(base_request(), derived);
+    failures += check(derived_omitted.generation.derive_output_budget &&
+                          derived_omitted.generation.max_tokens == 4096,
+                      "an omitted limit without a server cap was not marked for derivation");
+    Json explicit_limit          = base_request();
+    explicit_limit["max_tokens"] = 32;
+    const OpenAIChatRequest derived_explicit = parse_chat_completion_request(explicit_limit, derived);
+    failures += check(!derived_explicit.generation.derive_output_budget &&
+                          derived_explicit.generation.max_tokens == 32,
+                      "an explicit limit was marked for derivation");
+    ServeOptions server;
+    server.default_thinking_budget = 256;
+    GenerationRequest gen_req = derived_omitted.generation;
+    gen_req.thinking_budget = 256;
+    const ninfer::RequestOptions translated_derived =
+        to_request_options(gen_req, server, semantics(gen_req), true);
+    failures += check(derived_omitted.generation.derive_output_budget &&
+                          translated_derived.execution.thinking.budget == 256,
+                      "derived output budget request retained thinking budget in translation");
 
     Json malformed              = base_request();
     malformed["stream_options"] = true;
@@ -205,8 +227,15 @@ int test_structured_output() {
                               .text.find(generation.structured_output.schema) != std::string::npos,
                       "API-only response schema reaches the prompt");
     failures += check(options(generation).execution.structured_output.kind ==
-                          ninfer::StructuredOutputKind::JsonSchema,
-                      "JSON schema reaches Engine");
+                              ninfer::StructuredOutputKind::JsonSchema &&
+                          options(generation).execution.structured_output.strict,
+                      "strict JSON schema reaches Engine");
+    {
+        auto lenient = body;
+        lenient["response_format"]["json_schema"].erase("strict");
+        failures += check(!parse(lenient).generation.structured_output.strict,
+                          "a json_schema without strict:true keeps JSON Schema defaults");
+    }
     for (const auto& extra :
          {Json{{"enable_thinking", true}}, Json{{"reasoning_effort", "high"}}}) {
         auto enabled = body;
@@ -490,7 +519,7 @@ int test_tools() {
         plain["reasoning_effort"] = "high";
         const ResolvedPromptSemantics explicit_effort =
             resolve_prompt_semantics(parse(plain).generation, effort_server);
-        failures += check(explicit_effort.reasoning_effort == ninfer::ReasoningEffort::XHigh,
+        failures += check(explicit_effort.reasoning_effort == ninfer::ReasoningEffort::High,
                           "a request effort overrides the server default effort");
         plain.erase("reasoning_effort");
         plain["enable_thinking"] = false;
@@ -851,6 +880,57 @@ int test_reasoning_and_extensions() {
     failures +=
         check(api_error([&] { (void)parse(body); }).code == "mm_processor_kwargs_not_supported",
               "non-empty media processor kwargs rejected");
+
+    // Request efforts reach the template unchanged; the compiled template renders one it rejects
+    // as its nearest accepted effort. Claude Code sends 'high', pi 'minimal'.
+    body                     = base_request();
+    body["reasoning_effort"] = "high";
+    ResolvedPromptSemantics resolved = semantics(parse(body).generation);
+    failures += check(resolved.reasoning_effort == ninfer::ReasoningEffort::High &&
+                          resolved.enable_thinking == true,
+                      "request effort high did not reach the template unchanged");
+    body["reasoning_effort"] = "minimal";
+    failures += check(semantics(parse(body).generation).reasoning_effort ==
+                          ninfer::ReasoningEffort::Minimal,
+                      "request effort minimal did not reach the template unchanged");
+
+    // --default-reasoning-effort fills in for thinking requests that state no effort, and is
+    // logged as the server's choice rather than the client's.
+    ServeOptions server;
+    server.default_reasoning_effort = RequestedReasoningEffort::Max;
+    const GenerationRequest plain   = parse(base_request()).generation;
+    resolved                        = resolve_prompt_semantics(plain, server);
+    failures += check(resolved.reasoning_effort == ninfer::ReasoningEffort::Max &&
+                          resolved.enable_thinking == true &&
+                          !resolved.requested_reasoning_effort.has_value(),
+                      "server effort default did not apply to a request without one");
+    server.default_reasoning_effort = RequestedReasoningEffort::Medium;
+    body                            = base_request();
+    body["reasoning_effort"]        = "low";
+    resolved                        = resolve_prompt_semantics(parse(body).generation, server);
+    failures += check(resolved.reasoning_effort == ninfer::ReasoningEffort::Low &&
+                          resolved.requested_reasoning_effort == RequestedReasoningEffort::Low,
+                      "request effort did not override the server default");
+    body                         = base_request();
+    body["chat_template_kwargs"] = Json{{"reasoning_effort", "xhigh"}};
+    failures += check(resolve_prompt_semantics(parse(body).generation, server).reasoning_effort ==
+                          ninfer::ReasoningEffort::XHigh,
+                      "template-kwargs effort did not override the server default");
+    body                    = base_request();
+    body["enable_thinking"] = false;
+    resolved                = resolve_prompt_semantics(parse(body).generation, server);
+    failures += check(!resolved.reasoning_effort && resolved.enable_thinking == false,
+                      "server effort default applied to a non-thinking request");
+    server.enable_thinking = false;
+    resolved               = resolve_prompt_semantics(plain, server);
+    failures += check(!resolved.reasoning_effort && resolved.enable_thinking == false,
+                      "server effort default overrode --no-thinking");
+    body                     = base_request();
+    body["reasoning_effort"] = "medium";
+    resolved                 = resolve_prompt_semantics(parse(body).generation, server);
+    failures += check(resolved.reasoning_effort == ninfer::ReasoningEffort::Medium &&
+                          resolved.enable_thinking == true,
+                      "request effort under --no-thinking did not enable thinking");
     return failures;
 }
 
@@ -906,11 +986,21 @@ int test_stops_and_ranges() {
     failures += check(api_error([&] { (void)parse(body); }).param == "ignore_eos",
                       "a non-boolean ignore_eos is rejected");
 
-    body                                  = base_request();
-    body["top_k"]                         = 21;
+    // The translator owns the sampler value range. Above the 20-candidate domain it clamps, so a
+    // client carrying the llama.cpp/Ollama default of 40 is served; negative values stay errors.
+    body                                 = base_request();
+    body["top_k"]                        = 40;
+    const GenerationRequest wide_top_k   = parse(body).generation;
+    failures += check(options(wide_top_k).execution.sampling.top_k == 20,
+                      "Engine translator did not clamp top_k to the candidate domain");
+    body["post_thinking"]                = Json{{"top_k", 64}};
+    failures += check(options(parse(body).generation).execution.post_thinking_sampling->top_k == 20,
+                      "post_thinking top_k was not clamped to the candidate domain");
+    body.erase("post_thinking");
+    body["top_k"]                        = -3;
     const GenerationRequest invalid_top_k = parse(body).generation;
     failures += check(api_error([&] { (void)options(invalid_top_k); }).param == "top_k",
-                      "Engine translator owns sampler value range");
+                      "Engine translator accepted a negative top_k");
     body["top_k"]                         = 5;
     body["min_p"]                         = 1.1;
     const GenerationRequest invalid_min_p = parse(body).generation;
@@ -973,6 +1063,14 @@ int test_aggregate_response() {
             response["timings"]["predicted_per_second"] == 200.0 &&
             response["timings"]["draft_n"] == 9 && response["timings"]["draft_n_accepted"] == 6,
         "aggregate timings use exact cache and N-1 generation intervals");
+    failures += check(!response.contains("id_slot") && !response.contains("session_digest"),
+                      "an unretained session advertised a slot identity");
+    GenerationOutcome retained = outcome;
+    retained.id_slot           = 3;
+    retained.session_digest    = "0123456789abcdef";
+    const Json slotted = Json::parse(make_chat_completion_response(identity(), retained));
+    failures += check(slotted["id_slot"] == 3 && slotted["session_digest"] == "0123456789abcdef",
+                      "aggregate response omits the retained slot identity");
 
     outcome.text.clear();
     outcome.tool_calls.push_back(ninfer::GeneratedToolCall{
@@ -1032,6 +1130,24 @@ int test_stream_response() {
                           choiced_usage["usage"]["completion_tokens"] ==
                               usage["usage"]["completion_tokens"],
                       "usage-chunk-choice keeps usage accounting with a zero-delta choice");
+    // The retained slot identity rides the last chunk that carries terminal timings: the usage
+    // chunk when usage is requested, otherwise the finish chunk.
+    GenerationOutcome retained = sample_outcome();
+    retained.id_slot           = 1;
+    retained.session_digest    = "fedcba9876543210";
+    OpenAIChatStream with_usage(identity(), true);
+    (void)with_usage.start();
+    const std::vector<std::string> usage_events = with_usage.finish(retained);
+    failures += check(parse_sse(usage_events[usage_events.size() - 2])["id_slot"] == 1 &&
+                          !parse_sse(usage_events[usage_events.size() - 3]).contains("id_slot"),
+                      "stream usage chunk omits the retained slot identity");
+    OpenAIChatStream without_usage(identity(), false);
+    (void)without_usage.start();
+    const std::vector<std::string> plain_events = without_usage.finish(retained);
+    const Json plain_finish = parse_sse(plain_events[plain_events.size() - 2]);
+    failures += check(plain_finish["choices"][0]["finish_reason"] == "stop" &&
+                          plain_finish["session_digest"] == "fedcba9876543210",
+                      "stream finish chunk omits the retained slot identity without usage");
 
     OpenAIChatStream mismatch(identity(), false);
     (void)mismatch.start();
@@ -1137,8 +1253,11 @@ int test_common_objects() {
     int failures      = 0;
     Json unbounded          = base_request();
     unbounded["max_tokens"] = -1;
-    failures += check(parse(unbounded).generation.max_tokens == kUnboundedOutputTokens,
-                      "max_tokens -1 leaves the output bounded only by context");
+    {
+        const OpenAIChatRequest parsed = parse(unbounded);
+        failures += check(parsed.generation.derive_output_budget && parsed.output_tokens_explicit,
+                          "max_tokens -1 takes the concurrent lane budget");
+    }
     unbounded["max_tokens"] = -2;
     failures += check(api_error([&] { (void)parse(unbounded); }).param == "max_tokens",
                       "a negative max_tokens other than -1 is rejected");
@@ -1146,9 +1265,14 @@ int test_common_objects() {
     without_model.erase("model");
     failures += check(parse(without_model).model.empty(),
                       "Chat Completions accepts a request that omits the model");
+    for (const Json& unnamed : {Json(""), Json(nullptr)}) {
+        without_model["model"] = unnamed;
+        failures += check(parse(without_model).model.empty(),
+                          "Chat Completions accepts an empty or null model as the served one");
+    }
     without_model["model"] = 42;
     failures += check(api_error([&] { (void)parse(without_model); }).param == "model",
-                      "a model that is present must still be a non-empty string");
+                      "a model that is present must still be a string");
     const ninfer::ModelMetadata metadata{
         .model_id       = "qwen3.6-27b",
         .weights_id     = "groupwise-int",
@@ -1158,12 +1282,18 @@ int test_common_objects() {
         .parameters     = 27000000000ULL,
         .weight_bytes   = 17000000000ULL,
     };
-    const Json models = Json::parse(make_models_list("qwen", 7, 240000, true, metadata));
+    const ModelDescription text_only{
+        .id = "qwen", .max_model_len = 240000, .vision = false, .metadata = metadata};
+    const ModelDescription vision{
+        .id = "qwen", .max_model_len = 240000, .vision = true, .metadata = metadata};
+    const Json models = Json::parse(make_models_list(vision, 7));
     failures +=
         check(models["data"][0]["id"] == "qwen" && models["data"][0]["max_model_len"] == 240000 &&
                   models["data"][0]["context_window"] == 240000 &&
+                  models["data"][0]["context_length"] == 240000 &&
                   models["data"][0]["modalities"]["vision"] == true,
-              "models list advertises the configured context limit and vision");
+              "models list advertises the configured context limit under every field name and "
+              "vision");
     const Json list_meta = models["data"][0]["meta"];
     failures += check(list_meta["n_vocab"] == 248077 && list_meta["n_ctx"] == 240000 &&
                           list_meta["n_ctx_train"] == 262144 && list_meta["n_embd"] == 5120 &&
@@ -1182,17 +1312,65 @@ int test_common_objects() {
                                     endpoint["path"] == "/v1/chat/completions");
     }
     failures += check(lists_chat, "the API base index lists Chat Completions");
-    const Json model = Json::parse(make_model_object("qwen", 7, 240000, false, metadata));
+    const Json model = Json::parse(make_model_object(text_only, 7));
     failures += check(model["max_model_len"] == 240000 && model["context_window"] == 240000 &&
+                          model["context_length"] == 240000 &&
                           model["modalities"]["vision"] == false,
                       "model lookup advertises the configured context limit and vision");
     failures += check(model["meta"]["n_embd"] == 5120 && model["meta"]["n_ctx_train"] == 262144 &&
                           model["meta"]["ftype"] == "groupwise-int",
                       "model lookup exposes the llama.cpp-compatible model meta");
+    failures += check(model["architecture"] ==
+                          Json{{"input_modalities", Json::array({"text"})},
+                               {"output_modalities", Json::array({"text"})}},
+                      "a text-only server advertised media input");
+    const Json vision_input = Json::array({"text", "image", "video"});
+    failures += check(models["data"][0]["architecture"]["input_modalities"] == vision_input &&
+                          Json::parse(make_model_object(vision, 7))["architecture"]
+                                                                    ["input_modalities"] ==
+                              vision_input,
+                      "a --vision server did not advertise image and video input");
     const Json error = Json::parse(make_error_body(
         ApiError{.status = 400, .message = "bad", .param = "messages", .code = "invalid"}));
     failures += check(error["error"]["param"] == "messages" && error["error"]["code"] == "invalid",
                       "OpenAI common error shape remains stable");
+    return failures;
+}
+
+int test_thinking_budget_extension() {
+    Json body    = base_request();
+    int failures = check(!parse(body).generation.thinking_budget,
+                         "absent thinking_budget was not left unset");
+    body["thinking_budget"] = nullptr;
+    failures += check(!parse(body).generation.thinking_budget,
+                      "null thinking_budget was not left unset");
+    body["thinking_budget"] = 512;
+    failures += check(parse(body).generation.thinking_budget == 512U,
+                      "thinking_budget was not parsed");
+    body["thinking_budget"] = 1;
+    failures += check(parse(body).generation.thinking_budget == 1U,
+                      "the smallest positive thinking_budget was rejected");
+    for (const Json& invalid : {Json(0), Json(-5), Json("512"), Json(1.5), Json(true)}) {
+        body["thinking_budget"] = invalid;
+        failures += check(api_error([&] { (void)parse(body); }).param == "thinking_budget",
+                          "invalid thinking_budget was accepted: " + invalid.dump());
+    }
+    return failures;
+}
+
+int test_graft_extension() {
+    Json body       = base_request();
+    int failures    = check(!parse(body).generation.graft, "absent graft was not left unset");
+    body["graft"]   = nullptr;
+    failures       += check(!parse(body).generation.graft, "null graft was not left unset");
+    body["graft"]   = "";
+    failures       += check(parse(body).generation.graft == "",
+                            "empty graft did not explicitly select none");
+    body["graft"]   = "product";
+    failures       += check(parse(body).generation.graft == "product", "graft name was not parsed");
+    body["graft"]   = 5;
+    failures       += check(api_error([&] { (void)parse(body); }).param == "graft",
+                            "non-string graft was accepted");
     return failures;
 }
 
@@ -1250,6 +1428,8 @@ int test_assistant_continuation_mode() {
 
 int main() {
     int failures = 0;
+    failures += test_graft_extension();
+    failures += test_thinking_budget_extension();
     failures += test_request_envelope_and_sampling();
     failures += test_structured_output();
     failures += test_standard_field_policy();

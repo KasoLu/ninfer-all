@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ninfer/ops/rmsnorm_rope.h"
 #include "ops/common/warp.cuh"
 
 #include <cuda_bf16.h>
@@ -16,7 +17,7 @@ struct RmsnormRopeD128Pair {
 __device__ __forceinline__ RmsnormRopeD128Pair rmsnorm_rope_d128_head(
     __nv_bfloat162 input0, __nv_bfloat162 input1, __nv_bfloat162 weight0, __nv_bfloat162 weight1,
     const float* cos_cache, const float* sin_cache, int lane) {
-    constexpr float kEpsilon = 1.0e-6F;
+    constexpr float kEpsilon = kRmsnormRopeEpsilon;
     const float2 input0_f32  = __bfloat1622float2(input0);
     const float2 input1_f32  = __bfloat1622float2(input1);
     float sum                = input0_f32.x * input0_f32.x + input0_f32.y * input0_f32.y +

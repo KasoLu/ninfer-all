@@ -3,6 +3,7 @@
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include "core/paged_kv_storage.h"
+#include "ops/common/device_multiprocessors.h"
 #include "ops/common/device_route.h"
 #include "ops/common/math.h"
 #include "ops/kv_cache/d256_profile.h"
@@ -13,6 +14,7 @@
 #include "ninfer/ops/softmax_attention.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -163,19 +165,6 @@ int i8_partial_ctas_per_sm(std::int32_t tokens, std::int32_t window, KvCacheStor
     return 2;
 }
 
-int device_multiprocessors() {
-    static const int count = [] {
-        int device = 0;
-        int sms    = 0;
-        if (cudaGetDevice(&device) != cudaSuccess ||
-            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
-            return 0;
-        }
-        return sms;
-    }();
-    return count;
-}
-
 // Splits per full wave of a single-row INT8-family launch. The split tiers were set where their
 // largest count (85 splits of four KV heads at two CTAs per SM) is exactly one wave of a 170-SM
 // part; on a part with fewer SMs the same counts leave a nearly empty last wave that costs a full
@@ -184,7 +173,7 @@ int device_multiprocessors() {
 template <typename Geometry>
 std::int32_t causal_small_t_wave_splits(std::int32_t tokens, std::int32_t implementation_window,
                                         KvCacheStorage storage) {
-    return device_multiprocessors() *
+    return current_device_multiprocessors(0) *
            i8_partial_ctas_per_sm<Geometry>(tokens, implementation_window, storage) /
            Geometry::KVHeads;
 }
@@ -246,17 +235,21 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
         const int capacity =
             causal_small_t_launch_capacity<CausalD256H24Kv4>(envelope, tokens, cache_storage);
         if (batch_size > 1) {
-            // Keep complete grids within one or two 170-SM waves. Rounding from 160 CTAs
-            // leaves room for the indivisible 4*B group, including B=3/5/6/7.
+            // Keep complete grids within one or two waves of the current device. Rounding from
+            // sms - sms/16 CTAs (160 on the 170-SM part these targets were set on) leaves room
+            // for the indivisible 4*B group, including B=3/5/6/7. Targets sized for 170 SMs left
+            // a smaller part with partial waves and extra merge traffic.
+            const int sms     = current_device_multiprocessors(170);
+            const int wave    = sms - sms / 16;
             const bool narrow = tokens <= 5;
-            int target_ctas   = 160;
+            int target_ctas   = wave;
             if (cache_storage == KvCacheStorage::BFloat16)
                 target_ctas =
-                    narrow || batch_size >= 5 || envelope.max_visible_keys > 4096 ? 320 : 160;
+                    narrow || batch_size >= 5 || envelope.max_visible_keys > 4096 ? 2 * wave : wave;
             else if (cache_storage == KvCacheStorage::Int8Group64)
-                target_ctas = narrow || envelope.max_visible_keys > 4096 ? 320 : 160;
+                target_ctas = narrow || envelope.max_visible_keys > 4096 ? 2 * wave : wave;
             else if (cache_storage == KvCacheStorage::Nvfp4Group16)
-                target_ctas = narrow ? 320 : 160;
+                target_ctas = narrow ? 2 * wave : wave;
             const int grid_limit = div_up(target_ctas, 4 * batch_size);
             // A split stages at most 64 physical-page IDs, two of them for key-tile rounding and
             // page alignment; one that must span more reads the block table directly.
@@ -494,5 +487,85 @@ void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, 
                                                           invocation, envelope, partial_acc,
                                                           partial_m, partial_l, out, stream);
 }
+
+namespace {
+
+// Spreads a single row's block-table row and valid-column count over its query tiles: tile t
+// covers columns [t * tile_width, (t + 1) * tile_width), so it keeps valid - t * tile_width of them.
+__global__ void causal_small_t_tile_metadata_kernel(const std::int32_t* valid_columns,
+                                                    const std::int32_t* table_rows,
+                                                    std::int32_t tile_width, std::int32_t tiles,
+                                                    std::int32_t* tile_valid,
+                                                    std::int32_t* tile_rows) {
+    const int tile = static_cast<int>(threadIdx.x);
+    if (tile >= tiles) { return; }
+    if (tile_valid != nullptr) { tile_valid[tile] = valid_columns[0] - tile * tile_width; }
+    tile_rows[tile] = table_rows == nullptr ? 0 : table_rows[0];
+}
+
+} // namespace
+
+std::int32_t causal_attention_parallel_tile_width(std::int32_t q_heads, std::int32_t width,
+                                                  std::int32_t batch_size,
+                                                  KvCacheStorage storage) {
+    if (batch_size != 1 || !kv_cache_is_int8_family(storage)) { return 0; }
+    static const int forced = [] {
+        const char* value = std::getenv("NINFER_ATTN_PARALLEL_TILES");
+        return value == nullptr ? -1 : (value[0] == '1' ? 1 : 0);
+    }();
+    const bool enabled =
+        forced >= 0 ? forced == 1 : device_route_schedule("attn_parallel_tiles", 1) == "on";
+    if (!enabled) { return 0; }
+    // The widest tile the small-T kernel instantiates for this geometry that divides the width
+    // exactly: the tiles are views of one contiguous [D, H, width] block, so a ragged last tile
+    // would read past it. A width without such a divisor keeps the serial chunks.
+    const std::int32_t widest = q_heads == CausalD256H24Kv4::QHeads ? 8 : 6;
+    for (std::int32_t tile = widest; tile >= 2; --tile) {
+        if (width % tile == 0 && width / tile >= 2) { return tile; }
+    }
+    return 0;
+}
+
+void causal_attention_small_t_tiles_launch(const Tensor& q, const Tensor& positions,
+                                           const Tensor* valid_columns, const Tensor* table_rows,
+                                           float scale, PagedKVBatchLayerView cache,
+                                           CausalAttentionExecutionEnvelope envelope,
+                                           std::int32_t tile_width, Tensor& tile_valid,
+                                           Tensor& tile_rows, Tensor& partial_acc,
+                                           Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                                           cudaStream_t stream, const void* gate) {
+    const std::int32_t tiles = q.ne[2] / tile_width;
+    causal_small_t_tile_metadata_kernel<<<1, 32, 0, stream>>>(
+        valid_columns == nullptr ? nullptr
+                                 : static_cast<const std::int32_t*>(valid_columns->data),
+        table_rows == nullptr ? nullptr : static_cast<const std::int32_t*>(table_rows->data),
+        tile_width, tiles,
+        valid_columns == nullptr ? nullptr : static_cast<std::int32_t*>(tile_valid.data),
+        static_cast<std::int32_t*>(tile_rows.data));
+    CUDA_CHECK(cudaGetLastError());
+    // Each tile is one batch row of the multi-batch kernel over the cache the caller already
+    // appended: batch t starts at column t * full_width, the same column t * tile_width of q,
+    // positions and out.
+    const CausalSmallTInvocation invocation{
+        .valid_columns = valid_columns == nullptr ? nullptr : &tile_valid,
+        .table_rows    = &tile_rows,
+        .full_width    = tile_width,
+        .column_begin  = 0,
+        .width         = tile_width,
+        .batch_size    = tiles,
+    };
+    const CausalCachedInput input{};
+    if (q.ne[1] == CausalD256H24Kv4::QHeads) {
+        causal_attention_small_t_launch_for<CausalD256H24Kv4>(q, input, positions, scale, cache,
+                                                              invocation, envelope, partial_acc,
+                                                              partial_m, partial_l, out, stream,
+                                                              gate);
+        return;
+    }
+    causal_attention_small_t_launch_for<CausalD256H16Kv2>(q, input, positions, scale, cache,
+                                                          invocation, envelope, partial_acc,
+                                                          partial_m, partial_l, out, stream, gate);
+}
+
 
 } // namespace ninfer::ops::detail

@@ -411,6 +411,20 @@ void DeviceContext::synchronize() const {
     CUDA_CHECK(cudaSetDevice(endpoints_[active_rank_].device));
 }
 
+void DeviceContext::flush() const {
+    for (const RankContext& endpoint : endpoints_) {
+        CUDA_CHECK(cudaSetDevice(endpoint.device));
+        const cudaError_t status = cudaStreamQuery(endpoint.stream);
+        if (status == cudaErrorNotReady) {
+            // Pending work is the expected answer; do not leave it as the thread's last error.
+            (void)cudaGetLastError();
+            continue;
+        }
+        CUDA_CHECK(status);
+    }
+    CUDA_CHECK(cudaSetDevice(endpoints_[active_rank_].device));
+}
+
 ScopedDeviceRank::ScopedDeviceRank(DeviceContext& context, std::size_t rank)
     : context_(context), previous_rank_(context.active_rank()) {
     context_.activate_rank(rank);

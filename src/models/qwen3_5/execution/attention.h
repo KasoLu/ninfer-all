@@ -19,7 +19,8 @@ void text_rope(const Tensor& positions, const RopeConfig& config, const ops::Rop
 void text_rope(const Tensor& positions, const RopeConfig& config, const ops::RopeYarn& yarn,
                Tensor& query, Tensor& key, cudaStream_t stream);
 
-// Normalize q and k and rotate them. Where the fused Op covers the geometry this is one graph node
+// Normalize q and k and rotate them. Where the fused Op covers the geometry and the constants
+// (theta 1e7, epsilon 1e-6) this is one graph node
 // instead of three; everywhere else it is the three calls it replaces, which are the same
 // arithmetic bit for bit. It chooses a schedule, not a result.
 void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,

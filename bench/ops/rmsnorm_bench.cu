@@ -136,7 +136,7 @@ struct Case {
 
     void launch(cudaStream_t stream) {
         if (shape.gated)
-            ops::gated_rmsnorm(x, w, z, 1.e-6f, y, stream);
+            ops::gated_rmsnorm(x, w, z, ops::GateActivation::Silu, 1.e-6f, y, stream);
         else
             ops::rmsnorm(x, w, 1.e-6f, shape.offset, y, stream);
     }

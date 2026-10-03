@@ -2,6 +2,7 @@
 
 // ninfer::ops::detail - private launch prototypes for causal_softmax_attention policies.
 
+#include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -20,7 +21,8 @@ inline constexpr std::int32_t kPromptWaveRows = 128;
 
 // Whether a prompt call on this storage takes the fast kernel (register-resident rows, FP16 PV per
 // 64-key tile): when the caller asks for it (--fast-prefill-kernel), else as NINFER_PROMPT_FAST=0|1
-// or the device profile's "attn_prompt_fast" says. Storages outside the INT8 family never do.
+// or the device profile's "attn_prompt_fast" says. Of the other storages only NVFP4-G16 has one
+// (prompt_nvfp4_fast.cuh, Blackwell builds, over more than 2048 visible keys).
 [[nodiscard]] bool causal_attention_prompt_fast_kernel(KvCacheStorage storage, bool requested);
 
 struct CausalSmallTInvocation {
@@ -53,6 +55,27 @@ void causal_attention_small_t_launch(const Tensor& q, const Tensor& k, const Ten
                                      std::int32_t column_begin, std::int32_t width,
                                      Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
                                      Tensor& out, cudaStream_t stream, const void* gate = nullptr);
+
+// Parallel query tiles for a single row's chunked small-T width over an INT8-family cache: the
+// tile width (0 when off) whose tiles run as the batch rows of one split-KV launch and one reduce,
+// after one batched append, instead of the serial fused chunks. Opt-in: NINFER_ATTN_PARALLEL_TILES
+// or the device profile's "attn_parallel_tiles".
+[[nodiscard]] std::int32_t causal_attention_parallel_tile_width(std::int32_t q_heads,
+                                                                std::int32_t width,
+                                                                std::int32_t batch_size,
+                                                                KvCacheStorage storage);
+
+// Runs those tiles over keys already in the cache. tile_valid (only with valid_columns) and
+// tile_rows hold one I32 per tile; the partials are sized for tile_width columns, the split
+// capacity of that width at batch = tiles, and tiles batch rows.
+void causal_attention_small_t_tiles_launch(const Tensor& q, const Tensor& positions,
+                                           const Tensor* valid_columns, const Tensor* table_rows,
+                                           float scale, PagedKVBatchLayerView cache,
+                                           CausalAttentionExecutionEnvelope envelope,
+                                           std::int32_t tile_width, Tensor& tile_valid,
+                                           Tensor& tile_rows, Tensor& partial_acc,
+                                           Tensor& partial_m, Tensor& partial_l, Tensor& out,
+                                           cudaStream_t stream, const void* gate = nullptr);
 
 void causal_attention_cached_small_t_launch(const Tensor& q, const Tensor& positions, float scale,
                                             const PagedKVLayerView& cache,
@@ -128,6 +151,18 @@ void causal_attention_prompt_nvfp4_launch(const Tensor& q, const Tensor& k, cons
 void causal_attention_prompt_nvfp4_attention_launch(const Tensor& q, const Tensor& positions,
                                                     float scale, const PagedKVLayerView& cache,
                                                     Tensor& out, cudaStream_t stream);
+
+// The fast NVFP4 prompt kernel (block-scaled FP4 QK, V decoded in registers; Ian Ranson's
+// prompt_nvfp4_fast.cuh) over keys already in the cache. A single-row launch whose row blocks alone
+// would leave SMs idle splits its keys across CTAs into `workspace`. Blackwell (120a) builds only;
+// causal_attention_prompt_nvfp4_fast_applies() is false everywhere else.
+void causal_attention_prompt_nvfp4_fast_launch(const Tensor& q, const Tensor& positions,
+                                               const Tensor* valid_columns,
+                                               const Tensor* table_rows, float scale,
+                                               PagedKVBatchLayerView cache,
+                                               std::uint32_t max_visible_keys,
+                                               WorkspaceArena& workspace, Tensor& out,
+                                               cudaStream_t stream);
 
 void causal_attention_prompt_k8v4_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                          const Tensor& positions, const Tensor& valid_columns,

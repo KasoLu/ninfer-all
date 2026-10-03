@@ -209,7 +209,7 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
                                              request_plan.reuse_base)) {
             throw std::logic_error("planned resident prefix is no longer reusable");
         }
-        if (shared_state != nullptr &&
+        if (shared_state != nullptr && !is_pinned_graft(*shared_state) &&
             (!shared_state->identity || shared_state->identity->prefix_identity() == nullptr ||
              !qwen3_5::detail::prefix_matches(prompt, shared_state->identity->ledger(),
                                               *shared_state->identity->prefix_identity(),
@@ -314,15 +314,7 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
         if (prompt.has_media() && !request_plan.vision) { prompt.release_all_media_payloads(); }
 
         materialization_ledger_.assign(prompt.token_ids.begin(), prompt.token_ids.end());
-        if (ngram_draft_window != 0) {
-            request.ngram = std::make_unique<NgramProposer>();
-            request.ngram->set_boundaries(prompt.ngram_boundaries);
-            request.ngram->ingest(prompt.token_ids);
-            // Optional plain-text tool spans would otherwise be displaced by a large prompt.
-            for (const auto& source : prompt.ngram_sources) { request.ngram->ingest(source); }
-            request.ngram_indexed  = prompt.token_ids.size();
-            request.ngram_snapshot = std::move(prompt.ngram_snapshot);
-        }
+        if (ngram_draft_window != 0) { take_ngram_index(request, prompt); }
         materialization_identity_.assign(prompt);
         materialization_prefix_digests_.assign(prompt);
 
@@ -372,9 +364,6 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
                     DeviceSpan{static_cast<std::byte*>(workspace_storage.base()) +
                                    workspace_plan.vision_bridge_offset,
                                workspace_plan.vision_bridge_bytes});
-                // Start the first item now so its window overlaps the decode rounds that run
-                // before this lane gets a prefill unit.
-                request.prefill->vision->submit_next_item();
             } else {
                 request.prefill->vision = std::make_unique<execution::VisionPrefillSession>(
                     device, parameters,
@@ -659,8 +648,8 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
     }
     if (transaction.has_shared_source &&
         (transaction.shared_source_index >= shared_prefix_capacity ||
-         shared_prefix_slots[transaction.shared_source_index].role !=
-             SharedPrefixSlotRole::Catalogued ||
+         !is_live_shared_prefix_role(
+             shared_prefix_slots[transaction.shared_source_index].role) ||
          shared_prefix_slots[transaction.shared_source_index].generation !=
              transaction.shared_source_generation)) {
         throw std::logic_error("materialization shared source changed during capacity preparation");
@@ -1848,8 +1837,8 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
     const auto complete_shared_source_acknowledgement = [&](bool published) {
         if (!transaction.has_shared_source) { return; }
         if (transaction.shared_source_index >= shared_prefix_capacity ||
-            shared_prefix_slots[transaction.shared_source_index].role !=
-                SharedPrefixSlotRole::Catalogued ||
+            !is_live_shared_prefix_role(
+                shared_prefix_slots[transaction.shared_source_index].role) ||
             shared_prefix_slots[transaction.shared_source_index].generation !=
                 transaction.shared_source_generation) {
             throw std::logic_error("retained materialization shared source is unavailable");
@@ -2322,19 +2311,42 @@ ProgramImpl::progress_context_transaction(runtime::CancellationFlagView cancella
 }
 
 void ProgramImpl::finalize_context_transaction() noexcept {
+    std::optional<std::uint32_t> vision_ready_lane;
     const bool terminal = std::visit(
-        [](const auto& transaction) {
+        [&](const auto& transaction) {
             using T = std::decay_t<decltype(transaction)>;
             if constexpr (std::is_same_v<T, std::monostate>) {
                 return false;
             } else if constexpr (std::is_same_v<T, ActiveCaptureTransaction>) {
                 return transaction.published;
             } else {
+                if constexpr (std::is_same_v<T, MaterializationTransaction>) {
+                    if (transaction.terminal) { vision_ready_lane = transaction.destination.value; }
+                }
                 return transaction.terminal;
             }
         },
         context_transaction_);
     if (terminal) { context_transaction_.emplace<std::monostate>(); }
+    // has_context_transaction() is false from here on, so the KV-lending gate in
+    // program_impl.cpp no longer blocks on this transaction. Start the lane's vision encode now,
+    // rather than earlier while the gate would have refused the loan: its own KV entitlement is
+    // already bound (prefill.cpp sets Lifecycle::Prefilling before start_request() returns), and
+    // its own prefill unit still runs later via the scheduler, so the window still overlaps
+    // decode rounds that run before then. A cancelled/aborted admission clears requests[lane]
+    // .prefill before reaching here, so this is a no-op in that case.
+    if (vision_ready_lane) {
+        RequestControl& request = requests[*vision_ready_lane];
+        if (request.prefill && request.prefill->vision) {
+            // Best effort: this is an opportunistic overlap optimization, not a correctness
+            // requirement. A failed submission just leaves the item to prepare_chunk()'s
+            // synchronous encode fallback, so a failure here (this function is noexcept) must not
+            // propagate.
+            try {
+                request.prefill->vision->submit_next_item();
+            } catch (...) {}
+        }
+    }
 }
 
 bool ProgramImpl::has_context_transaction() const noexcept {

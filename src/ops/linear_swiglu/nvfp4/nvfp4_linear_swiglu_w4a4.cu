@@ -73,9 +73,11 @@ void launch_gemm(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace workspace
     const Nvfp4SwiGluRows row_policy{};
     const Nvfp4SwiGluOutput output{static_cast<__nv_bfloat16*>(out.data)};
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
-    CUDA_CHECK(pdl::launch_consumer({grid, dim3(Schedule::kThreads), 0, stream},
-                                    nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue,
-                                                          Nvfp4SwiGluOutput, Nvfp4SwiGluRows, true>,
+    constexpr auto kernel = nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue,
+                                                  Nvfp4SwiGluOutput, Nvfp4SwiGluRows, true>;
+    CUDA_CHECK(pdl::launch_consumer({grid, dim3(Schedule::kThreads),
+                                     nvfp4_w4a4_shared_bytes<Schedule>(kernel), stream},
+                                    kernel,
                                     activation, static_cast<const std::uint8_t*>(weight.qdata),
                                     static_cast<const std::uint8_t*>(weight.scales), tokens, alpha,
                                     Nvfp4IdentityEpilogue{}, output, row_policy,

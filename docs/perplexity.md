@@ -45,6 +45,47 @@ report is `report.json` under `profiles/perplexity/` unless `--output` supplies 
 For KV-format comparisons, the recommended long-context profile is the full corpus with
 `--context 65536 --stride 32768` and without `--quick`.
 
+## Held-out corpus
+
+`ninfer-ppl-1m-v1` is built from public datasets the model has almost certainly trained on, which
+can understate the cost of a weight or KV representation change. The repository also includes
+`ninfer-ppl-heldout-2026-09-v1`: 12 streams written after Qwen3.8's release, covering new English
+and Chinese Wikipedia articles, arXiv abstracts, new GitHub code in four languages, recent code of
+the fork it was built in, and chat-template conversations. Use it to judge representation quality,
+and keep `ninfer-ppl-1m-v1` for comparisons with numbers already published against it. Its
+selection rules and limitations are in its
+[README](../eval/corpora/perplexity-heldout-2026-09/README.md).
+
+```bash
+./build/apps/ninfer-perplexity models/qwen3_8_27b.ninfer \
+  --corpus eval/corpora/perplexity-heldout-2026-09/manifest.json \
+  --quick \
+  --kv-dtype int8
+```
+
+Perplexity alone compares two artifacts only through the reference text. `tools/eval/gguf_eval.py`
+measures a weight encoding's KL divergence from a reference model on the same streams with
+llama.cpp's `llama-perplexity`. Every grouped NInfer format maps exactly onto llama.cpp Q8_0
+blocks (a 64-weight group is two blocks sharing its FP16 scale), so `export` writes any recipe's
+encoding of the BF16 checkpoint, including role/format plans the engine cannot run yet, into a
+copy of a Q8_0 template GGUF whose weights dequantize to exactly the engine's values. `reference`
+saves the reference logits (`--kl-divergence-base`) of each stream's first chunks, `score` reports
+PPL, mean and 99th-percentile KLD and top-token agreement per stream, `probe` measures the KLD that
+one band of layers adds at a lower format, and `table` summarizes the scored variants:
+
+```bash
+python3 tools/eval/gguf_eval.py reference --model ref-q8_0.gguf --base-dir kld-base \
+  --corpus eval/corpora/perplexity-heldout-2026-09 --llama-perplexity <llama-perplexity>
+python3 tools/eval/gguf_eval.py export --source /path/to/Qwen3.8-27B --template q8_0.gguf \
+  --encoder search-neg --imatrix imatrix.gguf --plan 'mlp/down=q4' --device cuda --out search.gguf
+python3 tools/eval/gguf_eval.py score --model search.gguf --name search --base-dir kld-base \
+  --out kld-results --llama-perplexity <llama-perplexity>
+```
+
+The template must be a Qwen3.8-27B Q8_0 GGUF with llama.cpp's tensor names and Q8_0 layout (the
+GDN `a`/`b` projections and the MTP layer keep its values). `--encoder` is `rtn`
+(`grouped_absmax`), `search` or `search-neg` (`grouped_search` without or with signed scales).
+
 `--disjoint` replaces the sliding windows with back-to-back windows of `--context` tokens, each
 scored from its second token on, and drops a partial window at the end. That is the protocol of
 the WikiText-2 perplexities quantization papers and model cards quote (GPTQ lineage: the test rows

@@ -5,15 +5,18 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -89,6 +92,16 @@ ninfer::RequestOptions greedy(std::uint32_t outputs) {
     return options;
 }
 
+template <typename Call>
+bool fails_unavailable(Call&& call) {
+    try {
+        std::forward<Call>(call)();
+    } catch (const ninfer::RequestError& error) {
+        return error.kind() == ninfer::RequestErrorKind::Unavailable;
+    }
+    return false;
+}
+
 struct Observed {
     std::vector<ninfer::TokenId> tokens;
     std::uint32_t reused = 0;
@@ -148,9 +161,11 @@ int exercise_restore_exact(const char* artifact, ninfer::SpeculativeBackend back
     return failures;
 }
 
-// A restarted Engine resumes from the Host tier its predecessor saved: the restored snapshot is
-// the same bytes, so greedy generation matches an Engine that never restarted. A file written for
-// a different build identity is ignored.
+// A restarted Engine resumes from the Host tier its predecessor saved when stopped mid-generation:
+// the restored snapshot is the same bytes, so greedy generation matches an Engine that never
+// restarted. A file written for a different build identity is ignored, a Host tier one slab
+// smaller than the file restores some but not all of its snapshots, and an abandoned save keeps
+// the previous file and leaves no temporary one.
 int exercise_persist(const char* artifact) {
     const std::filesystem::path file =
         std::filesystem::temp_directory_path() / "ninfer-hybrid-persist-real-test.bin";
@@ -176,26 +191,92 @@ int exercise_persist(const char* artifact) {
         (void)engine.generate(engine.prepare_tokens(first), greedy(8));
         reference = engine.generate(engine.prepare_tokens(second), greedy(24)).generated_token_ids;
     }
+    int failures = 0;
     {
+        // The Engine stops the way ninfer-serve does: stop() while a generation is still far from
+        // its output limit. It fails as Unavailable instead of running on, new work is refused,
+        // and the Host tier is still saved.
         ninfer::Engine saver(options("persist-test"));
         (void)saver.generate(saver.prepare_tokens(first), greedy(8));
+        ninfer::GenerationHandle running =
+            saver.submit(saver.prepare_tokens(synthetic_tokens(200, 6)), greedy(3500));
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        saver.stop();
+        if (!fails_unavailable([&] { (void)running.wait(); })) {
+            std::cerr << "persist: a running generation was not ended as Unavailable by stop()\n";
+            ++failures;
+        }
+        // The answer comes before the Host tier is saved (seconds for a large one), so the file
+        // is not in place yet.
+        if (std::filesystem::exists(file)) {
+            std::cerr << "persist: stop() answered the running generation only after the save\n";
+            ++failures;
+        }
+        if (!fails_unavailable([&] { (void)saver.submit(saver.prepare_tokens(second), greedy(4)); })) {
+            std::cerr << "persist: a stopped Engine accepted a request\n";
+            ++failures;
+        }
     }
-    int failures = 0;
     if (!std::filesystem::exists(file)) {
         std::cerr << "persist: the Engine did not save its Host tier\n";
         return 1;
     }
+    // The saver's file, for the smaller Host tier below (the loader saves over `file`).
+    const std::filesystem::path partial =
+        std::filesystem::temp_directory_path() / "ninfer-hybrid-persist-real-test-partial.bin";
+    std::filesystem::copy_file(file, partial, std::filesystem::copy_options::overwrite_existing);
+    // The file read is published as one startup phase: the whole file, never a failure (a failed
+    // phase would be logged as a failed startup).
+    std::vector<ninfer::StartupEvent> load_events;
+    const auto observe = [&](ninfer::EngineOptions result) {
+        load_events.clear();
+        result.startup_observer.callback = [&](const ninfer::StartupEvent& event) {
+            if (event.phase == ninfer::StartupPhase::PrefixCacheLoad) {
+                load_events.push_back(event);
+            }
+        };
+        return result;
+    };
+    const auto observed = [&](const char* identity) { return observe(options(identity)); };
+    const auto one_phase = [&](std::uint64_t expected_bytes) {
+        bool monotonic = true;
+        for (std::size_t index = 1; index < load_events.size(); ++index) {
+            monotonic = monotonic && load_events[index].current >= load_events[index - 1].current &&
+                        load_events[index].current <= expected_bytes;
+        }
+        return load_events.size() >= 2 &&
+               load_events.front().status == ninfer::StartupStatus::Begin &&
+               load_events.front().total == expected_bytes &&
+               load_events.back().status == ninfer::StartupStatus::Complete &&
+               load_events.back().current == expected_bytes && monotonic &&
+               std::all_of(load_events.begin() + 1, load_events.end() - 1,
+                           [](const ninfer::StartupEvent& event) {
+                               return event.status == ninfer::StartupStatus::Progress;
+                           });
+    };
+    std::uint64_t required_host_bytes = 0;
+    std::uint64_t saved_snapshots     = 0;
     {
-        ninfer::Engine loader(options("persist-test"));
+        const std::uint64_t file_bytes = std::filesystem::file_size(file);
+        ninfer::Engine loader(observed("persist-test"));
+        if (!one_phase(file_bytes)) {
+            std::cerr << "persist: the file read was not published as one complete phase ("
+                      << load_events.size() << " events)\n";
+            ++failures;
+        }
         const ninfer::LoadSummary summary = loader.load_summary();
         const ninfer::GenerationResult resumed =
             loader.generate(loader.prepare_tokens(second), greedy(24));
         const ninfer::RuntimeStats stats = loader.runtime_stats();
-        if (!summary.prefix_cache.restored || summary.prefix_cache.snapshots == 0) {
-            std::cerr << "persist: the saved Host tier was not restored ("
-                      << summary.prefix_cache.message << ")\n";
+        const ninfer::LoadSummary::PrefixCacheRestore& cache = summary.prefix_cache;
+        if (!cache.restored || cache.snapshots == 0 || cache.snapshots != cache.saved_snapshots ||
+            cache.blocks != cache.saved_blocks || cache.required_host_bytes > cache.host_bytes) {
+            std::cerr << "persist: the saved Host tier was not wholly restored ("
+                      << cache.message << ")\n";
             ++failures;
         }
+        required_host_bytes = cache.required_host_bytes;
+        saved_snapshots     = cache.saved_snapshots;
         if (resumed.reused_prompt_tokens != 2 * kPrefillChunk ||
             stats.hybrid_host_block_restores == 0 || stats.hybrid_host_image_restores == 0) {
             std::cerr << "persist: the restarted Engine reused " << resumed.reused_prompt_tokens
@@ -208,15 +289,96 @@ int exercise_persist(const char* artifact) {
         }
     }
     {
-        ninfer::Engine foreign(options("another-build"));
+        ninfer::Engine foreign(observed("another-build"));
         const ninfer::LoadSummary summary = foreign.load_summary();
+        if (!load_events.empty()) {
+            std::cerr << "persist: a file from another build published a load phase\n";
+            ++failures;
+        }
         if (summary.prefix_cache.restored || summary.prefix_cache.message.empty() ||
             foreign.generate(foreign.prepare_tokens(second), greedy(4)).reused_prompt_tokens != 0) {
             std::cerr << "persist: a file from another build was not ignored\n";
             ++failures;
         }
     }
+    if (saved_snapshots < 2) {
+        std::cerr << "persist: the saved tier holds " << saved_snapshots
+                  << " snapshots; a smaller tier cannot be checked\n";
+        ++failures;
+    } else {
+        // One slab short of the file: whole snapshots are dropped, never all of them, and only the
+        // chosen entries are read.
+        ninfer::EngineOptions small = observe(hybrid_options(
+            artifact, ninfer::SpeculativeBackend::None, 16384, required_host_bytes - 1, 8));
+        small.context_cache.hybrid.persistent_file     = partial;
+        small.context_cache.hybrid.persistent_identity = "persist-test";
+        const std::uint64_t file_bytes                 = std::filesystem::file_size(partial);
+        ninfer::Engine engine(std::move(small));
+        const ninfer::LoadSummary::PrefixCacheRestore cache = engine.load_summary().prefix_cache;
+        if (!cache.restored || cache.snapshots == 0 || cache.snapshots >= cache.saved_snapshots ||
+            cache.blocks > cache.saved_blocks || cache.required_host_bytes <= cache.host_bytes) {
+            std::cerr << "persist: a smaller Host tier restored " << cache.snapshots << " of "
+                      << cache.saved_snapshots << " snapshots (" << cache.message << ")\n";
+            ++failures;
+        }
+        if (!one_phase(cache.bytes) || cache.bytes >= file_bytes) {
+            std::cerr << "persist: a smaller Host tier did not read only what it restored ("
+                      << cache.bytes << " of " << file_bytes << " bytes)\n";
+            ++failures;
+        }
+        (void)engine.generate(engine.prepare_tokens(second), greedy(4));
+    }
+    // A Ctrl+C during ninfer-serve's stop abandons the save: the unfinished file is deleted and
+    // the previous file stays as it was, whether the save was writing or had not begun.
+    std::filesystem::path temporary = file;
+    temporary += ".tmp";
+    const auto unchanged = [&, bytes = std::filesystem::file_size(file),
+                            time = std::filesystem::last_write_time(file)] {
+        std::error_code error;
+        return !std::filesystem::exists(temporary, error) &&
+               std::filesystem::file_size(file, error) == bytes &&
+               std::filesystem::last_write_time(file, error) == time;
+    };
+    using Abandon = ninfer::PrefixCacheSaveControl::Abandon;
+    {
+        ninfer::EngineOptions writing = options("persist-test");
+        const ninfer::PrefixCacheSaveControl control = writing.context_cache.hybrid.persistent_save;
+        std::optional<Abandon> result;
+        {
+            ninfer::Engine engine(std::move(writing));
+            (void)engine.generate(engine.prepare_tokens(first), greedy(8));
+            std::thread interrupt([&] {
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+                std::error_code error;
+                while (!std::filesystem::exists(temporary, error) &&
+                       std::chrono::steady_clock::now() < deadline) {}
+                result = control.abandon(std::chrono::seconds(5));
+            });
+            engine.stop();
+            interrupt.join();
+        }
+        if (result != Abandon::Unsaved || !unchanged()) {
+            std::cerr << "persist: a save abandoned while writing left its file or replaced the "
+                         "previous one\n";
+            ++failures;
+        }
+    }
+    {
+        ninfer::EngineOptions early = options("persist-test");
+        const ninfer::PrefixCacheSaveControl control = early.context_cache.hybrid.persistent_save;
+        Abandon result = Abandon::StillWriting;
+        {
+            ninfer::Engine engine(std::move(early));
+            (void)engine.generate(engine.prepare_tokens(first), greedy(8));
+            result = control.abandon(std::chrono::milliseconds(0));
+        }
+        if (result != Abandon::Unsaved || !unchanged()) {
+            std::cerr << "persist: a save abandoned before it began still wrote a file\n";
+            ++failures;
+        }
+    }
     std::filesystem::remove(file, ignored);
+    std::filesystem::remove(partial, ignored);
     return failures;
 }
 

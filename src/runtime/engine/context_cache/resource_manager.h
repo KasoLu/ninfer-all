@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <optional>
 #include <span>
@@ -31,6 +32,10 @@
 namespace ninfer::runtime {
 
 inline constexpr std::uint32_t kInvalidCatalogSlot = std::numeric_limits<std::uint32_t>::max();
+// A branch anchor is captured only where it saves at least this much prefill over the matched
+// owner's deepest restorable checkpoint, since the capture itself costs a prefill split and a
+// StateImage.
+inline constexpr std::uint32_t kBranchAnchorMinimumGainTokens = 1024;
 
 enum class LogicalLaneState : std::uint8_t {
     Free,
@@ -276,6 +281,47 @@ public:
         }
     }
 
+    // The depth at which a request should capture a branch anchor, or nothing: the deepest point
+    // its prompt matches a catalogued continuation or shared prefix to (tokens and identity), when
+    // the owner's restorable checkpoints all end at least kBranchAnchorMinimumGainTokens below it.
+    // A later request that diverges from the stored content at the same point then resumes there
+    // instead of re-prefilling the matched tail from an older checkpoint. Computed before the base
+    // plan, which captures the anchor through its own capture list.
+    [[nodiscard]] std::optional<std::uint32_t>
+    branch_anchor_frontier(const Program& program, const PreparedPrompt& prompt) const {
+        std::uint32_t best   = 0;
+        const auto consider = [&](std::uint32_t tokens, std::uint32_t restorable) {
+            if (tokens >= restorable + kBranchAnchorMinimumGainTokens && tokens > best) {
+                best = tokens;
+            }
+        };
+        const auto restorable_below = [](const ContinuationSummary& summary, std::uint32_t tokens) {
+            std::uint32_t restorable = 0;
+            const auto take          = [&](std::uint32_t frontier) {
+                if (frontier <= tokens) { restorable = std::max(restorable, frontier); }
+            };
+            if (summary.endpoint) { take(summary.endpoint->ref.frontier); }
+            if (summary.rewrite) { take(summary.rewrite->ref.frontier); }
+            for (const auto& anchor : summary.long_anchors) { take(anchor.ref.frontier); }
+            return restorable;
+        };
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            const CatalogEntry& entry = catalog_[slot];
+            if (entry.state != CatalogState::Catalogued || !entry.handle) { continue; }
+            const std::uint32_t tokens = program.matched_prefix_tokens(*entry.handle, prompt);
+            consider(tokens, restorable_below(entry.summary, tokens));
+        }
+        for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+            const SharedCatalogEntry& entry = shared_catalog_[slot];
+            if (entry.state != SharedCatalogState::Catalogued || !entry.handle) { continue; }
+            const std::uint32_t tokens = program.matched_prefix_tokens(*entry.handle, prompt);
+            const std::uint32_t frontier = entry.summary.checkpoint.ref.frontier;
+            consider(tokens, frontier <= tokens ? frontier : 0U);
+        }
+        if (best == 0) { return std::nullopt; }
+        return best;
+    }
+
     [[nodiscard]] Inspection inspect(Program& program, const PreparedPrompt& prompt,
                                      const RequestBasePlan& base, std::uint64_t publication_order,
                                      PlanningAllowance allowance = {}) {
@@ -333,8 +379,18 @@ public:
         candidates.reserve(1U + prefix_index_.size());
         std::optional<AdmissionCandidate> root = program.inspect_admission(
             prompt, base, *destination, nullptr, nullptr, std::nullopt, false);
-        if (!root) { throw std::logic_error("Program rejected isolated root planning"); }
-        candidates.push_back(Candidate{.plan = std::move(*root)});
+        // Isolated feasibility does not imply that an active Program is at a materialization
+        // boundary: an unfinished StateImage fork must settle before admission can be planned.
+        if (!root) { return {.readiness = Readiness::TemporarilyBlocked}; }
+        Candidate root_candidate{.plan = std::move(*root)};
+        if (const auto graft_slot = root_candidate.plan->graft_shared_slot()) {
+            if (*graft_slot < shared_catalog_count_ &&
+                shared_catalog_[*graft_slot].state == SharedCatalogState::Catalogued &&
+                shared_catalog_[*graft_slot].handle) {
+                root_candidate.shared_source = shared_capability(*graft_slot);
+            }
+        }
+        candidates.push_back(std::move(root_candidate));
 
         if (cache_enabled_) {
             const auto session_fingerprint = [](const std::string_view view) noexcept {
@@ -427,10 +483,24 @@ public:
                                  private_has_active_edge(index.slot) ? 1 : 0);
                         continue;
                     }
+                    // Two more requests must not consume their source. One that publishes
+                    // nothing would move the only copy into a lane that never gives one back.
+                    // One that declares an explicit boundary at this very frontier means that
+                    // prefix to stay published for other requests, and a Program captures
+                    // nothing at the frontier its prefill starts from.
+                    const bool declares_boundary_here = std::any_of(
+                        base.context_cache().opportunities.begin(),
+                        base.context_cache().opportunities.end(), [&](const auto& opportunity) {
+                            return opportunity.frontier == index.key.frontier &&
+                                   has_shared_candidate_evidence(
+                                       opportunity.evidence,
+                                       SharedCandidateEvidence::ExplicitBoundary);
+                        });
                     const bool retain =
-                        entry.session && (!base.context_cache().session_key ||
-                                          *entry.session != *base.context_cache().session_key ||
-                                          !base.context_cache().update_session_index);
+                        !base.summary().publish_continuation || declares_boundary_here ||
+                        (entry.session && (!base.context_cache().session_key ||
+                                           *entry.session != *base.context_cache().session_key ||
+                                           !base.context_cache().update_session_index));
                     std::optional<AdmissionCandidate> plan =
                         program.inspect_admission(prompt, base, *destination, &*entry.handle,
                                                   nullptr, index.checkpoint, retain);
@@ -533,6 +603,8 @@ public:
         }
         validate_choice(choice, resource_revision);
         MaterializationRecord record = take_materialization_record(choice);
+        // The observer reads the claims while every victim's physical state is still intact.
+        observe_planned_evictions(record.private_claims);
         transaction_.template emplace<MaterializationRecord>(std::move(record));
         MaterializationRecord& open = std::get<MaterializationRecord>(transaction_);
         reserve_logical_materialization(open);
@@ -1128,6 +1200,7 @@ public:
             }
         }
 
+        observe_planned_evictions(record.private_claims);
         transaction_.template emplace<ActiveCaptureRecord>(std::move(record));
         ActiveCaptureRecord& open = std::get<ActiveCaptureRecord>(transaction_);
         reserve_logical_active_capture(open);
@@ -1479,6 +1552,111 @@ public:
         return lane.value < lane_count_ ? lanes_[lane.value] : LogicalLaneState::Free;
     }
 
+    // Session persistence addresses retained sessions by private catalog cell. These entry points
+    // expose read-only cell state, surrender an idle catalogued continuation, adopt a restored one
+    // into a vacant cell, and observe the loss of a cell's session so a slot file bound to it can
+    // be written before the state is destroyed.
+    struct CatalogSlotView {
+        CatalogState state               = CatalogState::Vacant;
+        std::uint64_t id                 = 0;
+        std::uint64_t revision           = 0;
+        bool active_edge                 = false;
+        const ContinuationHandle* handle = nullptr;
+    };
+
+    [[nodiscard]] std::uint32_t catalog_capacity() const noexcept { return catalog_count_; }
+
+    [[nodiscard]] CatalogSlotView catalog_slot(std::uint32_t slot) const noexcept {
+        if (slot >= catalog_count_) { return {}; }
+        const CatalogEntry& entry = catalog_[slot];
+        return CatalogSlotView{
+            .state       = entry.state,
+            .id          = entry.id,
+            .revision    = entry.revision,
+            .active_edge = entry.summary.active_references != 0 || private_has_active_edge(slot),
+            .handle      = entry.handle ? &*entry.handle : nullptr,
+        };
+    }
+
+    // The private catalog cell an active lane will publish into, if it publishes at all.
+    [[nodiscard]] std::optional<std::uint32_t> lane_publication_slot(LaneId lane) const noexcept {
+        if (lane.value >= lane_count_ || !active_[lane.value].occupied ||
+            active_[lane.value].publication_slot >= catalog_count_) {
+            return std::nullopt;
+        }
+        return active_[lane.value].publication_slot;
+    }
+
+    // The private catalog cell an active lane reads as a retained source (PrivateSourceMode::Retain),
+    // if any: the lane continues that conversation while the source stays catalogued.
+    [[nodiscard]] std::optional<std::uint32_t>
+    lane_retained_private_source_slot(LaneId lane) const noexcept {
+        if (lane.value >= lane_count_ || !active_[lane.value].occupied ||
+            !active_[lane.value].retained_private_source ||
+            active_[lane.value].retained_private_source->slot >= catalog_count_) {
+            return std::nullopt;
+        }
+        return active_[lane.value].retained_private_source->slot;
+    }
+
+    // Surrenders one idle catalogued continuation: the caller releases the returned handle at the
+    // Program and the cell becomes vacant.
+    [[nodiscard]] ContinuationHandle take_catalogued(std::uint32_t slot) {
+        if (slot >= catalog_count_) { throw std::invalid_argument("catalog slot is out of range"); }
+        CatalogEntry& entry = catalog_[slot];
+        if (!std::holds_alternative<std::monostate>(transaction_) ||
+            entry.state != CatalogState::Catalogued || !entry.handle ||
+            entry.summary.active_references != 0 || private_has_active_edge(slot)) {
+            throw std::logic_error("catalog slot is not releasable");
+        }
+        ContinuationHandle handle = std::move(*entry.handle);
+        erase_session_if_owner(entry.id);
+        clear_catalog_entry(entry);
+        return handle;
+    }
+
+    // Adopts a Program-restored continuation into a vacant cell as an anonymous RecentPrivate
+    // owner, reachable by prefix match. Throws, leaving the handle with the caller, when the cell
+    // or summary is unusable; never throws after taking the handle.
+    void adopt_restored(std::uint32_t slot, ContinuationHandle&& handle,
+                        const ContinuationSummary& summary) {
+        if (slot >= catalog_count_) {
+            throw std::invalid_argument("restored continuation slot is out of range");
+        }
+        CatalogEntry& entry = catalog_[slot];
+        if (!std::holds_alternative<std::monostate>(transaction_) ||
+            entry.state != CatalogState::Vacant || entry.handle ||
+            !valid_continuation_summary(summary) || summary.active_references != 0) {
+            throw std::logic_error("restored continuation has no vacant catalog cell");
+        }
+        entry.state = CatalogState::Catalogued;
+        entry.id    = next_continuation_id_++;
+        if (entry.id == 0) { entry.id = next_continuation_id_++; }
+        entry.session.reset();
+        entry.retention = RetentionClass::RecentPrivate;
+        assign_continuation_summary(entry.summary, summary);
+        migrate_observations(entry, summary, entry.retention);
+        advance_revision(entry.revision);
+        entry.handle.emplace(std::move(handle));
+    }
+
+    // Called with each catalogued continuation a reserved transaction plans to evict, before any
+    // physical state is destroyed. An aborted transaction leaves the session alive, so a spurious
+    // observation costs one redundant but valid slot file.
+    using EvictionObserver = std::function<void(std::uint32_t, const ContinuationHandle&)>;
+    // Called whenever a cell stops holding the session it held, by any route: eviction,
+    // consumption, release, abort or cleanup. Engine state keyed by cell (the slot file binding)
+    // must end here, or it would apply to whichever session lands in the cell next.
+    using SlotReleaseObserver = std::function<void(std::uint32_t)>;
+
+    void set_eviction_observer(EvictionObserver observer) {
+        eviction_observer_ = std::move(observer);
+    }
+
+    void set_slot_release_observer(SlotReleaseObserver observer) {
+        slot_release_observer_ = std::move(observer);
+    }
+
     void clear_after_program_cleanup() noexcept {
         transaction_.template emplace<std::monostate>();
         for (CatalogEntry& entry : catalog_) {
@@ -1496,6 +1674,29 @@ public:
         }
         demand_window_.clear();
         demand_epoch_ = 0;
+    }
+
+    std::uint32_t register_external_shared_prefix(SharedPrefixHandle handle,
+                                                   SharedPrefixSummary summary) {
+        for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+            if (shared_catalog_[slot].state == SharedCatalogState::Vacant) {
+                SharedCatalogEntry& entry = shared_catalog_[slot];
+                entry.state               = SharedCatalogState::Catalogued;
+                entry.id                  = next_shared_prefix_id_++;
+                if (entry.id == 0) { entry.id = next_shared_prefix_id_++; }
+                entry.summary         = summary;
+                entry.handle.emplace(std::move(handle));
+                entry.observation     = RetentionObservation{.retention_class = RetentionClass::SharedStable};
+                // A graft is pinned for the Engine's life: the permanent transaction pin keeps every
+                // eviction, demotion and LRU path off it, and its credit never ages out.
+                entry.transaction_pins    = 1;
+                entry.explicit_credit     = true;
+                entry.credit_expiry_epoch = std::numeric_limits<std::uint64_t>::max();
+                advance_revision(entry.revision);
+                return slot;
+            }
+        }
+        throw std::runtime_error("no vacant shared catalog slot for graft registration");
     }
 
 private:
@@ -1940,6 +2141,21 @@ private:
         return found == observations.end() ? nullptr : &found->observation;
     }
 
+    // A singleton checkpoint (endpoint, turn closure, replay: ordinal 0) keeps its identity across
+    // republication although its frontier advances every turn, so an exact-ref match fails on
+    // every republish and the owner's hit history restarts at zero. Long anchors carry a real
+    // ordinal and are matched exactly.
+    static const RetentionObservation*
+    find_singleton_observation(const std::vector<CheckpointObservation>& observations,
+                               CheckpointRef checkpoint) noexcept {
+        if (checkpoint.ordinal != 0) { return nullptr; }
+        const auto found = std::find_if(
+            observations.begin(), observations.end(), [&](const CheckpointObservation& value) {
+                return value.checkpoint.kind == checkpoint.kind && value.checkpoint.ordinal == 0;
+            });
+        return found == observations.end() ? nullptr : &found->observation;
+    }
+
     void migrate_observations(CatalogEntry& entry, const ContinuationSummary& summary,
                               RetentionClass retention) noexcept {
         observation_scratch_.clear();
@@ -1948,8 +2164,11 @@ private:
                 std::terminate();
             }
             RetentionObservation observation{.retention_class = retention};
-            if (const RetentionObservation* old =
-                    find_observation(entry.observations, checkpoint.ref)) {
+            const RetentionObservation* old = find_observation(entry.observations, checkpoint.ref);
+            if (old == nullptr) {
+                old = find_singleton_observation(entry.observations, checkpoint.ref);
+            }
+            if (old != nullptr) {
                 observation                 = *old;
                 observation.retention_class = retention;
             }
@@ -1966,6 +2185,7 @@ private:
     }
 
     void clear_catalog_entry(CatalogEntry& entry) noexcept {
+        notify_slot_released(entry);
         entry.state = CatalogState::Vacant;
         entry.id    = 0;
         entry.summary.endpoint.reset();
@@ -2869,6 +3089,29 @@ private:
         };
     }
 
+    // catalog_ is contiguous, so the entry recovers its own cell index. Runs before the entry is
+    // reset so an observer can still read it.
+    void notify_slot_released(const CatalogEntry& entry) const noexcept {
+        if (!slot_release_observer_ || catalog_.empty()) { return; }
+        const std::ptrdiff_t index = &entry - catalog_.data();
+        if (index < 0 || static_cast<std::size_t>(index) >= catalog_.size()) { return; }
+        try {
+            slot_release_observer_(static_cast<std::uint32_t>(index));
+        } catch (...) {}
+    }
+
+    void observe_planned_evictions(const std::vector<OwnerClaim>& claims) noexcept {
+        if (!eviction_observer_) { return; }
+        for (const OwnerClaim& claim : claims) {
+            if (claim.disposition != VictimDisposition::Evicted) { continue; }
+            const std::uint32_t slot = claim.capability.slot;
+            if (slot >= catalog_count_ || !catalog_[slot].handle) { continue; }
+            try {
+                eviction_observer_(slot, *catalog_[slot].handle);
+            } catch (...) {}
+        }
+    }
+
     void reserve_logical_materialization(const MaterializationRecord& record) noexcept {
         lanes_[record.destination.value] = LogicalLaneState::Materializing;
         if (record.private_source) {
@@ -3541,7 +3784,11 @@ private:
                 source.summary.endpoint.reset();
                 source.summary.rewrite.reset();
                 source.summary.long_anchors.clear();
-                source.observations.clear();
+                // The consumed owner republishes into this same cell at finish, and its
+                // observations (stamped by the selected hit above) are the only record that it
+                // was ever reused. Clearing them made every republished owner look never-used to
+                // the eviction planner, so retention depth collapsed to one request.
+                if (record->publication_slot != capability.slot) { source.observations.clear(); }
                 source.session.reset();
             }
         }
@@ -3977,7 +4224,9 @@ private:
     void observe_transfer(const ContextTransferObservation& observation) noexcept {
         const double seconds = static_cast<double>(observation.elapsed_ns) * 1.0e-9;
         context_stats_.actual_context_transfer_seconds += seconds;
-        const std::uint64_t bytes = observation.units;
+        // State units count images, whereas KV units count bytes. Telemetry uses the physical
+        // payload for both resources, independent of cost units.
+        const std::uint64_t bytes = observation.work.payload_bytes;
         switch (observation.resource) {
         case ContextResourceClass::State:
             switch (observation.direction) {
@@ -4083,6 +4332,8 @@ private:
     ContextMachineCostModel cost_model_;
     Planner planner_;
     CapturePlanner capture_planner_;
+    EvictionObserver eviction_observer_;
+    SlotReleaseObserver slot_release_observer_;
     RuntimeStats context_stats_;
     std::uint64_t next_continuation_id_  = 1;
     std::uint64_t next_shared_prefix_id_ = 1;

@@ -2,6 +2,7 @@
 
 #include "ninfer/types.h"
 #include "models/qwen3_5/ngram.h"
+#include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/frontend/output_session.h"
 #include "models/registry.h"
 #include "runtime/contract/request.h"
@@ -47,6 +48,8 @@ struct FrontendOptions {
     // Minimum token gap between consecutive automatic anchors (and between the prompt end and the
     // first one), doubling per anchor; 0 anchors every one of the last boundaries.
     std::uint32_t long_anchor_min_spacing_tokens = 0;
+    // Hidden prompt prefixes a request may select through PromptOptions::graft.
+    std::vector<PromptGraft> grafts;
 };
 
 struct FrontendResources;
@@ -108,6 +111,8 @@ public:
     // plan exists, so the Engine hands the host-cache-resolved value to the grid the capture path
     // will create checkpoints for, before any request is prepared.
     void publish_long_anchor_limit(std::uint32_t anchors) noexcept;
+    [[nodiscard]] const std::vector<PromptGraft>& grafts() const noexcept;
+    [[nodiscard]] std::uint32_t thinking_control_token_count() const noexcept;
 
 private:
     class Impl;

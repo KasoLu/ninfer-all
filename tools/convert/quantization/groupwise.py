@@ -67,169 +67,6 @@ def pick_device(preferred: str | torch.device = "cuda") -> torch.device:
     return device
 
 
-def _mse_scale_candidates(
-    s_hi: np.ndarray,
-    s_ls: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Per-group candidate binary16 scales for the MSE-optimal scale search.
-
-    ``s_hi`` is the canonical max-abs scale (index 0 of the result, so ties keep
-    the ``grouped_absmax`` outcome) and ``s_ls`` the least-squares estimate from
-    the max-abs codes.  Candidates are exact binary16 values: the two scales,
-    power-of-two multiples around them, and ±2-ulp neighbourhoods in word space.
-    Words outside the positive finite binary16 range (zero, NaN, negative) are
-    marked invalid; a zero group therefore keeps only its zero candidate.
-    """
-    def words_of(values: np.ndarray) -> np.ndarray:
-        return values.astype(np.float16).view(np.uint16)
-
-    def scaled(words: np.ndarray, exponent: int) -> np.ndarray:
-        # Bit-cast the binary16 words to their values, scale by the exact
-        # power of two, and round back to binary16.  Multiples beyond the
-        # binary16 range become infinity; those words are masked out below.
-        values = words.view(np.float16).astype(np.float64) * (2.0**exponent)
-        with np.errstate(over="ignore", invalid="ignore"):
-            return words_of(values)
-
-    def shifted(words: np.ndarray, offset: int) -> np.ndarray:
-        return (words.astype(np.int32) + offset).astype(np.uint16)
-
-    w_hi = words_of(s_hi)
-    w_ls = words_of(s_ls)
-    raw = np.stack(
-        (
-            w_hi,
-            scaled(w_hi, -2),
-            scaled(w_hi, -1),
-            scaled(w_hi, 1),
-            scaled(w_hi, 2),
-            w_ls,
-            scaled(w_ls, -1),
-            scaled(w_ls, 1),
-            shifted(w_hi, -2),
-            shifted(w_hi, -1),
-            shifted(w_hi, 1),
-            shifted(w_hi, 2),
-            shifted(w_ls, -2),
-            shifted(w_ls, 2),
-        ),
-        axis=1,
-    )
-    # Word 0 (scale 0) stays a candidate: for an all-zero group it is the
-    # index-0 tie-break keeping the grouped_absmax result, and for a nonzero
-    # group its error is the full sum of squares, so it never wins.  Infinity
-    # (0x7C00), NaN (0x7C01 and up) and negative words are excluded.
-    valid = raw <= 0x7BFF
-    raw = raw.view(np.float16).astype(np.float64)
-    return raw, valid
-
-
-def quantize_matrix_mse(
-    weight: torch.Tensor,
-    format: str | QuantFormat,
-    *,
-    device: str | torch.device | None = None,
-) -> QuantizedMatrix:
-    """Grouped quantisation choosing the per-group scale that minimises the
-    encoded squared error.
-
-    Each group's scale is the best binary16 candidate (see
-    ``_mse_scale_candidates``) under the exact engine encoding -- codes are
-    ``round(w * binary32(1 / scale))`` clamped to the code range -- with the
-    canonical max-abs scale breaking ties.  The search and code evaluation run
-    on the host in ordered arithmetic, so results are bit-identical across
-    devices; the stored codes and scales are exactly what the row-split codec
-    and the runtime dequantisation consume.
-    """
-    spec = get_format(format) if isinstance(format, str) else format
-    if not isinstance(spec, QuantFormat):
-        raise ValueError("grouped quantization requires a quantized numeric format")
-    if weight.dim() != 2:
-        raise ValueError(
-            f"grouped quantization requires rank 2, got {tuple(weight.shape)}"
-        )
-    if not weight.dtype.is_floating_point:
-        raise TypeError("grouped quantization requires floating-point values")
-
-    geometry = row_split_geometry(spec, weight.shape)
-    target = pick_device() if device is None else pick_device(device)
-    logical = weight.detach().to(device=target, dtype=torch.float32)
-    if geometry.k_pad != geometry.k:
-        physical = torch.zeros(
-            (geometry.n, geometry.k_pad), dtype=torch.float32, device=target
-        )
-        physical[:, : geometry.k].copy_(logical)
-        logical = physical
-
-    grouped = logical.reshape(geometry.n, geometry.groups_per_row, spec.group_size)
-    max_abs = grouped.abs().amax(dim=2)
-    base_scales, base_reciprocal = _canonical_scale_words(max_abs, spec.qmax)
-    base_codes = torch.clamp(
-        torch.round(grouped * base_reciprocal.unsqueeze(-1)), spec.qmin, spec.qmax
-    )
-
-    host_values = grouped.detach().cpu().numpy().astype(np.float64)
-    host_max = max_abs.detach().cpu().numpy().astype(np.float64)
-    if not np.isfinite(host_max).all():
-        raise ValueError("grouped quantization source contains NaN or infinity")
-    host_base_codes = base_codes.detach().cpu().numpy().astype(np.float64)
-
-    flat_w = host_values.reshape(-1, spec.group_size)
-    flat_base_scales = base_scales.detach().cpu().numpy().astype(np.float64).reshape(-1)
-    flat_base_codes = host_base_codes.reshape(-1, spec.group_size)
-
-    # Least-squares scale estimate: the scale fitting the max-abs code pattern.
-    code_norm = (flat_base_codes**2).sum(axis=1)
-    s_ls = np.where(
-        code_norm > 0,
-        (flat_w * flat_base_codes).sum(axis=1) / np.maximum(code_norm, 1e-300),
-        flat_base_scales,
-    )
-    candidates, candidate_valid = _mse_scale_candidates(flat_base_scales, s_ls)
-
-    # True encoded error per candidate, using the exact engine code formula.
-    # A valid zero scale encodes every value to code 0 (reciprocal 0), and an
-    # invalid word never competes, so no NaN can enter the search.
-    values32 = flat_w.astype(np.float32)
-    best_error = np.full(candidates.shape, np.inf)
-    for index in range(candidates.shape[1]):
-        scale_c = candidates[:, index]
-        valid_c = candidate_valid[:, index]
-        positive = valid_c & (scale_c > 0.0)
-        reciprocal = np.zeros(candidates.shape[0], dtype=np.float32)
-        reciprocal[positive] = (1.0 / scale_c[positive]).astype(np.float32)
-        codes_c = np.clip(
-            np.rint(values32 * reciprocal[:, None]), spec.qmin, spec.qmax
-        ).astype(np.float64)
-        # Invalid rows keep a zero scale so the error product stays finite;
-        # their SSE is discarded below.
-        error = flat_w - codes_c * np.where(valid_c, scale_c, 0.0)[:, None]
-        sse = (error**2).sum(axis=1)
-        best_error[:, index] = np.where(valid_c, sse, np.inf)
-    best = best_error.argmin(axis=1)  # first minimum wins ties: index 0 = max-abs
-    chosen = candidates[np.arange(candidates.shape[0]), best]
-
-    # Emit codes through the same formula the runtime dequantisation assumes.
-    scales = chosen.astype(np.float16)
-    reciprocal = np.zeros(candidates.shape[0], dtype=np.float32)
-    positive = scales > 0
-    reciprocal[positive] = (1.0 / scales[positive].astype(np.float64)).astype(
-        np.float32
-    )
-    codes = np.clip(
-        np.rint(values32 * reciprocal[:, None]), spec.qmin, spec.qmax
-    ).astype(np.int8)
-
-    return QuantizedMatrix(
-        codes=torch.from_numpy(codes)
-        .reshape(geometry.n, geometry.groups_per_row, spec.group_size)
-        .to(target),
-        scales=torch.from_numpy(scales)
-        .reshape(geometry.n, geometry.groups_per_row)
-        .to(target),
-    )
-
-
 def quantize_matrix(
     weight: torch.Tensor,
     format: str | QuantFormat,
@@ -272,3 +109,171 @@ def quantize_matrix(
         torch.round(grouped * reciprocal.unsqueeze(-1)), spec.qmin, spec.qmax
     ).to(torch.int8)
     return QuantizedMatrix(codes=codes, scales=scales)
+
+
+# Multipliers tried around the max-abs and full-range base scales: a dense sweep of the clipping
+# region. It contains 1.0, so both base scales themselves are candidates.
+SEARCH_RATIOS = tuple(round(0.70 + 0.02 * step, 2) for step in range(25))
+
+
+def _round_scales(raw: np.ndarray, nonzero: np.ndarray) -> np.ndarray:
+    """Round signed candidate scales to binary16 as ``_canonical_scale_words`` does.
+
+    binary64 values round through binary32 to binary16. A nonzero group whose candidate
+    underflows takes the smallest subnormal of the candidate's sign; overflow gives infinity,
+    which the caller rejects.
+    """
+
+    with np.errstate(over="ignore", invalid="ignore"):
+        scale = raw.astype(np.float64).astype(np.float32).astype(np.float16)
+    underflow = (scale == 0) & nonzero & (raw != 0)
+    if underflow.any():
+        scale[underflow] = np.where(
+            raw[underflow] < 0, -_FP16_MIN_SUBNORMAL, _FP16_MIN_SUBNORMAL
+        ).astype(np.float16)
+    return scale
+
+
+def _ulp_neighbour(scale: np.ndarray, offset: int) -> np.ndarray:
+    """The binary16 scale ``offset`` magnitude steps from ``scale``, keeping its sign.
+
+    Steps that leave the finite nonzero range give zero, which the caller rejects."""
+
+    words = scale.view(np.uint16)
+    magnitude = (words & 0x7FFF).astype(np.int32) + offset
+    legal = (words & 0x7FFF).astype(np.int32) > 0
+    legal &= (magnitude > 0) & (magnitude <= 0x7BFF)
+    shifted = (words & 0x8000) | np.clip(magnitude, 0, 0x7BFF).astype(np.uint16)
+    return np.where(legal, shifted, 0).astype(np.uint16).view(np.float16)
+
+
+def search_quantize_matrix(
+    weight: torch.Tensor,
+    format: str | QuantFormat,
+    *,
+    importance: torch.Tensor | None = None,
+    negative_scales: bool = False,
+    device: str | torch.device | None = None,
+) -> QuantizedMatrix:
+    """Choose each group's binary16 scale by minimizing weighted squared reconstruction error.
+
+    The error of a group is ``sum_k importance[k] * (w[k] - scale * code[k])^2`` with codes
+    selected exactly as the engine encoding assumes: ``round(w * binary32(1 / scale))`` clamped
+    to the code interval. ``importance`` holds one finite nonnegative weight per input channel
+    (length K), normally the mean squared activation from an importance matrix; without it every
+    channel weighs the same. Candidates, in tie-break order:
+
+    - the ``quantize_matrix`` result, which only a strictly smaller error replaces, so no group
+      is worse than round-to-nearest;
+    - ``SEARCH_RATIOS`` times the max-abs scale ``amax / qmax``;
+    - ``SEARCH_RATIOS`` times the full-range scale ``extreme / qmin``, which maps the group's
+      largest-magnitude value onto the most negative code. It is negative when that value is
+      positive, and negative candidates compete only when ``negative_scales`` is set;
+    - the max-abs scale times 1/4, 1/2, 2 and 4, and its +-1 and +-2 binary16 steps;
+    - the weighted least-squares scale of the max-abs codes, times 1/2 and 2, and its +-1 and
+      +-2 steps;
+    - the weighted least-squares refit of the codes chosen so far, and its +-1 steps.
+
+    Code selection is exact on every device. The errors are accumulated in binary64, so a CPU
+    and a CUDA search agree except where two candidates' errors tie to binary64 rounding.
+    """
+
+    spec = get_format(format) if isinstance(format, str) else format
+    if not isinstance(spec, QuantFormat):
+        raise ValueError("grouped quantization requires a quantized numeric format")
+    # Validates rank, dtype and finiteness, and is the first candidate.
+    baseline = quantize_matrix(weight, spec, device=device)
+    target = baseline.codes.device
+    geometry = row_split_geometry(spec, weight.shape)
+    logical = weight.detach().to(device=target, dtype=torch.float32)
+    if geometry.k_pad != geometry.k:
+        physical = torch.zeros(
+            (geometry.n, geometry.k_pad), dtype=torch.float32, device=target
+        )
+        physical[:, : geometry.k].copy_(logical)
+        logical = physical
+    grouped = logical.reshape(geometry.n, geometry.groups_per_row, spec.group_size)
+    exact = grouped.to(torch.float64)
+
+    if importance is None:
+        weights = torch.ones(
+            (1, geometry.groups_per_row, spec.group_size),
+            dtype=torch.float64,
+            device=target,
+        )
+    else:
+        if importance.dim() != 1 or importance.numel() != geometry.k:
+            raise ValueError(
+                f"importance must have one value per input channel ({geometry.k})"
+            )
+        values = importance.detach().to(device=target, dtype=torch.float64)
+        if not bool(torch.isfinite(values).all()) or bool((values < 0).any()):
+            raise ValueError("importance must be finite and nonnegative")
+        padded = torch.zeros(geometry.k_pad, dtype=torch.float64, device=target)
+        padded[: geometry.k] = values
+        weights = padded.reshape(1, geometry.groups_per_row, spec.group_size)
+
+    def error(scales: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
+        residual = exact - scales.to(torch.float64).unsqueeze(-1) * codes.to(torch.float64)
+        return (weights * residual * residual).sum(dim=2)
+
+    def least_squares(codes: torch.Tensor) -> np.ndarray:
+        codes = codes.to(torch.float64)
+        numerator = (weights * exact * codes).sum(dim=2)
+        denominator = (weights * codes * codes).sum(dim=2)
+        fit = torch.where(
+            denominator > 0, numerator / denominator.clamp_min(1e-300), 0.0
+        )
+        return fit.cpu().numpy()
+
+    magnitude = grouped.abs()
+    max_abs, position = magnitude.max(dim=2)
+    extreme = grouped.gather(2, position.unsqueeze(-1)).squeeze(-1)
+    nonzero = (max_abs > 0).cpu().numpy()
+    host_max = max_abs.cpu().numpy().astype(np.float64)
+    host_extreme = extreme.cpu().numpy().astype(np.float64)
+
+    best_codes = baseline.codes.clone()
+    best_scales = baseline.scales.clone()
+    best_error = error(best_scales, best_codes)
+
+    def consider(candidate: np.ndarray) -> None:
+        nonlocal best_codes, best_scales, best_error
+        valid = nonzero & np.isfinite(candidate) & (candidate != 0)
+        if not negative_scales:
+            valid &= candidate > 0
+        if not valid.any():
+            return
+        scale = np.where(valid, candidate, np.float16(0))
+        reciprocal = np.zeros(scale.shape, dtype=np.float32)
+        reciprocal[valid] = (1.0 / scale[valid].astype(np.float64)).astype(np.float32)
+        scales = torch.from_numpy(scale).to(target)
+        codes = torch.clamp(
+            torch.round(grouped * torch.from_numpy(reciprocal).to(target).unsqueeze(-1)),
+            spec.qmin,
+            spec.qmax,
+        ).to(torch.int8)
+        candidate_error = error(scales, codes)
+        better = torch.from_numpy(valid).to(target) & (candidate_error < best_error)
+        best_error = torch.where(better, candidate_error, best_error)
+        best_scales = torch.where(better, scales, best_scales)
+        best_codes = torch.where(better.unsqueeze(-1), codes, best_codes)
+
+    for base in (host_max / float(spec.qmax), host_extreme / float(spec.qmin)):
+        for ratio in SEARCH_RATIOS:
+            consider(_round_scales(base * ratio, nonzero))
+    canonical = baseline.scales.cpu().numpy()
+    for exponent in (-2, -1, 1, 2):
+        consider(_round_scales(canonical.astype(np.float64) * 2.0**exponent, nonzero))
+    for offset in (-2, -1, 1, 2):
+        consider(_ulp_neighbour(canonical, offset))
+    fit = _round_scales(least_squares(baseline.codes), nonzero)
+    consider(fit)
+    for exponent in (-1, 1):
+        consider(_round_scales(fit.astype(np.float64) * 2.0**exponent, nonzero))
+    for offset in (-2, -1, 1, 2):
+        consider(_ulp_neighbour(fit, offset))
+    refit = _round_scales(least_squares(best_codes), nonzero)
+    for candidate in (refit, _ulp_neighbour(refit, -1), _ulp_neighbour(refit, 1)):
+        consider(candidate)
+    return QuantizedMatrix(codes=best_codes, scales=best_scales)

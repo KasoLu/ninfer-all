@@ -3,6 +3,7 @@
 #include "serve/translate.h"
 
 #include <filesystem>
+
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -209,6 +210,31 @@ int main() {
     failures += check(resolve_public_model_id(defaults, "artifact-model") == "artifact-model",
                       "artifact model id was not selected by default");
 
+    // Without --default-max-tokens an omitted request limit is derived per request from the Engine's
+    // concurrent lane budget, bounded above by --max-context; the flag replaces it with a fixed cap.
+    const ServeOptions long_context =
+        parse({"ninfer-serve", "model.ninfer", "--max-context", "262144"});
+    const RequestLimits derived = request_limits(long_context);
+    failures += check(!derived.default_max_tokens && derived.max_context == 262144,
+                      "omitted --default-max-tokens did not select the derived lane budget");
+    GenerationRequest omitted;
+    apply_default_output_limit(omitted, derived);
+    failures += check(omitted.derive_output_budget && omitted.max_tokens == 262144,
+                      "an omitted limit was not marked for derivation under the context bound");
+    const ServeOptions capped = parse(
+        {"ninfer-serve", "model.ninfer", "--max-context", "262144", "--default-max-tokens", "4096"});
+    GenerationRequest fixed;
+    apply_default_output_limit(fixed, request_limits(capped));
+    failures += check(!fixed.derive_output_budget && fixed.max_tokens == 4096,
+                      "explicit --default-max-tokens was not the default output limit");
+    bool zero_default_output_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.ninfer", "--default-max-tokens", "0"});
+    } catch (const std::invalid_argument&) { zero_default_output_rejected = true; }
+    failures += check(zero_default_output_rejected, "--default-max-tokens 0 was accepted");
+
+    failures += check(!defaults.default_reasoning_effort,
+                      "a reasoning effort is unexpectedly configured by default");
     const ServeOptions fp8 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "fp8"});
     failures += check(fp8.kv_cache == ninfer::KvCacheStorage::Fp8E4M3Row256,
                       "--kv-dtype fp8 did not select row-scaled E4M3 KV");
@@ -327,10 +353,6 @@ int main() {
         (void)parse({"ninfer-serve", "model.ninfer", "--thinking-budget-message", ""});
     } catch (const std::invalid_argument&) { empty_thinking_message_rejected = true; }
     failures += check(empty_thinking_message_rejected, "empty --thinking-budget-message accepted");
-
-    failures += check(parse({"ninfer-serve", "model.ninfer", "--default-max-tokens", "0"})
-                              .default_max_tokens == kUnboundedOutputTokens,
-                      "--default-max-tokens 0 does not leave the output bounded only by context");
 
     const ServeOptions reasoning_effort =
         parse({"ninfer-serve", "model.ninfer", "--default-reasoning-effort", "low"});
@@ -574,6 +596,33 @@ int main() {
         } catch (const std::invalid_argument&) { rejected = true; }
         failures += check(rejected, "an inconsistent disk tier configuration was accepted");
     }
+    const ServeOptions no_slots = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(no_slots.slot_save_path.empty() && !no_slots.auto_save_evicted,
+                      "slot persistence was on by default");
+    const ServeOptions slots = parse(
+        {"ninfer-serve", "model.ninfer", "--slot-save-path", "sessions", "--auto-save-evicted"});
+    failures += check(slots.slot_save_path == "sessions" && slots.auto_save_evicted,
+                      "slot persistence options did not reach serving options");
+    const auto rejected = [&](std::vector<std::string> argv) {
+        try {
+            (void)parse(std::move(argv));
+        } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--auto-save-evicted"}),
+                      "--auto-save-evicted was accepted without --slot-save-path");
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--slot-save-path", ""}),
+                      "an empty --slot-save-path was accepted");
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--no-prefix-reuse",
+                                "--slot-save-path", "sessions"}),
+                      "--slot-save-path was accepted with prefix reuse disabled");
+    failures += check(rejected({"ninfer-serve", "model.ninfer", "--use-alt-prefix-caching",
+                                "--slot-save-path", "sessions"}),
+                      "--slot-save-path was accepted with the hybrid prefix cache, which has no "
+                      "catalog cells");
+    failures += check(serve_usage_text("ninfer-serve").find("--slot-save-path") !=
+                          std::string::npos,
+                      "serve help omits --slot-save-path");
 
     failures += check(!parse({"ninfer-serve", "model.ninfer"}).auto_prefix_grid,
                       "automatic prefix grid was on without --auto-prefix-grid");
@@ -634,6 +683,7 @@ int main() {
                                                {"--max-long-anchors-per-continuation", "2"},
                                                {"--long-anchor-spacing", "0"},
                                                {"--auto-long-anchors"},
+                                               {"--branch-anchors"},
                                                {"--auto-prefix-grid"},
                                                {"--derive-session-keys"},
                                                {"--context-cache-policy", "rolling"},
@@ -796,25 +846,24 @@ int main() {
     failures += check(resolve_prompt_semantics(request, configured).preserve_thinking == false,
                       "request preserve-thinking override did not win");
 
-    // Client effort vocabularies are wider than the three rungs the maintained Qwen templates
-    // accept: OpenAI and Claude Code send 'high', pi sends 'minimal' and 'max'. Those collapse
-    // onto the nearest rung rather than making the template raise.
-    const auto collapses = [&](RequestedReasoningEffort wire) {
+    // Client effort vocabularies are wider than the efforts a template may accept: OpenAI and
+    // Claude Code send 'high', pi sends 'minimal' and 'max'. Serving passes each through unchanged;
+    // the compiled template renders an effort it rejects as its nearest accepted one.
+    const auto resolved_effort = [&](RequestedReasoningEffort wire) {
         GenerationRequest aliased = GenerationRequest{};
         aliased.max_tokens        = 1;
         aliased.reasoning_effort  = wire;
         return resolve_prompt_semantics(aliased, defaults).reasoning_effort;
     };
-    failures += check(collapses(RequestedReasoningEffort::Minimal) == ninfer::ReasoningEffort::Low,
-                      "'minimal' did not collapse onto the template's low rung");
-    failures += check(collapses(RequestedReasoningEffort::High) == ninfer::ReasoningEffort::XHigh,
-                      "'high' did not collapse onto the template's xhigh rung");
-    failures += check(collapses(RequestedReasoningEffort::Max) == ninfer::ReasoningEffort::XHigh,
-                      "'max' did not collapse onto the template's xhigh rung");
-    failures += check(collapses(RequestedReasoningEffort::Medium) == ninfer::ReasoningEffort::Medium,
-                      "'medium' did not pass through unchanged");
-    failures += check(collapses(RequestedReasoningEffort::None) == ninfer::ReasoningEffort::None,
-                      "'none' did not pass through unchanged");
+    failures += check(
+        resolved_effort(RequestedReasoningEffort::Minimal) == ninfer::ReasoningEffort::Minimal &&
+            resolved_effort(RequestedReasoningEffort::Low) == ninfer::ReasoningEffort::Low &&
+            resolved_effort(RequestedReasoningEffort::Medium) == ninfer::ReasoningEffort::Medium &&
+            resolved_effort(RequestedReasoningEffort::High) == ninfer::ReasoningEffort::High &&
+            resolved_effort(RequestedReasoningEffort::XHigh) == ninfer::ReasoningEffort::XHigh &&
+            resolved_effort(RequestedReasoningEffort::Max) == ninfer::ReasoningEffort::Max &&
+            resolved_effort(RequestedReasoningEffort::None) == ninfer::ReasoningEffort::None,
+        "a requested effort did not reach the template unchanged");
 
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
@@ -822,6 +871,9 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--auto-prefix-grid") != std::string::npos,
               "serve help omits --auto-prefix-grid");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--auto-long-anchors") != std::string::npos,
+              "serve help omits --auto-long-anchors");
 
     // --devices selects the ordered CUDA devices the model's pipeline stages run on. Only the shape
     // is parsed here; matching compute capability is the engine's to validate, because it needs real
@@ -886,6 +938,8 @@ int main() {
                                         "--assistant-prefill",
                                         "--auto-long-anchors",
                                         "--auto-prefix-grid",
+                                        "--auto-save-evicted",
+                                        "--branch-anchors",
                                         "--cache-tap-ladder",
                                         "--cache-tap-min-gap",
                                         "--cache-taps-per-request",
@@ -896,6 +950,7 @@ int main() {
                                         "--cors",
                                         "--cuda-graph-allowance-mib",
                                         "--default-max-tokens",
+                                        "--default-graft",
                                         "--default-reasoning-effort",
                                         "--default-thinking-budget",
                                         "--derive-session-keys",
@@ -916,6 +971,7 @@ int main() {
                                         "--first-token-logprobs",
                                         "--frequency-penalty",
                                         "--gdn-state-fp16",
+                                        "--graft",
                                         "--greedy",
                                         "--host",
                                         "--host-cache-mib",
@@ -987,6 +1043,7 @@ int main() {
                                         "--rope-yarn",
                                         "--rope-yarn-factor",
                                         "--seed",
+                                        "--slot-save-path",
                                         "--spec",
                                         "--stage-layers",
                                         "--stats-port",
@@ -1394,6 +1451,10 @@ int main() {
                              "--long-anchor-spacing", "0"})
                               .context_cache.long_anchor_min_spacing_tokens == 0U,
                   "--auto-long-anchors was not an off-by-default switch carrying its spacing");
+        failures += check(!parse({"ninfer-serve", "model.ninfer"}).context_cache.branch_anchors &&
+                              parse({"ninfer-serve", "model.ninfer", "--branch-anchors"})
+                                  .context_cache.branch_anchors,
+                          "--branch-anchors was not an off-by-default switch");
         bool spacing_without_anchors_rejected = false;
         try {
             (void)parse({"ninfer-serve", "model.ninfer", "--long-anchor-spacing", "512"});
@@ -1418,6 +1479,82 @@ int main() {
         failures += check(headroom.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
                               headroom.kv_capacity.automatic_headroom_bytes == (512ULL << 20),
                           "--vram-headroom-mib is not an alias of --kv-headroom-mib");
+    }
+
+    {
+        const ServeOptions grafted = parse({"ninfer-serve", "model.ninfer", "--graft",
+                                            "product=C:/grafts/p.bin", "--graft", "b=b.bin"});
+        failures += check(grafted.grafts.size() == 2 && grafted.grafts[0].name == "product" &&
+                              grafted.grafts[0].path == "C:/grafts/p.bin" &&
+                              grafted.grafts[1].name == "b",
+                          "--graft NAME=PATH was not parsed in order");
+        for (const char* malformed : {"product", "=p.bin", "product="}) {
+            bool rejected = false;
+            try {
+                (void)parse({"ninfer-serve", "model.ninfer", "--graft", malformed});
+            } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "malformed --graft was accepted");
+        }
+
+        GenerationRequest graft_request;
+        graft_request.max_tokens = 1;
+        graft_request.graft      = "product";
+        failures += check(resolve_prompt_semantics(graft_request, grafted).graft == "product" &&
+                              to_prompt_input(graft_request,
+                                              resolve_prompt_semantics(graft_request, grafted), {})
+                                      .options.graft == "product",
+                          "a loaded graft did not reach the Engine prompt options");
+        std::string unknown_code;
+        try {
+            (void)resolve_prompt_semantics(graft_request, defaults);
+        } catch (const ApiException& error) { unknown_code = error.error().code; }
+        failures += check(unknown_code == "unknown_graft",
+                          "a graft the server did not load was not rejected");
+        graft_request.graft.reset();
+        failures += check(resolve_prompt_semantics(graft_request, grafted).graft.empty(),
+                          "a request without a graft selected one with no default configured");
+        graft_request.graft = "";
+        failures += check(resolve_prompt_semantics(graft_request, grafted).graft.empty(),
+                          "an empty graft selected one");
+    }
+
+    {
+        const ServeOptions with_default =
+            parse({"ninfer-serve", "model.ninfer", "--default-graft", "b", "--graft",
+                   "product=p.bin", "--graft", "b=b.bin"});
+        failures += check(with_default.default_graft == "b",
+                          "--default-graft was not parsed independent of --graft order");
+
+        GenerationRequest request;
+        request.max_tokens = 1;
+        failures += check(resolve_prompt_semantics(request, with_default).graft == "b",
+                          "a request without a graft did not take the server default");
+        request.graft = std::string{};
+        failures += check(resolve_prompt_semantics(request, with_default).graft.empty(),
+                          "an empty graft did not opt out of the server default");
+        request.graft = "product";
+        failures += check(resolve_prompt_semantics(request, with_default).graft == "product",
+                          "an explicit graft did not override the server default");
+        request.graft = "missing";
+        std::string unknown_code;
+        try {
+            (void)resolve_prompt_semantics(request, with_default);
+        } catch (const ApiException& error) { unknown_code = error.error().code; }
+        failures += check(unknown_code == "unknown_graft",
+                          "an unknown explicit graft was accepted under a server default");
+
+        for (const std::vector<std::string>& invalid : {
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--default-graft", "b"},
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--graft", "a=a.bin",
+                                          "--default-graft", "b"},
+                 std::vector<std::string>{"ninfer-serve", "model.ninfer", "--graft", "a=a.bin",
+                                          "--default-graft", ""}}) {
+            bool rejected = false;
+            try {
+                (void)parse(invalid);
+            } catch (const std::invalid_argument&) { rejected = true; }
+            failures += check(rejected, "--default-graft naming no loaded graft was accepted");
+        }
     }
 
     return failures == 0 ? 0 : 1;

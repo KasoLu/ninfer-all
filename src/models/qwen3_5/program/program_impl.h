@@ -10,6 +10,7 @@
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen3_5/program/graft_injection.h"
 
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/storage/draft_context.h"
@@ -18,6 +19,8 @@
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
 #include "models/qwen3_5/program/prefix_identity.h"
+#include "models/qwen3_5/program/shared_slot_release.h"
+#include "models/qwen3_5/program/planning/output_budget.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -38,6 +41,9 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
+#include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -54,10 +60,7 @@ using RewriteCheckpointSpec = qwen3_5::RewriteCheckpointSpec;
 // cannot spare one.
 inline constexpr std::uint32_t kKVLeaseGrowthMarginTokens = 4096;
 
-[[nodiscard]] constexpr std::uint32_t kv_pages_for_tokens(std::uint32_t tokens) noexcept {
-    return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
-}
-
+// kv_pages_for_tokens lives in planning/output_budget.h, beside the entitlement formula.
 [[nodiscard]] constexpr std::uint32_t kv_tokens_for_pages(std::uint32_t pages) noexcept {
     return pages == 0 ? 0U : (pages - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize) + 1U;
 }
@@ -282,6 +285,7 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     std::uint32_t disk_restore_frontier   = 0;
     bool text_retained_tail_release       = false;
     bool backend_retained_tail_release    = false;
+    std::optional<std::uint32_t> graft_shared_slot_index;
 };
 
 struct CapturePressureCandidateImpl : ResourceCandidateState {};
@@ -311,6 +315,7 @@ struct HybridPendingTap {
     std::uint32_t frontier = 0;
     StateImageHandle image;
     std::uint32_t slot = 0; // staging device snapshot slot
+    bool boundary      = false;
 };
 
 // Per-lane hybrid bookkeeping for the active sequence.
@@ -333,6 +338,16 @@ struct HybridLaneState {
     std::uint32_t last_capture = 0;
     // Deepest snapshot frontier known on this path (reused or created by this sequence).
     std::uint32_t deepest_snapshot = 0;
+    // The snapshot this sequence resumed from (invalid: root). Once the sequence publishes a
+    // deeper snapshot, its lineage resumes from that one and this one is superseded.
+    runtime::prefix_cache::SnapshotRef resume_snapshot;
+    std::uint32_t resume_frontier = 0;
+    // The newest Tap (not Boundary) this sequence published. A deeper tap of the same prompt
+    // supersedes it: the lineage resumes from the deeper one, and it only serves a request
+    // diverging between them. The endpoint does not, since a next turn whose template re-renders
+    // the reply resumes from the prompt-end tap.
+    runtime::prefix_cache::SnapshotRef tap_snapshot;
+    std::uint32_t tap_frontier = 0;
     // The Host restore this sequence was admitted from (0 without one). Its first prefill pass
     // queues behind the restore's per-layer events; releasing the lane queues behind the whole
     // restore if it may still be landing.
@@ -478,12 +493,17 @@ struct SharedPrefixState {
     std::uint32_t active_references = 0;
 };
 
-enum class SharedPrefixSlotRole : std::uint8_t {
-    Free,
-    ReservedCapture,
-    ReservedReplacement,
-    Catalogued,
-};
+// A direct graft's pinned prefix is the only shared prefix without a capture identity: it is
+// restored from its own container rather than captured from a prompt, so there is no ledger to
+// compare the request against. Its content is selected by name, and the prompt's placeholder ids
+// stand for it.
+inline bool is_pinned_graft(const SharedPrefixState& state) noexcept {
+    return state.identity == nullptr;
+}
+
+constexpr bool is_live_shared_prefix_role(SharedPrefixSlotRole role) noexcept {
+    return role == SharedPrefixSlotRole::Catalogued || role == SharedPrefixSlotRole::Pinned;
+}
 
 struct SharedPrefixSlot {
     SharedPrefixSlotRole role = SharedPrefixSlotRole::Free;
@@ -562,6 +582,11 @@ struct RequestControl {
     }
 };
 
+// FNV-1a 64 over the token ids of a ledger prefix, as 16 lowercase hex characters. Session and
+// checkpoint digests both use it, so a checkpoint digest equals the session digest of the same
+// prefix.
+[[nodiscard]] std::string ledger_prefix_digest(std::span<const TokenId> tokens);
+
 class ProgramImpl {
 public:
     struct PressureRecoveryScratch {
@@ -596,7 +621,12 @@ public:
     ~ProgramImpl() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
-                                               const runtime::ResolvedExecutionOptions& options);
+                                               const runtime::ResolvedExecutionOptions& options,
+                                               std::optional<std::uint32_t> branch_anchor = {});
+    [[nodiscard]] std::uint32_t matched_prefix_tokens(const ContinuationHandle& owner,
+                                                      const PreparedPromptData& prompt) const;
+    [[nodiscard]] std::uint32_t matched_prefix_tokens(const SharedPrefixHandle& owner,
+                                                      const PreparedPromptData& prompt) const;
     [[nodiscard]] std::vector<float> causal_score(PreparedPromptData&& prompt,
                                                   std::uint32_t first_target);
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
@@ -683,12 +713,26 @@ public:
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
+
+    [[nodiscard]] qwen3_5::SessionSnapshot
+    save_continuation(const ContinuationHandle& continuation, std::string_view model_binding);
+    [[nodiscard]] ContinuationHandle restore_continuation(std::span<const std::uint8_t> snapshot,
+                                                          std::string_view model_binding);
+    [[nodiscard]] std::uint32_t
+    continuation_depth(const ContinuationHandle& continuation) const noexcept;
+    [[nodiscard]] std::string continuation_digest(const ContinuationHandle& continuation) const;
+    [[nodiscard]] std::vector<SlotCheckpoint>
+    continuation_checkpoints(const ContinuationHandle& continuation) const;
+    [[nodiscard]] qwen3_5::ContinuationSummary
+    continuation_summary(const ContinuationHandle& continuation) const;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     [[nodiscard]] std::optional<qwen3_5::PhysicalUsageSnapshot>
     fail_all_cleanup(ProgramCleanup cleanup) noexcept;
     [[nodiscard]] bool context_stores_idle() const noexcept;
     [[nodiscard]] bool rebuild_context_stores() noexcept;
     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;
+    [[nodiscard]] KVEntitlementShape kv_entitlement_shape() const noexcept;
+    [[nodiscard]] std::uint32_t concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept;
     [[nodiscard]] bool isolated_request_feasible(const RequestBasePlan& base) const noexcept;
 
     [[nodiscard]] bool hybrid_prefix_cache() const noexcept { return hybrid_ != nullptr; }
@@ -704,6 +748,12 @@ public:
                                    runtime::CancellationFlagView cancellation);
     [[nodiscard]] std::uint32_t hybrid_reclaim_device_kv(std::uint32_t main_pages,
                                                          std::uint32_t backend_pages);
+    // Prefetch for a waiting request (spec §6.6): blocks whose copy started, absent while a
+    // prefetch or an admission is still in flight.
+    [[nodiscard]] std::optional<std::uint32_t> hybrid_prefetch(const PreparedPromptData& prompt,
+                                                               const RequestBasePlan& base);
+    // Device pages a prefetch could fill now: free ones and host-backed cached ones.
+    [[nodiscard]] std::uint32_t hybrid_prefetch_room() const noexcept;
     [[nodiscard]] HybridPrefixCacheStats hybrid_stats() const noexcept;
     // Installs the Engine's calibrated machine model for hybrid admission and eviction.
     void set_hybrid_cost(const runtime::prefix_cache::CacheCostModel& cost);
@@ -713,7 +763,8 @@ public:
     }
 
     [[nodiscard]] HybridCachePersistence attach_hybrid_cache_file(const std::filesystem::path& path,
-                                                                  std::string fingerprint);
+                                                                  std::string fingerprint,
+                                                                  const StartupObserver& observer);
 
     [[nodiscard]] std::optional<HybridCachePersistence> hybrid_shutdown_save() const {
         return hybrid_shutdown_save_;
@@ -846,6 +897,12 @@ public:
     std::vector<ContinuationSlot> continuation_slots;
     std::vector<SharedPrefixState> shared_prefix_states;
     std::vector<SharedPrefixSlot> shared_prefix_slots;
+    struct GraftPrefixEntry {
+        std::uint32_t slot_index;
+        std::uint64_t generation;
+    };
+    std::unordered_map<std::string, GraftPrefixEntry> graft_prefix_slots;
+    std::unordered_map<std::string, std::uint32_t> graft_rm_catalog_slots;
     std::array<std::uint32_t, kMaximumConcurrency> active_continuations{};
     // Overlay Vision residency only: the one-window broker and the per-lane pinned result slots.
     // Declared before `requests`, whose Vision sessions borrow both.
@@ -879,6 +936,10 @@ public:
 
     std::size_t workspace_logical_peak_bytes = 0;
     std::size_t vision_handoff_peak_bytes    = 0;
+
+    friend class qwen3_5::Program;
+    // Injection builds the shared-prefix entry's backend KV through the private accessor.
+    friend void qwen3_5::inject_direct_graft(ProgramImpl&, const PromptGraft&);
 
 private:
     void advance_resource_revision() noexcept {
@@ -1218,7 +1279,9 @@ private:
     std::optional<HybridCachePersistence> hybrid_shutdown_save_;
 
     void create_hybrid_prefix_cache(const StartupObserver& observer);
-    // The per-layer events the lane's first prefill pass waits on, consumed by this call.
+    // The per-layer events the lane's first prefill pass waits on, consumed by this call; empty
+    // once the batch has landed. The view is valid only until the cache's next poll(), which every
+    // KV commit runs, so only PrefillContext::take_layer_ready calls it, inside the chunk function.
     [[nodiscard]] std::span<const cudaEvent_t> hybrid_take_restore_layers(std::uint32_t lane);
     // True when a sibling lane still prefilling a prompt that shares more with this one than the
     // cache offers will publish a snapshot where they diverge soon enough to wait for. Plans that
@@ -1238,16 +1301,15 @@ private:
     // Builds the lane from the staged, Device-resident source.
     [[nodiscard]] StartResult hybrid_activate(HybridMaterializationTransaction& transaction);
     void hybrid_abort_materialization(HybridMaterializationTransaction& transaction) noexcept;
-    void hybrid_prompt_keys(const PreparedPromptData& prompt, std::vector<std::uint64_t>& hashes,
-                            std::vector<std::uint64_t>& extras) const;
     [[nodiscard]] bool hybrid_make_room(std::uint32_t text_pages, std::uint32_t backend_pages);
     // The backend KV frontier restored with a snapshot at `frontier` (MTP trails by one token).
     [[nodiscard]] std::uint32_t hybrid_backend_frontier(std::uint32_t frontier) const noexcept;
     // Inserts every newly committed full block of the lane's sequence into the tree, then
     // publishes the pending taps those blocks complete.
     void hybrid_publish_blocks(SequenceState& sequence);
-    // Snapshots the lane's committed state at the prefill frontier `frontier`.
-    void hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier);
+    // Snapshots the lane's committed state at the prefill frontier `frontier`; a boundary tap is
+    // published as SnapshotKind::Boundary.
+    void hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier, bool boundary);
     // Realizes the planned taps a completed prefill chunk reached.
     void hybrid_after_prefill_chunk(SequenceState& sequence, std::uint32_t cursor,
                                     std::uint32_t prompt_tokens);
@@ -1257,17 +1319,23 @@ private:
     // Copies a tail bundle into cache-owned pages; absent when no Device page can be freed.
     [[nodiscard]] std::optional<std::uint32_t> hybrid_copy_tail(const HybridBlockPages& source,
                                                                 std::uint32_t columns);
-    // Terminal publication: committed blocks and, when useful, an endpoint snapshot. Then the
-    // lane's sequence is released. Returns false when the lane could not be released strictly.
+    // Terminal publication: committed blocks and, when useful, an endpoint snapshot; the snapshot
+    // the lane resumed from is superseded once a deeper one exists. Then the lane's sequence is
+    // released. Returns false when the lane could not be released strictly.
     [[nodiscard]] bool hybrid_finish_lane(SequenceState& sequence, RequestControl& request,
                                           std::uint32_t lane, bool endpoint) noexcept;
     // Drops the lane's index pins. Safe on any lane state.
     void hybrid_release_lane(std::uint32_t lane) noexcept;
+    // Supersedes the snapshot the sequence resumed from once it snapshots past it at
+    // `frontier`, before the new snapshot takes a slot or slabs (spec §9.2, §9.3).
+    void hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier);
+    void hybrid_supersede_tap(HybridLaneState& lane, std::uint32_t frontier);
 
     [[nodiscard]] std::optional<AdmissionCandidate>
     inspect_lane(std::uint32_t lane, const PreparedPromptData& prompt, const RequestBasePlan& base,
                  const SequenceState* source, const SharedPrefixState* shared_source,
-                 std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source);
+                 std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
+                 bool is_graft = false);
     [[nodiscard]] StartResult start_request(MaterializationTransaction& transaction);
     void prepare_materialization(MaterializationTransaction& transaction);
     void enqueue_materialization_transfers(MaterializationTransaction& transaction);
@@ -1562,9 +1630,6 @@ private:
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
                     runtime::ExecutionTiming* failed_timing);
-    // Row-0 DFlash frame controls (lane, state slots, backend KV row) read by a prefill's
-    // feature sink. The frame is shared with decode rounds, so every prefill step re-uploads them.
-    void upload_dflash_prefill_controls(const SequenceState& sequence);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
@@ -1573,6 +1638,8 @@ private:
     [[nodiscard]] std::vector<NgramProposer::Match>
     propose_ngram(std::span<const std::uint32_t> lanes,
                   std::span<const runtime::RoundBudget> budgets);
+    // Moves the prepared prompt's ngram index and archive snapshot into an admitted request.
+    static void take_ngram_index(RequestControl& request, PreparedPromptData& prompt);
     [[nodiscard]] NgramProposer::Match propose_ngram_one(std::uint32_t lane,
                                                          const runtime::RoundBudget& budget);
     static void record_ngram_round(RequestControl& request, const NgramProposer::Match& match,

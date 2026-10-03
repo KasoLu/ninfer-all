@@ -5,6 +5,9 @@
 #if defined(__linux__)
 #    include <netinet/tcp.h>
 #    include <sys/socket.h>
+#elif defined(_WIN32)
+#    include <winsock2.h>
+#    include <ws2tcpip.h>
 #endif
 
 #include <algorithm>
@@ -19,7 +22,7 @@ bool has_ngram_generation(const NgramArchiveStats& stats) noexcept {
     return stats.enabled && stats.bound && stats.published && stats.generation != 0;
 }
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(_WIN32)
 constexpr int kKeepAliveIdleSeconds                = 10;
 constexpr int kKeepAliveIntervalSeconds            = 3;
 constexpr int kKeepAliveProbeCount                 = 3;
@@ -27,7 +30,8 @@ constexpr unsigned int kTcpUserTimeoutMilliseconds = 15000;
 
 template <class T>
 void set_socket_option(socket_t socket, int level, int option, const T& value) noexcept {
-    (void)::setsockopt(socket, level, option, &value, sizeof(value));
+    (void)::setsockopt(socket, level, option, reinterpret_cast<const char*>(&value),
+                       static_cast<int>(sizeof(value)));
 }
 #endif
 
@@ -194,11 +198,28 @@ void configure_http_server_socket(socket_t socket) noexcept {
     httplib::default_socket_options(socket);
 #if defined(__linux__)
     const int enabled = 1;
+    // httplib sets only SO_REUSEPORT. Linux binds over a port's TIME_WAIT connections only when
+    // the old and new sockets both set SO_REUSEADDR, or both set SO_REUSEPORT under one uid.
+    // Without this, a server that sets only SO_REUSEADDR (llama.cpp, uvicorn) cannot take the
+    // port for about a minute after NInfer stops, and NInfer cannot after such a server stops.
+    set_socket_option(socket, SOL_SOCKET, SO_REUSEADDR, enabled);
     set_socket_option(socket, SOL_SOCKET, SO_KEEPALIVE, enabled);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, kKeepAliveIdleSeconds);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPINTVL, kKeepAliveIntervalSeconds);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPCNT, kKeepAliveProbeCount);
     set_socket_option(socket, IPPROTO_TCP, TCP_USER_TIMEOUT, kTcpUserTimeoutMilliseconds);
+#elif defined(_WIN32)
+    // The same liveness on Windows: keepalive probes find a silently dead peer, and TCP_MAXRTMS
+    // (Windows' TCP_USER_TIMEOUT) bounds how long unacknowledged stream writes are retried, so
+    // the SSE liveness gate sees a failed write instead of the retransmission window.
+    const DWORD enabled = 1;
+    set_socket_option(socket, SOL_SOCKET, SO_KEEPALIVE, enabled);
+    set_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, static_cast<DWORD>(kKeepAliveIdleSeconds));
+    set_socket_option(socket, IPPROTO_TCP, TCP_KEEPINTVL,
+                      static_cast<DWORD>(kKeepAliveIntervalSeconds));
+    set_socket_option(socket, IPPROTO_TCP, TCP_KEEPCNT, static_cast<DWORD>(kKeepAliveProbeCount));
+    set_socket_option(socket, IPPROTO_TCP, TCP_MAXRTMS,
+                      static_cast<DWORD>(kTcpUserTimeoutMilliseconds));
 #endif
 }
 

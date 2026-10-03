@@ -41,7 +41,12 @@ namespace ninfer::ops {
  * compared directly with that result; output storage rounding belongs to the Op's numerical
  * criterion, not the oracle. Recurrent implementations may apply the normalization directly;
  * chunked implementations may use private normalized staging. The corresponding private storage
- * is included by gated_delta_net_workspace_capacity_bytes when `normalize_qk` is true.
+ * is included by gated_delta_net_workspace_capacity_bytes when `normalize_qk` is true. The
+ * chunked (WY) prefill evaluates a call's leading floor(T/64)*64 tokens in chunks and the
+ * remainder with the recurrent route, and a recurrent token's arithmetic never depends on whether
+ * chunked tokens precede it in the same call. When every call takes that prefill, splitting a
+ * sequence into calls whose lengths are multiples of 64 (followed by any final call) therefore
+ * reproduces the single call bit-exactly.
  * Inputs and out do not overlap state or one another. `ws` supplies transient storage reported by
  * gated_delta_net_workspace_capacity_bytes; scratch is scoped to the call. T may be any positive
  * value.
@@ -54,8 +59,8 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
 
 /**
  * Distinct-state form of the same recurrence. `ssm_state_out` receives the final state;
- * `ssm_state_in` and `ssm_state_out` may be disjoint or exactly the same storage. No other
- * arguments may overlap either state.
+ * `ssm_state_in` and `ssm_state_out` may be disjoint or exactly the same storage and must share
+ * one dtype. No other arguments may overlap either state.
  */
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,

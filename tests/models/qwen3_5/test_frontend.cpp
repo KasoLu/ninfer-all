@@ -74,6 +74,11 @@ constexpr std::string_view kThinkingControl =
 constexpr std::string_view kUtf8Replacement = "\xef\xbf\xbd";
 
 constexpr ninfer::TokenId kFixtureByteTokenBase = 1'000;
+// Ordinary vocabulary tokens (not added tokens, so the output grammar can license them) whose text
+// a caller stop string "STOP" can cut. Decode-only: the fixture has no merges to produce them.
+constexpr ninfer::TokenId kStopCutToken  = 2'000; // "}STOPjunk"
+constexpr ninfer::TokenId kStopTailToken = 2'001; // "OPend"
+constexpr ninfer::TokenId kThinkCloseStopToken = 2'002; // "</think>STOP"
 
 constexpr ninfer::TokenId fixture_byte_token(std::uint8_t byte) {
     // Preserve IDs already used by the output-session fixtures. All other bytes live outside the
@@ -219,7 +224,8 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
     FrontendResources result;
     result.chat_template_jinja  = chat_template;
     const nlohmann::json tokens = nlohmann::json::array(
-        {added(1, "helloST"), added(2, "OPtail"), added(3, "thought</thi"),
+        {added(1, "helloST"), added(2, "OPtail"), added(5, "}STOPgarbage"),
+         added(3, "thought</thi"),
          added(4, "nk>\n\nanswer"), added(6, "<eos>", true), added(7, "<0.0 seconds>"),
          added(8, std::string(kThinkingControlGuidance)), added(30, "user\n"),
          added(31, "assistant\n"), added(32, "\n"), added(248045, "<|im_start|>", true),
@@ -232,6 +238,9 @@ FrontendResources resources(const std::string& chat_template = thinking_toggle_t
         const auto byte                = static_cast<std::uint8_t>(value);
         vocab[byte_level_symbol(byte)] = fixture_byte_token(byte);
     }
+    vocab["}STOPjunk"]  = kStopCutToken;
+    vocab["OPend"]      = kStopTailToken;
+    vocab["</think>STOP"] = kThinkCloseStopToken;
     result.tokenizer_json = nlohmann::json{
         {"model",
          {{"type", "BPE"}, {"vocab", std::move(vocab)}, {"merges", nlohmann::json::array()}}},
@@ -1064,6 +1073,77 @@ int test_literal_cache_boundary() {
     return failures;
 }
 
+int test_reasoning_effort_substitution() {
+    using ninfer::ReasoningEffort;
+    const std::vector<fi::ChatMessage> question{chat_message(ninfer::ChatRole::User, "question")};
+    const auto rendered_effort = [&](const fi::CompiledChatTemplate& compiled,
+                                     ReasoningEffort effort) {
+        return compiled.render(question, {.reasoning_effort = effort}).text;
+    };
+
+    // The official Qwen3.8 template accepts only low, medium and xhigh; the standard values it
+    // rejects render as the nearest one, a tie rounding up.
+    const auto qwen38    = fi::CompiledChatTemplate::resolve(reasoning_effort_template_source());
+    const auto effort_is = [](const std::string& text, std::string_view tier) {
+        return text.find("Reasoning effort is set to " + std::string(tier) + ".") !=
+               std::string::npos;
+    };
+    int failures = check(effort_is(rendered_effort(qwen38, ReasoningEffort::High), "xhigh") &&
+                             effort_is(rendered_effort(qwen38, ReasoningEffort::Max), "xhigh") &&
+                             effort_is(rendered_effort(qwen38, ReasoningEffort::XHigh), "xhigh"),
+                         "Qwen3.8 did not render high and max as its xhigh effort");
+    failures += check(effort_is(rendered_effort(qwen38, ReasoningEffort::Minimal), "low") &&
+                          effort_is(rendered_effort(qwen38, ReasoningEffort::Low), "low"),
+                      "Qwen3.8 did not render minimal as its low effort");
+    const std::string medium = rendered_effort(qwen38, ReasoningEffort::Medium);
+    failures += check(!effort_is(medium, "xhigh") && !effort_is(medium, "low"),
+                      "Qwen3.8 changed an effort it accepts");
+
+    // The nearest accepted effort wins in either direction; the substitute is what renders.
+    const auto sparse = fi::CompiledChatTemplate::resolve(
+        "{%- if reasoning_effort is defined and reasoning_effort not in ('medium', 'max') %}"
+        "{{- raise_exception('unsupported effort') }}{%- endif %}"
+        "<|im_start|>user\n{{ messages[0].content }}<|im_end|>\n<|im_start|>assistant\n"
+        "[{{ reasoning_effort | default('unset') }}]");
+    failures += check(
+        rendered_effort(sparse, ReasoningEffort::High).ends_with("[medium]") &&
+            rendered_effort(sparse, ReasoningEffort::XHigh).ends_with("[max]") &&
+            rendered_effort(sparse, ReasoningEffort::Minimal).ends_with("[medium]") &&
+            sparse.render(question).text.ends_with("[unset]"),
+        "a rejected effort did not render as the nearest accepted one");
+
+    // A template that cannot render the probe (a lone user message) reveals nothing about its
+    // efforts, so none is substituted: an effort it rejects keeps the request's value and raises,
+    // where a probed template would have rendered the nearest accepted one.
+    const auto unprobed = fi::CompiledChatTemplate::resolve(
+        "{%- if messages[0].role != 'system' %}{{- raise_exception('needs a system message') }}"
+        "{%- endif %}"
+        "{%- if reasoning_effort is defined and reasoning_effort not in ('medium', 'max') %}"
+        "{{- raise_exception('unsupported effort') }}{%- endif %}"
+        "<|im_start|>system\n{{ messages[0].content }}<|im_end|>\n"
+        "<|im_start|>user\n{{ messages[1].content }}<|im_end|>\n<|im_start|>assistant\n"
+        "[{{ reasoning_effort | default('unset') }}]");
+    const std::vector<fi::ChatMessage> instructed{
+        chat_message(ninfer::ChatRole::System, "instructions"),
+        chat_message(ninfer::ChatRole::User, "question")};
+    failures += check(
+        unprobed.render(instructed, {.reasoning_effort = ReasoningEffort::Medium})
+                .text.ends_with("[medium]") &&
+            throws_invalid_argument([&] {
+                (void)unprobed.render(instructed, {.reasoning_effort = ReasoningEffort::High});
+            }),
+        "a template that fails the probe had an effort substituted");
+
+    // A template that rejects every effort keeps the request's value and raises as before.
+    const auto none = fi::CompiledChatTemplate::resolve(
+        "{%- if reasoning_effort is defined %}{{- raise_exception('no effort') }}{%- endif %}"
+        "<|im_start|>user\n{{ messages[0].content }}<|im_end|>\n<|im_start|>assistant\n");
+    failures += check(
+        throws_invalid_argument([&] { (void)rendered_effort(none, ReasoningEffort::High); }),
+        "an effort was invented for a template that accepts none");
+    return failures;
+}
+
 int test_official_resource_guards() {
     FrontendResources stale_pad     = resources();
     nlohmann::json tokenizer_config = nlohmann::json::parse(stale_pad.tokenizer_config_json);
@@ -1181,6 +1261,190 @@ int test_media_token_ids_come_from_tokenizer() {
                      std::count(data.token_ids.begin(), data.token_ids.end(), 1600) > 0 &&
                      std::count(data.token_ids.begin(), data.token_ids.end(), 248056) == 0,
                  "Vision preparation ignored the loaded image token ID");
+}
+
+// A graft is a hidden token prefix: the grafted prompt must be exactly the graft followed by the
+// ungrafted prompt, with every later position, frontier and Vision span moved by the graft length.
+int test_prompt_graft() {
+    const ninfer::models::qwen3_5::PromptGraft graft{
+        .name   = "product",
+        .tokens = {248045, fixture_byte_token('s'), fixture_byte_token('y'), 248046, 32}};
+    const std::size_t n = graft.tokens.size();
+    ninfer::models::qwen3_5::FrontendOptions options;
+    options.vision_enabled = true;
+    options.max_context    = std::numeric_limits<std::uint32_t>::max();
+    options.grafts         = {graft};
+    const Frontend frontend = make_frontend(resources(), options);
+
+    const auto text_input = [](std::string graft_name) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        input.options.graft = std::move(graft_name);
+        return input;
+    };
+    const auto plain_prompt   = frontend.prepare(text_input(""));
+    const auto grafted_prompt = frontend.prepare(text_input("product"));
+    const auto& plain         = FrontendFactory::inspect(plain_prompt);
+    const auto& grafted       = FrontendFactory::inspect(grafted_prompt);
+
+    std::vector<ninfer::TokenId> expected = graft.tokens;
+    expected.insert(expected.end(), plain.token_ids.begin(), plain.token_ids.end());
+    int failures = check(grafted.token_ids == expected,
+                         "grafted prompt is not the graft followed by the plain prompt");
+    bool positions = true;
+    for (int axis = 0; axis < 3; ++axis) {
+        const auto shifted = grafted.position_axis(axis);
+        const auto base    = plain.position_axis(axis);
+        for (std::size_t i = 0; i < n; ++i) { positions &= shifted[i] == static_cast<int>(i); }
+        for (std::size_t i = 0; i < base.size(); ++i) {
+            positions &= shifted[n + i] == base[i] + static_cast<int>(n);
+        }
+    }
+    failures += check(positions && grafted.rope_delta == plain.rope_delta,
+                      "graft positions are not contiguous with the prompt");
+    failures += check(grafted.identity.rewrite_checkpoint && plain.identity.rewrite_checkpoint &&
+                          grafted.identity.rewrite_checkpoint->frontier ==
+                              plain.identity.rewrite_checkpoint->frontier + n,
+                      "rewrite checkpoint did not move past the graft");
+    const auto& opportunities = grafted.context_cache.opportunities;
+    failures += check(std::any_of(opportunities.begin(), opportunities.end(),
+                                  [&](const auto& opportunity) {
+                                      return opportunity.frontier == n &&
+                                             opportunity.kind ==
+                                                 ninfer::PromptCacheMarkerKind::SharedStablePrefix;
+                                  }),
+                      "the end of the graft is not offered as a shared prefix");
+    failures += check(frontend.count_tokens(text_input("product")) ==
+                          frontend.count_tokens(text_input("")) + n,
+                      "token counting ignored the graft");
+    bool unknown = false;
+    try {
+        (void)frontend.prepare(text_input("missing"));
+    } catch (const std::invalid_argument&) { unknown = true; }
+    failures += check(unknown, "an unknown graft name was accepted");
+
+    // Vision spans and their M-RoPE positions move by the graft length too.
+    auto image_plain   = image_input();
+    auto image_grafted = image_input();
+    image_grafted.options.graft = "product";
+    const auto plain_image      = frontend.prepare(std::move(image_plain));
+    const auto grafted_image    = frontend.prepare(std::move(image_grafted));
+    const auto& plain_media     = FrontendFactory::inspect(plain_image);
+    const auto& grafted_media   = FrontendFactory::inspect(grafted_image);
+    bool media = grafted_media.vision_items.size() == plain_media.vision_items.size() &&
+                 grafted_media.rope_delta == plain_media.rope_delta &&
+                 grafted_media.token_types.size() == plain_media.token_types.size() + n;
+    for (std::size_t item = 0; media && item < plain_media.vision_items.size(); ++item) {
+        const auto& before = plain_media.vision_items[item].token_spans;
+        const auto& after  = grafted_media.vision_items[item].token_spans;
+        media &= before.size() == after.size();
+        for (std::size_t span = 0; media && span < before.size(); ++span) {
+            media &= after[span].begin == before[span].begin + n &&
+                     after[span].count == before[span].count;
+        }
+    }
+    for (int axis = 0; media && axis < 3; ++axis) {
+        const auto shifted = grafted_media.position_axis(axis);
+        const auto base    = plain_media.position_axis(axis);
+        for (std::size_t i = 0; i < base.size(); ++i) {
+            media &= shifted[n + i] == base[i] + static_cast<int>(n);
+        }
+    }
+    failures += check(media, "graft did not shift Vision spans and positions");
+
+    // The graft consumes context: a prompt that fits exactly without it no longer fits.
+    ninfer::models::qwen3_5::FrontendOptions tight = options;
+    tight.max_context =
+        static_cast<std::uint32_t>(FrontendFactory::inspect(frontend.prepare(text_input("")))
+                                       .token_ids.size());
+    const Frontend tight_frontend = make_frontend(resources(), tight);
+    failures += check(tight_frontend.prepare(text_input("")).summary().prompt_tokens ==
+                          tight.max_context,
+                      "tight frontend rejected the ungrafted prompt");
+    failures += check(throws_context_length([&] { (void)tight_frontend.prepare(text_input("product")); }),
+                      "grafted prompt beyond max_context was accepted");
+    return failures;
+}
+
+// A direct graft is restored whole from a pinned slot, and the request's own frontiers must move
+// past it while everything else about caching stays as for any other prompt: the graft is a root,
+// not a reason to skip the cache. Its positions are told apart by token identity, so two grafts and
+// a plain prompt can never share a prefix.
+int test_direct_graft_context_cache() {
+    using ninfer::models::qwen3_5::GraftKind;
+    const auto make_graft = [](std::string name, std::vector<ninfer::TokenId> ids) {
+        ninfer::models::qwen3_5::PromptGraft graft;
+        graft.name            = std::move(name);
+        graft.kind            = GraftKind::DirectKV;
+        graft.n_slots         = static_cast<std::uint32_t>(ids.size());
+        graft.placeholder_ids = std::move(ids);
+        return graft;
+    };
+    const auto first  = make_graft("first", {101, 102, 103, 104, 105, 106});
+    const auto second = make_graft("second", {201, 202, 203, 204, 205, 206});
+    const std::size_t n = first.n_slots;
+    ninfer::models::qwen3_5::FrontendOptions options;
+    options.max_context = std::numeric_limits<std::uint32_t>::max();
+    options.grafts      = {first, second};
+    const Frontend frontend = make_frontend(resources(), options);
+
+    const auto input = [](std::string graft_name) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        input.options.graft = std::move(graft_name);
+        return input;
+    };
+    const auto plain_prompt  = frontend.prepare(input(""));
+    const auto first_prompt  = frontend.prepare(input("first"));
+    const auto second_prompt = frontend.prepare(input("second"));
+    const auto& plain        = FrontendFactory::inspect(plain_prompt);
+    const auto& grafted      = FrontendFactory::inspect(first_prompt);
+    const auto& other        = FrontendFactory::inspect(second_prompt);
+
+    int failures = check(grafted.graft_name == "first" && grafted.graft_frontier == n,
+                         "direct graft prompt does not name its pinned slot");
+    failures += check(grafted.identity.reusable,
+                      "a direct graft request is excluded from the context cache");
+    failures += check(grafted.token_ids.size() == plain.token_ids.size() + n &&
+                          std::equal(first.placeholder_ids.begin(), first.placeholder_ids.end(),
+                                     grafted.token_ids.begin()) &&
+                          std::equal(plain.token_ids.begin(), plain.token_ids.end(),
+                                     grafted.token_ids.begin() + n),
+                      "direct graft prompt is not its placeholder ids followed by the plain prompt");
+    failures += check(!std::equal(grafted.token_ids.begin(), grafted.token_ids.begin() + n,
+                                  other.token_ids.begin()),
+                      "two direct grafts share placeholder ids");
+    failures += check(grafted.identity.rewrite_checkpoint && plain.identity.rewrite_checkpoint &&
+                          grafted.identity.rewrite_checkpoint->frontier ==
+                              plain.identity.rewrite_checkpoint->frontier + n,
+                      "rewrite checkpoint did not move past the direct graft");
+    failures += check(grafted.identity.rewrite_execution_frontiers.size() ==
+                              plain.identity.rewrite_execution_frontiers.size() &&
+                          std::equal(plain.identity.rewrite_execution_frontiers.begin(),
+                                     plain.identity.rewrite_execution_frontiers.end(),
+                                     grafted.identity.rewrite_execution_frontiers.begin(),
+                                     [n](std::uint32_t before, std::uint32_t after) {
+                                         return after == before + n;
+                                     }),
+                      "rewrite execution frontiers did not move past the direct graft");
+    const auto& opportunities = grafted.context_cache.opportunities;
+    failures += check(std::none_of(opportunities.begin(), opportunities.end(),
+                                   [&](const auto& opportunity) { return opportunity.frontier <= n; }),
+                      "a direct graft offered a capture inside its own restored positions");
+    failures += check(grafted.context_cache.retention == plain.context_cache.retention &&
+                          opportunities.size() == plain.context_cache.opportunities.size(),
+                      "a direct graft changed the request's cache opportunities");
+    failures += check(frontend.count_tokens(input("first")) == frontend.count_tokens(input("")) + n,
+                      "token counting ignored the direct graft");
+    return failures;
 }
 
 int test_text_and_image_prepare(const Frontend& frontend) {
@@ -1860,6 +2124,16 @@ int test_structured_tool_output() {
     return failures;
 }
 
+// Structured output: the constraint's masks follow the committed output and each speculative
+// prefix, reasoning stays unconstrained until it closes, and the session refuses a token the
+// grammar forbids. The fixture tokenizer has one token per byte, so the oracle is the JSON syntax
+// itself.
+// A caller stop string can land inside the same token that completes the licensed JSON value, so
+// the byte-level cut it applies (mid-token) must be what the grammar is asked to license, not the
+// token's full decoded text (which also carries the stop marker and whatever the model emitted
+// past it -- neither of those is ever published).
+// Mask construction must judge a token a caller stop string cuts by the prefix that is published,
+// exactly as preview does once the token is sampled -- not by its full decoded text.
 int test_reasoning_split(const Frontend& frontend) {
     ninfer::ChatMessage message;
     message.role = ninfer::ChatRole::User;
@@ -2093,13 +2367,6 @@ int test_thinking_budget_control(const Frontend& frontend) {
     failures += check(pending.size() > 1,
                       "thinking boundary did not expose a multi-token canonical control span");
     const std::vector<ninfer::TokenId> control(pending.begin(), pending.end());
-    failures += check(
-        throws_invalid_argument([&] {
-            session.validate_generation_capacity(static_cast<std::uint32_t>(2 + control.size()));
-        }),
-        "planning accepted a capacity that cannot fit control plus a post-close model token");
-    session.validate_generation_capacity(static_cast<std::uint32_t>(3 + control.size()));
-
     const auto control_decision = session.preview_control(control, 18);
     failures +=
         check(control_decision.accepted_tokens == control.size() && !control_decision.finished() &&
@@ -2111,7 +2378,8 @@ int test_thinking_budget_control(const Frontend& frontend) {
                           channel_text(control_output, ninfer::OutputChannel::Content).empty(),
                       "thinking control was truncated by caller stops or published to content");
     const ninfer::ThinkingBudgetStats stats = session.thinking_stats();
-    failures += check(stats.configured_budget == 2 && stats.model_thinking_tokens == 2 &&
+    failures += check(stats.requested_budget == 2 && stats.effective_budget == 2 &&
+                          stats.model_thinking_tokens == 2 &&
                           stats.injected_tokens == control.size() && stats.applied &&
                           session.pending_control_tokens().empty() &&
                           session.model_token_budget_remaining(17) == 17,
@@ -2239,6 +2507,167 @@ int test_thinking_budget_message() {
     failures += check(
         throws_invalid_argument([&] { (void)make_frontend(resources(), terminal_options); }),
         "thinking budget message containing a terminal token was accepted");
+    return failures;
+}
+
+int test_thinking_budget_branches(const Frontend& frontend) {
+    auto prompt = thinking_prompt(frontend);
+    auto sample_session =
+        frontend.make_output_session(prompt, {}, {}, ninfer::ThinkingControlOptions{.budget = 2});
+    const std::array<ninfer::TokenId, 2> model_tokens{0, 0};
+    (void)sample_session.preview_model(model_tokens, 20, ninfer::FinishReason::OutputLimit);
+    (void)sample_session.commit_preview();
+    const std::span<const ninfer::TokenId> pending = sample_session.pending_control_tokens();
+    const std::uint32_t required = static_cast<std::uint32_t>(pending.size() + 1);
+
+    int failures = 0;
+    failures += check(required >= 3, "test fixture assumes required control tokens >= 3");
+
+    // Branch 1 (C <= B or C - B >= R) is the unconstrained path: test_thinking_budget_control
+    // drives the cap, control insertion and post-close token for it.
+
+    // 2. Branch 2: C > R and C - B < R (effective budget C - R, available)
+    // Multi-round execution with nonzero remaining budget before hitting the cap
+    {
+        const std::uint32_t b_requested = 10;
+        const std::uint32_t b_effective = 4;
+        const std::uint32_t total_cap   = b_effective + required;
+        auto session = frontend.make_output_session(
+            prompt, {}, {},
+            ninfer::ThinkingControlOptions{.budget                = b_requested,
+                                           .effective_budget      = b_effective,
+                                           .early_close_available = true});
+
+        failures += check(session.thinking_stats().requested_budget == b_requested &&
+                              session.thinking_stats().effective_budget == b_effective,
+                          "Branch 2 stats did not record requested and effective budgets");
+
+        // Round 1: generate 2 tokens. Remaining thinking budget is 4 - 2 = 2 > 0.
+        failures += check(session.model_token_budget_remaining(total_cap) == b_effective,
+                          "initial model token budget license mismatch");
+        const std::array<ninfer::TokenId, 2> round1_tokens{0, 0};
+        const auto r1_decision =
+            session.preview_model(round1_tokens, total_cap, ninfer::FinishReason::OutputLimit);
+        failures += check(
+            r1_decision.accepted_tokens == 2 && !r1_decision.finished() &&
+                r1_decision.continuation == ninfer::runtime::ContinuationAction::Decode,
+            "Branch 2 Round 1 did not decode normally");
+        (void)session.commit_preview();
+
+        // Verify remaining budget is nonzero (2 tokens remaining)
+        const std::uint32_t rem_cap = total_cap - 2U;
+        failures += check(session.model_token_budget_remaining(rem_cap) == 2,
+                          "Branch 2 multi-round remaining thinking budget is not 2");
+
+        // Round 2: generate 2 tokens (reaching the effective cap 4). Triggers target control.
+        const std::array<ninfer::TokenId, 2> round2_tokens{0, 0};
+        const auto r2_decision =
+            session.preview_model(round2_tokens, rem_cap, ninfer::FinishReason::OutputLimit);
+        failures += check(
+            r2_decision.accepted_tokens == 2 && !r2_decision.finished() &&
+                r2_decision.continuation ==
+                    ninfer::runtime::ContinuationAction::ApplyTargetControl,
+            "Branch 2 Round 2 did not request target control at effective budget boundary");
+        (void)session.commit_preview();
+
+        // Control insertion with prefix execution split
+        const std::span<const ninfer::TokenId> ctrl_span = session.pending_control_tokens();
+        failures += check(ctrl_span.size() == required - 1U,
+                          "pending control tokens count does not match expected");
+        const std::vector<ninfer::TokenId> ctrl_vec(ctrl_span.begin(), ctrl_span.end());
+        const auto ctrl_decision = session.preview_control(ctrl_vec, rem_cap - 2U);
+        failures += check(!ctrl_decision.finished() &&
+                              ctrl_decision.prefix_execution_split_after == ctrl_vec.size(),
+                          "Branch 2 control preview did not report atomic prefix split");
+        (void)session.commit_preview();
+
+        failures += check(session.thinking_stats().applied &&
+                              session.thinking_stats().injected_tokens == ctrl_vec.size() &&
+                              session.thinking_stats().model_thinking_tokens == b_effective,
+                          "Branch 2 thinking stats not properly updated after control commit");
+
+        // Round 3: post-control model token
+        const auto post_decision = session.preview_model(
+            std::array<ninfer::TokenId, 1>{0}, 1, ninfer::FinishReason::OutputLimit);
+        failures += check(post_decision.accepted_tokens == 1 &&
+                              post_decision.finish_reason == ninfer::FinishReason::OutputLimit,
+                          "post-control model token was not accepted at output limit");
+        const auto post_output = session.commit_preview();
+        failures += check(!channel_text(post_output, ninfer::OutputChannel::Content).empty(),
+                          "post-control model output did not publish content");
+    }
+
+    // 3. Branch 3: C <= R and C > B (early close unavailable; the cap is not enforced)
+    // Model token budget must not cut reasoning off at B and session must not request target control
+    {
+        const std::uint32_t b_requested = 2;
+        const std::uint32_t total_cap   = required; // C <= R (and C > B)
+        auto session = frontend.make_output_session(
+            prompt, {}, {},
+            ninfer::ThinkingControlOptions{.budget                = b_requested,
+                                           .effective_budget      = b_requested,
+                                           .early_close_available = false});
+
+        // The cap is not enforced, so no effective budget is reported.
+        failures += check(session.thinking_stats().requested_budget == b_requested &&
+                              !session.thinking_stats().effective_budget.has_value(),
+                          "Branch 3 reported an effective budget for an unenforced cap");
+
+        // Verify model_token_budget_remaining does NOT cut reasoning off at B
+        failures += check(session.model_token_budget_remaining(total_cap) == total_cap,
+                          "Branch 3 model_token_budget_remaining prematurely cut reasoning off at B");
+
+        // Generate tokens past B (preview 3 tokens when B = 2)
+        const std::array<ninfer::TokenId, 3> tokens_past_b{0, 0, 0};
+        const auto past_b_decision =
+            session.preview_model(tokens_past_b, total_cap, ninfer::FinishReason::OutputLimit);
+        failures += check(
+            past_b_decision.accepted_tokens == 3 && !past_b_decision.finished() &&
+                past_b_decision.continuation == ninfer::runtime::ContinuationAction::Decode,
+            "Branch 3 unexpectedly triggered target control at or past B");
+        (void)session.commit_preview();
+
+        failures += check(!session.thinking_stats().applied &&
+                              session.pending_control_tokens().empty(),
+                          "Branch 3 unexpectedly armed or applied control");
+
+        // Remaining tokens up to total_cap
+        const std::uint32_t remaining = total_cap - 3U;
+        std::vector<ninfer::TokenId> tail_tokens(remaining, 0);
+        const auto tail_decision =
+            session.preview_model(tail_tokens, remaining, ninfer::FinishReason::OutputLimit);
+        failures += check(
+            tail_decision.accepted_tokens == remaining &&
+                tail_decision.finish_reason == ninfer::FinishReason::OutputLimit &&
+                tail_decision.continuation == ninfer::runtime::ContinuationAction::Decode,
+            "Branch 3 did not run thinking to output limit");
+        (void)session.commit_preview();
+
+        const auto stats = session.thinking_stats();
+        failures += check(stats.model_thinking_tokens == total_cap &&
+                              stats.injected_tokens == 0 && !stats.applied,
+                          "Branch 3 accounting mismatch after running to output limit");
+    }
+
+    // 4. Non-reasoning session: prompt does not start in reasoning
+    {
+        auto non_reasoning_prompt = frontend.prepare_tokens({0});
+        auto session = frontend.make_output_session(
+            non_reasoning_prompt, {}, {}, ninfer::ThinkingControlOptions{.budget = 10});
+        failures += check(session.thinking_stats().requested_budget == 10 &&
+                              session.thinking_stats().effective_budget == 10,
+                          "non-reasoning session stats mismatch");
+    }
+
+    // 5. No-budget session: session has no thinking budget cap
+    {
+        auto session = frontend.make_output_session(
+            prompt, {}, {}, ninfer::ThinkingControlOptions{});
+        failures += check(!session.thinking_stats().requested_budget.has_value() &&
+                              !session.thinking_stats().effective_budget.has_value(),
+                          "uncapped session reported a thinking budget");
+    }
+
     return failures;
 }
 
@@ -2814,11 +3243,14 @@ int main() {
     failures += test_rewrite_checkpoint_trace();
     failures += test_adjacent_tool_message_boundary();
     failures += test_literal_cache_boundary();
+    failures += test_reasoning_effort_substitution();
     failures += test_selected_template_recovery_boundary();
     failures += test_official_resource_guards();
     failures += test_template_file_execution();
     failures += test_invalid_public_part_enums(frontend);
     failures += test_text_and_image_prepare(frontend);
+    failures += test_prompt_graft();
+    failures += test_direct_graft_context_cache();
     failures += test_media_token_ids_come_from_tokenizer();
     failures += test_template_media_contract();
     failures += test_image_resize_rejection_policy();
@@ -2842,6 +3274,7 @@ int main() {
     failures += test_thinking_budget_ignores_quoted_close(frontend);
     failures += test_structured_thinking_control(frontend);
     failures += test_thinking_budget_message();
+    failures += test_thinking_budget_branches(frontend);
     failures += test_utf8_and_hidden_eos(frontend);
     failures += test_media_cache_reuses_immutable_payload();
     failures += test_media_payload_outlives_frontend_cache();

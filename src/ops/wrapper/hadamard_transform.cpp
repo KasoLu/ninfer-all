@@ -197,7 +197,7 @@ void gated_rmsnorm_hadamard(const Tensor& x, const Tensor& weight, const Tensor&
         return;
     }
     Tensor rows = out.view({x.ne[0], x.ne[1], x.ne[2], x.ne[3]});
-    gated_rmsnorm(x, weight, z, eps, rows, stream);
+    gated_rmsnorm(x, weight, z, GateActivation::Silu, eps, rows, stream);
     Tensor columns = columns_view(out, width);
     hadamard_transform(columns, signs, false, columns, stream);
 }

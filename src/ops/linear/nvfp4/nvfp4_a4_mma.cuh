@@ -6,6 +6,7 @@
 #include "ops/linear/nvfp4/nvfp4_schedule.cuh"
 #include "ops/linear/nvfp4/nvfp4_operands.h"
 #include "ops/linear/nvfp4/nvfp4_shared.cuh"
+#include "core/pdl.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/common/vector_output.cuh"
 
@@ -166,6 +167,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
     const std::uint8_t* __restrict__ weight_codes, const std::uint8_t* __restrict__ weight_scales,
     int rows, int input_rows, float alpha, OutputPolicy output, Epilogue epilogue,
     RowPolicy row_policy, int token_offset, int count) {
+    // Streams its weights through the K loop: wait for the producer (the activation quantizer),
+    // and let dependents launch only once that loop is done.
+    pdl::enter_streaming();
     constexpr bool PairRows = RowPolicy::kPaired;
     const int k             = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     const int tokens        = token_offset + count;
@@ -283,6 +287,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
         }
         cp_commit();
     }
+    pdl::trigger_dependents();
 
     constexpr bool collective = requires {
         epilogue.template finish_tile<Schedule, FullTokens>(output, shared_raw, accumulators,
@@ -312,15 +317,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_m
                 const int local = warp_n * Schedule::kWarpRows + mr * 8 + ac;
                 const int r0    = row_policy.weight_row(row_begin, local, rows);
                 const int r1    = row_policy.weight_row(row_begin, local + 1, rows);
-                float a = accumulators[mt][mr][0] * alpha, b = accumulators[mt][mr][1] * alpha;
-                float c = accumulators[mt][mr][2] * alpha, d = accumulators[mt][mr][3] * alpha;
+                float a = 0.0F, b = 0.0F, c = 0.0F, d = 0.0F;
                 if (FullTokens || t0 < tokens) {
-                    a = epilogue.apply(r0, t0, a);
-                    b = epilogue.apply(r1, t0, b);
+                    a = epilogue.apply_scaled(r0, t0, accumulators[mt][mr][0], alpha);
+                    b = epilogue.apply_scaled(r1, t0, accumulators[mt][mr][1], alpha);
                 }
                 if (FullTokens || t1 < tokens) {
-                    c = epilogue.apply(r0, t1, c);
-                    d = epilogue.apply(r1, t1, d);
+                    c = epilogue.apply_scaled(r0, t1, accumulators[mt][mr][2], alpha);
+                    d = epilogue.apply_scaled(r1, t1, accumulators[mt][mr][3], alpha);
                 }
                 *reinterpret_cast<__nv_bfloat162*>(tile + (t0 - token_begin) * stride + local) =
                     __floats2bfloat162_rn(a, b);

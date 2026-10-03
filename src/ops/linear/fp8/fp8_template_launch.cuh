@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include <stdexcept>
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
@@ -9,6 +10,7 @@
 #include "ops/linear/fp8/fp8_a16_mma.cuh"
 #include "ops/linear/fp8/fp8_a16_sliced_k_mma.cuh"
 #include "ops/linear/fp8/fp8_a8_mma_unified.cuh"
+#include "ops/linear/fp8/fp8_a8_tma_mma.cuh"
 
 namespace ninfer::ops::detail::unified {
 template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows>
@@ -24,7 +26,8 @@ void launch_fp8_a16_gemv(const Fp8A16Operands& p, Output output, Epilogue epilog
 
 template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows>
 void launch_fp8_a16_simt(const Fp8A16Operands& p, Output output, Epilogue epilogue,
-                         cudaStream_t stream, Rows rows = {}) {
+                         cudaStream_t stream, Rows rows = {},
+                         pdl::Dependency dependency = pdl::Dependency::Serialized) {
     validate_fp8_operands<Schedule>(p);
     if (p.rows % Schedule::kBlockRows || p.k % (32 * Schedule::kValuesPerLane) ||
         (Schedule::kTokenCapacity && p.tokens > Schedule::kTokenCapacity) ||
@@ -37,9 +40,9 @@ void launch_fp8_a16_simt(const Fp8A16Operands& p, Output output, Epilogue epilog
     }
     const int capacity = Schedule::kTokenCapacity ? Schedule::kTokenCapacity : p.tokens;
     const int blocks   = p.rows / Schedule::kBlockRows * div_up(capacity, Schedule::kBlockTokens);
-    fp8_a16_simt_kernel<Schedule>
-        <<<blocks, Schedule::kThreads, 0, stream>>>(p, output, epilogue, rows);
-    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_with(dependency, {dim3(blocks), dim3(Schedule::kThreads), 0, stream},
+                                fp8_a16_simt_kernel<Schedule, Output, Epilogue, Rows>, p, output,
+                                epilogue, rows));
 }
 
 template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows>
@@ -67,7 +70,8 @@ void launch_fp8_a16_mma(const Fp8A16Operands& p, Output output, Epilogue epilogu
 
 template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows>
 void launch_fp8_a16_sliced_k_mma(const Fp8A16Operands& p, Output output, Epilogue epilogue,
-                                 cudaStream_t stream, Rows rows = {}) {
+                                 cudaStream_t stream, Rows rows = {},
+                                 pdl::Dependency dependency = pdl::Dependency::Serialized) {
     validate_fp8_operands<Schedule>(p);
     constexpr int capacity =
         Schedule::kTokenCapacity ? Schedule::kTokenCapacity : Schedule::kBlockTokens;
@@ -78,16 +82,19 @@ void launch_fp8_a16_sliced_k_mma(const Fp8A16Operands& p, Output output, Epilogu
             "FP8 sliced-K requires complete row/K tiles and matching tokens");
     constexpr auto kernel = fp8_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, Rows>;
     const int bytes       = fp8_prepare_shared<Schedule::kSharedBytes, kernel>();
-    for_each_token_slice(p.tokens, capacity, [&](int offset, int count) {
+    for_each_token_slice(p.tokens, capacity, [&, kernel](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, capacity));
-        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset);
-        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(pdl::launch_with(
+            dependency,
+            {grid, dim3(Schedule::kThreads), static_cast<std::size_t>(bytes), stream}, kernel, p,
+            output, epilogue, rows, offset));
     });
 }
 
 template <class Schedule, class Output, class Epilogue, class Rows = Fp8IdentityRows>
 void launch_fp8_a8_mma(const Fp8A8Operands& p, Output output, Epilogue epilogue,
-                       cudaStream_t stream, Rows rows = {}) {
+                       cudaStream_t stream, Rows rows = {},
+                       pdl::Dependency dependency = pdl::Dependency::Serialized) {
 #if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8)
     // The A8 MMA emits mma.sync...kind::f8f6f4, which sm_8x does not have; A8 is never admitted
     // there (see fp8_sm86_stubs.cpp).
@@ -96,6 +103,7 @@ void launch_fp8_a8_mma(const Fp8A8Operands& p, Output output, Epilogue epilogue,
     (void)epilogue;
     (void)stream;
     (void)rows;
+    (void)dependency;
     throw std::runtime_error("FP8 A8 execution requires an sm_100a or sm_120a GPU");
 #else
     validate_fp8_operands<Schedule>(p);
@@ -108,9 +116,10 @@ void launch_fp8_a8_mma(const Fp8A8Operands& p, Output output, Epilogue epilogue,
             constexpr auto kernel = fp8_a8_mma_kernel<Schedule, Full, Epilogue, Output, Rows>;
             const int bytes =
                 fp8_prepare_shared<fp8_mma_shared_bytes<Schedule, Epilogue>, kernel>();
-            kernel<<<blocks, Schedule::kThreads, bytes, stream>>>(p, output, epilogue, rows, offset,
-                                                                  count);
-            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(pdl::launch_with(
+                dependency,
+                {dim3(blocks), dim3(Schedule::kThreads), static_cast<std::size_t>(bytes), stream},
+                kernel, p, output, epilogue, rows, offset, count));
         };
         if (count % Schedule::kBlockTokens == 0)
             launch.template operator()<true>();

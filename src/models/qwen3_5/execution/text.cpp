@@ -1132,7 +1132,7 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         project_add(normalized, p.output, x, work_, s, InputBasis::Rotated);
         return;
     }
-    ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s);
+    ops::gated_rmsnorm(o, p.norm, z, ops::GateActivation::Silu, config_.rms_norm_eps, on, s);
     project_add(normalized, p.output, x, work_, s, InputBasis::Primal,
                 wide_residual_verification(ph, active_sequence_batch_, T, T));
 }
@@ -1464,14 +1464,14 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             if (vision_chunk.control != nullptr) {
                 const auto scatter =
                     std::span<const std::int32_t>(vision_chunk.control->scatter_indices);
-                const auto begin = std::lower_bound(scatter.begin(), scatter.end(), prompt_t0);
-                const auto end   = std::lower_bound(begin, scatter.end(), prompt_t0 + len);
+                const auto prompt_t0_i32 = static_cast<std::int32_t>(prompt_t0);
+                const auto begin = std::lower_bound(scatter.begin(), scatter.end(), prompt_t0_i32);
+                const auto end = std::lower_bound(begin, scatter.end(), prompt_t0_i32 + len);
                 const auto count = static_cast<std::int32_t>(end - begin);
                 visual_begin     = static_cast<std::int32_t>(begin - scatter.begin());
                 local_scatter_indices.resize(static_cast<std::size_t>(count));
                 for (std::int32_t i = 0; i < count; ++i) {
-                    local_scatter_indices[static_cast<std::size_t>(i)] =
-                        begin[i] - static_cast<std::int32_t>(prompt_t0);
+                    local_scatter_indices[static_cast<std::size_t>(i)] = begin[i] - prompt_t0_i32;
                 }
             }
 

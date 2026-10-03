@@ -6,8 +6,10 @@
 #include "core/layout.h"
 #include "core/device.h"
 #include "core/paged_kv_storage.h"
+#include "ops/kv_cache/append/launch.h"
 #include "ops/kv_cache/d256_profile.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast_plan.h"
 
 #include <algorithm>
 #include <cmath>
@@ -52,6 +54,23 @@ void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
           (geometry.query_heads == 16 && geometry.kv_heads == 2))) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
+}
+
+// Whether a prompt-route launch over this cache runs the fast NVFP4 kernel: NVFP4-G16 storage on a
+// Blackwell build, the fast prompt kernel selected (--fast-prefill-kernel, NINFER_PROMPT_FAST or the
+// profile's attn_prompt_fast), more than 2048 visible keys and a single query row.
+bool prompt_nvfp4_fast(KvCacheStorage storage, CausalAttentionExecutionEnvelope envelope,
+                       std::int32_t batch_size) {
+#if defined(NINFER_SM120_NVFP4)
+    return storage == KvCacheStorage::Nvfp4Group16 && batch_size == 1 &&
+           detail::causal_attention_prompt_fast_kernel(storage, envelope.fast_prompt_kernel) &&
+           detail::nvfp4_fast_prompt_applies(envelope.max_visible_keys);
+#else
+    (void)storage;
+    (void)envelope;
+    (void)batch_size;
+    return false;
+#endif
 }
 
 void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
@@ -283,6 +302,28 @@ SmallTWorkspace allocate_small_t_workspace(Allocator& workspace, std::int32_t q_
     };
 }
 
+struct SmallTTileWorkspace {
+    SmallTWorkspace partial;
+    Tensor valid;
+    Tensor rows;
+};
+
+// The partials and per-tile metadata of the parallel query tiles over `width` columns.
+template <class Allocator>
+SmallTTileWorkspace allocate_small_t_tile_workspace(Allocator& workspace, std::int32_t q_heads,
+                                                    std::int32_t width, std::int32_t tile_width,
+                                                    KvCacheStorage storage,
+                                                    CausalAttentionExecutionEnvelope envelope) {
+    const std::int32_t tiles  = width / tile_width;
+    const std::int32_t splits = detail::causal_attention_split_capacity(q_heads, tile_width,
+                                                                        storage, envelope, tiles);
+    SmallTWorkspace partial =
+        allocate_small_t_workspace(workspace, q_heads, tile_width, splits, tiles);
+    Tensor valid = workspace.alloc(DType::I32, {tiles});
+    Tensor rows  = workspace.alloc(DType::I32, {tiles});
+    return {partial, valid, rows};
+}
+
 template <typename Launch>
 void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceArena& workspace,
                             KvCacheStorage cache_storage, CausalAttentionExecutionEnvelope envelope,
@@ -304,11 +345,27 @@ void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceA
     }
 }
 
-void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
+// Returns whether the gate was applied.
+bool launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             const Tensor& positions, const Tensor& valid_columns,
                             const Tensor& table_rows, float scale, PagedKVBatchLayerView cache,
                             CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                            Tensor& out, cudaStream_t stream) {
+                            Tensor& out, cudaStream_t stream, const void* gate) {
+    if (const std::int32_t tile = detail::causal_attention_parallel_tile_width(
+            q.ne[1], q.ne[2], q.ne[3], cache.storage);
+        tile > 0) {
+        // One batched append, then every tile reads the cache at once; the reduce applies the gate.
+        detail::kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache,
+                                             stream);
+        auto tile_scope = workspace.scope();
+        SmallTTileWorkspace tiles = allocate_small_t_tile_workspace(
+            workspace, q.ne[1], q.ne[2], tile, cache.storage, envelope);
+        detail::causal_attention_small_t_tiles_launch(
+            q, positions, valid_columns.data == nullptr ? nullptr : &valid_columns, &table_rows,
+            scale, cache, envelope, tile, tiles.valid, tiles.rows, tiles.partial.acc,
+            tiles.partial.m, tiles.partial.l, out, stream, gate);
+        return true;
+    }
     for (std::int32_t begin = 0; begin < q.ne[2];
          begin += causal_attention_chunk_tokens(q.ne[1], q.ne[2], q.ne[3], cache.storage,
                                                         envelope)) {
@@ -324,12 +381,25 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                                                 scale, cache, envelope, begin, count, partial.acc,
                                                 partial.m, partial.l, out, stream);
     }
+    return false;
 }
 
 void launch_cached_chunked_small_t(const Tensor& q, const Tensor& positions, float scale,
                                    const PagedKVLayerView& cache,
                                    CausalAttentionExecutionEnvelope envelope,
                                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+    if (const std::int32_t tile =
+            detail::causal_attention_parallel_tile_width(q.ne[1], q.ne[2], 1, cache.storage);
+        tile > 0) {
+        auto tile_scope = workspace.scope();
+        SmallTTileWorkspace tiles = allocate_small_t_tile_workspace(
+            workspace, q.ne[1], q.ne[2], tile, cache.storage, envelope);
+        detail::causal_attention_small_t_tiles_launch(
+            q, positions, nullptr, nullptr, scale, single_row_paged_kv_batch_view(cache), envelope,
+            tile, tiles.valid, tiles.rows, tiles.partial.acc, tiles.partial.m, tiles.partial.l,
+            out, stream);
+        return;
+    }
     for_each_small_t_chunk(
         q, positions, workspace, cache.storage, envelope, out,
         [&](std::int32_t, std::int32_t, const Tensor& q_chunk, const Tensor& position_chunk,
@@ -432,6 +502,32 @@ int causal_softmax_attention_route_family(AttentionHeadGeometry geometry,
     return 2;
 }
 
+int causal_softmax_attention_small_t_launches(AttentionHeadGeometry geometry,
+                                              KvCacheStorage cache_storage,
+                                              CausalAttentionExecutionEnvelope envelope,
+                                              std::int32_t batch_size, std::int32_t width) {
+    require_causal_geometry(geometry, "causal_softmax_attention small-T launches");
+    switch (detail::causal_attention_resolve_route(geometry.query_heads, width, batch_size,
+                                                   cache_storage, envelope)) {
+    case detail::CausalAttentionRoute::SmallT:
+        return 1;
+    case detail::CausalAttentionRoute::ChunkedSmallT: {
+        // Parallel query tiles run as one launch; otherwise launch_chunked_small_t's loop runs
+        // one per chunk of this width.
+        if (detail::causal_attention_parallel_tile_width(geometry.query_heads, width, batch_size,
+                                                         cache_storage) > 0) {
+            return 1;
+        }
+        const std::int32_t chunk = causal_attention_chunk_tokens(geometry.query_heads, width,
+                                                                 batch_size, cache_storage, envelope);
+        return (width + chunk - 1) / chunk;
+    }
+    case detail::CausalAttentionRoute::Prompt:
+        return 0;
+    }
+    return 0;
+}
+
 std::int32_t causal_softmax_attention_prompt_wave_tokens(AttentionHeadGeometry geometry) {
     require_causal_geometry(geometry, "causal_softmax_attention prompt wave");
     int device          = 0;
@@ -509,6 +605,14 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         if (route == detail::CausalAttentionRoute::Prompt) { return std::size_t{0}; }
         if (route == detail::CausalAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
+        if (const std::int32_t tile = detail::causal_attention_parallel_tile_width(
+                q_heads, width, batch_size, cache_storage);
+            tile > 0) {
+            WorkspaceLayoutBuilder layout;
+            (void)allocate_small_t_tile_workspace(layout, q_heads, width, tile, cache_storage,
+                                                  envelope);
+            return layout.peak_bytes(1);
+        }
         for (std::int32_t begin = 0; begin < width;
              begin += causal_attention_chunk_tokens(q_heads, width, batch_size,
                                                             cache_storage, envelope)) {
@@ -531,6 +635,20 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         for (std::int32_t width = min_width; width <= last; ++width) {
             maximum = std::max(maximum, exact_capacity(width));
         }
+    }
+    if (prompt_nvfp4_fast(cache_storage, envelope, batch_size)) {
+        // The fast NVFP4 prompt kernel's split partials: its plan picks the split count from the
+        // visible keys of each launch, so reserve the most any split count within its 64 MiB
+        // budget can take at the widest width rather than the count the envelope's keys select.
+        constexpr std::size_t kSplitBudgetBytes = std::size_t{64} << 20;
+        std::size_t split_bytes                 = 0;
+        for (std::int32_t splits = 2; splits <= 16; ++splits) {
+            const std::size_t bytes =
+                detail::rotated_fast_prompt_split_bytes(q_heads, max_width, splits);
+            if (bytes > kSplitBudgetBytes) { break; }
+            split_bytes = bytes;
+        }
+        maximum = std::max(maximum, split_bytes);
     }
     return maximum;
 }
@@ -567,9 +685,11 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
     if (route == detail::CausalAttentionRoute::ChunkedSmallT) {
-        launch_chunked_small_t(q, k, v, positions, valid_columns, kv_table_rows, scale, cache,
-                               envelope, workspace, out, stream);
-        if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
+        const bool fusable = kv_cache_is_int8_family(cache.storage);
+        const bool gated   = launch_chunked_small_t(
+            q, k, v, positions, valid_columns, kv_table_rows, scale, cache, envelope, workspace,
+            out, stream, (gate != nullptr && fusable) ? gate->data : nullptr);
+        if (gate != nullptr && !gated) { sigmoid_mul(*gate, out, stream); }
         return;
     }
     if (route == detail::CausalAttentionRoute::SmallT) {
@@ -577,11 +697,13 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
             detail::causal_attention_split_capacity(q.ne[1], width, cache.storage, envelope, batch);
         SmallTWorkspace partial =
             allocate_small_t_workspace(workspace, q.ne[1], width, splits, batch);
-        // Only the shared BF16/INT8 reducer carries a gate. The FP8, NVFP4 and K8V4 storages reach
-        // their own reduce kernels, so they take the standalone multiply like the routes that
-        // cannot fold it at all; every caller still sees one contract.
-        const bool fusable = cache.storage == KvCacheStorage::BFloat16 ||
-                             cache.storage == KvCacheStorage::Int8Group64;
+        // Only the shared BF16/INT8-family reducer carries a gate; its epilogue rounds exactly as
+        // the standalone multiply does, whatever the key/value coding (int8, rk8v4, rk4v4,
+        // rk4v4-e8, rk2v4-e8). The FP8, NVFP4 and K8V4 storages reach their own reduce kernels, so
+        // they take the standalone multiply like the routes that cannot fold it at all; every
+        // caller still sees one contract.
+        const bool fusable =
+            cache.storage == KvCacheStorage::BFloat16 || kv_cache_is_int8_family(cache.storage);
         detail::causal_attention_small_t_launch(
             q, k, v, positions, valid_columns, kv_table_rows, scale, cache, envelope, 0, width,
             partial.acc, partial.m, partial.l, out, stream,
@@ -589,6 +711,17 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         if (gate != nullptr && !fusable) { sigmoid_mul(*gate, out, stream); }
         return;
     }
+#if defined(NINFER_SM120_NVFP4)
+    if (prompt_nvfp4_fast(cache.storage, envelope, batch)) {
+        detail::kv_cache_append_batch_launch(k, v, positions, valid_columns, kv_table_rows, cache,
+                                             stream);
+        detail::causal_attention_prompt_nvfp4_fast_launch(
+            q, positions, valid_columns.data == nullptr ? nullptr : &valid_columns,
+            &kv_table_rows, scale, cache, envelope.max_visible_keys, workspace, out, stream);
+        if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
+        return;
+    }
+#endif
     detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
                                            cache, out, envelope.fast_prompt_kernel, stream);
     if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
@@ -618,6 +751,14 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
             q, positions, scale, cache, envelope, partial.acc, partial.m, partial.l, out, stream);
         return;
     }
+#if defined(NINFER_SM120_NVFP4)
+    if (prompt_nvfp4_fast(cache.storage, envelope, 1)) {
+        detail::causal_attention_prompt_nvfp4_fast_launch(
+            q, positions, nullptr, nullptr, scale, single_row_paged_kv_batch_view(cache),
+            envelope.max_visible_keys, workspace, out, stream);
+        return;
+    }
+#endif
     detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, out,
                                                      envelope.fast_prompt_kernel, stream);
 }

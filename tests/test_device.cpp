@@ -86,6 +86,9 @@ int main(int argc, char** argv) {
     if ((actual_flags & cudaDeviceScheduleMask) != expected_flags) {
         return fail("CUDA did not apply the requested synchronization schedule");
     }
+    if (std::string_view(ctx.sync_mode()).empty()) {
+        return fail("sync_mode() returned an empty name");
+    }
     if (ctx.device != 0) {
         ++failures;
         std::cerr << "ctx.device expected 0, got " << ctx.device << '\n';

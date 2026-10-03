@@ -42,8 +42,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
 
     AnthropicMessagesRequest request;
     try {
-        RequestLimits limits;
-        limits.default_max_tokens        = options_.default_max_tokens;
+        const RequestLimits limits       = request_limits(options_);
         const auto body                  = parse_json_body(req);
         request                          = parse_anthropic_messages_request(body, limits);
         request.generation.ngram_session = resolve_ngram_session(req, body, options_);
@@ -114,6 +113,13 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
             return;
         }
         lifecycle->done(outcome);
+        if (outcome.finish_reason == ninfer::FinishReason::Cancelled) {
+            // The client disconnected: an Anthropic message cannot express a cancelled
+            // outcome, and there is nobody left to answer.
+            lifecycle->response_failure(
+                make_client_disconnected_failure(RequestFailurePhase::Transport));
+            return;
+        }
         try {
             set_ngram_generation_header(res, outcome.metrics.ngram_archive);
             set_owned_json_content(res, make_anthropic_messages_response(identity, outcome),
@@ -208,6 +214,13 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 }
 
                 lifecycle->done(outcome);
+                if (outcome.finish_reason == ninfer::FinishReason::Cancelled) {
+                    // The client disconnected mid-stream: terminal events have no recipient,
+                    // and rendering a cancelled outcome would be reported as a 500.
+                    lifecycle->response_failure(
+                        make_client_disconnected_failure(RequestFailurePhase::Transport));
+                    return false;
+                }
                 std::vector<std::string> terminal;
                 try {
                     terminal = encoder->finish(outcome);

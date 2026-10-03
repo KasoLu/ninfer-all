@@ -52,6 +52,19 @@ bool optional_bool(const RequestJson& object, const char* key, bool fallback) {
     return object.at(key).get<bool>();
 }
 
+std::optional<std::string> parse_graft_field(const RequestJson& body) {
+    if (!body.contains("graft") || body.at("graft").is_null()) { return std::nullopt; }
+    if (!body.at("graft").is_string()) { bad_request("graft must be a string or null", "graft"); }
+    return body.at("graft").get<std::string>();
+}
+
+std::optional<std::uint32_t> parse_thinking_budget_field(const RequestJson& body) {
+    const std::optional<int> budget = optional_int(body, "thinking_budget");
+    if (!budget) { return std::nullopt; }
+    if (*budget < 1) { bad_request("thinking_budget must be a positive integer", "thinking_budget"); }
+    return static_cast<std::uint32_t>(*budget);
+}
+
 bool valid_tool_name(std::string_view name, std::size_t maximum_length) noexcept {
     if (name.empty() || name.size() > maximum_length) { return false; }
     for (const unsigned char character : name) {
@@ -127,9 +140,10 @@ std::optional<SamplingParams> parse_post_thinking(const RequestJson& body, doubl
     out.presence_penalty  = ranged("presence_penalty", -2.0, 2.0);
     out.frequency_penalty = ranged("frequency_penalty", -2.0, 2.0);
     out.top_k             = optional_int(object, "top_k");
-    if (out.top_k && (*out.top_k < 0 || *out.top_k > 20)) {
-        bad_request("post_thinking.top_k must be in [0,20]", "post_thinking.top_k");
+    if (out.top_k && *out.top_k < 0) {
+        bad_request("post_thinking.top_k must not be negative", "post_thinking.top_k");
     }
+    if (out.top_k) { out.top_k = clamp_request_top_k(*out.top_k); }
     if (object.contains("seed") && !object.at("seed").is_null()) {
         const RequestJson& seed = object.at("seed");
         if (!seed.is_number_integer()) {

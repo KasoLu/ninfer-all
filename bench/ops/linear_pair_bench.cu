@@ -206,8 +206,8 @@ int main(int argc, char** argv) {
         DeviceBuffer input = bench::make_bf16(static_cast<std::size_t>(options.k) * maximum_tokens);
         DeviceBuffer first_output(static_cast<std::size_t>(kRows) * maximum_tokens * 2);
         DeviceBuffer second_output(static_cast<std::size_t>(kRows) * maximum_tokens * 2);
-        bench::PackedQuantizedWeight parent = bench::make_row_split_weight(
-            QType::Q8_G32_FP16, kParentRows, options.k, options.k, {0x31, 0x00, 0x3c00});
+        bench::PackedQuantizedWeight parent =
+            bench::make_row_split_weight(QType::Q8_G32_FP16, kParentRows, options.k, options.k);
         const Weight first_weight  = bench::row_view(parent.weight, kFirstRow, kRows);
         const Weight second_weight = bench::row_view(parent.weight, kSecondRow, kRows);
 

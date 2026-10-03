@@ -6,6 +6,17 @@
 
 namespace ninfer::ops {
 
+// Every form below fixes these constants in its formula; they are not operands. A caller may
+// dispatch a model's q/k RMSNorm and RoPE here only when rmsnorm_rope_constants_match() holds for
+// the model's rope_theta and rms_norm_eps (and its rotation is unscaled); otherwise it must take
+// the separate rmsnorm and rope Ops, which take both as operands.
+inline constexpr float kRmsnormRopeTheta   = 1.0e7F;
+inline constexpr float kRmsnormRopeEpsilon = 1.0e-6F;
+
+constexpr bool rmsnorm_rope_constants_match(float rope_theta, float rms_norm_eps) noexcept {
+    return rope_theta == kRmsnormRopeTheta && rms_norm_eps == kRmsnormRopeEpsilon;
+}
+
 /**
  * Apply plain per-head RMSNorm followed by full-head split-half 1-D RoPE in place.
  *
@@ -44,7 +55,7 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, Tensor& x,
  *
  * The profile is q_in BF16 [256,Q,T], k_in BF16 [256,K,T], q_out and k_out of the same shapes as
  * their inputs, q_norm_weight and k_norm_weight BF16 [256], and positions I32 [T], with
- * (Q,K) either (16,2) or (24,4) and T any positive count the launch grid can address. For
+ * (Q,K) one of (16,2), (24,4) and (24,2) and T any positive count the launch grid can address. For
  * each head and token,
  *
  *   inv       = 1 / sqrt(sum_d x[d]^2 / 256 + 1e-6)
@@ -62,6 +73,7 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, Tensor& x,
  * rope(q_out, k_out) with the Offset epilogue. The outputs must not overlap each other, the
  * inputs, positions, or either norm weight; read-only operands may overlap each other. All
  * tensors are contiguous and 4-byte aligned. The Op owns no workspace or persistent state.
+ * theta, epsilon and the unscaled rotation are the fixed constants above.
  */
 void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Tensor& k_norm_weight,
                   const Tensor& q_in, const Tensor& k_in, Tensor& q_out, Tensor& k_out,

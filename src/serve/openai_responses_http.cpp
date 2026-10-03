@@ -46,6 +46,7 @@ struct StreamingResponse {
 ApiError responses_error(ApiError error) {
     if (error.param == "messages") { error.param = "input"; }
     if (error.param == "reasoning_effort") { error.param = "reasoning.effort"; }
+    if (error.param == "response_format") { error.param = "text.format"; }
     return error;
 }
 
@@ -243,11 +244,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
     OpenAIResponsesResolvedPrompt resolved;
     const std::string id = new_openai_response_id();
     try {
-        RequestLimits limits;
-        limits.default_max_tokens        = options_.default_max_tokens;
-        limits.lenient_assistant_history = options_.lenient_assistant_history;
-        const auto body           = parse_json_body(req);
-        request                   = parse_openai_responses_create_request(body, limits);
+        const RequestLimits limits = request_limits(options_);
+        const auto body            = parse_json_body(req);
+        request                    = parse_openai_responses_create_request(body, limits);
         validate_openai_model(request.prompt.model, public_model_id_);
         resolved = resolve_openai_responses_prompt(request.prompt, openai_responses_store_, id,
                                                    request.store);
@@ -519,9 +518,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
 
 void HttpServer::handle_response_input_tokens(const httplib::Request& req, httplib::Response& res) {
     try {
-        RequestLimits limits;
-        limits.default_max_tokens        = options_.default_max_tokens;
-        limits.lenient_assistant_history = options_.lenient_assistant_history;
+        const RequestLimits limits = request_limits(options_);
         OpenAIResponsesPromptRequest request =
             parse_openai_responses_input_tokens_request(parse_json_body(req), limits);
         validate_openai_model(request.model, public_model_id_);

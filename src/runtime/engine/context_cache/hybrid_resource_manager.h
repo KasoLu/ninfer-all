@@ -153,6 +153,23 @@ public:
         return std::nullopt;
     }
 
+    // A blocked FIFO head's Host-only blocks are copied into spare Device cache while it waits
+    // (hybrid-prefix-cache-spec §6.6). Matching a long prompt walks its path, so a new attempt
+    // needs a new head, progress on the last attempt, or more room.
+    void prefetch_blocked_head(Program& program, const PreparedPrompt& prompt,
+                               const RequestBasePlan& base, std::uint64_t publication_order) {
+        if (open_lane_ || program.has_context_transaction()) { return; }
+        if (publication_order == prefetch_order_ && !prefetch_retry_ &&
+            program.hybrid_prefetch_room() <= prefetch_room_) {
+            return;
+        }
+        const std::optional<std::uint32_t> started = program.hybrid_prefetch(prompt, base);
+        prefetch_order_                            = publication_order;
+        // A prefetch still in flight, or one that copied blocks, may leave more to copy.
+        prefetch_retry_ = !started || *started != 0;
+        prefetch_room_  = program.hybrid_prefetch_room();
+    }
+
     [[nodiscard]] MaterializationReserveResult
     reserve_materialization(Program& program, Choice&& choice, PreparedPrompt&& prompt,
                             CancellationFlagView cancellation) {
@@ -359,6 +376,9 @@ public:
     void clear_after_program_cleanup() noexcept {
         open_lane_.reset();
         lanes_.fill(Lane::Free);
+        prefetch_order_ = 0;
+        prefetch_retry_ = false;
+        prefetch_room_  = 0;
     }
 
 private:
@@ -381,6 +401,10 @@ private:
     std::uint32_t lane_count_ = 0;
     std::array<Lane, kMaximumConcurrency> lanes_{};
     std::optional<LaneId> open_lane_;
+    // The last prefetch attempt: the head it served, whether to try again and the room it left.
+    std::uint64_t prefetch_order_ = 0;
+    bool prefetch_retry_          = false;
+    std::uint32_t prefetch_room_  = 0;
 };
 
 } // namespace ninfer::runtime

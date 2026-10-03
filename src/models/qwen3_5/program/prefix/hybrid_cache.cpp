@@ -631,6 +631,34 @@ std::uint64_t HybridPrefixCache::land_restore(cudaStream_t consumer) {
     return ticket;
 }
 
+void HybridPrefixCache::detach_prefetch() {
+    if (!restore_.submitted || restore_.image || restore_.tail) {
+        throw std::logic_error("hybrid prefetch is not a submitted batch of blocks");
+    }
+    for (const NodeRef node : restore_.nodes) { index_->pin_node(node); }
+    restore_.prefetch = true;
+    counters_.prefetched_blocks += restore_.nodes.size();
+    landing_.push_back(std::move(restore_));
+    restore_ = RestoreBatch{};
+}
+
+bool HybridPrefixCache::prefetch_landing() const noexcept {
+    return std::any_of(landing_.begin(), landing_.end(),
+                       [](const RestoreBatch& batch) { return batch.prefetch; });
+}
+
+void HybridPrefixCache::settle_prefetch() {
+    // One restore stream completes batches in submission order: the last prefetch batch's final
+    // event covers every batch submitted before it.
+    for (auto batch = landing_.rbegin(); batch != landing_.rend(); ++batch) {
+        if (batch->prefetch) {
+            CUDA_CHECK(cudaEventSynchronize(batch->layers.back()));
+            break;
+        }
+    }
+    poll();
+}
+
 std::span<const cudaEvent_t>
 HybridPrefixCache::restore_layer_events(std::uint64_t ticket) const noexcept {
     for (const RestoreBatch& batch : landing_) {

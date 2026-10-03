@@ -1,4 +1,4 @@
-{"schema": "ninfer.device-route-profiles", "schema_version": 1, "devices": [
+{"schema": "ninfer.device-route-profiles", "schema_version": 2, "devices": [
     {"hardware_class": "nvidia-geforce-rtx-3090-sm86", "multiprocessors": 82, "origin": "built in: RTX 3090 at 390 W, 2026-09-25; unified routes and two-stage GDN at 420 W, 2026-09-27",
      "routes": {
         "attn_i8_small/h24/int8/w3": [[1048576, "8x2x32q"]],
@@ -40,6 +40,8 @@
         "attn_pv_f16": [[1, "on"]],
         "gdn_two_stage/h32": [[2147483647, "on"]],
         "gdn_two_stage/h48": [[2147483647, "on"]],
+        "q4_linear_add/5120x17408": [[8, ""], [16, "small_t_c16"], [32, "small_t_c32"]],
+        "q6_head/248320x5120": [[2, "gemv"], [3, "small_t"], [18, ""], [20, "small_t"]],
         "t2_i8_small/248320x5120": [[12, ""], [16, "r32c16"]],
         "t2_i8_small/34816x5120": [[6, ""], [7, "r32c8k4"], [32, ""]],
         "t2_i8_small/5120x6144": [[1, ""], [3, "r16c8w1"], [5, ""], [6, "r16c8w1"], [7, ""], [8, "r16c8w1"], [32, ""]],

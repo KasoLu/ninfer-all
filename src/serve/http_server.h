@@ -3,6 +3,7 @@
 #include "serve/console_stats.h"
 #include "serve/generation_service.h"
 #include "serve/load_report.h"
+#include "serve/openai_common.h"
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request_log.h"
@@ -37,6 +38,13 @@ httplib::Server::HandlerResponse handle_unrendered_http_error(const ServeOptions
 [[nodiscard]] bool matches_bearer_credential(std::string_view authorization,
                                              std::string_view api_key) noexcept;
 
+// Anthropic SDKs append /v1/<endpoint> to their base URL, so a client given the OpenAI-style base
+// URL that already ends in /v1 requests /v1/v1/<endpoint>. Every /v1 API route also answers there:
+// api_route_pattern("/messages") matches /v1/messages and /v1/v1/messages without adding a capture
+// group, and canonical_api_path maps the doubled form back to the /v1/<endpoint> it names.
+[[nodiscard]] std::string api_route_pattern(std::string_view endpoint);
+[[nodiscard]] std::string_view canonical_api_path(std::string_view path) noexcept;
+
 class HttpServer {
 public:
     // `panel` is the console panel for the session statistics; it is drawn only when enabled by
@@ -57,6 +65,9 @@ public:
     bool bind();
     void attach(GenerationService& service);
     bool listen();
+    // Closes the listening sockets and stops the attached service's Engine, whose queued and
+    // running requests then fail, so listen() returns within about one unit of Engine work.
+    // Does not block; callable from any thread.
     void stop();
 
     // Serve 503 while the Engine is still loading.
@@ -129,9 +140,11 @@ private:
     void handle_stats(const httplib::Request& req, httplib::Response& res) const;
     void handle_health(httplib::Response& res) const;
     void handle_slots(const httplib::Request& req, httplib::Response& res) const;
+    void handle_slot_action(const httplib::Request& req, httplib::Response& res);
     void handle_props(const httplib::Request& req, httplib::Response& res) const;
     void handle_webui(const httplib::Request& req, httplib::Response& res) const;
     [[nodiscard]] LoadSample load_sample() const;
+    [[nodiscard]] ModelDescription model_description() const;
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
 

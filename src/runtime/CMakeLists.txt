@@ -11,6 +11,7 @@ add_library(ninfer_runtime_support STATIC
   engine/context_cache/context_cost.cpp
   engine/context_cache/context_cost_defaults.cpp
   engine/device_profile.cpp
+  engine/device_profile_build_id.cpp
   ${CMAKE_CURRENT_BINARY_DIR}/engine/device_profiles_builtin.cpp
   engine/kv_capacity.cpp
   engine/public_types.cpp
@@ -20,6 +21,8 @@ add_library(ninfer_runtime_support STATIC
 )
 ninfer_internal_includes(ninfer_runtime_support)
 target_link_libraries(ninfer_runtime_support PUBLIC ninfer_core ninfer_ops PRIVATE ninfer::json)
+# Calibrated device profiles record the build id (engine/device_profile_build_id.cpp).
+ninfer_stamp_build_id(ninfer_runtime_support)
 
 # Public Engine and common contracts; model execution remains in the model layer.
 add_library(ninfer_engine STATIC

@@ -262,11 +262,21 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         decoder->text_kv.execution_tables().logical_page_capacity());
     if (vision_broker && kv_arena) {
         // A loan changes the admission capacity, so it may not race a sealed plan: refuse one while
-        // a context transaction or a pressure-planning session is in flight, and advance the
-        // resource revision whenever the capacity moves.
+        // a context transaction or a pressure-planning session is in flight, or while any lane has
+        // been provisionally admitted (prefill staged) but hasn't yet bound its own KV entitlement
+        // (lifecycle still Empty) -- that lane's future KV demand is real but not yet reflected in
+        // the arena's free-page accounting.
         vision_broker->enable_kv_tier(
             *kv_arena, decoder->text_kv.page_pool(),
-            [this] { return !has_context_transaction() && !pressure_planning_active_; },
+            [this] {
+                if (has_context_transaction() || pressure_planning_active_) { return false; }
+                for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+                    if (requests[lane].prefill && requests[lane].lifecycle == Lifecycle::Empty) {
+                        return false;
+                    }
+                }
+                return true;
+            },
             [this] { advance_resource_revision(); });
     }
     state_images = std::make_unique<qwen3_5::StateImageDevicePool>(backings,
@@ -671,7 +681,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 state_slot,
                 state_slot,
                 0,
-                nullptr};
+                0};
             mark_workspace_usage(workspace_plan.text_prefill);
             const execution::PrefillChunkResult result = execution::prefill_text_chunk(
                 schedule_state, std::span<const TokenId>(prompt.token_ids), nominal, std::nullopt,

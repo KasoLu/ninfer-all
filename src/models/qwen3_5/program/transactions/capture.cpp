@@ -355,8 +355,18 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
     const SharedPrefixHandle* replacement,
     std::optional<runtime::CheckpointRef> private_replacement, bool permit_shared_publication,
     std::optional<CapturePressureCandidate> pressure, runtime::CancellationFlagView cancellation) {
-    if (has_context_transaction() || has_unsettled_state_fork() || !valid_capture_offer(offer)) {
-        throw std::logic_error("capture transaction is not reservable");
+    if (!valid_capture_offer(offer)) {
+        // A stale offer is an internal-consistency failure, not contention: keep it loud and
+        // distinct from the contention skip below.
+        throw std::logic_error("capture offer is stale for this program state");
+    }
+    // Contention is not corruption. Another context transaction, or an unsettled state fork left
+    // by a shared-prefix reuse, owns the program; a capture is optional retention, so it degrades
+    // to a skip and the lane still reaches a finite terminal state instead of failing the whole
+    // batch through a worker recovery.
+    if (has_context_transaction() || has_unsettled_state_fork()) {
+        skip_capture(std::move(offer));
+        return runtime::ContextTransactionReserveStatus::Aborted;
     }
     if (cancellation.requested()) {
         skip_capture(std::move(offer));
@@ -842,17 +852,19 @@ void ProgramImpl::abort_active_capture(ActiveCaptureTransaction& transaction) no
     }
     if (transaction.shared_index && *transaction.shared_index < shared_prefix_capacity) {
         SharedPrefixSlot& slot = shared_prefix_slots[*transaction.shared_index];
-        if (transaction.replaces_shared && transaction.replacement_removed &&
-            slot.role == SharedPrefixSlotRole::ReservedCapture &&
-            slot.generation == transaction.replacement_generation) {
-            slot.role = SharedPrefixSlotRole::Free;
-        } else if (transaction.replaces_shared && !transaction.replacement_removed &&
-                   slot.role == SharedPrefixSlotRole::ReservedReplacement &&
-                   slot.generation == transaction.replacement_generation) {
-            slot.role = SharedPrefixSlotRole::Catalogued;
-        } else if (!transaction.replaces_shared &&
-                   slot.role == SharedPrefixSlotRole::ReservedCapture) {
-            slot.role = SharedPrefixSlotRole::Free;
+        // A reserved role of a transaction that goes away is never left reserved
+        // (shared_slot_release.h). A replacement flow keeps its generation guard: a slot that no
+        // longer carries the generation this transaction recorded is not its to dispose of.
+        const bool owned = !transaction.replaces_shared ||
+                           slot.generation == transaction.replacement_generation;
+        if (owned) {
+            switch (resolve_shared_slot_release(transaction.replacement_removed, slot.role)) {
+            case SharedSlotReleaseAction::Free: slot.role = SharedPrefixSlotRole::Free; break;
+            case SharedSlotReleaseAction::Catalogue:
+                slot.role = SharedPrefixSlotRole::Catalogued;
+                break;
+            case SharedSlotReleaseAction::Leave: break;
+            }
         }
     }
     transaction.prepared = false;

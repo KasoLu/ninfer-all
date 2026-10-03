@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/tma_descriptor_staging.cuh"
 #include "ops/common/mbarrier.cuh"
 #include "ops/linear/bf16/bf16_mma_common.cuh"
 #include "ops/linear/bf16/bf16_operands.h"
@@ -11,10 +12,24 @@
 
 namespace ninfer::ops::detail::unified {
 
-struct alignas(128) Bf16TmaDescriptors {
+// Passed by value as a __grid_constant__ kernel parameter. TMA requires 64-byte descriptor
+// alignment. It is stated here because cuda.h keys CUtensorMap's alignas on __cplusplus, which
+// MSVC reports as 199711L, and MSVC cannot pass a parameter aligned beyond 64 bytes by value
+// (C2719). Elsewhere CUtensorMap may keep a larger alignas of its own, which the struct inherits.
+struct alignas(64) Bf16TmaDescriptors {
     CUtensorMap weight;
     CUtensorMap activation;
 };
+static_assert(alignof(Bf16TmaDescriptors) % 64 == 0);
+
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+// The single staged-descriptor (Windows) staging for Bf16TmaDescriptors. See
+// core/tma_descriptor_staging.cuh for the invariants its device buffer relies on.
+inline TmaDescriptorStaging<Bf16TmaDescriptors>& bf16_tma_descriptor_staging() {
+    static TmaDescriptorStaging<Bf16TmaDescriptors> staging;
+    return staging;
+}
+#endif
 
 inline CUtensorMap bf16_tma_map(const __nv_bfloat16* pointer, int rows, int k, int block_rows,
                                 int block_k) {
@@ -69,8 +84,17 @@ inline constexpr int bf16_tma_scratch_bytes =
 template <class Schedule, bool FullTokens, class Output, class Epilogue>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_tma_mma_kernel(
-    const __grid_constant__ Bf16TmaDescriptors descriptors, Output output, Epilogue epilogue,
-    int rows, int input_rows, int token_offset, int count) {
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+    // MSVC cannot pass the over-aligned (alignas(128)) CUtensorMap struct by value as a
+    // __grid_constant__ parameter (C2719); on Windows the descriptors come from the staging buffer.
+    const Bf16TmaDescriptors* descriptors_pointer,
+#else
+    const __grid_constant__ Bf16TmaDescriptors descriptors,
+#endif
+    Output output, Epilogue epilogue, int rows, int input_rows, int token_offset, int count) {
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+    const Bf16TmaDescriptors& descriptors = *descriptors_pointer;
+#endif
     constexpr int BR = Schedule::kBlockRows, BT = Schedule::kBlockTokens, BK = Schedule::kBlockK;
     constexpr int S   = Schedule::kStages;
     const int K       = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
@@ -96,6 +120,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
     const int tiles_k = K / BK;
     if (threadIdx.x < Schedule::kProducerThreads) {
         if (threadIdx.x == 0) {
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+            // Each staged 128-byte map needs its own acquire for the TMA (tensormap) proxy.
+            acquire_staged_tensor_map(&descriptors.weight);
+            acquire_staged_tensor_map(&descriptors.activation);
+#endif
             for (int kt = 0; kt < tiles_k; ++kt) {
                 const int stage = kt % S;
                 cta_mbarrier_wait(empty + stage, 1U ^ ((kt / S) & 1U));
@@ -145,6 +174,10 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
 #else
     // Descriptors are launch-owned values, copied into kernel parameters during Graph capture.
     const auto descriptors = make_bf16_tma_descriptors<Schedule>(p);
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+    // Staged once: every token-slice launch below reads the same copy, in stream order.
+    const Bf16TmaDescriptors* staged = bf16_tma_descriptor_staging().stage(descriptors, stream);
+#endif
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const auto blocks = static_cast<std::int64_t>(p.rows / Schedule::kBlockRows) *
                             div_up(count, Schedule::kBlockTokens);
@@ -155,8 +188,13 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
             constexpr int bytes =
                 bf16_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
             bf16_prepare_shared<bytes, kernel>();
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+            kernel<<<static_cast<unsigned>(blocks), Schedule::kThreads, bytes, stream>>>(
+                staged, output, epilogue, p.rows, p.k, offset, count);
+#else
             kernel<<<static_cast<unsigned>(blocks), Schedule::kThreads, bytes, stream>>>(
                 descriptors, output, epilogue, p.rows, p.k, offset, count);
+#endif
             CUDA_CHECK(cudaGetLastError());
         };
         if (count % Schedule::kBlockTokens == 0)

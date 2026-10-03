@@ -16,7 +16,12 @@ the `tuned` profiles set both to the same value. Any one request can use the who
 lanes' requests together hold at most that many tokens at a time.
 
 `tuned` is the recommended profile. `int8` (one user, 64K of INT8 KV, the quality default) and `c8`
-(eight lanes at 8K) are the older reference profiles, with every serving flag fixed. The former
+(eight lanes at 8K) are the older reference profiles, with every serving flag fixed. `c8` sizes its
+context cache per lane -- two retained conversations and two host StateImages per lane, one extra
+device StateImage per lane -- so rotating agents keep their conversations cached; at 147 MiB per
+BF16 StateImage the host slots pin 2.3 GiB, and on Windows it still starts with about 2 GiB of the
+card free (2026-09-29). With engine defaults, a single lane keeps only two conversations, and four
+rotating agents reused 12% of their prompts against 76% with room for all four. The former
 vision-only launchers are gone: `tuned` serves vision in overlay residency, which costs about
 10 MiB, and `NINFER_VISION=off` turns it off.
 
@@ -33,6 +38,15 @@ The first is the fastest at one stream (prefill about 1.7x and decode about 1.39
 defaults) and the second is the full context with a second lane, still fast. The Qwen3.6-35B-A3B
 `tuned` profile runs MTP3 + draft head at 262,144 tokens with three lanes on Linux and two on
 Windows.
+
+MTP DRAFT COUNT, 2026-09-28. MTP now accepts `NINFER_DRAFT_TOKENS` up to 15 (it was capped at
+five). The `mtp` profiles keep three: it is best or within 2% on prose, while 7, 9 and 15 lose 12%,
+27% and 38% on a short story. On output that reproduces the prompt (editing and returning a file)
+11 to 15 decode 1.7-1.85x faster than three, and on newly written code seven is about 10% faster;
+the table is in [performance](../performance.md#choosing-the-draft-count-rtx-3090-qwen38-27b). Eight and above add a second CUDA
+Graph topology class on the 27B, about 64 MiB more reserved per lane, which the 27B `mtp` profile's
+~1.2 GiB of headroom covers. Measured single-stream with the CLI; the two-lane server was not
+re-measured at larger counts.
 
 RK4V4 DEFAULTS, 2026-09-24. Every `tuned` profile moved from `rk8v4` to `rk4v4` KV (Lloyd-Max 4-bit
 keys, 31% smaller than `rk8v4` at the same decode speed, +0.10% perplexity over it; see the

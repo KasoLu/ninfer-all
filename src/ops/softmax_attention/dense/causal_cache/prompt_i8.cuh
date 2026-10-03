@@ -289,13 +289,15 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
         }
     };
 
-    auto issue_kv_tile = [&](int tile_k0) {
+    // A FullTile lies wholly at or below the first query row, so every key is visible and the
+    // per-key causal test drops out of the staging.
+    auto issue_kv_tile = [&]<bool FullTile>(int tile_k0) {
         const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
         for (int key_l = tid; key_l < Bc; key_l += kCausalPromptI8Threads) {
             const int key = tile_k0 + key_l;
             __half* kd    = &k_scale_s[key_l * Groups];
             __half* vd    = &v_scale_s[key_l * VGroups];
-            if (key <= max_query_abs) {
+            if (FullTile || key <= max_query_abs) {
                 const std::int64_t off =
                     kv_cache_int8_quant_scale_index<Geometry>(physical_page, kv_head, 0, key_l);
                 ninfer::ops::cp_async<8>(kd, &cache_k_scale[off]);
@@ -326,7 +328,7 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
                     const int d     = dc * 16;
                     const int key   = tile_k0 + key_l;
                     k_packed[i]     = KeyChunk{};
-                    if (key <= max_query_abs) {
+                    if (FullTile || key <= max_query_abs) {
                         const std::int64_t key_off =
                             kv_cache_packed_key_chunk_index<Geometry, Keys>(physical_page, kv_head,
                                                                             d, key_l);
@@ -342,44 +344,54 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
                     }
                 }
             }
-            ninfer::ops::cp_commit();
-            return;
-        }
+        } else {
 #pragma unroll 1
-        for (int chunk = tid; chunk < Bc * (D / 16); chunk += kCausalPromptI8Threads) {
-            const int key_l = chunk / (D / 16);
-            const int dc    = chunk - key_l * (D / 16);
-            const int d     = dc * 16;
-            const int key   = tile_k0 + key_l;
-            std::int8_t* kd = &k_i8[(key_l * DB16 + causal_prompt_swz(key_l, dc * 8)) * 2];
-            std::int8_t* vd = &v_i8[key_l * D + d];
-            if (key <= max_query_abs) {
-                const std::int64_t off =
-                    kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d, key_l);
-                cp_async<16, Cache::cg>(kd, &cache_k[off]);
-                if constexpr (PackedValues) {
-                    // Sixteen dimensions occupy eight packed bytes.
-                    const std::int64_t voff = kv_cache_int4_value_code_index<Geometry>(
-                        physical_page, kv_head, d >> 1, key_l);
-                    // cp.async.cg is 16-byte only; the 8-byte form uses the default policy.
-                    ninfer::ops::cp_async<8>(&v_i8[key_l * D + (d >> 1)],
-                                             reinterpret_cast<const std::uint8_t*>(cache_v) + voff);
+            for (int chunk = tid; chunk < Bc * (D / 16); chunk += kCausalPromptI8Threads) {
+                const int key_l = chunk / (D / 16);
+                const int dc    = chunk - key_l * (D / 16);
+                const int d     = dc * 16;
+                const int key   = tile_k0 + key_l;
+                std::int8_t* kd = &k_i8[(key_l * DB16 + causal_prompt_swz(key_l, dc * 8)) * 2];
+                if (FullTile || key <= max_query_abs) {
+                    const std::int64_t off =
+                        kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d, key_l);
+                    cp_async<16, Cache::cg>(kd, &cache_k[off]);
+                    if constexpr (PackedValues) {
+                        // Sixteen dimensions occupy eight packed bytes.
+                        const std::int64_t voff = kv_cache_int4_value_code_index<Geometry>(
+                            physical_page, kv_head, d >> 1, key_l);
+                        // cp.async.cg is 16-byte only; the 8-byte form uses the default policy.
+                        ninfer::ops::cp_async<8>(
+                            &v_i8[key_l * D + (d >> 1)],
+                            reinterpret_cast<const std::uint8_t*>(cache_v) + voff);
+                    } else {
+                        cp_async<16, Cache::cg>(&v_i8[key_l * D + d], &cache_v[off]);
+                    }
                 } else {
-                    cp_async<16, Cache::cg>(vd, &cache_v[off]);
-                }
-            } else {
-                store_vec(kd, make_int4(0, 0, 0, 0));
-                if constexpr (PackedValues) {
-                    store_vec(&v_i8[key_l * D + (d >> 1)], make_int2(0, 0));
-                } else {
-                    store_vec(vd, make_int4(0, 0, 0, 0));
+                    store_vec(kd, make_int4(0, 0, 0, 0));
+                    if constexpr (PackedValues) {
+                        store_vec(&v_i8[key_l * D + (d >> 1)], make_int2(0, 0));
+                    } else {
+                        store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
+                    }
                 }
             }
         }
         ninfer::ops::cp_commit();
     };
 
-    issue_kv_tile(0);
+    // Leading key blocks lie wholly at or below the first query row of a full row tile. They run a
+    // FullTile body: no causal mask, no zero-selects in the softmax, and unconditional staging.
+    // Only the blocks crossing the diagonal, and every block of a partial tail tile, keep the
+    // masked path. Rows are packed (token, head) pairs under PackGqa, so the first row's token
+    // bounds the visible keys, not q0.
+    const int full_blocks =
+        q0 + Br <= valid_rows ? min(key_blocks, (base_pos + row_token(0) + 1) / Bc) : 0;
+    if (full_blocks > 0) {
+        issue_kv_tile.template operator()<true>(0);
+    } else {
+        issue_kv_tile.template operator()<false>(0);
+    }
     commit_k_tile();
     ninfer::ops::cp_wait<0>();
     __syncthreads();
@@ -418,7 +430,7 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
     float running_l0     = 0.0f;
     float running_l1     = 0.0f;
     const float scale_l2 = scale * Log2E;
-    for (int kb = 0; kb < key_blocks; ++kb) {
+    const auto step = [&]<bool FullTile>(int kb) {
         const int k0 = kb * Bc;
         if (warp < ProducerWarps) {
             const int row_base = warp * 16;
@@ -481,17 +493,15 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
 
             const int row0             = row_base + gid;
             const int row1             = row0 + 8;
-            const int qabs0            = row0 < tile_rows ? base_pos + row_token(row0) : -1;
-            const int qabs1            = row1 < tile_rows ? base_pos + row_token(row1) : -1;
-            const bool full_score_tile =
-                q0 + Br <= valid_rows && k0 + Bc - 1 <= base_pos + row_token(0);
-            float bm0                  = -CUDART_INF_F;
-            float bm1                  = -CUDART_INF_F;
+            const int qabs0 = row0 < tile_rows ? base_pos + row_token(row0) : -1;
+            const int qabs1 = row1 < tile_rows ? base_pos + row_token(row1) : -1;
+            float bm0       = -CUDART_INF_F;
+            float bm1       = -CUDART_INF_F;
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
-                if (!full_score_tile) {
+                if constexpr (!FullTile) {
                     score[nt][0] = key0 <= qabs0 ? score[nt][0] : -CUDART_INF_F;
                     score[nt][1] = key1 <= qabs0 ? score[nt][1] : -CUDART_INF_F;
                     score[nt][2] = key0 <= qabs1 ? score[nt][2] : -CUDART_INF_F;
@@ -519,18 +529,19 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int col0  = nt * 8 + 2 * lid;
                 const int col1  = col0 + 1;
-                const float p00 = score[nt][0] > -CUDART_INF_F
+                const float p00 = FullTile || score[nt][0] > -CUDART_INF_F
                                       ? exp2_approx(__fmaf_rn(score[nt][0], scale_l2, -nm0_scaled))
                                       : 0.0f;
-                const float p01 = score[nt][1] > -CUDART_INF_F
+                const float p01 = FullTile || score[nt][1] > -CUDART_INF_F
                                       ? exp2_approx(__fmaf_rn(score[nt][1], scale_l2, -nm0_scaled))
                                       : 0.0f;
-                const float p10 = score[nt][2] > -CUDART_INF_F
+                const float p10 = FullTile || score[nt][2] > -CUDART_INF_F
                                       ? exp2_approx(__fmaf_rn(score[nt][2], scale_l2, -nm1_scaled))
                                       : 0.0f;
-                const float p11 = score[nt][3] > -CUDART_INF_F
+                const float p11 = FullTile || score[nt][3] > -CUDART_INF_F
                                       ? exp2_approx(__fmaf_rn(score[nt][3], scale_l2, -nm1_scaled))
                                       : 0.0f;
+                // A FullTile has no masked score, so no probability needs the zero-select.
                 // Quantise before the sum as well as before the store, so the denominator matches
                 // what the PV matmul will actually accumulate.
                 const float q00 = NINFER_QUANTISE_P(p00);
@@ -563,7 +574,7 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
                 const int d     = dc * 8;
                 const int key   = k0 + key_l;
                 __half* dst     = &v_f16[key_l * D + causal_prompt_swz(key_l, d)];
-                if (key <= max_query_abs) {
+                if (FullTile || key <= max_query_abs) {
                     // The lanes of one value group read the same scale: a shared-memory broadcast,
                     // where a shuffle from a computed lane costs an out-of-line call.
                     const int grp   = PackedValues ? (d >> 5) : (d >> 6);
@@ -589,7 +600,13 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
         __syncthreads();
 
         const bool has_next = kb + 1 < key_blocks;
-        if (has_next) { issue_kv_tile((kb + 1) * Bc); }
+        if (has_next) {
+            if (kb + 1 < full_blocks) {
+                issue_kv_tile.template operator()<true>((kb + 1) * Bc);
+            } else {
+                issue_kv_tile.template operator()<false>((kb + 1) * Bc);
+            }
+        }
 
         const int row_tile = warp % kCausalPromptI8RowTiles;
         const int d_slice  = warp / kCausalPromptI8RowTiles;
@@ -652,7 +669,9 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
             ninfer::ops::cp_wait<0>();
         }
         __syncthreads();
-    }
+    };
+    for (int kb = 0; kb < full_blocks; ++kb) { step.template operator()<true>(kb); }
+    for (int kb = full_blocks; kb < key_blocks; ++kb) { step.template operator()<false>(kb); }
 
     if (warp < ProducerWarps && lid == 0) {
         const int row0  = warp * 16 + gid;

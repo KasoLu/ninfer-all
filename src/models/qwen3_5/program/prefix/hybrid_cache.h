@@ -53,7 +53,8 @@ struct HybridCacheCounters {
     std::uint64_t host_image_writes   = 0;
     std::uint64_t host_block_writes   = 0;
     std::uint64_t host_image_restores = 0;
-    std::uint64_t host_block_restores = 0;
+    std::uint64_t host_block_restores = 0; // prefetched blocks included
+    std::uint64_t prefetched_blocks   = 0;
     std::uint64_t host_tail_restores  = 0;
     std::uint64_t host_write_bytes    = 0;
     std::uint64_t host_restore_bytes  = 0;
@@ -77,6 +78,12 @@ struct HybridPersistResult {
     std::uint64_t snapshots = 0;
     std::uint64_t bytes     = 0;
     double seconds          = 0.0;
+    // Load only: the file's entries and the Host tier bytes they all take, against this tier.
+    // A tier smaller than the file restores the snapshots it values most (plan_host_restore).
+    std::uint64_t saved_blocks        = 0;
+    std::uint64_t saved_snapshots     = 0;
+    std::uint64_t required_host_bytes = 0;
+    std::uint64_t host_bytes          = 0;
 };
 
 class HybridPrefixCache final : public runtime::prefix_cache::PrefixIndexBackend {
@@ -190,19 +197,32 @@ public:
     void order_after_restore(std::uint64_t ticket, cudaStream_t consumer) const;
     // Waits for any submitted copies of the staged batch and returns every destination.
     void abort_restore() noexcept;
+    // Hands a submitted batch of blocks to the cache without a consumer: a prefetch for a request
+    // still waiting (spec §6.6). Its nodes stay Filling and pinned until poll() sees it land.
+    void detach_prefetch();
+    // Whether a prefetch batch may still be landing.
+    [[nodiscard]] bool prefetch_landing() const noexcept;
+    // Waits for every landing prefetch batch and publishes it.
+    void settle_prefetch();
 
     // Releases every reference the cache holds. The index is rebuilt empty.
     void clear() noexcept;
 
     // ---- persistence (hybrid_persist.cpp) -------------------------------------------------------
     // Writes every Host-backed snapshot and the block paths it anchors on to `path` (through a
-    // temporary file renamed into place). Requires no restore or write in flight.
+    // temporary file renamed into place). Requires no restore or write in flight. Once `abandoned`
+    // reports a request, at the latest after the slab being written, the temporary file is
+    // deleted and the previous file stays.
     [[nodiscard]] HybridPersistResult save(const std::filesystem::path& path,
-                                           std::string_view fingerprint) const;
+                                           std::string_view fingerprint,
+                                           const CancellationView& abandoned) const;
     // Rebuilds a saved Host tier into this empty cache when the file's fingerprint and geometry
-    // match. A mismatch or damaged file loads nothing; a smaller Host tier loads what fits.
+    // match. A mismatch or damaged file loads nothing; a smaller Host tier restores the snapshots
+    // it values most and only their paths, reading nothing else. Reading a file whose header
+    // matches publishes StartupPhase::PrefixCacheLoad to `observer`.
     [[nodiscard]] HybridPersistResult load(const std::filesystem::path& path,
-                                           std::string_view fingerprint);
+                                           std::string_view fingerprint,
+                                           const StartupObserver& observer);
 
     // PrefixIndexBackend
     void release_device_block(std::uint32_t device_id) noexcept override;
@@ -252,6 +272,8 @@ private:
         std::vector<cudaEvent_t> layers;
         // Pins a landing batch holds on its snapshot (tail or image source) until it lands.
         std::optional<runtime::prefix_cache::SnapshotRef> pinned_snapshot;
+        // Copies blocks for a waiting request; no lane waits on its events.
+        bool prefetch = false;
     };
 
     [[nodiscard]] std::uint32_t allocate_block_id(HybridBlockPages pages);

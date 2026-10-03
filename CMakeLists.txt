@@ -144,7 +144,9 @@ if(MSVC)
     $<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>)
   # CUDA's static runtime requests LIBCMT even when the application and vcpkg dependencies use
-  # the project-wide /MD runtime. Keep one CRT in the final process.
+  # the project-wide /MD runtime. Keep one CRT in the final process. $<HOST_LINK:...> keeps this
+  # off the CUDA relocatable device-link step, which forwards it to cl.exe without the /link
+  # passthrough separator and only produces a harmless but noisy D9002 "unknown option" warning.
   add_link_options($<HOST_LINK:/NODEFAULTLIB:LIBCMT>)
 else()
   # Schedule dispatch in this project is a switch per Op mapping a schedule id to a kernel launch,
@@ -206,6 +208,29 @@ endif()
 
 include(cmake/Dependencies.cmake)
 include(cmake/NinferTargets.cmake)
+
+# The build id is stamped at BUILD time (see cmake/GenerateBuildId.cmake) into a generated header,
+# so it reflects the tree actually being compiled rather than the last configure. Every product
+# binary records it in its startup log ("build <id>"), and calibrated device profiles record it as
+# their provenance (src/runtime/engine/device_profile_build_id.cpp). The header is only rewritten
+# when its content changes, so only the files that include it recompile when the id does.
+set(NINFER_BUILD_ID_HEADER "${CMAKE_BINARY_DIR}/generated/ninfer_build_id.h")
+add_custom_target(ninfer_build_id_stamp ALL
+  COMMAND ${CMAKE_COMMAND}
+          -DSRC_DIR=${CMAKE_SOURCE_DIR}
+          -DOUT=${NINFER_BUILD_ID_HEADER}
+          -P ${CMAKE_SOURCE_DIR}/cmake/GenerateBuildId.cmake
+  BYPRODUCTS ${NINFER_BUILD_ID_HEADER}
+  COMMENT "Stamping NINFER build id from git (build-time)"
+  VERBATIM)
+
+# A product binary depends on the stamp, and lists the header as a source so a changed id
+# recompiles its main.cpp under every generator.
+function(ninfer_stamp_build_id target)
+  add_dependencies(${target} ninfer_build_id_stamp)
+  target_sources(${target} PRIVATE ${NINFER_BUILD_ID_HEADER})
+  target_include_directories(${target} PRIVATE ${CMAKE_BINARY_DIR}/generated)
+endfunction()
 
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)

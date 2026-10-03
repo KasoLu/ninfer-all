@@ -6,8 +6,17 @@ namespace ninfer::ops::detail {
 
 // Thread-local operations over a fully reduced accumulator. The contraction
 // owns predicates and synchronization; epilogues only receive valid coordinates.
+//
+// apply_scaled(row, token, value, scale) is apply(row, token, value * scale) with the rounding
+// stated by the epilogue. A kernel that scales under a live-column predicate calls it, so the
+// compiler's MUL+ADD contraction choice cannot differ between full and partial tiles and a
+// column's result does not depend on how many tokens share its tile.
 struct LinearIdentityEpilogue {
     __device__ __forceinline__ float apply(int, int, float value) const { return value; }
+
+    __device__ __forceinline__ float apply_scaled(int, int, float value, float scale) const {
+        return value * scale;
+    }
 };
 
 struct LinearResidualAddEpilogue {
@@ -15,6 +24,12 @@ struct LinearResidualAddEpilogue {
 
     __device__ __forceinline__ float apply(int row, int token, float value) const {
         return value + residual.load(row, token);
+    }
+
+    // One rounding for the scaled residual update.
+    __device__ __forceinline__ float apply_scaled(int row, int token, float value,
+                                                  float scale) const {
+        return __fmaf_rn(value, scale, residual.load(row, token));
     }
 };
 
