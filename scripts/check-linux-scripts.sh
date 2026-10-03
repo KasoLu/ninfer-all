@@ -288,6 +288,29 @@ clear_env NINFER_SERVER="$tmp/ninfer-serve-tight" NINFER_MODEL_DIR="$tmp" NINFER
   NINFER_TEST_FITS=1000 "$root/run.sh" qwen38-27b int8 >/dev/null 2>&1 || true
 expect_eq 'int8 profile has no ladder' "$(field --max-context)" '65536 '
 
+# The ladder keeps the server as its child, so a stop request sent to the launcher must be passed
+# on: `docker stop` sends SIGTERM to the launcher alone (PID 1 of the container). Without that the
+# server ran on until the runtime's timeout killed it mid-shutdown.
+cat > "$tmp/ninfer-serve-stoppable" <<'STOPPABLE'
+#!/usr/bin/env bash
+trap 'echo TERM > "$NINFER_TEST_LOG"; exit 143' TERM
+echo started > "$NINFER_TEST_LOG"
+while :; do sleep 0.1; done
+STOPPABLE
+chmod +x "$tmp/ninfer-serve-stoppable"
+stop_log="$tmp/stop.log"; : > "$stop_log"
+# exec, so that $! is the launcher itself rather than a subshell around it.
+( exec env ${ninfer_clear[@]+"${ninfer_clear[@]}"} NINFER_SERVER="$tmp/ninfer-serve-stoppable" \
+    NINFER_MODEL_DIR="$tmp" NINFER_TEST_LOG="$stop_log" "$root/run.sh" qwen38-27b ) \
+  < /dev/null > /dev/null 2>&1 &
+launcher=$!
+for _ in $(seq 1 100); do [[ -s "$stop_log" ]] && break; sleep 0.1; done
+kill -TERM "$launcher"
+launcher_status=0
+wait "$launcher" || launcher_status=$?
+expect_eq 'SIGTERM reaches the server' "$(cat "$stop_log")" 'TERM'
+expect_eq 'the launcher exits with the server' "$launcher_status" '143'
+
 # run.sh ships *inside* the release archive as well as living here, and README calls it the Linux
 # entry point. It once resolved both the server and the artifact from `dirname(script)/..` -- the
 # archive's parent once packaged -- so the documented quick start exited before serving, with a
