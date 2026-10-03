@@ -19,6 +19,12 @@ sed -e "s/id=ninfer-build,/id=$cache_id,/" \
     -e "s/type=cache,target=\/ccache/type=cache,id=$cache_id-ccache,target=\/ccache/" \
     "$repo/Dockerfile" > "$test_dir/Dockerfile"
 cp "$test_dir/Dockerfile" "$context/Dockerfile"
+# The build stage drives the real build and staging scripts; the fixture project stands in for
+# NInfer behind them, so the four staged binaries are fixture executables.
+mkdir -p "$context/scripts" "$context/docker" "$test_dir/scripts"
+cp "$repo/scripts/build-native.sh" "$test_dir/scripts/build-native.sh"
+cp "$repo/scripts/build-native.sh" "$context/scripts/build-native.sh"
+cp "$repo/docker/stage-dist.sh" "$context/docker/stage-dist.sh"
 
 cat > "$context/CMakeLists.txt" <<'EOF'
 cmake_minimum_required(VERSION 3.28)
@@ -28,6 +34,8 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/apps")
 add_executable(ninfer main.cpp)
 target_compile_definitions(ninfer PRIVATE CACHED_DEFAULT=${CACHED_DEFAULT})
 add_executable(ninfer-serve other.cpp)
+add_executable(ninfer-perplexity other.cpp)
+add_executable(ninfer-calibrate other.cpp)
 EOF
 printf 'set(CACHED_DEFAULT 0 CACHE STRING "Fixture default")\n' > "$context/defaults.cmake"
 cat > "$context/main.cpp" <<'EOF'
@@ -50,7 +58,7 @@ build() {
     local label=$1
     # A changed context forces RUN to execute rather than reuse an image layer.
     printf '%s\n' "$label" > "$context/build-check.txt"
-    if ! "$builder" build --target build --tag "$tag" "$context" \
+    if ! "$builder" build --target build --build-arg ARCHS=86 --tag "$tag" "$context" \
         > "$test_dir/$label.log" 2>&1; then
         cat "$test_dir/$label.log"
         return 1
@@ -62,11 +70,11 @@ expect 0 0
 build cold
 
 sed 's/-DCMAKE_BUILD_TYPE=Release/-DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS=-DRECIPE_FLAG=1/' \
-    "$test_dir/Dockerfile" > "$context/Dockerfile"
+    "$test_dir/scripts/build-native.sh" > "$context/scripts/build-native.sh"
 expect 1 0
 build flag-added
 
-cp "$test_dir/Dockerfile" "$context/Dockerfile"
+cp "$test_dir/scripts/build-native.sh" "$context/scripts/build-native.sh"
 expect 0 0
 # Exercise restored headers with old timestamps as well as flag removal.
 touch -t 200001010000 "$context/expected.h"
@@ -77,7 +85,7 @@ grep -q 'ninja: no work to do' "$test_dir/non-code-edit.log"
 
 printf '\nstatic_assert(true, "ordinary source edit");\n' >> "$context/main.cpp"
 build source-edit
-# Exactly one translation unit should rebuild; the other executable is unchanged.
+# Exactly one translation unit should rebuild; the other executables are unchanged.
 test "$(grep -c 'Building CXX object' "$test_dir/source-edit.log")" -eq 1
 
 printf 'set(CACHED_DEFAULT 1 CACHE STRING "Fixture default")\n' > "$context/defaults.cmake"

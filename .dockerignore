@@ -31,3 +31,6 @@ models
 *.qus
 *.safetensors
 *.sqlite
+grafts
+dist
+build-cache-test.*
