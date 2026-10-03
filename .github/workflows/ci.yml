@@ -117,13 +117,13 @@ jobs:
       fail-fast: false
       matrix:
         arch: ['86', '120a']
-    env:
-      CCACHE_HOST_DIR: ${{ github.workspace }}/../ccache
     steps:
       # The runner image's preinstalled SDKs take most of its disk; a CUDA build tree and its
       # ccache need it.
       - name: Free disk space
         run: |
+          # Outside the workspace, and without '..': actions/cache refuses such a path and saves nothing.
+          echo "CCACHE_HOST_DIR=$RUNNER_TEMP/ccache" >> "$GITHUB_ENV"
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL \
             /usr/local/share/boost /usr/local/.ghcup
           df -h /
