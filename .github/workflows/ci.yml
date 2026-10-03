@@ -175,8 +175,12 @@ jobs:
           key: ccache-sm${{ matrix.arch }}-${{ github.sha }}
       - name: Run CTest
         run: |
+          # No driver on the runner: the toolkit's stub libcuda lets the binaries load, cuInit fails,
+          # and every test that needs a device skips itself.
           docker run --rm -v "$PWD:/src" -w /src -e NINFER_BUILD_DIR=/src/build-ci \
-            ninfer-toolchain:ci scripts/build-native.sh test
+            ninfer-toolchain:ci bash -c 'mkdir -p /tmp/stub && \
+              ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/stub/libcuda.so.1 && \
+              LD_LIBRARY_PATH=/tmp/stub scripts/build-native.sh test'
       - name: Stage the image binaries
         run: |
           docker run --rm -v "$PWD:/src" -w /src ninfer-toolchain:ci \
