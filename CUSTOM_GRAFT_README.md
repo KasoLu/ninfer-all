@@ -271,6 +271,7 @@ build-ninja/apps/ninfer-serve.exe \
 `scripts/run.bat` now auto-loads trained grafts at server startup. Each model
 key maps to a graft filename; the script looks in the sibling `phantom-kv`
 repo's `artifacts/grafts/` directory by default.
+Compiled grafts are local artifacts and are not stored in this repository.
 
 | Model key           | Graft file                      |
 |---------------------|---------------------------------|
