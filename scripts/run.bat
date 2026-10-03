@@ -48,9 +48,8 @@ rem The qwen3_8_27b.ninfer that download-model.bat fetches is the DFlash2 bundle
 rem MTP weights too, so one file serves both.
 rem
 rem OVERRIDES, from the environment. All profiles: NINFER_MODEL (artifact path), NINFER_MODEL_DIR,
-rem NINFER_SERVER, NINFER_HOST, NINFER_PORT, NINFER_GRAFT_DIR (phantom-kv graft directory),
-rem NINFER_GRAFTS (set to "off" to disable graft loading), NINFER_DEFAULT_GRAFT (set to "on" to
-rem apply the loaded graft to every request that names none), NINFER_CHAT_TEMPLATE (path to a local
+rem NINFER_SERVER, NINFER_HOST, NINFER_PORT, NINFER_GRAFT_DIR, NINFER_GRAFTS (off),
+rem NINFER_DEFAULT_GRAFT (see PROMPT GRAFTS below), NINFER_CHAT_TEMPLATE (path to a local
 rem Jinja file, passed straight to --chat-template; overrides the artifact's built-in template).
 rem `tuned` also: NINFER_CONTEXT,
 rem NINFER_CONCURRENCY, NINFER_KV_DTYPE, NINFER_SPEC, NINFER_DRAFT_TOKENS, NINFER_PREFILL_CHUNK,
@@ -91,7 +90,6 @@ if /i "%MODEL_KEY%"=="--help" goto :help
 if /i "%MODEL_KEY%"=="qwen38-27b" (
   set "ARTIFACT=qwen3_8_27b.ninfer"
   set "TITLE=Qwen3.8-27B"
-  set "GRAFT_FILE=godmode_q38_trained.bin"
   goto :model_known
 )
 if /i "%MODEL_KEY%"=="qwen36-35b-a3b" (
@@ -148,10 +146,14 @@ set "SERVER=%ROOT%\build-ninja\apps\ninfer-serve.exe"
 if not exist "%SERVER%" set "SERVER=%~dp0ninfer-serve.exe"
 if not "%NINFER_SERVER%"=="" set "SERVER=%NINFER_SERVER%"
 
-rem Phantom-KV graft: default directory is artifacts\grafts in this repo. The graft
-rem file name is set per model key above. NINFER_GRAFTS=off disables graft loading entirely;
-rem NINFER_GRAFT_DIR overrides where to look.
-set "GRAFT_DIR=%ROOT%\artifacts\grafts"
+rem PROMPT GRAFTS are optional and never shipped: nothing here needs one to start. Every NAME.bin
+rem with its NAME.json sidecar in grafts\<model>\ (beside models\, by the same layout rule, or
+rem NINFER_GRAFT_DIR) is loaded as --graft NAME=<file>, and a request selects it with
+rem "graft": "NAME" (docs\serving.md). No directory or an empty one serves without grafts.
+rem NINFER_GRAFTS=off skips them; NINFER_DEFAULT_GRAFT=NAME applies one to every request that
+rem names none. Same contract as run.sh.
+set "GRAFT_DIR=%~dp0grafts\%MODEL_KEY%"
+if /i "%SCRIPT_DIRNAME%"=="scripts" if exist "%ROOT%\CMakeLists.txt" set "GRAFT_DIR=%ROOT%\grafts\%MODEL_KEY%"
 if not "%NINFER_GRAFT_DIR%"=="" set "GRAFT_DIR=%NINFER_GRAFT_DIR%"
 
 rem The profile fixes the whole serving shape. LABEL is the banner; PROFILE_ARGS is everything
@@ -318,18 +320,19 @@ set "PROFILE_ARGS=%PROFILE_ARGS% --max-pending-requests 16 --pending-timeout-ms 
 
 :launch
 set "GRAFT_ARGS="
+set "GRAFT_NAMES="
 if /i "%NINFER_GRAFTS%"=="off" goto :graft_done
-if "%GRAFT_FILE%"=="" goto :graft_done
-if exist "%GRAFT_DIR%\%GRAFT_FILE%" goto :graft_found
-rem No parenthesised block here: GRAFT_DIR may contain ")" (e.g. "Program Files (x86)").
-echo WARNING: graft file not found, serving without a graft: "%GRAFT_DIR%\%GRAFT_FILE%"
-echo          Requests naming "godmode" will fail with unknown_graft.
+rem One-line for and a subroutine, no parenthesised block: GRAFT_DIR may contain ")" (e.g.
+rem "Program Files (x86)").
+if exist "%GRAFT_DIR%\*.bin" for %%G in ("%GRAFT_DIR%\*.bin") do call :add_graft "%%~fG"
+if "%NINFER_DEFAULT_GRAFT%"=="" goto :graft_done
+if not exist "%GRAFT_DIR%\%NINFER_DEFAULT_GRAFT%.json" goto :graft_default_missing
+if not exist "%GRAFT_DIR%\%NINFER_DEFAULT_GRAFT%.bin" goto :graft_default_missing
+set GRAFT_ARGS=%GRAFT_ARGS% --default-graft "%NINFER_DEFAULT_GRAFT%"
 goto :graft_done
-:graft_found
-set "GRAFT_ARGS=--graft "godmode=%GRAFT_DIR%\%GRAFT_FILE%""
-rem Opt-in: NINFER_DEFAULT_GRAFT=on makes godmode apply to every request that states no graft
-rem (--default-graft godmode); a request opts out with "graft": "". Only reached when a graft loaded.
-if /i "%NINFER_DEFAULT_GRAFT%"=="on" set "GRAFT_ARGS=%GRAFT_ARGS% --default-graft godmode"
+:graft_default_missing
+echo NINFER_DEFAULT_GRAFT=%NINFER_DEFAULT_GRAFT% names no graft in "%GRAFT_DIR%"
+exit /b 2
 :graft_done
 set "CHAT_TEMPLATE_ARGS="
 rem The wrapping "set "VAR=..."" form closes its quoted span right before a spliced %VAR%, so cmd
@@ -355,10 +358,7 @@ if not exist "%MODEL%" (
 echo %TITLE%  ^|  %LABEL%
 if not "%PREFILL_NOTE%"=="" echo %PREFILL_NOTE%
 if /i "%PROFILE%"=="tuned" echo Cache: 8 shared / 8 private / %HOST_STATE_SLOTS% host states  ^|  automatic prefix grid on
-rem GRAFT_ARGS carries literal embedded quotes (--graft "godmode=<path>"), so re-quoting it for a
-rem string comparison here garbles the quoting and breaks the if statement. `defined` sidesteps
-rem that: it tests the variable directly, with no substitution.
-if defined GRAFT_ARGS echo Graft: godmode = %GRAFT_FILE%
+if defined GRAFT_NAMES echo Grafts:%GRAFT_NAMES%
 if defined CHAT_TEMPLATE_ARGS echo Chat template: "%NINFER_CHAT_TEMPLATE%"
 if not "%HINT%"=="" echo %HINT%
 echo API: http://%HOST%:%PORT%/v1
@@ -428,4 +428,11 @@ endlocal & exit /b %SERVER_STATUS%
 echo usage: run.bat ^<model^> [profile]
 echo   qwen38-27b       tuned (default), int8, c8   (recommended)
 echo   qwen36-35b-a3b   tuned (default)
+exit /b 0
+
+:add_graft
+rem A .bin without its .json sidecar is not a graft (the server would refuse it), so skip it.
+if not exist "%~dpn1.json" exit /b 0
+set GRAFT_ARGS=%GRAFT_ARGS% --graft "%~n1=%~1"
+set "GRAFT_NAMES=%GRAFT_NAMES% %~n1"
 exit /b 0

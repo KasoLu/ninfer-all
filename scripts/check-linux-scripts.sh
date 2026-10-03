@@ -102,7 +102,7 @@ record() { # record <label> [NAME=value ...] -- <run.sh arguments>; prints the r
   while [[ "$1" != '--' ]]; do assignments+=("$1"); shift; done
   shift
   clear_env NINFER_SERVER="$tmp/ninfer-serve" NINFER_TEST_ARGS="$recorded" NINFER_MODEL_DIR="$tmp" \
-    ${assignments[@]+"${assignments[@]}"} "$root/run.sh" "$@" >/dev/null
+    NINFER_GRAFT_DIR="$tmp/no-grafts" ${assignments[@]+"${assignments[@]}"} "$root/run.sh" "$@" >/dev/null
   printf '%s' "$recorded"
 }
 expect_flags() { # expect_flags <label> <recorded> <flag sequence>...: each appears, in order, adjacent
@@ -165,6 +165,21 @@ expect_flags '27B chat template override' \
   "$(record chat_template NINFER_CHAT_TEMPLATE="$tmp/custom.jinja" -- qwen38-27b)" \
   "--chat-template $tmp/custom.jinja"
 refuse_flag '27B no chat template override' "$(record no_chat_template -- qwen38-27b)" '--chat-template'
+
+# Prompt grafts are optional: none found serves without one, every NAME.bin with its NAME.json
+# sidecar loads as --graft NAME, a .bin without a sidecar is not a graft, NINFER_GRAFTS=off skips
+# them all, and NINFER_DEFAULT_GRAFT must name one that loaded.
+refuse_flag '27B no grafts' "$(record no_grafts -- qwen38-27b)" '--graft'
+mkdir -p "$tmp/grafts"
+touch "$tmp/grafts/red.bin" "$tmp/grafts/red.json" "$tmp/grafts/stray.bin"
+recorded="$(record grafts NINFER_GRAFT_DIR="$tmp/grafts" NINFER_DEFAULT_GRAFT=red -- qwen38-27b)"
+expect_flags '27B grafts' "$recorded" "--graft red=$tmp/grafts/red.bin" '--default-graft red'
+refuse_flag '27B grafts' "$recorded" "--graft stray=$tmp/grafts/stray.bin"
+refuse_flag '27B grafts off' \
+  "$(record grafts_off NINFER_GRAFT_DIR="$tmp/grafts" NINFER_GRAFTS=off -- qwen38-27b)" '--graft'
+expect_exit 2 'unknown NINFER_DEFAULT_GRAFT' clear_env NINFER_SERVER="$tmp/ninfer-serve" \
+  NINFER_TEST_ARGS="$tmp/run.bad_graft.args" NINFER_MODEL_DIR="$tmp" NINFER_GRAFT_DIR="$tmp/grafts" \
+  NINFER_DEFAULT_GRAFT=stray "$root/run.sh" qwen38-27b
 
 # The banner reports what is being served: an explicit vision residency shows up in it, not the
 # default. (The stub server prints nothing, so stdout here is the launcher's own.)

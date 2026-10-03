@@ -33,6 +33,8 @@ venv/
 *.ninfer
 *.ninfer.conversion.json
 /models/
+# Optional local prompt grafts (scripts/run.*); never part of the repository.
+/grafts/
 out/
 vcpkg_installed/
 

@@ -56,13 +56,20 @@
 #
 # OVERRIDES, from the environment. All profiles: NINFER_MODEL (artifact path), NINFER_MODEL_DIR,
 # NINFER_SERVER, NINFER_HOST, NINFER_PORT, NINFER_CHAT_TEMPLATE (path to a local Jinja file, passed
-# straight to --chat-template; overrides the artifact's built-in template). `tuned` also:
+# straight to --chat-template; overrides the artifact's built-in template), NINFER_GRAFT_DIR,
+# NINFER_GRAFTS (off), NINFER_DEFAULT_GRAFT (see PROMPT GRAFTS below). `tuned` also:
 # NINFER_CONTEXT, NINFER_CONCURRENCY,
 # NINFER_KV_CAPACITY, NINFER_KV_DTYPE, NINFER_SPEC, NINFER_DRAFT_TOKENS, NINFER_PREFILL_CHUNK,
 # NINFER_VISION (on|off), NINFER_VISION_RESIDENCY, NINFER_HOST_STATE_SLOTS. Each spec's defaults (context, lanes, chunk)
 # are the ones that fit; the context figures below are extrapolated for a headless card, so treat
 # the first start as the confirmation and drop a rung if it refuses:
 # 229376 / 212992 / 196608 / 163840 / 131072 / 114688 / 98304 / 65536.
+#
+# PROMPT GRAFTS are optional and never shipped: nothing here needs one to start. Every NAME.bin with
+# its NAME.json sidecar in grafts/<model>/ (beside models/, or NINFER_GRAFT_DIR) is loaded as
+# --graft NAME=<file>, and a request selects it with "graft": "NAME" (docs/serving.md). No
+# directory or an empty one serves without grafts. NINFER_GRAFTS=off skips them;
+# NINFER_DEFAULT_GRAFT=NAME applies one to every request that names none.
 # ------------------------------------------------------------------------------------------------
 set -euo pipefail
 
@@ -249,6 +256,26 @@ if [[ -n "${NINFER_CHAT_TEMPLATE:-}" ]]; then
   profile_args+=(--chat-template "$NINFER_CHAT_TEMPLATE")
 fi
 
+# Same two layouts as models/: the checkout's grafts/ first, then the one beside the launcher.
+graft_dir="${NINFER_GRAFT_DIR:-$root/grafts/$model_key}"
+[[ -n "${NINFER_GRAFT_DIR:-}" || -d "$graft_dir" ]] || graft_dir="$script_dir/grafts/$model_key"
+graft_names=()
+if [[ "${NINFER_GRAFTS:-on}" != 'off' && -d "$graft_dir" ]]; then
+  for graft in "$graft_dir"/*.bin; do
+    [[ -f "$graft" && -f "${graft%.bin}.json" ]] || continue
+    name="$(basename -- "$graft" .bin)"
+    graft_names+=("$name")
+    profile_args+=(--graft "$name=$graft")
+  done
+fi
+if [[ -n "${NINFER_DEFAULT_GRAFT:-}" && "${NINFER_GRAFTS:-on}" != 'off' ]]; then
+  if [[ " ${graft_names[*]-} " != *" $NINFER_DEFAULT_GRAFT "* ]]; then
+    printf 'NINFER_DEFAULT_GRAFT=%s names no graft in %s\n' "$NINFER_DEFAULT_GRAFT" "$graft_dir" >&2
+    exit 2
+  fi
+  profile_args+=(--default-graft "$NINFER_DEFAULT_GRAFT")
+fi
+
 if [[ ! -x "$server" ]]; then
   printf 'Missing ninfer-serve (looked for %s)\n' "$server" >&2
   printf 'Build it first:  ./scripts/build.sh\n' >&2
@@ -266,6 +293,8 @@ if [[ "$profile" == 'tuned' ]]; then
   printf 'Cache: 8 shared / 8 private / %s host states  |  automatic prefix grid on\n' "$HOST_STATE_SLOTS"
 fi
 [[ -z "${NINFER_CHAT_TEMPLATE:-}" ]] || printf 'Chat template: %s\n' "$NINFER_CHAT_TEMPLATE"
+(( ${#graft_names[@]} == 0 )) || printf 'Grafts: %s%s\n' "${graft_names[*]}" \
+  "${NINFER_DEFAULT_GRAFT:+ (default $NINFER_DEFAULT_GRAFT)}"
 [[ -z "${hint:-}" ]] || printf '%s\n' "$hint"
 printf 'API: http://%s:%s/v1\n\n' "$HOST" "$PORT"
 

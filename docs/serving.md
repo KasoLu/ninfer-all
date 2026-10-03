@@ -1374,6 +1374,11 @@ fails with `400 unknown_graft`, and a non-string value fails as a malformed `gra
 `--default-graft NAME` makes one loaded graft the default for requests that state none. It must
 name a `--graft`, or the server refuses to start.
 
+Grafts are local files; the repository and release archives ship none. `scripts/run.sh` and
+`scripts/run.bat` pass `--graft NAME=<file>` for every `NAME.bin` with its `NAME.json` sidecar in
+`grafts/<model key>/` beside `models/` (or `NINFER_GRAFT_DIR`), serve without grafts when there are
+none, skip them under `NINFER_GRAFTS=off`, and pass `--default-graft` from `NINFER_DEFAULT_GRAFT`.
+
 | request `graft` | without `--default-graft` | with `--default-graft D` |
 |---|---|---|
 | absent or `null` | none | `D` |
