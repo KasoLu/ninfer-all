@@ -32,6 +32,7 @@ RUN apt-get update \
         ninja-build \
         pkg-config \
         python3 \
+        python3-jinja2 \
         rsync \
         zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
