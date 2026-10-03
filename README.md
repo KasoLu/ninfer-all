@@ -359,7 +359,12 @@ touches and the tests that cover it.
 RTX 30 series (compute capability 8.6), which also runs the RTX 40 series (8.9), and `sm_120a` for the
 RTX 50 series and the RTX PRO 6000 Blackwell (12.0). The host needs an NVIDIA driver of the CUDA 13
 branch (580 or newer) and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-Other tags: `sha-<commit>` for every published commit, and the `VERSION` of the newest one.
+Other tags: `sha-<commit>` for every published commit, and the `VERSION` of the newest one. The image
+is 1.6 GB compressed: Ubuntu, cuBLAS and the CUDA runtime from NVIDIA's repository, FFmpeg, and one
+multi-call executable per architecture that all four programs are names of. On an RTX 3090 and an
+RTX 5090 with driver 580.159.03 it downloaded the 27B and answered chat completions through
+`run qwen38-27b`; the 5090 started at the full 262,144-token context, the 3090 at 196,608 after two
+of the launcher's step-downs.
 
 ```bash
 docker pull ghcr.io/iamwavecut/ninfer-all:latest
