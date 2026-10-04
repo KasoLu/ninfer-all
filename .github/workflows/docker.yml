@@ -3,7 +3,8 @@
 # compiled twice and nothing unpublished by CI reaches the image. Tags:
 #   latest            the newest master commit that passed CI
 #   <VERSION>         the newest such commit of that release line
-#   sha-<12 hex>      every published commit
+#   sha-<12 hex>      the published commit
+# The registry keeps `latest` and the image published before it (docker/prune-images.sh).
 name: Container image
 
 on:
@@ -78,3 +79,8 @@ jobs:
           # binaries as well and evict the CI's ccache from the repository's 10 GB budget.
           cache-from: type=registry,ref=${{ steps.tags.outputs.image }}:latest
           cache-to: type=inline
+      # Older images go, with the platform manifests and attestations their indexes list.
+      - name: Prune older images
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: docker/prune-images.sh "$GITHUB_REPOSITORY"
