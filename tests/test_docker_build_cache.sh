@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # Exercise the real Dockerfile with a tiny CMake project; never run NInfer.
+# NINFER_TOOLCHAIN_IMAGE=<image> stands in for the Dockerfile's toolchain stage (CI passes the one
+# it published), so the check does not rebuild it.
 set -euo pipefail
 
 builder=${1:-docker}
+toolchain_context=()
+if [[ -n "${NINFER_TOOLCHAIN_IMAGE:-}" ]]; then
+    toolchain_context=(--build-context "toolchain=docker-image://$NINFER_TOOLCHAIN_IMAGE")
+fi
 export BUILDKIT_PROGRESS=plain
 repo=$(cd "$(dirname "$0")/.." && pwd)
 test_dir=$(mktemp -d "$repo/build-cache-test.XXXXXX")
@@ -55,7 +61,8 @@ build() {
     local label=$1
     # A changed context forces RUN to execute rather than reuse an image layer.
     printf '%s\n' "$label" > "$context/build-check.txt"
-    if ! "$builder" build --target build --build-arg ARCHS=86 --tag "$tag" "$context" \
+    if ! "$builder" build --target build --build-arg ARCHS=86 ${toolchain_context[@]+"${toolchain_context[@]}"} \
+        --tag "$tag" "$context" \
         > "$test_dir/$label.log" 2>&1; then
         cat "$test_dir/$label.log"
         return 1
