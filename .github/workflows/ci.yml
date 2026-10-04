@@ -190,4 +190,5 @@ jobs:
         with:
           name: dist-sm${{ matrix.arch }}
           path: dist/
-          retention-days: 7
+          # Only the publishing run that follows reads them.
+          retention-days: 1
