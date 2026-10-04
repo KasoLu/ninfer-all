@@ -359,7 +359,8 @@ touches and the tests that cover it.
 RTX 30 series (compute capability 8.6), which also runs the RTX 40 series (8.9), and `sm_120a` for the
 RTX 50 series and the RTX PRO 6000 Blackwell (12.0). The host needs an NVIDIA driver of the CUDA 13
 branch (580 or newer) and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-Other tags: `sha-<commit>` for every published commit, and the `VERSION` of the newest one. The image
+Other tags: `sha-<commit>`, and the `VERSION` of the newest one; the registry keeps `latest` and the
+image published before it, which stays available under its `sha-` tag. The image
 is 1.6 GB compressed: Ubuntu, cuBLAS and the CUDA runtime from NVIDIA's repository, FFmpeg, and one
 multi-call executable per architecture that all four programs are names of. On an RTX 3090 and an
 RTX 5090 with driver 580.159.03 it downloaded the 27B and answered chat completions through
