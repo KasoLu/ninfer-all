@@ -13,7 +13,6 @@
 #include <limits>
 #include <optional>
 #include <span>
-#include <string>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -124,17 +123,7 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         actual.device.active_lanes               = 1;
         const detail::PhysicalResources expected = active;
         if (actual != expected) {
-            const auto describe = [](const detail::PhysicalResources& r) {
-                return "lanes " + std::to_string(r.device.active_lanes) + " state_slots " +
-                       std::to_string(r.device.state_slots) + " main_kv_pages " +
-                       std::to_string(r.device.main_kv_pages) + " backend_kv_pages " +
-                       std::to_string(r.device.backend_kv_pages) + " host_state_slots " +
-                       std::to_string(r.host.state_slots) + " host_kv_bytes " +
-                       std::to_string(r.host.kv_bytes);
-            };
-            throw std::logic_error(
-                "materialized sequence does not match its active entitlement (actual: " +
-                describe(actual) + "; expected: " + describe(expected) + ")");
+            throw std::logic_error("materialized sequence does not match its active entitlement");
         }
         if (details.reuse != ReusePath::Root) {
             if (transaction.state_restored) {
@@ -155,12 +144,6 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         return StartResult{.sequence = handle};
     } catch (...) {
         if (destination && *destination < max_concurrency) {
-            // Startup may have queued work on any stage's stream before a later publication check
-            // failed. Complete it before returning its buffers, pages or execution row to the
-            // pools; a device that cannot synchronize is past saving and the rethrow reports it.
-            try {
-                device.synchronize();
-            } catch (...) {}
             const std::uint32_t lane = *destination;
             if (active_continuations[lane] < continuation_capacity) {
                 clear_lane_best_effort(active_sequence(lane), requests[lane]);
@@ -355,6 +338,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     (backend_kv_cache() && !sequence.kv->backend)) {
                     throw std::logic_error("DFlash forced continuation state is incomplete");
                 }
+                upload_dflash_prefill_controls(sequence);
             }
 
             std::uint32_t cursor = base;
@@ -376,8 +360,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     selectors.source,
                     selectors.destination,
                     0,
-                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                         : 0};
+                    dflash_host_ingress};
                 mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
                                          ? workspace_plan.mtp_prefill
                                          : workspace_plan.text_prefill);
@@ -749,13 +732,6 @@ bool ProgramImpl::salvage_continuation(SequenceState& state, RequestControl& req
             state.dflash_context_frontier < frontier) {
             return false;
         }
-        // The next request reuses this endpoint under MTP only with the tail hidden state and the
-        // MTP KV up to frontier - 1 (request_plan.cpp). A prefill cut before its last chunk has no
-        // tail hidden state, so the conversation resumes from its last captured checkpoint.
-        if (speculative_backend == SpeculativeBackend::Mtp &&
-            (!state.tail_hidden_valid || state.mtp_kv_valid + 1 < frontier)) {
-            return false;
-        }
     } else if (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Finishable) {
         frontier = state.execution_frontier;
         if (frontier < kSalvageMinFrontier || state.text_kv_valid != frontier) { return false; }
@@ -790,13 +766,6 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
     }
     SequenceState& state = active_sequence(lane);
     const std::uint32_t continuation_index = active_continuations[lane];
-    // Cancellation can arrive after activation and before the first prefill unit has waited for
-    // its uploads and initialization, or with a chunk still running a step behind the host. Settle
-    // that work on every stage before any branch below releases, salvages or publishes the lane's
-    // pages; a device that cannot synchronize leaves the abort unconsumed for recovery.
-    try {
-        device.synchronize();
-    } catch (...) { return out; }
     if (hybrid_) {
         // The committed state is publishable as an endpoint when no model unit is in flight.
         out.timings     = request.timings;
@@ -849,8 +818,7 @@ bool ProgramImpl::can_release_shared_prefix_state(std::uint32_t index,
         return false;
     }
     const SharedPrefixState& shared = shared_prefix_states[index];
-    const bool needs_identity = expected_role != SharedPrefixSlotRole::Pinned;
-    if (shared.active_references != 0 || !shared.kv || (needs_identity && !shared.identity) ||
+    if (shared.active_references != 0 || !shared.kv || !shared.identity ||
         !state_store->valid(shared.state) || !text_kv_addresses->can_release(shared.kv->text) ||
         (shared.kv->backend &&
          (!backend_kv_addresses || !backend_kv_addresses->can_release(*shared.kv->backend)))) {
@@ -898,13 +866,12 @@ ReleaseResult ProgramImpl::release_shared_prefix(SharedPrefixHandle&& handle) no
         shared_prefix_slots[index].generation != generation) {
         return out;
     }
-    const SharedPrefixSlotRole actual_role = shared_prefix_slots[index].role;
     try {
-        if (!can_release_shared_prefix_state(index, actual_role)) {
+        if (!can_release_shared_prefix_state(index, SharedPrefixSlotRole::Catalogued)) {
             return out;
         }
     } catch (...) { return out; }
-    (void)release_shared_prefix_state_strict(index, actual_role);
+    (void)release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
     ContractAccess::consume(handle);
     advance_resource_revision();
     out.status = runtime::ConsumeStatus::Consumed;
@@ -939,13 +906,18 @@ ProgramImpl::fail_all_cleanup(ProgramCleanup cleanup) noexcept {
         }
         hybrid_->clear();
     }
+    // The orderly stop writes the catalogued continuations still resident to the disk tier before
+    // the release below drops their owners; the destructor's flush would otherwise find no
+    // Catalogued slot left. A failure cleanup may leave state an invariant throw corrupted, and a
+    // CRC-valid page would keep it restorable, so only the orderly stop persists.
+    if (cleanup == ProgramCleanup::Shutdown) { flush_disk_tier(); }
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
         if (continuation_slots[index].role != ContinuationSlotRole::Free) {
             release_continuation_slot_best_effort(index);
         }
     }
     for (std::uint32_t index = 0; index < shared_prefix_capacity; ++index) {
-        if (!is_live_shared_prefix_role(shared_prefix_slots[index].role)) { continue; }
+        if (shared_prefix_slots[index].role != SharedPrefixSlotRole::Catalogued) { continue; }
         shared_prefix_states[index].active_references = 0;
         auto handle =
             ContractAccess::make_shared_prefix(this, index, shared_prefix_slots[index].generation);
