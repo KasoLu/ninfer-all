@@ -1551,13 +1551,16 @@ void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_
     const auto target = [reach](std::uint32_t cap, std::uint32_t pages, std::uint32_t wanted) {
         return std::min(cap, std::max(pages, std::min(reach, wanted)));
     };
+    // Only a thin lease grows: extending a whole one would ask its pool for space the other lease
+    // needs, and the one reservation that fails settles both.
     const auto targets = [&](std::uint32_t extra_tokens) {
         return DeviceKVPages{
-            .main = target(std::min(text_kv_pages->physical_pool().capacity_pages(),
-                                    text_kv_addresses->page_capacity()),
-                           text_pages,
-                           kv_lease_pages_for_tokens(
-                               std::min(request.lease_ceiling, main_tokens + extra_tokens))),
+            .main = main_thin ? target(std::min(text_kv_pages->physical_pool().capacity_pages(),
+                                                text_kv_addresses->page_capacity()),
+                                       text_pages,
+                                       kv_lease_pages_for_tokens(std::min(
+                                           request.lease_ceiling, main_tokens + extra_tokens)))
+                              : text_pages,
             .backend =
                 sequence.kv->backend
                     ? target(std::min(backend_kv_pages->physical_pool().capacity_pages(),
