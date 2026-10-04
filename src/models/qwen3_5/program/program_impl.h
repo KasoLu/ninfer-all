@@ -383,7 +383,8 @@ struct PendingCandidate {
 };
 
 // Why every owner is being dropped: a failure discards everything; an orderly shutdown first saves
-// the hybrid Host tier when a cache file is attached.
+// the hybrid Host tier when a cache file is attached and writes the resident continuations to the
+// disk tier when one is configured.
 enum class ProgramCleanup : std::uint8_t {
     Failure,
     Shutdown,
