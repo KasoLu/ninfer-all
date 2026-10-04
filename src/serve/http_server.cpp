@@ -60,6 +60,28 @@ void ensure_openai_request_id(const httplib::Request& request, httplib::Response
     }
 }
 
+// A plain-handler route has its body read by dispatch_request() through Server::read_content,
+// which rejects any application/x-www-form-urlencoded body larger than 8 KiB (httplib's
+// CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH) with a 413 that ignores --max-request-mib --
+// and `curl -d` sends JSON with that content type. The check runs before any handler, so no route
+// can correct it. The content-reader route form reads through read_content_core, which enforces
+// only the configured payload limit; buffering the body here keeps a 413 meaning exactly "the raw
+// request body exceeds --max-request-mib".
+void buffer_request_body(const httplib::Request& request, httplib::Response& response,
+                         const httplib::ContentReader& content_reader,
+                         const httplib::Server::Handler& handler) {
+    httplib::Request buffered = request;
+    buffered.body.clear();
+    const bool complete = content_reader([&](const char* data, std::size_t length) {
+        buffered.body.append(data, length);
+        return true;
+    });
+    // An aborted read already carries httplib's own status (413 for the payload limit); the
+    // unrendered-error handler renders its documented envelope.
+    if (!complete) { return; }
+    handler(buffered, response);
+}
+
 ThroughputReport make_throughput_report(const ninfer::RuntimeStats& previous,
                                         const ninfer::RuntimeStats& current,
                                         double interval_seconds) {
@@ -483,6 +505,22 @@ httplib::Server::HandlerResponse HttpServer::pre_route(const httplib::Request& r
     return httplib::Server::HandlerResponse::Unhandled;
 }
 
+void HttpServer::register_post(const std::string& pattern, httplib::Server::Handler handler) {
+    server_.Post(pattern, [handler = std::move(handler)](const httplib::Request& request,
+                                                         httplib::Response& response,
+                                                         const httplib::ContentReader& reader) {
+        buffer_request_body(request, response, reader, handler);
+    });
+}
+
+void HttpServer::register_delete(const std::string& pattern, httplib::Server::Handler handler) {
+    server_.Delete(pattern, [handler = std::move(handler)](const httplib::Request& request,
+                                                           httplib::Response& response,
+                                                           const httplib::ContentReader& reader) {
+        buffer_request_body(request, response, reader, handler);
+    });
+}
+
 void HttpServer::register_routes() {
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
         return handle_unrendered_http_error(options_, request, response);
@@ -574,7 +612,7 @@ void HttpServer::register_routes() {
     server_.Get("/slots", [this](const httplib::Request& req, httplib::Response& res) {
         handle_slots(req, res);
     });
-    server_.Post(R"(/slots/(\d+))", [this](const httplib::Request& req, httplib::Response& res) {
+    register_post(R"(/slots/(\d+))", [this](const httplib::Request& req, httplib::Response& res) {
         handle_slot_action(req, res);
     });
     server_.Get("/props", [this](const httplib::Request& req, httplib::Response& res) {
@@ -600,73 +638,73 @@ void HttpServer::register_routes() {
         handle_models_sse(req, res);
     });
     for (const char* action : {"load", "unload", "sleep"}) {
-        server_.Post(std::string("/models/") + action,
-                     [this, action](const httplib::Request& req, httplib::Response& res) {
-                         handle_models_action(req, res, action);
-                     });
+        register_post(std::string("/models/") + action,
+                      [this, action](const httplib::Request& req, httplib::Response& res) {
+                          handle_models_action(req, res, action);
+                      });
     }
     // Before the single-model route below, which would take "<id>/residency" for a model id.
     server_.Get(api_route_pattern(R"(/models/(.+)/residency)"),
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_model_residency(req, res);
                 });
-    server_.Post(api_route_pattern(R"(/models/(.+)/suspend)"),
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_model_suspend(req, res);
-                 });
-    server_.Post(api_route_pattern(R"(/models/(.+)/resume)"),
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_model_resume(req, res);
-                 });
+    register_post(api_route_pattern(R"(/models/(.+)/suspend)"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_model_suspend(req, res);
+                  });
+    register_post(api_route_pattern(R"(/models/(.+)/resume)"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_model_resume(req, res);
+                  });
     server_.Get(api_route_pattern(R"(/models/(.+))"),
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_model(req, res);
                 });
-    server_.Post(api_route_pattern("/chat/completions"),
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_chat_completions(req, res);
-                 });
-    server_.Post(api_route_pattern("/completions"),
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_text_completion(req, res, TextCompletionDialect::OpenAI);
-                 });
+    register_post(api_route_pattern("/chat/completions"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_chat_completions(req, res);
+                  });
+    register_post(api_route_pattern("/completions"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_text_completion(req, res, TextCompletionDialect::OpenAI);
+                  });
     for (const char* path : {"/completion", "/completions"}) {
-        server_.Post(path, [this](const httplib::Request& req, httplib::Response& res) {
+        register_post(path, [this](const httplib::Request& req, httplib::Response& res) {
             handle_text_completion(req, res, TextCompletionDialect::LlamaCpp);
         });
     }
-    server_.Post("/tokenize", [this](const httplib::Request& req, httplib::Response& res) {
+    register_post("/tokenize", [this](const httplib::Request& req, httplib::Response& res) {
         handle_tokenize(req, res);
     });
-    server_.Post("/detokenize", [this](const httplib::Request& req, httplib::Response& res) {
+    register_post("/detokenize", [this](const httplib::Request& req, httplib::Response& res) {
         handle_detokenize(req, res);
     });
-    server_.Post("/apply-template", [this](const httplib::Request& req, httplib::Response& res) {
+    register_post("/apply-template", [this](const httplib::Request& req, httplib::Response& res) {
         handle_apply_template(req, res);
     });
     for (const char* endpoint : {"/rerank", "/reranking"}) {
         const auto rerank = [this](const httplib::Request& req, httplib::Response& res) {
             handle_rerank(req, res);
         };
-        server_.Post(endpoint, rerank);
-        server_.Post(api_route_pattern(endpoint), rerank);
+        register_post(endpoint, rerank);
+        register_post(api_route_pattern(endpoint), rerank);
     }
-    server_.Post(api_route_pattern("/responses"),
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_responses(req, res);
-                 });
-    server_.Post(api_route_pattern("/responses/input_tokens"),
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_response_input_tokens(req, res);
-                 });
-    server_.Post(api_route_pattern("/responses/compact"),
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_response_compact(req, res);
-                 });
-    server_.Post(api_route_pattern(R"(/responses/([^/]+)/cancel)"),
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_response_cancel(req, res);
-                 });
+    register_post(api_route_pattern("/responses"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_responses(req, res);
+                  });
+    register_post(api_route_pattern("/responses/input_tokens"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_response_input_tokens(req, res);
+                  });
+    register_post(api_route_pattern("/responses/compact"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_response_compact(req, res);
+                  });
+    register_post(api_route_pattern(R"(/responses/([^/]+)/cancel)"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_response_cancel(req, res);
+                  });
     server_.Get(api_route_pattern(R"(/responses/([^/]+)/input_items)"),
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_response_input_items(req, res);
@@ -675,25 +713,24 @@ void HttpServer::register_routes() {
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_response_get(req, res);
                 });
-    server_.Delete(api_route_pattern(R"(/responses/([^/]+))"),
-                   [this](const httplib::Request& req, httplib::Response& res) {
-                       handle_response_delete(req, res);
-                   });
-    server_.Post(api_route_pattern("/messages/count_tokens"),
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_count_tokens(req, res);
-                 });
-    server_.Post(api_route_pattern("/messages"),
-                 [this](const httplib::Request& req, httplib::Response& res) {
-                     handle_messages(req, res);
-                 });
+    register_delete(api_route_pattern(R"(/responses/([^/]+))"),
+                    [this](const httplib::Request& req, httplib::Response& res) {
+                        handle_response_delete(req, res);
+                    });
+    register_post(api_route_pattern("/messages/count_tokens"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_count_tokens(req, res);
+                  });
+    register_post(
+        api_route_pattern("/messages"),
+        [this](const httplib::Request& req, httplib::Response& res) { handle_messages(req, res); });
     if (options_.webui_mcp_proxy) {
         const auto relay = [](const httplib::Request& req, httplib::Response& res) {
             relay_mcp_proxy(req, res);
         };
         server_.Get(kMcpProxyPath, relay);
-        server_.Post(kMcpProxyPath, relay);
-        server_.Delete(kMcpProxyPath, relay);
+        register_post(kMcpProxyPath, relay);
+        register_delete(kMcpProxyPath, relay);
     }
     // Registered last: httplib tries routes in order, so every API route above wins its path.
     if (webui_enabled()) {

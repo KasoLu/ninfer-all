@@ -127,6 +127,10 @@ private:
     [[nodiscard]] httplib::Server::HandlerResponse pre_route(const httplib::Request& req,
                                                              httplib::Response& res) const;
     void register_routes();
+    // Body-carrying routes are registered through httplib's content-reader form so that
+    // --max-request-mib stays the only source of a 413; see buffer_request_body.
+    void register_post(const std::string& pattern, httplib::Server::Handler handler);
+    void register_delete(const std::string& pattern, httplib::Server::Handler handler);
     void register_stats_routes();
     void start_stats_listener();
     void stop_stats_listener();
