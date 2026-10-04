@@ -418,6 +418,8 @@ std::uint64_t Program::device_state_backing_bytes() const noexcept {
     return impl_->device_state_backing_bytes();
 }
 
+bool Program::shutdown_persists() const noexcept { return impl_->shutdown_persists(); }
+
 std::uint64_t Program::persistent_capacity_bytes() const noexcept {
     std::uint64_t bytes = impl_->persistent.capacity();
     for (const DeviceArena& arena : impl_->persistent_by_rank) { bytes += arena.capacity(); }

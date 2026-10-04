@@ -1050,6 +1050,9 @@ public:
     [[nodiscard]] std::uint64_t device_state_backing_bytes() const noexcept;
     // Every rank's persistent state: the largest snapshot a suspend can take.
     [[nodiscard]] std::uint64_t persistent_capacity_bytes() const noexcept;
+    // Whether the orderly stop writes anything out (a hybrid prefix cache file, the disk tier):
+    // only then is a suspended model worth resuming at shutdown.
+    [[nodiscard]] bool shutdown_persists() const noexcept;
     DeviceSnapshot::Stats suspend_device_state(DeviceSnapshot& snapshot);
     DeviceSnapshot::Stats resume_device_state(DeviceSnapshot& snapshot);
     // True while the sequence's next media item is still encoding in a concurrent overlay Vision

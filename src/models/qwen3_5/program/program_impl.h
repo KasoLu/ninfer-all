@@ -666,6 +666,9 @@ public:
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
     // Model suspend (see Program::suspend_device_state).
+    [[nodiscard]] bool shutdown_persists() const noexcept {
+        return (hybrid_ && !hybrid_file_.empty()) || disk_kv != nullptr;
+    }
     [[nodiscard]] std::uint64_t device_state_backing_bytes() const noexcept;
     DeviceSnapshot::Stats suspend_device_state(DeviceSnapshot& snapshot);
     DeviceSnapshot::Stats resume_device_state(DeviceSnapshot& snapshot);

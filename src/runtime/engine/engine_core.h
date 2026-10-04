@@ -2893,13 +2893,14 @@ private:
                         RequestErrorKind::Unavailable, "inference engine is shutting down"));
                     std::scoped_lock execution_lock(execution_mutex_);
                     // The orderly cleanup reads device state to persist the caches. A model that
-                    // resumes on demand comes back for it; one held suspended -- or one whose resume
-                    // fails -- is cleaned up without touching the device, losing only what the
-                    // device alone held.
+                    // resumes on demand comes back for it when there is something to persist; one
+                    // held suspended -- or one whose resume fails -- is cleaned up without touching
+                    // the device, losing only what the device alone held.
                     ProgramCleanup cleanup = ProgramCleanup::Shutdown;
                     if (suspended_.load(std::memory_order_acquire)) {
                         cleanup = ProgramCleanup::Failure;
-                        if (auto_resume_.load(std::memory_order_acquire)) {
+                        if (auto_resume_.load(std::memory_order_acquire) &&
+                            instance_.program->shutdown_persists()) {
                             try {
                                 resume_locked();
                                 cleanup = ProgramCleanup::Shutdown;
