@@ -66,13 +66,66 @@ std::unique_ptr<EvictableKVPool> make_kv_arena(DeviceContext& device,
                 });
 }
 
+// Devices whose kernels or copies may address memory on `rank` directly: every other rank's device
+// that the context enabled peer access from. A suspendable region grants them access explicitly,
+// which an ordinary allocation got implicitly when peer access was enabled.
+std::vector<int> peers_of(const DeviceContext& device, std::size_t rank) {
+    std::vector<int> out;
+    const int own = device.rank(rank).device;
+    for (std::size_t other = 0; other < device.size(); ++other) {
+        const int id = device.rank(other).device;
+        if (other == rank || id == own || !device.peer_access(other, rank)) { continue; }
+        if (std::find(out.begin(), out.end(), id) == out.end()) { out.push_back(id); }
+    }
+    return out;
+}
+
+VmmRegion make_region(DeviceContext& device, std::size_t rank, std::size_t bytes) {
+    RankBinding bind(device, rank);
+    return VmmRegion(bytes, VmmRegion::Options{.device = device.rank(rank).device,
+                                               .peers  = peers_of(device, rank)});
+}
+
+// A Model materialized suspendable makes the Program's device memory suspendable too: persistent
+// state and workspace on every rank at fixed addresses (rank 0's persistent state in the KV pool
+// when overlay Vision built one, whose pieces release the same way).
+ProgramImpl::SuspendableStorage make_suspendable_storage(DeviceContext& device,
+                                                         const execution::Parameters& parameters,
+                                                         const SequencePlanImpl& plan,
+                                                         bool kv_pool_backs_persistent) {
+    ProgramImpl::SuspendableStorage out;
+    if (!parameters.model.weights_suspendable()) { return out; }
+    out.enabled = true;
+    if (!kv_pool_backs_persistent) {
+        out.persistent.emplace(make_region(device, 0, plan.persistent.bytes));
+    }
+    for (std::size_t index = 0; index < plan.persistent.extra_rank_bytes.size(); ++index) {
+        out.persistent_by_rank.push_back(
+            make_region(device, index + 1, plan.persistent.extra_rank_bytes[index]));
+    }
+    out.workspace.emplace(make_region(device, 0, plan.workspace.capacity));
+    if (parameters.text.split_execution()) {
+        for (std::size_t rank = 1; rank < parameters.text.rank_count; ++rank) {
+            out.workspace_by_rank.push_back(
+                make_region(device, rank, plan.workspace.general_capacity));
+        }
+    }
+    return out;
+}
+
 // Persistent state for the ranks beyond the first, each allocated while its own device is current
-// so it lands in that card's memory. Empty on one device, which leaves that path unchanged.
+// so it lands in that card's memory. Empty on one device, which leaves that path unchanged. With
+// suspendable storage the arenas view its regions instead.
 std::vector<DeviceArena> make_rank_persistent(DeviceContext& device,
-                                              const std::vector<std::size_t>& bytes_by_rank) {
+                                              const std::vector<std::size_t>& bytes_by_rank,
+                                              std::span<const VmmRegion> regions) {
     std::vector<DeviceArena> out;
     out.reserve(bytes_by_rank.size());
     for (std::size_t index = 0; index < bytes_by_rank.size(); ++index) {
+        if (!regions.empty()) {
+            out.emplace_back(regions[index].span());
+            continue;
+        }
         RankBinding bind(device, index + 1);
         out.emplace_back(bytes_by_rank[index]);
     }
@@ -123,7 +176,8 @@ make_stage_runtime(DeviceContext& device, const execution::Parameters& parameter
 // the Vision, causal-score or bridge regions the primary card's capacity also covers.
 std::vector<DeviceArena> make_rank_workspaces(DeviceContext& device,
                                               const execution::TextParameters& text,
-                                              std::size_t general_capacity_bytes) {
+                                              std::size_t general_capacity_bytes,
+                                              std::span<const VmmRegion> regions) {
     std::vector<DeviceArena> out;
     if (!text.split_execution()) { return out; }
     if (text.rank_count > device.size()) {
@@ -131,6 +185,10 @@ std::vector<DeviceArena> make_rank_workspaces(DeviceContext& device,
     }
     out.reserve(text.rank_count - 1);
     for (std::size_t rank = 1; rank < text.rank_count; ++rank) {
+        if (!regions.empty()) {
+            out.emplace_back(regions[rank - 1].span());
+            continue;
+        }
         ScopedDeviceRank guard(device, rank);
         out.emplace_back(general_capacity_bytes);
     }
@@ -156,11 +214,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       kv_arena(make_kv_arena(device_in, parameters_in, plan)),
-      persistent(kv_arena ? DeviceArena(kv_arena->arena()) : DeviceArena(plan.persistent.bytes)),
-      persistent_by_rank(make_rank_persistent(device_in, plan.persistent.extra_rank_bytes)),
-      workspace_storage(plan.workspace.capacity),
-      workspace_storage_by_rank(
-          make_rank_workspaces(device_in, parameters_in.text, plan.workspace.general_capacity)),
+      suspendable(make_suspendable_storage(device_in, parameters_in, plan, kv_arena != nullptr)),
+      persistent(kv_arena                 ? DeviceArena(kv_arena->arena())
+                 : suspendable.persistent ? DeviceArena(suspendable.persistent->span())
+                                          : DeviceArena(plan.persistent.bytes)),
+      persistent_by_rank(make_rank_persistent(device_in, plan.persistent.extra_rank_bytes,
+                                              suspendable.persistent_by_rank)),
+      workspace_storage(suspendable.workspace ? DeviceArena(suspendable.workspace->span())
+                                              : DeviceArena(plan.workspace.capacity)),
+      workspace_storage_by_rank(make_rank_workspaces(device_in, parameters_in.text,
+                                                     plan.workspace.general_capacity,
+                                                     suspendable.workspace_by_rank)),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
       shared_prefix_states(shared_prefix_capacity), shared_prefix_slots(shared_prefix_capacity),

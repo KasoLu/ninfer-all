@@ -66,6 +66,16 @@ filled to it, both models find two of the three needles.
 
 ## What this line adds
 
+- **Model suspend.** With `--model-suspend` an idle server gives its device memory back without
+  exiting -- `POST /v1/models/{id}/suspend` -- and takes it again on the next request or on
+  `/resume`, with its retained conversations intact: every device allocation sits at a fixed
+  address, so the CUDA Graphs and caches survive, and only the live persistent bytes travel to host
+  memory (free KV pages stay behind). On an RTX 3090 serving Ternary Bonsai 2 27B, a suspend takes
+  the card from 7.9 GiB in use to 0.3 GiB (the CUDA context) in 0.33 s, and a resume takes 1.1 s,
+  almost all of it the weights read again from a warm page cache (0.8 s with `--suspend-weights
+  host`). Greedy output and prefix reuse are identical before and after, on one device, across
+  pipeline stages, with MTP, with the hybrid prefix cache and with overlay Vision. See
+  [Model suspend](docs/serving.md#model-suspend).
 - **GGUF block formats.** Qwen3.8-27B GGUF releases that choose a ggml quantization type per tensor,
   such as ISTA-DASLab's GSQ-RCO models, import without requantization: the converter recipe
   `qwen3_8_27b_gguf` copies every quantized tensor's blocks unchanged, and the runtime multiplies

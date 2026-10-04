@@ -42,9 +42,14 @@ ninfer_add_test(ninfer_evictable_weight_pool_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_evictable_weight_pool.cu"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_suspend_memory_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_suspend_memory.cu"
+  LIBRARIES ninfer_core CUDA::cuda_driver)
+
 set_tests_properties(
   ninfer_arena_ranks_test
   ninfer_device_buffer_visibility_test
+  ninfer_suspend_memory_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_disk_kv_store_test

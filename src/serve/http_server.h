@@ -140,6 +140,9 @@ private:
     void handle_stats(const httplib::Request& req, httplib::Response& res) const;
     void handle_health(httplib::Response& res) const;
     void handle_slots(const httplib::Request& req, httplib::Response& res) const;
+    void handle_model_residency(const httplib::Request& req, httplib::Response& res) const;
+    void handle_model_suspend(const httplib::Request& req, httplib::Response& res);
+    void handle_model_resume(const httplib::Request& req, httplib::Response& res);
     void handle_slot_action(const httplib::Request& req, httplib::Response& res);
     void handle_props(const httplib::Request& req, httplib::Response& res) const;
     void handle_webui(const httplib::Request& req, httplib::Response& res) const;

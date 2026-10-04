@@ -19,6 +19,8 @@ add_library(ninfer_core STATIC
   decode_graph.cpp
   evictable_kv_pool.cu
   evictable_weight_pool.cu
+  vmm.cu
+  device_snapshot.cu
 )
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)

@@ -412,6 +412,26 @@ void Program::finalize_context_transaction() noexcept { impl_->finalize_context_
 
 bool Program::has_context_transaction() const noexcept { return impl_->has_context_transaction(); }
 
+bool Program::device_state_suspendable() const noexcept { return impl_->suspendable.enabled; }
+
+std::uint64_t Program::device_state_backing_bytes() const noexcept {
+    return impl_->device_state_backing_bytes();
+}
+
+std::uint64_t Program::persistent_capacity_bytes() const noexcept {
+    std::uint64_t bytes = impl_->persistent.capacity();
+    for (const DeviceArena& arena : impl_->persistent_by_rank) { bytes += arena.capacity(); }
+    return bytes;
+}
+
+DeviceSnapshot::Stats Program::suspend_device_state(DeviceSnapshot& snapshot) {
+    return impl_->suspend_device_state(snapshot);
+}
+
+DeviceSnapshot::Stats Program::resume_device_state(DeviceSnapshot& snapshot) {
+    return impl_->resume_device_state(snapshot);
+}
+
 bool Program::vision_pending(SequenceHandle sequence) const noexcept {
     return impl_->vision_pending(sequence);
 }

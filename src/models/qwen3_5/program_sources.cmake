@@ -11,6 +11,7 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/program/graft_injection.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/program_impl.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/residency.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/context_work.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/pressure.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/planning/checkpoint_recovery.cpp"

@@ -81,6 +81,15 @@ public:
     [[nodiscard]] bool transaction_open() const noexcept;
     [[nodiscard]] bool poisoned() const noexcept;
 
+    // Model suspend: every physical piece goes back to the device while the home addresses stay
+    // reserved, so the pointers and graphs that captured them stay valid. Nothing may be borrowed
+    // and the caller has drained every stream that addresses the arena. restore_backing maps fresh
+    // pieces home; their contents are undefined until the owner rewrites them. A restore that fails
+    // part-way releases what it created and leaves the pool unbacked, so it may be retried.
+    void release_backing();
+    void restore_backing();
+    [[nodiscard]] bool backed() const noexcept;
+
     // Fixes the largest extent one transaction may borrow (rounded up to whole chunks), reserves
     // its overlay range and pins a copy of every tail byte such a window can dirty. Call exactly
     // once after the weights landed; the window is sized from execution planning, which needs the

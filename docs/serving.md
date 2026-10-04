@@ -274,6 +274,8 @@ tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
 | `GET /v1` | endpoint index for the announced API base: the model alias and this table |
 | `GET /v1/models` | configured OpenAI model alias, effective context limit (`max_model_len`, also as `context_window` and `context_length`), input modalities (`modalities.vision` and an OpenRouter-style `architecture`), and a llama.cpp-compatible `meta` object (see [Models](#models)) |
 | `GET /v1/models/{id}` | lookup of the configured alias with the same fields |
+| `GET /v1/models/{id}/residency` | whether the model is resident or suspended, what a suspend releases and holds (see [Model suspend](#model-suspend)) |
+| `POST /v1/models/{id}/suspend`, `POST /v1/models/{id}/resume` | give the model's device memory back while idle, and take it again (`--model-suspend`) |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
 | `POST /v1/responses` | OpenAI Responses Core generation, state, typed Items, and SSE |
 | `POST /v1/responses/input_tokens` | Responses prompt-token count without generation |
@@ -433,6 +435,47 @@ requests waiting for admission, and `entries`: the first 16 of them in submissio
 its Engine `request_id`, `position` and `wait_seconds`, refreshed at least once a second while
 requests wait. It needs the API key like `/v1/load` and, like it, reads only published snapshots.
 Dashboards poll it, or the same route on `--stats-port`.
+
+### Model suspend
+
+With `--model-suspend`, an idle server can give its device memory back to the GPU without exiting
+and take it again later, for instance to let another program use the card for a while. Every device
+allocation the model owns -- weights, KV cache and recurrent state, workspace, on every device of a
+`--devices` split -- sits at a fixed address whose physical memory a suspend releases; the CUDA
+Graphs, block tables and Host caches stay as they are. A resume maps fresh memory at the same
+addresses, uploads the weights and copies the retained state back, so conversations retained before
+the suspend reuse their prefixes afterwards exactly as before. It needs CUDA virtual memory
+management on every device and cannot be combined with `--wddm-evictable-budget`.
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/models/qwen3.8-27b/suspend -d '{}'
+curl -X POST http://127.0.0.1:8080/v1/models/qwen3.8-27b/suspend -d '{"auto_resume": false}'
+curl http://127.0.0.1:8080/v1/models/qwen3.8-27b/residency
+curl -X POST http://127.0.0.1:8080/v1/models/qwen3.8-27b/resume -d '{}'
+```
+
+A suspend runs only while nothing is queued, admitted or running and answers
+`409 model_busy` otherwise; it never cancels work. While suspended nothing executes. With
+`auto_resume` (the default, `--no-auto-resume` changes it, a suspend body may override it), the next
+generation request resumes the model and then runs, its wait counting toward the queue timeout;
+without it requests fail with `503` and `GET /health` reports the server unavailable. A failed
+resume (the device no longer has the memory, say) fails the requests waiting on it, leaves the
+model suspended with its state intact and reports `last_error`; the next request or `resume`
+retries. Session save, restore and erase resume the model first, under the same rule. Stopping a
+suspended server resumes it to save the prefix cache and the disk tier when `auto_resume` is set;
+otherwise it exits without saving what only the device held.
+
+| Option | Effect |
+|---|---|
+| `--suspend-snapshot pageable` | default: the retained state goes to ordinary host memory allocated at suspend, sized to what is live (free KV pages are skipped), and freed after the resume |
+| `--suspend-snapshot pinned` | a page-locked block sized for the whole persistent state is reserved at startup and kept: transfers at full bus speed, that much host memory for the life of the server |
+| `--suspend-weights artifact` | default: a resume reads the weights again from the artifact, whose files the server keeps open |
+| `--suspend-weights host` | a suspend copies the weights to host memory (in the snapshot memory): as much host memory as the weights while suspended, resume at bus speed |
+
+`GET /v1/models/{id}/residency` returns `state` (`resident` or `suspended`), `auto_resume`,
+`releasable_device_bytes`, `host_snapshot_bytes` and `host_reserved_bytes`, the suspend and resume
+counts, the last of each with its duration and the bytes it moved (`state_bytes`, `weight_bytes`,
+`artifact_read_bytes`), and `last_error`. Suspend and resume answer with the same object.
 
 ### Slots
 

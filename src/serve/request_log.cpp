@@ -790,6 +790,13 @@ std::string format_server_start_json(
         {"concurrent_prefill", engine_options.concurrent_prefill},
         {"recover_invariant_failures", engine_options.recover_invariant_failures},
         {"wddm_evictable_budget", engine_options.wddm_evictable_budget},
+        {"model_suspend", engine_options.suspend.enabled},
+        {"suspend_snapshot",
+         engine_options.suspend.snapshot_memory == SuspendSnapshotMemory::Pinned ? "pinned"
+                                                                                  : "pageable"},
+        {"suspend_weights",
+         engine_options.suspend.weights == SuspendWeightSource::Host ? "host" : "artifact"},
+        {"auto_resume", engine_options.suspend.auto_resume},
         {"mlp_a8_decode", engine_options.mlp_a8_decode},
         {"prefill_a8", engine_options.prefill_a8},
         {"prefix_reuse", options.allow_prefix_reuse},

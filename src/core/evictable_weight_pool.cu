@@ -1,11 +1,10 @@
 #include "core/evictable_weight_pool.h"
 
-#include <cuda.h>
+#include "core/vmm.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
-#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -14,21 +13,6 @@ namespace ninfer {
 namespace {
 
 using Clock = std::chrono::steady_clock;
-
-void cu_check(CUresult result, const char* expr) {
-    if (result == CUDA_SUCCESS) { return; }
-    const char* name = nullptr;
-    (void)cuGetErrorName(result, &name);
-    throw std::runtime_error(std::string(expr) + " failed: " +
-                             (name != nullptr ? name : "unknown CUresult"));
-}
-
-#define NINFER_CU_CHECK(expr) ::ninfer::cu_check((expr), #expr)
-
-void ensure_driver_initialized() {
-    static std::once_flag once;
-    std::call_once(once, [] { NINFER_CU_CHECK(cuInit(0)); });
-}
 
 std::size_t align_up(std::size_t value, std::size_t alignment) {
     return (value + alignment - 1) / alignment * alignment;
@@ -60,39 +44,22 @@ struct EvictableWeightPool::Impl {
     std::unique_ptr<PinnedHostBuffer> mirror;
     bool mirror_captured = false;
     bool poisoned        = false;
+    bool backed          = false; // physical pieces exist and are mapped home or at the overlay
 
     explicit Impl(DeviceContext& context) : device(context) {}
 
-    void set_access(CUdeviceptr va, std::size_t bytes) {
-        CUmemAccessDesc access{};
-        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        access.location.id   = device.device;
-        access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-        NINFER_CU_CHECK(cuMemSetAccess(va, bytes, &access, 1));
-    }
-
     void map_home(std::size_t piece) {
-        NINFER_CU_CHECK(cuMemMap(home + offsets[piece], sizes[piece], 0, handles[piece], 0));
-        set_access(home + offsets[piece], sizes[piece]);
+        vmm::map(home + offsets[piece], sizes[piece], handles[piece], std::span(&device.device, 1));
     }
 
     void map_overlay(std::size_t piece, std::size_t rank) {
-        NINFER_CU_CHECK(
-            cuMemMap(overlay + rank * kChunkBytes, sizes[piece], 0, handles[piece], 0));
-        set_access(overlay + rank * kChunkBytes, sizes[piece]);
+        vmm::map(overlay + rank * kChunkBytes, sizes[piece], handles[piece],
+                 std::span(&device.device, 1));
     }
 };
 
 bool EvictableWeightPool::supported(const DeviceContext& device) {
-    ensure_driver_initialized();
-    CUdevice handle = 0;
-    if (cuDeviceGet(&handle, device.device) != CUDA_SUCCESS) { return false; }
-    int value = 0;
-    if (cuDeviceGetAttribute(&value, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
-                             handle) != CUDA_SUCCESS) {
-        return false;
-    }
-    return value != 0;
+    return vmm::supported(device.device);
 }
 
 EvictableWeightPool::EvictableWeightPool(DeviceContext& device, const Config& config)
@@ -103,16 +70,13 @@ EvictableWeightPool::EvictableWeightPool(DeviceContext& device, const Config& co
     if (config.evictable_tail_bytes == 0 || config.evictable_tail_bytes > config.arena_bytes) {
         throw std::invalid_argument("evictable pool tail must be a nonempty arena suffix");
     }
-    ensure_driver_initialized();
-    Impl& impl  = *impl_;
-    impl.config = config;
-
-    CUmemAllocationProp prop{};
-    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id   = device.device;
-    NINFER_CU_CHECK(cuMemGetAllocationGranularity(&impl.granularity, &prop,
-                                                  CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    vmm::ensure_driver_initialized();
+    Impl& impl       = *impl_;
+    impl.config      = config;
+    impl.granularity = vmm::granularity(device.device);
+    if (impl.granularity == 0) {
+        throw std::invalid_argument("evictable pool needs CUDA virtual memory management");
+    }
     if (kChunkBytes % impl.granularity != 0) {
         throw std::runtime_error("evictable pool chunk is not a multiple of the VMM granularity");
     }
@@ -141,28 +105,67 @@ EvictableWeightPool::EvictableWeightPool(DeviceContext& device, const Config& co
     }
 
     impl.handles.resize(impl.offsets.size());
-    for (std::size_t piece = 0; piece < impl.offsets.size(); ++piece) {
-        NINFER_CU_CHECK(cuMemCreate(&impl.handles[piece], impl.sizes[piece], &prop, 0));
-        impl.map_home(piece);
-    }
+    restore_backing();
 }
 
 EvictableWeightPool::~EvictableWeightPool() {
     if (impl_ == nullptr || impl_->home == 0) { return; }
     Impl& impl               = *impl_;
     const std::size_t pieces = impl.handles.size();
-    for (std::size_t piece = 0; piece < pieces; ++piece) {
-        const bool away = impl.evicted_pieces != 0 && piece >= pieces - impl.evicted_pieces;
-        if (away) {
-            const std::size_t rank = piece - (pieces - impl.evicted_pieces);
-            (void)cuMemUnmap(impl.overlay + rank * kChunkBytes, impl.sizes[piece]);
-        } else {
-            (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
+    if (impl.backed) {
+        for (std::size_t piece = 0; piece < pieces; ++piece) {
+            const bool away = impl.evicted_pieces != 0 && piece >= pieces - impl.evicted_pieces;
+            if (away) {
+                const std::size_t rank = piece - (pieces - impl.evicted_pieces);
+                (void)cuMemUnmap(impl.overlay + rank * kChunkBytes, impl.sizes[piece]);
+            } else {
+                (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
+            }
+            (void)cuMemRelease(impl.handles[piece]);
         }
-        (void)cuMemRelease(impl.handles[piece]);
     }
     (void)cuMemAddressFree(impl.home, impl.arena_reserved);
     if (impl.overlay != 0) { (void)cuMemAddressFree(impl.overlay, impl.window_reserved); }
+}
+
+bool EvictableWeightPool::backed() const noexcept { return impl_->backed; }
+
+void EvictableWeightPool::release_backing() {
+    Impl& impl = *impl_;
+    if (!impl.backed) { return; }
+    if (impl.evicted_pieces != 0) {
+        throw std::logic_error("evictable pool cannot release its backing during a transaction");
+    }
+    for (std::size_t piece = 0; piece < impl.handles.size(); ++piece) {
+        (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
+        (void)cuMemRelease(impl.handles[piece]);
+        impl.handles[piece] = {};
+    }
+    impl.backed = false;
+}
+
+void EvictableWeightPool::restore_backing() {
+    Impl& impl = *impl_;
+    if (impl.backed) { return; }
+    std::size_t created = 0;
+    try {
+        for (; created < impl.handles.size(); ++created) {
+            impl.handles[created] = vmm::create(impl.sizes[created], impl.device.device);
+            try {
+                impl.map_home(created);
+            } catch (...) {
+                (void)cuMemRelease(impl.handles[created]);
+                throw;
+            }
+        }
+    } catch (...) {
+        for (std::size_t piece = 0; piece < created; ++piece) {
+            (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
+            (void)cuMemRelease(impl.handles[piece]);
+        }
+        throw;
+    }
+    impl.backed = true;
 }
 
 DeviceSpan EvictableWeightPool::arena() const noexcept {

@@ -155,6 +155,20 @@ std::string serve_usage_text(const char* argv0) {
            "  --wddm-evictable-budget       Windows D3D12 builds: budget against dedicated\n"
            "                                memory, holding arenas resident\n"
            "\n"
+           "MODEL SUSPEND\n"
+           "  --model-suspend               enable POST /v1/models/{id}/suspend and /resume\n"
+           "                                (and /models/unload, /models/load): device memory\n"
+           "                                at fixed addresses, released while suspended;\n"
+           "                                needs CUDA virtual memory management\n"
+           "  --suspend-snapshot M          where suspended state waits: pageable (default;\n"
+           "                                host memory only while suspended) or pinned\n"
+           "                                (reserved at startup, faster transfers)\n"
+           "  --suspend-weights S           resume reads the weights from: artifact\n"
+           "                                (default) or host (a host copy taken at suspend:\n"
+           "                                weight-sized host memory, resume at bus speed)\n"
+           "  --no-auto-resume              a request while suspended fails (503) instead of\n"
+           "                                resuming the model (also per suspend request)\n"
+           "\n"
            "KV CACHE\n"
            "  --kv-capacity N|auto          shared KV capacity in tokens (default\n"
            "                                --max-context, or auto with\n"
@@ -1133,6 +1147,36 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--wddm-evictable-budget") {
             options.wddm_evictable_budget = true;
+            continue;
+        }
+        if (arg == "--model-suspend") {
+            options.suspend.enabled = true;
+            continue;
+        }
+        if (arg == "--suspend-snapshot") {
+            const std::string value = require_value("--suspend-snapshot");
+            if (value == "pageable") {
+                options.suspend.snapshot_memory = SuspendSnapshotMemory::Pageable;
+            } else if (value == "pinned") {
+                options.suspend.snapshot_memory = SuspendSnapshotMemory::Pinned;
+            } else {
+                throw std::invalid_argument("--suspend-snapshot must be pageable or pinned");
+            }
+            continue;
+        }
+        if (arg == "--suspend-weights") {
+            const std::string value = require_value("--suspend-weights");
+            if (value == "artifact") {
+                options.suspend.weights = SuspendWeightSource::Artifact;
+            } else if (value == "host") {
+                options.suspend.weights = SuspendWeightSource::Host;
+            } else {
+                throw std::invalid_argument("--suspend-weights must be artifact or host");
+            }
+            continue;
+        }
+        if (arg == "--no-auto-resume") {
+            options.suspend.auto_resume = false;
             continue;
         }
         if (arg == "--mlp-a8-decode") {

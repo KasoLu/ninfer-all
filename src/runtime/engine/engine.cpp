@@ -826,6 +826,51 @@ bool Engine::is_available() const {
         impl_->core);
 }
 
+ResidencyStatus Engine::suspend(std::optional<bool> auto_resume) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](auto& core) -> ResidencyStatus {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::GenerationCore>> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::HybridGenerationCore>>) {
+                return core->suspend(auto_resume);
+            } else {
+                throw std::invalid_argument("model suspend applies to Generation Engines");
+            }
+        },
+        impl_->core);
+}
+
+ResidencyStatus Engine::resume() {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](auto& core) -> ResidencyStatus {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::GenerationCore>> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::HybridGenerationCore>>) {
+                return core->resume();
+            } else {
+                throw std::invalid_argument("model suspend applies to Generation Engines");
+            }
+        },
+        impl_->core);
+}
+
+ResidencyStatus Engine::residency() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return std::visit(
+        [&](const auto& core) -> ResidencyStatus {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::GenerationCore>> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::HybridGenerationCore>>) {
+                return core->residency();
+            } else {
+                return ResidencyStatus{};
+            }
+        },
+        impl_->core);
+}
+
 void Engine::stop() noexcept {
     if (impl_ != nullptr) { impl_->stop(); }
 }

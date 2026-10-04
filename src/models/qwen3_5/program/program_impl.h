@@ -3,6 +3,8 @@
 #include "models/qwen3_5/program/internal.h"
 
 #include "core/arena.h"
+#include "core/device_snapshot.h"
+#include "core/vmm.h"
 #include "core/disk_kv_bridge.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
@@ -663,6 +665,13 @@ public:
     [[nodiscard]] ContextTransactionProgress
     progress_context_transaction(runtime::CancellationFlagView cancellation);
     void finalize_context_transaction() noexcept;
+    // Model suspend (see Program::suspend_device_state).
+    [[nodiscard]] std::uint64_t device_state_backing_bytes() const noexcept;
+    DeviceSnapshot::Stats suspend_device_state(DeviceSnapshot& snapshot);
+    DeviceSnapshot::Stats resume_device_state(DeviceSnapshot& snapshot);
+    [[nodiscard]] std::vector<DeviceSnapshot::Range> live_persistent_ranges() const;
+    void release_device_state_backing();
+    void restore_device_state_backing();
     [[nodiscard]] bool has_context_transaction() const noexcept;
     // True while this sequence waits for a media item submitted to a concurrent overlay window:
     // the lane must not be given a prefill unit, and every other lane keeps running.
@@ -845,6 +854,18 @@ public:
     // Overlay Vision residency only: the persistent arena is VMM-backed so free KV granules can be
     // lent to a Vision window. Null otherwise, where `persistent` owns a plain allocation.
     std::unique_ptr<EvictableKVPool> kv_arena;
+    // Model suspend only (the Model was materialized suspendable): fixed-address memory behind the
+    // persistent state and workspace of every rank, which a suspend releases and a resume maps
+    // again. Rank 0's persistent state is the KV pool's when there is one. Empty otherwise, where
+    // the arenas below own plain allocations; declared before them, which only view it.
+    struct SuspendableStorage {
+        std::optional<VmmRegion> persistent;
+        std::vector<VmmRegion> persistent_by_rank; // ranks 1..
+        std::optional<VmmRegion> workspace;
+        std::vector<VmmRegion> workspace_by_rank; // ranks 1..
+        bool enabled = false;
+    };
+    SuspendableStorage suspendable;
     DeviceArena persistent;
     // Pipeline stages only: the persistent state of each further device -- its layers' KV planes,
     // block-table copy and recurrent state -- allocated in that device's own memory.

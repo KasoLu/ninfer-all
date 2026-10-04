@@ -90,6 +90,15 @@ public:
     [[nodiscard]] bool lease_open() const noexcept;
     [[nodiscard]] bool poisoned() const noexcept;
 
+    // Model suspend: every physical piece goes back to the device while the home addresses stay
+    // reserved, so the pointers and graphs that captured them stay valid. Nothing may be borrowed
+    // and the caller has drained every stream that addresses the arena. restore_backing maps fresh
+    // pieces home; their contents are undefined until the owner rewrites them. A restore that fails
+    // part-way releases what it created and leaves the pool unbacked, so it may be retried.
+    void release_backing();
+    void restore_backing();
+    [[nodiscard]] bool backed() const noexcept;
+
     // Granule containing an arena offset, and the arena range one granule covers.
     [[nodiscard]] std::size_t granule_of(std::size_t offset) const;
     [[nodiscard]] DeviceSpan granule_bytes(std::size_t index) const;

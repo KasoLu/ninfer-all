@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -123,6 +124,18 @@ public:
     [[nodiscard]] bool is_available() const;
 
     void reset_memory_peaks() noexcept;
+
+    // Model residency (EngineOptions::suspend, Generation Engines). suspend() gives the model's
+    // device memory back while the Engine is idle and returns once it is released; it refuses with
+    // RequestError(Overloaded) while anything is queued, admitted or running, and never cancels
+    // work. `auto_resume` (default: the Engine option) decides whether a generation request
+    // arriving meanwhile resumes the model first or fails as Unavailable. resume() maps the memory
+    // again, uploads the weights and restores the retained state; a failure leaves the model
+    // suspended with its state intact, so it may be retried. Both are idempotent and callable from
+    // any thread; with suspend disabled they throw std::invalid_argument.
+    ResidencyStatus suspend(std::optional<bool> auto_resume = std::nullopt);
+    ResidencyStatus resume();
+    [[nodiscard]] ResidencyStatus residency() const;
 
     // Begins the orderly stop without waiting for it: new work is refused, and queued and active
     // generation requests end with an Unavailable error within one unit of work. A Generation

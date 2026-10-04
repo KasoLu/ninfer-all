@@ -419,6 +419,36 @@ struct GraftSource {
     std::filesystem::path path;
 };
 
+// Where a suspended model's retained device state waits in host memory.
+enum class SuspendSnapshotMemory : std::uint8_t {
+    // Ordinary memory allocated at suspend, sized to the live bytes, freed after the resume.
+    Pageable,
+    // One page-locked block reserved at startup for the largest snapshot: transfers at bus speed,
+    // at the cost of that much host memory for the life of the Engine.
+    Pinned,
+};
+
+// Where a resume takes the weights from.
+enum class SuspendWeightSource : std::uint8_t {
+    // Read again from the artifact the Engine loaded, whose files stay open while it runs.
+    Artifact,
+    // A host copy taken at suspend, kept in the snapshot memory: as much host memory as the device
+    // weights while suspended, in exchange for a resume at bus speed.
+    Host,
+};
+
+struct ModelSuspendOptions {
+    // Engine::suspend and Engine::resume: every device allocation the model owns sits at fixed
+    // addresses whose physical memory a suspend gives back to the device while captured graphs and
+    // tensor views stay valid. Needs CUDA virtual memory management on every device.
+    bool enabled                          = false;
+    SuspendSnapshotMemory snapshot_memory = SuspendSnapshotMemory::Pageable;
+    SuspendWeightSource weights           = SuspendWeightSource::Artifact;
+    // Default for a suspend that does not say: a generation request arriving while suspended
+    // resumes the model and then runs, instead of failing as Unavailable.
+    bool auto_resume = true;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -469,6 +499,7 @@ struct EngineOptions {
     // on the grounds that WDDM will evict other allocations. Not for a GPU that drives the
     // desktop, whose allocations are often not evictable.
     bool wddm_evictable_budget         = false;
+    ModelSuspendOptions suspend;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
@@ -1355,6 +1386,43 @@ struct VisionWorkspaceMemorySummary {
     std::size_t window_capacity_bytes     = 0; // overlay: device bytes one window borrows
     std::size_t pinned_weight_bytes       = 0; // overlay: host-pinned tower bytes
     std::size_t mirror_bytes              = 0; // overlay: pinned mirror of the borrowable tail
+};
+
+enum class ModelResidency : std::uint8_t {
+    Resident,
+    Suspended,
+};
+
+// One suspend or resume, as it was carried out.
+struct ResidencyTransition {
+    double seconds = 0.0;
+    // Device state copied to host memory (suspend) or back (resume).
+    std::uint64_t state_bytes   = 0;
+    double state_seconds        = 0.0;
+    // Weight bytes copied to host memory (suspend, Host weights), or uploaded again (resume).
+    std::uint64_t weight_bytes  = 0;
+    double weight_seconds       = 0.0;
+    // Payload read from the artifact by a resume.
+    std::uint64_t artifact_read_bytes = 0;
+};
+
+struct ResidencyStatus {
+    bool enabled          = false;
+    ModelResidency state  = ModelResidency::Resident;
+    bool auto_resume      = true;
+    // Device memory a suspend gives back: the model's fixed-address regions on every device.
+    std::uint64_t releasable_device_bytes = 0;
+    // Host memory held for the suspended model now: the retained state and any weight copy (the
+    // pinned reservation counts while it exists, suspended or not).
+    std::uint64_t host_snapshot_bytes = 0;
+    std::uint64_t host_reserved_bytes = 0;
+    std::uint64_t suspend_count       = 0;
+    std::uint64_t resume_count        = 0;
+    std::optional<ResidencyTransition> last_suspend;
+    std::optional<ResidencyTransition> last_resume;
+    // The last failed resume; cleared by the next successful one. The model stays suspended and a
+    // later resume retries.
+    std::string last_error;
 };
 
 struct MemorySummary {

@@ -73,6 +73,26 @@ public:
         return backing_.weight_pool();
     }
 
+    // Model suspend: the weight arenas give their device memory back and later receive the same
+    // bytes again from the artifact, at the same addresses, so every bound weight and captured
+    // graph stays valid. The caller has drained every stream that reads them.
+    [[nodiscard]] bool weights_suspendable() const noexcept { return backing_.suspendable(); }
+    [[nodiscard]] bool weights_resident() const noexcept { return backing_.device_backed(); }
+    [[nodiscard]] std::uint64_t weight_backing_bytes() const noexcept {
+        return backing_.device_backing_bytes();
+    }
+    [[nodiscard]] std::vector<artifact::MaterializedArtifact::RankArena>
+    device_weight_arenas() const {
+        return backing_.device_arenas();
+    }
+    void release_device_weights() { backing_.release_device_backing(); }
+    void restore_device_weight_backing(DeviceContext& device) {
+        backing_.restore_device_backing(device);
+    }
+    artifact::MaterializationStats reload_device_weights(DeviceContext& device) {
+        return backing_.upload_device_objects_again(device);
+    }
+
     // CPU Vision residency only: the tower decoded to host FP32, shared with every encode session.
     [[nodiscard]] const std::shared_ptr<const CpuVisionWeights>& cpu_vision() const noexcept {
         return cpu_vision_;
@@ -80,7 +100,8 @@ public:
 
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
-                                                    const StartupObserver*);
+                                                    const StartupObserver*,
+                                                    const artifact::MaterializeOptions&);
     Model(Config config, LoadOptions options, ModelWeights weights, std::vector<BoundWeight> bound,
           FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing,
           std::optional<VisionOverlayLayout> vision_overlay,

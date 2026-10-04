@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/device_snapshot.h"
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/runtime_types.h"
@@ -28,6 +29,20 @@ struct ModelInstance {
     // Writes every startup-pinned graft (all but PrefillKV) into the Program's shared prefixes. At
     // startup, and again after a worker recovery has released them with the rest of the cache.
     void inject_pinned_grafts();
+
+    // Model suspend (EngineOptions::suspend). The caller holds the instance idle and owns the
+    // snapshots: `state` receives the Program's live device state, `weights` (when given) a host
+    // copy of the weights, which a resume then uploads instead of reading the artifact again. A
+    // failure part-way through a suspend restores what was released before it throws, so the
+    // instance stays resident; a failed resume leaves everything released and the snapshots
+    // intact, so it may be retried.
+    [[nodiscard]] bool suspendable() const noexcept;
+    [[nodiscard]] std::uint64_t releasable_device_bytes() const noexcept;
+    [[nodiscard]] std::uint64_t weight_host_copy_bytes() const noexcept;
+    ResidencyTransition suspend(DeviceContext& device, DeviceSnapshot& state,
+                                DeviceSnapshot* weights);
+    ResidencyTransition resume(DeviceContext& device, DeviceSnapshot& state,
+                               DeviceSnapshot* weights);
     ModelInstance(const ModelInstance&)            = delete;
     ModelInstance& operator=(const ModelInstance&) = delete;
 };

@@ -232,6 +232,15 @@ Frontend 和 Parameters，最后释放 Model backing。Reader 与上传 staging 
 权重、State/KV backing、block-table matrices、workspace 与 CUDA Graph resources 在 Engine 开始接受请求前
 建立。运行期改变 ownership、mapping、frontier 与 replica placement，但不重建这些大块 Device allocations。
 
+启用模型挂起（`EngineOptions::suspend`）时，这些 Device allocations 位于固定虚拟地址（`core/vmm.h` 的
+`VmmRegion` 与两个 eviction pool），物理内存可以释放与重建而地址不变，因此 Parameters、Program 的
+tensor 视图与已捕获的 CUDA Graph 保持有效。挂起只在 Engine 空闲时进行：Program 把各 rank persistent
+arena 中除空闲 KV 页之外的字节复制到 host（`DeviceSnapshot`），然后释放 persistent、workspace 与权重的
+物理内存；恢复时在原地址重新映射，从 artifact（materializer 保留 Reader 与 device placement，按加载
+时的 direct-I/O 路径重新上传）或 host 副本恢复权重，再写回 persistent 字节。workspace 在请求之间不承载
+状态，恢复后直接使用新的物理内存。ModelInstance 编排两者的顺序与失败回滚；EngineCore 持有挂起状态、
+snapshot 和自动恢复策略，worker 在挂起期间不执行任何单元。
+
 ### 3.5 固定执行与原生参数
 
 逻辑参数、物理对象和 Op 参数数量分别由数学、存储和实际入口决定。例如当前 Dense Attention

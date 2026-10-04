@@ -165,6 +165,13 @@ public:
 
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
 
+    // Model residency (--model-suspend).
+    ninfer::ResidencyStatus suspend(std::optional<bool> auto_resume) {
+        return engine_->suspend(auto_resume);
+    }
+    ninfer::ResidencyStatus resume() { return engine_->resume(); }
+    [[nodiscard]] ninfer::ResidencyStatus residency() const { return engine_->residency(); }
+
     // Session persistence over the private context-cache catalog; see ninfer::Engine.
     [[nodiscard]] std::vector<ninfer::SlotState> slot_states() const {
         return engine_->slot_states();
