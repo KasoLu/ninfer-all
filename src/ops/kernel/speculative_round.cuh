@@ -511,7 +511,9 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_greedy_draft
                                                 merge_idx, cand_val, cand_idx, prob, &n_support,
                                                 row_drafts, i);
         }
-        if (tid == 0 && done_sh == 0) {
+        // The loop leaves at the barrier below once the row is decided, so no thread reads the
+        // shared flag here while thread 0 may be writing it.
+        if (tid == 0) {
             const int L = L_sh;
             if (i < extent) {
                 const int d = row_drafts[i];
