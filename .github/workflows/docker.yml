@@ -13,9 +13,11 @@ on:
     types: [completed]
     branches: [master]
 
+# A newer publish supersedes one still running: it takes `latest`, and the prune after it removes
+# whatever the cancelled one had pushed.
 concurrency:
   group: container-image
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   publish:

@@ -28,6 +28,8 @@ on:
     # ci/** runs the whole workflow on a branch without a pull request; only master publishes.
     branches: [master, 'ci/**']
 
+# A newer push to a branch or pull request cancels the run still going for the older one; a merged
+# or closed pull request's runs are cancelled by cancel-superseded.yml.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
