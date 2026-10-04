@@ -95,6 +95,12 @@ public:
     bool await_startup_listener();
 
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
+
+    // True once the engine watch stopped listen() because the one model's Engine failed
+    // Engine-wide; the process then exits non-zero so a supervisor reloads the model.
+    [[nodiscard]] bool engine_failed() const noexcept {
+        return engine_failed_.load(std::memory_order_acquire);
+    }
     [[nodiscard]] bool webui_enabled() const noexcept;
 
 private:
@@ -210,6 +216,8 @@ private:
     void record_throughput(const ThroughputReport& report);
     void run_stats_reporter();
     void stop_stats_reporter();
+    void run_engine_watch();
+    void stop_engine_watch();
 
     // Written once by attach() on the main thread and read by request handlers on httplib's worker
     // threads, so the publication has to be ordered. Handlers only ever test readiness through
@@ -239,6 +247,11 @@ private:
     std::condition_variable stats_cv_;
     std::thread stats_thread_;
     bool stats_stopping_ = false;
+    std::mutex watch_mutex_;
+    std::condition_variable watch_cv_;
+    std::thread watch_thread_;
+    bool watch_stopping_ = false;
+    std::atomic<bool> engine_failed_{false};
 };
 
 } // namespace ninfer::serve

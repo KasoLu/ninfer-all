@@ -171,7 +171,9 @@ retained conversations reuse their prefixes as before. A model with requests in 
 to sleep or unloaded under them: the request that needs the room waits for them to finish (up to
 ten minutes, then 503). `--sleep-idle-seconds N` puts a model idle for N seconds to sleep (it needs
 `--model-suspend`) and `--unload-idle-seconds N` unloads one; both apply to a single-model server
-too.
+too. Only requests count as use: polling a model's state (`/props`, `/metrics`, `/slots`) does not
+keep it awake. A model whose Engine fails Engine-wide is unloaded and loads again on its next request
+(see [Stop the server](#stop-the-server)).
 
 | Method and path | Behavior |
 |---|---|
@@ -312,6 +314,13 @@ after logging `server stopped` and the save result. One more Ctrl+C during the s
 previous file is kept. Ctrl+C with console text selected only copies the text. Windows ends the
 process about 5 seconds after its console window is closed, so stop with Ctrl+C when a large Host
 tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
+
+An Engine-wide failure (an error the Engine's worker cannot attribute to one request) fails every
+queued request and refuses every new one, and the Engine never recovers from it. A single-model
+server then stops on its own and exits with status 2, distinct from startup failures (1), so a
+supervisor such as a container restart policy reloads the model instead of keeping a dead endpoint
+up. A router instead unloads the failed model once its requests are gone and reports it as failed in
+`GET /models`; its next request loads it again.
 
 ## Endpoints
 

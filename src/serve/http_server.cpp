@@ -1490,6 +1490,43 @@ void HttpServer::attach(ModelRegistry& registry) {
     ready_.store(true, std::memory_order_release);
 }
 
+// ENGINE WATCH. After an Engine-wide failure the Engine fails every queued request and refuses
+// every new one, but never recovers, while /v1/models keeps answering: a single-model server would
+// stay up as a dead endpoint. The watch polls the model while listen() runs and stops the accept
+// loop the first time its Engine has failed, so main() exits with status 2 and a supervisor reloads
+// the model. A router instead unloads a failed model, which its next request loads again.
+void HttpServer::run_engine_watch() {
+    constexpr auto kInterval = std::chrono::milliseconds(250);
+    for (;;) {
+        {
+            std::unique_lock lock(watch_mutex_);
+            if (watch_cv_.wait_for(lock, kInterval, [this] { return watch_stopping_; })) { return; }
+        }
+        bool failed = false;
+        try {
+            if (auto lease = registry_->observe(public_model_id_)) {
+                failed = lease->service().has_failed();
+            }
+        } catch (...) {}
+        if (failed) {
+            engine_failed_.store(true, std::memory_order_release);
+            operational_log_.engine_failure();
+            server_.stop();
+            return;
+        }
+    }
+}
+
+void HttpServer::stop_engine_watch() {
+    if (!watch_thread_.joinable()) { return; }
+    {
+        std::lock_guard lock(watch_mutex_);
+        watch_stopping_ = true;
+    }
+    watch_cv_.notify_one();
+    watch_thread_.join();
+}
+
 bool HttpServer::listen() {
     if (registry_ == nullptr) { throw std::logic_error("HTTP model registry is not attached"); }
     if (!registry_->router() && public_model_id_.empty()) {
@@ -1502,15 +1539,21 @@ bool HttpServer::listen() {
             stats_stopping_ = false;
             stats_thread_   = std::thread([this] { run_stats_reporter(); });
         }
+        if (!registry_->router()) {
+            watch_stopping_ = false;
+            watch_thread_   = std::thread([this] { run_engine_watch(); });
+        }
         // When the startup listener is running, the accept loop is already live on its thread and
         // has been since bind(); calling listen_after_bind() again would try to accept on the same
         // socket from two threads. Wait for that loop instead.
         const bool result =
             startup_listener_.joinable() ? await_startup_listener() : server_.listen_after_bind();
+        stop_engine_watch();
         stop_stats_listener();
         stop_stats_reporter();
         return result;
     } catch (...) {
+        stop_engine_watch();
         stop_stats_listener();
         stop_stats_reporter();
         // Stop and join the startup listener before this exception unwinds past us. attach() has

@@ -830,6 +830,20 @@ bool Engine::is_available() const {
         impl_->core);
 }
 
+bool Engine::has_failed() const {
+    if (impl_ == nullptr) { return false; }
+    return std::visit(
+        [](const auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                return false;
+            } else {
+                return core != nullptr && core->has_failed();
+            }
+        },
+        impl_->core);
+}
+
 ResidencyStatus Engine::suspend(std::optional<bool> auto_resume) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     return std::visit(

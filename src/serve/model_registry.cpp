@@ -40,7 +40,8 @@ ModelRegistry::ModelRegistry(std::vector<ModelDefinition> models, RegistryPolicy
     for (ModelDefinition& definition : models) {
         models_.push_back(Slot{.definition = std::move(definition)});
     }
-    if (policy_.sleep_idle.count() > 0 || policy_.unload_idle.count() > 0) {
+    // A router also watches for models whose Engine failed, which it unloads.
+    if (router_ || policy_.sleep_idle.count() > 0 || policy_.unload_idle.count() > 0) {
         idle_thread_ = std::thread([this] { idle_loop(); });
     }
 }
@@ -270,15 +271,15 @@ ModelRegistry::Lease ModelRegistry::acquire(std::string_view model, std::optiona
     Slot& ready = models_[index];
     ++ready.leases;
     ready.last_used = Clock::now();
-    return Lease(*this, index);
+    return Lease(*this, index, true);
 }
 
-void ModelRegistry::release(std::size_t index) noexcept {
+void ModelRegistry::release(std::size_t index, bool use) noexcept {
     {
         std::lock_guard lock(mutex_);
         Slot& slot = models_[index];
         if (slot.leases != 0) { --slot.leases; }
-        slot.last_used = Clock::now();
+        if (use) { slot.last_used = Clock::now(); }
     }
     changed_.notify_all();
 }
@@ -291,7 +292,7 @@ std::optional<ModelRegistry::Lease> ModelRegistry::observe(std::string_view mode
         return std::nullopt;
     }
     ++slot.leases;
-    return Lease(*this, index);
+    return Lease(*this, index, false);
 }
 
 void ModelRegistry::load(std::string_view model) {
@@ -416,8 +417,13 @@ void ModelRegistry::idle_loop() {
             if (slot.leases != 0) { continue; }
             const auto idle = now - slot.last_used;
             try {
-                if (slot.state == ModelState::Loaded && policy_.sleep_idle.count() > 0 &&
-                    idle >= policy_.sleep_idle && slot.service->suspendable()) {
+                if (router_ && slot.state == ModelState::Loaded && slot.service->failed()) {
+                    slot.failed = true;
+                    slot.last_error =
+                        "the model's Engine failed; it loads again on the next request";
+                    unload_locked(lock, index);
+                } else if (slot.state == ModelState::Loaded && policy_.sleep_idle.count() > 0 &&
+                           idle >= policy_.sleep_idle && slot.service->suspendable()) {
                     put_to_sleep_locked(lock, index);
                 } else if ((slot.state == ModelState::Loaded ||
                             slot.state == ModelState::Sleeping) &&
@@ -431,21 +437,22 @@ void ModelRegistry::idle_loop() {
     }
 }
 
-ModelRegistry::Lease::Lease(ModelRegistry& owner, std::size_t index) noexcept
-    : owner_(&owner), index_(index) {}
+ModelRegistry::Lease::Lease(ModelRegistry& owner, std::size_t index, bool use) noexcept
+    : owner_(&owner), index_(index), use_(use) {}
 
 ModelRegistry::Lease::~Lease() {
-    if (owner_ != nullptr) { owner_->release(index_); }
+    if (owner_ != nullptr) { owner_->release(index_, use_); }
 }
 
 ModelRegistry::Lease::Lease(Lease&& other) noexcept
-    : owner_(std::exchange(other.owner_, nullptr)), index_(other.index_) {}
+    : owner_(std::exchange(other.owner_, nullptr)), index_(other.index_), use_(other.use_) {}
 
 ModelRegistry::Lease& ModelRegistry::Lease::operator=(Lease&& other) noexcept {
     if (this != &other) {
-        if (owner_ != nullptr) { owner_->release(index_); }
+        if (owner_ != nullptr) { owner_->release(index_, use_); }
         owner_ = std::exchange(other.owner_, nullptr);
         index_ = other.index_;
+        use_   = other.use_;
     }
     return *this;
 }

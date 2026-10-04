@@ -169,6 +169,8 @@ public:
 
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
 
+    [[nodiscard]] bool has_failed() const { return engine_->has_failed(); }
+
     // The artifact tokenizer, for /tokenize and /detokenize.
     [[nodiscard]] std::vector<ninfer::TokenId> tokenize(std::string_view text,
                                                         bool parse_special = true) const {

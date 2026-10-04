@@ -34,6 +34,8 @@ void expect(bool condition, const std::string& label) {
 struct Journal {
     std::vector<std::string> calls;
     std::map<std::string, int> alive;
+    // Read by the registry's idle thread: entries exist before a service is loaded.
+    std::map<std::string, std::atomic<bool>> failing;
 };
 
 class FakeService final : public ModelService {
@@ -56,6 +58,11 @@ public:
     void suspend() override { journal_.calls.push_back("sleep " + id_); }
 
     void resume() override { journal_.calls.push_back("wake " + id_); }
+
+    bool failed() const override {
+        const auto found = journal_.failing.find(id_);
+        return found != journal_.failing.end() && found->second.load();
+    }
 
 private:
     std::string id_;
@@ -179,6 +186,46 @@ void idle_sleep_and_events() {
     expect(state_of(registry, "b") == ModelState::Loaded, "an explicit load wakes it");
 }
 
+void observing_is_not_use() {
+    Journal journal;
+    RegistryPolicy policy;
+    policy.models_max = 1;
+    policy.sleep_idle = std::chrono::seconds(1);
+    ModelRegistry registry({model("a")}, policy, factory(journal), true);
+    { auto lease = registry.acquire("a"); }
+    // A monitor polling the model (GET /props, /metrics) must not keep it awake.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (state_of(registry, "a") != ModelState::Sleeping &&
+           std::chrono::steady_clock::now() < deadline) {
+        { auto observed = registry.observe("a"); }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    expect(state_of(registry, "a") == ModelState::Sleeping,
+           "an observed but otherwise idle model goes to sleep");
+}
+
+void failed_model_reloads() {
+    Journal journal;
+    RegistryPolicy policy;
+    policy.models_max    = 1;
+    journal.failing["a"] = false;
+    ModelRegistry registry({model("a")}, policy, factory(journal), true);
+    { auto lease = registry.acquire("a"); }
+    journal.failing["a"] = true;
+    const auto deadline  = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (state_of(registry, "a") != ModelState::Unloaded &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    const auto status = registry.status("a");
+    expect(status->state == ModelState::Unloaded && status->failed && journal.alive["a"] == 0,
+           "a router unloads a model whose Engine failed and reports the failure");
+    journal.failing["a"] = false;
+    { auto lease = registry.acquire("a"); }
+    expect(state_of(registry, "a") == ModelState::Loaded && !registry.status("a")->failed,
+           "the next request loads the failed model again");
+}
+
 void single_model_mode() {
     Journal journal;
     ModelRegistry registry({model("only")}, RegistryPolicy{}, factory(journal), false);
@@ -246,6 +293,8 @@ int main() {
         lifecycle_under_one_slot();
         leases_hold_models();
         idle_sleep_and_events();
+        observing_is_not_use();
+        failed_model_reloads();
         single_model_mode();
         catalog();
     } catch (const std::exception& error) {

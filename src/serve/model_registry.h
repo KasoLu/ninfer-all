@@ -9,7 +9,9 @@
 // follows the configured bounds: at most `models_max` models are loaded at once, and the least
 // recently used loaded model without leases makes way -- put to sleep when it was started with
 // model suspend (it then wakes in seconds, with its retained conversations), unloaded otherwise.
-// Idle models go to sleep after `sleep_idle` and are unloaded after `unload_idle`.
+// Idle models go to sleep after `sleep_idle` and are unloaded after `unload_idle`. In router mode a
+// model whose Engine failed Engine-wide is unloaded once its requests are gone, so the next request
+// for it loads it again.
 
 #include "serve/generation_service.h"
 
@@ -80,6 +82,9 @@ public:
     [[nodiscard]] virtual bool suspendable() const     = 0;
     virtual void suspend()                             = 0;
     virtual void resume()                              = 0;
+
+    // The model's Engine failed Engine-wide and never recovers: only a reload serves it again.
+    [[nodiscard]] virtual bool failed() const { return false; }
 };
 
 using ModelServiceFactory =
@@ -101,6 +106,8 @@ public:
     void suspend() override { (void)service_->suspend(true); }
 
     void resume() override { (void)service_->resume(); }
+
+    [[nodiscard]] bool failed() const override { return service_->has_failed(); }
 
 private:
     std::unique_ptr<GenerationService> service_;
@@ -141,9 +148,12 @@ public:
 
     private:
         friend class ModelRegistry;
-        Lease(ModelRegistry& owner, std::size_t index) noexcept;
+        Lease(ModelRegistry& owner, std::size_t index, bool use) noexcept;
         ModelRegistry* owner_ = nullptr;
         std::size_t index_    = 0;
+        // A request's lease counts as use of the model; an observer's does not, so polling a
+        // model's state never keeps it from going idle.
+        bool use_ = true;
     };
 
     // Resolves `model` (an id or alias; empty names the default model) and returns it loaded and
@@ -211,7 +221,7 @@ private:
     void put_to_sleep_locked(std::unique_lock<std::mutex>& lock, std::size_t index);
     void unload_locked(std::unique_lock<std::mutex>& lock, std::size_t index);
     void publish_locked(std::size_t index);
-    void release(std::size_t index) noexcept;
+    void release(std::size_t index, bool use) noexcept;
     void idle_loop();
     [[nodiscard]] std::size_t loaded_count_locked() const;
 

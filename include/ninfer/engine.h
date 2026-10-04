@@ -131,6 +131,10 @@ public:
     [[nodiscard]] RuntimeStats runtime_stats() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] bool is_available() const;
+    // True after an Engine-wide failure, from which the Engine never recovers: every request fails
+    // until a new Engine is constructed. Unavailability for any other reason (a stop, a model held
+    // suspended) is not a failure.
+    [[nodiscard]] bool has_failed() const;
 
     void reset_memory_peaks() noexcept;
 

@@ -107,6 +107,8 @@ public:
         return !stopping_;
     }
 
+    [[nodiscard]] bool has_failed() const noexcept { return false; }
+
     void reset_memory_peaks() noexcept {
         try {
             std::scoped_lock lock(execution_mutex_);
