@@ -126,6 +126,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+# NInfer uses no C++20 modules. Scanning for them, CMake's default with C++20 and Ninja, gives every
+# C++ source a dependency-scan step and compiler options under which ccache does not cache it: CI
+# recompiled every C++ object on every run.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)        # clangd / IDE tooling
 if(MSVC)
   add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)

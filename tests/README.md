@@ -339,7 +339,8 @@ bash tests/test_docker_build_cache.sh docker
 
 This uses the real build stage with a tiny CMake fixture and isolated cache mounts. It checks added
 and removed compiler flags, changed and restored cached defaults, environment flags, old header
-timestamps, non-code edits, and one-file incremental compilation. Docker BuildKit is required;
+timestamps, non-code edits, and one-file incremental compilation. `NINFER_TOOLCHAIN_IMAGE=<image>`
+stands in for the Dockerfile's toolchain stage, as CI does with the one it publishes. Docker BuildKit is required;
 `podman` can be passed instead to check that builder. Logs and the fixture remain in an ignored
 `build-cache-test.*` directory; the test image and its small build caches remain in the builder.
 The check needs the Dockerfile's build dependencies but no GPU or model weights.
