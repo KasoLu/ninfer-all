@@ -98,8 +98,12 @@ int verify_preserved(const GuardedDeviceBuffer& device, std::span<const std::uin
     return 1;
 }
 
+// `cancellation` runs the A8 routes up to 128 columns on inputs whose product the residual almost
+// exactly cancels: unit weight codes keep the Tensor Core dot exact, zero/one activations have no
+// A8 representation error, and the residual is minus the exact product, so the final BF16 store
+// exposes whether a column's scaled update was contracted into one FMA or rounded as MUL+ADD.
 int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32_t seed,
-              bool wide_only) {
+              bool wide_only, bool cancellation = false) {
     std::vector<Invocation> invocations{
         Invocation{1, ops::LinearPolicy::A16Only},
         Invocation{2, ops::LinearPolicy::A16Only},
@@ -120,7 +124,7 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
     for (int columns = wide_only ? 33 : 2; columns <= (wide_only ? 64 : 32); ++columns) {
         invocations.push_back({columns, ops::LinearPolicy::A16Only});
     }
-    if (!wide_only) {
+    if (!wide_only && !cancellation) {
         for (int columns : {63, 64, 65, 127, 128, 129, 1024})
             invocations.push_back({columns, ops::LinearPolicy::A16Only});
         // Upstream's TMA split-K boundaries for the A8 routes.
@@ -128,14 +132,48 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
                             767, 768, 769, 1023, 1025})
             invocations.push_back({columns, ops::LinearPolicy::AllowA8});
     }
-    const std::int32_t kMaximumTokens = wide_only ? 64 : 1025;
+    if (cancellation) {
+        std::erase_if(invocations, [&](Invocation invocation) {
+            return invocation.policy != ops::LinearPolicy::AllowA8 ||
+                   invocation.tokens < first_a8 || invocation.tokens > 128;
+        });
+    }
+    const std::int32_t kMaximumTokens = wide_only ? 64 : cancellation ? 128 : 1025;
     quantized_weight::PackedWeight host_weight =
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, n, k, seed);
+    if (cancellation) {
+        for (std::size_t i = 0; i < host_weight.code_plane_bytes; ++i) {
+            host_weight.payload[i] = (host_weight.payload[i] & 0x80U) | 0x38U;
+        }
+        for (int row = 0; row < n; ++row) {
+            const auto scale =
+                f32_to_bf16(0.005F * (1.0F + static_cast<float>(row % 127) / 128.0F));
+            quantized_weight::detail::store_u16_le(
+                host_weight.payload,
+                host_weight.scale_plane_offset + static_cast<std::size_t>(row) * 2, scale);
+        }
+    }
     const std::vector<std::int32_t> rows = sampled_indices(n);
     const std::vector<float> materialized_weight =
         quantized_weight::materialize_rows_fp32(host_weight, rows);
-    const std::vector<std::uint16_t> activation = make_activation(k, kMaximumTokens, seed + 1U);
-    const std::vector<std::uint16_t> initial_residual = make_residual(n, kMaximumTokens, seed + 2U);
+    std::vector<std::uint16_t> activation       = make_activation(k, kMaximumTokens, seed + 1U);
+    std::vector<std::uint16_t> initial_residual = make_residual(n, kMaximumTokens, seed + 2U);
+    if (cancellation) {
+        for (auto& value : activation) {
+            value = value & 0x8000U ? f32_to_bf16(0) : f32_to_bf16(1);
+        }
+        for (std::size_t sampled_row = 0; sampled_row < rows.size(); ++sampled_row) {
+            for (int token = 0; token < kMaximumTokens; ++token) {
+                double sum = 0;
+                for (int column = 0; column < k; ++column) {
+                    sum += static_cast<double>(materialized_weight[sampled_row * k + column]) *
+                           bf16_to_f32(activation[static_cast<std::size_t>(token) * k + column]);
+                }
+                initial_residual[static_cast<std::size_t>(token) * n + rows[sampled_row]] =
+                    f32_to_bf16(static_cast<float>(-sum));
+            }
+        }
+    }
 
     GuardedDeviceBuffer device_activation(activation.size() * sizeof(std::uint16_t));
     device_activation.copy_from_host(activation.data(), device_activation.bytes());
@@ -156,12 +194,13 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
         GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
         WorkspaceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 256)});
         const bool replay_changed_input =
-            invocation.tokens == 4 || invocation.tokens == 128 ||
-            ((invocation.tokens == 32 || invocation.tokens == 64) &&
-             invocation.policy == ops::LinearPolicy::A16Only) ||
-            (invocation.policy == ops::LinearPolicy::AllowA8 &&
-             (invocation.tokens == 193 || invocation.tokens == 257 || invocation.tokens == 512 ||
-              invocation.tokens == 513 || invocation.tokens == 1025));
+            !cancellation &&
+            (invocation.tokens == 4 || invocation.tokens == 128 ||
+             ((invocation.tokens == 32 || invocation.tokens == 64) &&
+              invocation.policy == ops::LinearPolicy::A16Only) ||
+             (invocation.policy == ops::LinearPolicy::AllowA8 &&
+              (invocation.tokens == 193 || invocation.tokens == 257 || invocation.tokens == 512 ||
+               invocation.tokens == 513 || invocation.tokens == 1025)));
         try {
             ops::linear_add(x, weight, residual, invocation.policy, workspace, nullptr);
             cuda_check(cudaDeviceSynchronize(), "synchronize FP8 linear_add");
@@ -237,6 +276,25 @@ int run_shape(std::int32_t n, std::int32_t k, std::int32_t first_a8, std::uint32
             }
         }
         failures += verify_reduction(label, actual, expected, a8 ? kA8Tolerance : kA16Tolerance);
+        if (a8 && cancellation && invocation.tokens == 64) {
+            // A column's residual update must not depend on whether its launch is predicated: the
+            // same 63 columns run as a partial launch (T = 63) must store exactly what the full
+            // launch stored.
+            output.copy_from_host(initial_residual.data(), output.bytes());
+            Tensor partial_input  = x.slice(1, 0, 63);
+            Tensor partial_output = residual.slice(1, 0, 63);
+            ops::linear_add(partial_input, weight, partial_output, invocation.policy, workspace,
+                            nullptr);
+            cuda_check(cudaDeviceSynchronize(), "synchronize FP8 partial-launch residual update");
+            std::vector<std::uint16_t> partial(output_words);
+            output.copy_to_host(partial.data(), output.bytes());
+            if (!std::equal(partial.begin(), partial.begin() + static_cast<std::ptrdiff_t>(n) * 63,
+                            actual_bits.begin())) {
+                std::cerr << label << ": a partial launch stored different residual columns\n";
+                ++failures;
+            }
+            failures += output.verify_guards(label + " partial launch");
+        }
     }
 
     failures += device_activation.verify_guards("FP8 linear_add activation");
@@ -284,6 +342,10 @@ int main(int argc, char** argv) {
     int failures = 0;
     failures += run_shape(5120, 6144, 22, 861U, wide_only);
     failures += run_shape(5120, 17408, 25, 863U, wide_only);
+    if (!wide_only) {
+        failures += run_shape(5120, 6144, 22, 877U, false, true);
+        failures += run_shape(5120, 17408, 25, 881U, false, true);
+    }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 linear_add\n";
     return failures == 0 ? 0 : 1;
 }

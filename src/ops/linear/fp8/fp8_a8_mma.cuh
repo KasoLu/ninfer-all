@@ -329,19 +329,42 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                 accumulators[mma_token][mma_row][2] * activation_scale1 * weight_scale.x;
             float value11 =
                 accumulators[mma_token][mma_row][3] * activation_scale1 * weight_scale.y;
+            const auto finish = [&](int row, int token, int element, float activation_scale,
+                                    float weight_scale, float value) {
+                if constexpr (requires {
+                                  epilogue.apply_scaled(row, token, value, weight_scale);
+                              }) {
+                    // Full and tail tiles must contract the same residual update. Activation
+                    // scaling stays outside that FMA, so a live-column predicate cannot decide the
+                    // MUL+ADD contraction and a column's result cannot depend on its tile.
+                    const float scaled =
+                        __fmul_rn(accumulators[mma_token][mma_row][element], activation_scale);
+                    return epilogue.apply_scaled(row, token, scaled, weight_scale);
+                } else {
+                    return epilogue.apply(row, token, value);
+                }
+            };
             if constexpr (FullTokens) {
-                value00 = epilogue.apply(parent_row0, token0, value00);
-                value01 = epilogue.apply(parent_row1, token0, value01);
-                value10 = epilogue.apply(parent_row0, token1, value10);
-                value11 = epilogue.apply(parent_row1, token1, value11);
+                value00 =
+                    finish(parent_row0, token0, 0, activation_scale0, weight_scale.x, value00);
+                value01 =
+                    finish(parent_row1, token0, 1, activation_scale0, weight_scale.y, value01);
+                value10 =
+                    finish(parent_row0, token1, 2, activation_scale1, weight_scale.x, value10);
+                value11 =
+                    finish(parent_row1, token1, 3, activation_scale1, weight_scale.y, value11);
             } else {
                 if (token0 < tokens) {
-                    value00 = epilogue.apply(parent_row0, token0, value00);
-                    value01 = epilogue.apply(parent_row1, token0, value01);
+                    value00 =
+                        finish(parent_row0, token0, 0, activation_scale0, weight_scale.x, value00);
+                    value01 =
+                        finish(parent_row1, token0, 1, activation_scale0, weight_scale.y, value01);
                 }
                 if (token1 < tokens) {
-                    value10 = epilogue.apply(parent_row0, token1, value10);
-                    value11 = epilogue.apply(parent_row1, token1, value11);
+                    value10 =
+                        finish(parent_row0, token1, 2, activation_scale1, weight_scale.x, value10);
+                    value11 =
+                        finish(parent_row1, token1, 3, activation_scale1, weight_scale.y, value11);
                 }
             }
             auto* destination0 = reinterpret_cast<__nv_bfloat162*>(
