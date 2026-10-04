@@ -325,8 +325,10 @@ std::optional<RegisteredFrontendGoldens> registered_frontend_goldens(
     if (model_name == "qwen3.6-27b") {
         return RegisteredFrontendGoldens{16, 18, ninfer::PrefixReusePath::PrivateTurnClosure};
     }
+    // The host-restore scenario edits the replayed reply so that it diverges from the endpoint;
+    // Qwen3.8 then restores from the turn closure, as Qwen3.6 does.
     if (model_name == "qwen3.8-27b") {
-        return RegisteredFrontendGoldens{58, 18, ninfer::PrefixReusePath::PrivateEndpoint};
+        return RegisteredFrontendGoldens{58, 18, ninfer::PrefixReusePath::PrivateTurnClosure};
     }
     return std::nullopt;
 }
