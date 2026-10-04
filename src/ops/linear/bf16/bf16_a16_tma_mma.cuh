@@ -12,11 +12,13 @@
 
 namespace ninfer::ops::detail::unified {
 
-// Passed by value as a __grid_constant__ kernel parameter. TMA requires 64-byte descriptor
-// alignment. It is stated here because cuda.h keys CUtensorMap's alignas on __cplusplus, which
-// MSVC reports as 199711L, and MSVC cannot pass a parameter aligned beyond 64 bytes by value
-// (C2719). Elsewhere CUtensorMap may keep a larger alignas of its own, which the struct inherits.
-struct alignas(64) Bf16TmaDescriptors {
+// Passed by value as a __grid_constant__ kernel parameter (through device memory where
+// NINFER_TMA_STAGED_DESCRIPTORS is set: MSVC cannot pass an over-aligned parameter by value,
+// C2719). TMA requires 64-byte descriptor alignment, stated here because cuda.h keys CUtensorMap's
+// own alignas(128) on __cplusplus, which MSVC reports as 199711L unless /Zc:__cplusplus is given.
+// It is never stated below CUtensorMap's own alignment: a weaker alignas than a member's is
+// ill-formed, and nvcc's MSVC front end rejects it.
+struct alignas(alignof(CUtensorMap) > 64 ? alignof(CUtensorMap) : 64) Bf16TmaDescriptors {
     CUtensorMap weight;
     CUtensorMap activation;
 };

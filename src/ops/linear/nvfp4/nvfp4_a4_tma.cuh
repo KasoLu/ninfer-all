@@ -22,9 +22,9 @@
 
 namespace ninfer::ops::detail::unified {
 
-// Passed by value as a __grid_constant__ kernel parameter; see Bf16TmaDescriptors for why the
-// struct states 64-byte alignment (MSVC C2719) instead of 128.
-struct alignas(64) Nvfp4A4TmaDescriptors {
+// Passed by value as a __grid_constant__ kernel parameter; see Bf16TmaDescriptors for how and why
+// the struct states its alignment.
+struct alignas(alignof(CUtensorMap) > 64 ? alignof(CUtensorMap) : 64) Nvfp4A4TmaDescriptors {
     CUtensorMap a_codes;
     CUtensorMap b_codes;
     CUtensorMap a_scales;

@@ -509,68 +509,106 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
             return argv[i];
         };
+        // One `if` per option, each ending in `continue`, not an `else if` chain: MSVC nests each
+        // `else if` one block deeper and stops compiling at 128 (C1061).
         if (arg == "--host") {
             options.host = require_value("--host");
-        } else if (arg == "--port") {
+            continue;
+        }
+        if (arg == "--port") {
             options.port = parse_nonnegative_int(require_value("--port"), "port");
-        } else if (arg == "--stats-port") {
+            continue;
+        }
+        if (arg == "--stats-port") {
             options.stats_port = parse_nonnegative_int(require_value("--stats-port"), "stats-port");
-        } else if (arg == "--api-key") {
+            continue;
+        }
+        if (arg == "--api-key") {
             options.api_key = require_value("--api-key");
-        } else if (arg == "--model-id") {
+            continue;
+        }
+        if (arg == "--model-id") {
             options.model_id_override = require_value("--model-id");
             if (options.model_id_override->empty()) {
                 throw std::invalid_argument("--model-id must not be empty");
             }
-        } else if (arg == "--max-context") {
+            continue;
+        }
+        if (arg == "--max-context") {
             options.max_context = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-context"), "max-context"));
-        } else if (arg == "--kv-capacity") {
+            continue;
+        }
+        if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
             kv_capacity_explicit = true;
-        } else if (arg == "--kv-headroom-mib" || arg == "--vram-headroom-mib") {
+            continue;
+        }
+        if (arg == "--kv-headroom-mib" || arg == "--vram-headroom-mib") {
             // --vram-headroom-mib is the Wallawalla47 fork's name for the same headroom.
             const std::uint64_t mib = parse_u64(require_value(arg.c_str()), arg.c_str() + 2);
             if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
                 throw std::invalid_argument(arg + " is out of range");
             }
             kv_headroom_mib = static_cast<std::size_t>(mib);
-        } else if (arg == "--max-concurrency") {
+            continue;
+        }
+        if (arg == "--max-concurrency") {
             options.max_concurrency = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
-        } else if (arg == "--max-pending-requests") {
+            continue;
+        }
+        if (arg == "--max-pending-requests") {
             options.max_pending_requests = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--max-pending-requests"), "max-pending-requests"));
-        } else if (arg == "--pending-timeout-ms") {
+            continue;
+        }
+        if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
-        } else if (arg == "--prefill-chunk") {
+            continue;
+        }
+        if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
-        } else if (arg == "--first-token-logprobs") {
+            continue;
+        }
+        if (arg == "--first-token-logprobs") {
             options.first_token_logprobs = true;
-        } else if (arg == "--fast-prefill-kernel") {
+            continue;
+        }
+        if (arg == "--fast-prefill-kernel") {
             options.fast_prefill_kernel = true;
-        } else if (arg == "--device-profile") {
+            continue;
+        }
+        if (arg == "--device-profile") {
             options.device_profile = require_value("--device-profile");
             if (options.device_profile != "auto" && options.device_profile != "off" &&
                 options.device_profile != "calibrate") {
                 throw std::invalid_argument("--device-profile must be auto, off or calibrate");
             }
-        } else if (arg == "--device-profile-path") {
+            continue;
+        }
+        if (arg == "--device-profile-path") {
             options.device_profile_path = require_value("--device-profile-path");
             if (options.device_profile_path.empty()) {
                 throw std::invalid_argument("--device-profile-path must not be empty");
             }
-        } else if (arg == "--context-cost-presets") {
+            continue;
+        }
+        if (arg == "--context-cost-presets") {
             options.context_cost_presets = require_value("--context-cost-presets");
             if (options.context_cost_presets.empty()) {
                 throw std::invalid_argument("--context-cost-presets must not be empty");
             }
-        } else if (arg == "--log-stats-interval-ms") {
+            continue;
+        }
+        if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));
-        } else if (arg == "--log-colours") {
+            continue;
+        }
+        if (arg == "--log-colours") {
             const std::string_view value = require_value("--log-colours");
             if (value == "on") {
                 options.log_colours = true;
@@ -579,7 +617,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("--log-colours accepts on or off");
             }
-        } else if (arg == "--log-stats-panel") {
+            continue;
+        }
+        if (arg == "--log-stats-panel") {
             const std::string_view value = require_value("--log-stats-panel");
             if (value == "on") {
                 options.log_stats_panel = true;
@@ -588,74 +628,102 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("--log-stats-panel accepts on or off");
             }
-        } else if (arg == "--max-request-mib") {
+            continue;
+        }
+        if (arg == "--max-request-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--max-request-mib"), "max-request-mib");
             if (mib == 0 || mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
                 throw std::invalid_argument("--max-request-mib is out of range");
             }
             options.max_request_bytes = static_cast<std::size_t>(mib << 20);
-        } else if (arg == "--media-cache-mib") {
+            continue;
+        }
+        if (arg == "--media-cache-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--media-cache-mib"), "media-cache-mib");
             if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
                 throw std::invalid_argument("--media-cache-mib is out of range");
             }
             options.media_cache_bytes = static_cast<std::size_t>(mib << 20);
-        } else if (arg == "--media-live-mib") {
+            continue;
+        }
+        if (arg == "--media-live-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--media-live-mib"), "media-live-mib");
             if (mib == 0 || mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
                 throw std::invalid_argument("--media-live-mib is out of range");
             }
             options.media_live_bytes = static_cast<std::size_t>(mib << 20);
-        } else if (arg == "--media-preprocess-threads") {
+            continue;
+        }
+        if (arg == "--media-preprocess-threads") {
             const int threads = parse_nonnegative_int(require_value("--media-preprocess-threads"),
                                                       "media-preprocess-threads");
             if (threads > 64) {
                 throw std::invalid_argument("--media-preprocess-threads must be in [0,64]");
             }
             options.media_preprocess_threads = static_cast<std::uint32_t>(threads);
-        } else if (arg == "--use-alt-prefix-caching") {
+            continue;
+        }
+        if (arg == "--use-alt-prefix-caching") {
             options.context_cache.mode = ContextCacheMode::Hybrid;
-        } else if (arg == "--use-original-prefix-caching") {
+            continue;
+        }
+        if (arg == "--use-original-prefix-caching") {
             original_cache_selected = true;
-        } else if (arg == "--device-snapshot-slots") {
+            continue;
+        }
+        if (arg == "--device-snapshot-slots") {
             options.context_cache.hybrid.device_snapshot_slots =
                 static_cast<std::uint32_t>(parse_nonnegative_int(
                     require_value("--device-snapshot-slots"), "device-snapshot-slots"));
             hybrid_option_flag = "--device-snapshot-slots";
-        } else if (arg == "--cache-taps-per-request") {
+            continue;
+        }
+        if (arg == "--cache-taps-per-request") {
             options.context_cache.hybrid.max_new_taps =
                 static_cast<std::uint32_t>(parse_nonnegative_int(
                     require_value("--cache-taps-per-request"), "cache-taps-per-request"));
             hybrid_option_flag = "--cache-taps-per-request";
-        } else if (arg == "--cache-tap-ladder") {
+            continue;
+        }
+        if (arg == "--cache-tap-ladder") {
             options.context_cache.hybrid.tap_ladder_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--cache-tap-ladder"), "cache-tap-ladder"));
             hybrid_option_flag = "--cache-tap-ladder";
-        } else if (arg == "--prefix-cache-file") {
+            continue;
+        }
+        if (arg == "--prefix-cache-file") {
             options.context_cache.hybrid.persistent_file = require_value("--prefix-cache-file");
             if (options.context_cache.hybrid.persistent_file.empty()) {
                 throw std::invalid_argument("--prefix-cache-file must not be empty");
             }
             hybrid_option_flag = "--prefix-cache-file";
-        } else if (arg == "--cache-tap-min-gap") {
+            continue;
+        }
+        if (arg == "--cache-tap-min-gap") {
             options.context_cache.hybrid.tap_min_gap_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--cache-tap-min-gap"), "cache-tap-min-gap"));
             hybrid_option_flag = "--cache-tap-min-gap";
-        } else if (arg == "--device-state-slots") {
+            continue;
+        }
+        if (arg == "--device-state-slots") {
             legacy_cache_flag                        = "--device-state-slots";
             options.context_cache.device_state_slots = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--device-state-slots"), "device-state-slots"));
             context_capacity_explicit = true;
-        } else if (arg == "--host-state-slots") {
+            continue;
+        }
+        if (arg == "--host-state-slots") {
             legacy_cache_flag                      = "--host-state-slots";
             options.context_cache.host_state_slots = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--host-state-slots"), "host-state-slots"));
             context_capacity_explicit = true;
             host_state_slots_explicit = true;
-        } else if (arg == "--host-kv-mib") {
+            continue;
+        }
+        if (arg == "--host-kv-mib") {
             legacy_cache_flag       = "--host-kv-mib";
             const std::uint64_t mib = parse_u64(require_value("--host-kv-mib"), "host-kv-mib");
             if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
@@ -664,7 +732,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.context_cache.host_kv_capacity_bytes = static_cast<std::size_t>(mib << 20);
             context_capacity_explicit                    = true;
             host_kv_mib_explicit                         = true;
-        } else if (arg == "--host-cache-mib") {
+            continue;
+        }
+        if (arg == "--host-cache-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--host-cache-mib"), "host-cache-mib");
             if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
@@ -673,23 +743,33 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.context_cache.host_cache_budget_bytes = static_cast<std::size_t>(mib << 20);
             context_capacity_explicit                     = true;
             host_cache_budget_explicit                    = true;
-        } else if (arg == "--disk-kv-path") {
+            continue;
+        }
+        if (arg == "--disk-kv-path") {
             legacy_cache_flag                  = "--disk-kv-path";
             options.context_cache.disk_kv_path = require_value("--disk-kv-path");
             if (options.context_cache.disk_kv_path.empty()) {
                 throw std::invalid_argument("--disk-kv-path must not be empty");
             }
-        } else if (arg == "--disk-kv-gib") {
+            continue;
+        }
+        if (arg == "--disk-kv-gib") {
             const std::uint64_t gib = parse_u64(require_value("--disk-kv-gib"), "disk-kv-gib");
             if (gib == 0 || gib > (std::numeric_limits<std::uint64_t>::max() >> 30U)) {
                 throw std::invalid_argument("--disk-kv-gib must be positive and in range");
             }
             options.context_cache.disk_kv_capacity_bytes = gib << 30U;
-        } else if (arg == "--disk-kv-restore") {
+            continue;
+        }
+        if (arg == "--disk-kv-restore") {
             options.context_cache.disk_kv_restore = true;
-        } else if (arg == "--disk-kv-directstorage") {
+            continue;
+        }
+        if (arg == "--disk-kv-directstorage") {
             options.context_cache.disk_kv_directstorage = true;
-        } else if (arg == "--context-cache-policy") {
+            continue;
+        }
+        if (arg == "--context-cache-policy") {
             legacy_cache_flag        = "--context-cache-policy";
             const std::string policy = require_value("--context-cache-policy");
             if (policy != "default" && policy != "rolling") {
@@ -697,113 +777,169 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.context_cache.rolling_retention = policy == "rolling";
             context_capacity_explicit               = true;
-        } else if (arg == "--release-diverged-checkpoints") {
+            continue;
+        }
+        if (arg == "--release-diverged-checkpoints") {
             legacy_cache_flag                                  = "--release-diverged-checkpoints";
             options.context_cache.release_diverged_checkpoints = true;
             context_capacity_explicit                          = true;
-        } else if (arg == "--concurrent-prefill") {
+            continue;
+        }
+        if (arg == "--concurrent-prefill") {
             options.concurrent_prefill = true;
-        } else if (arg == "--recover-invariant-failures") {
+            continue;
+        }
+        if (arg == "--recover-invariant-failures") {
             options.recover_invariant_failures = true;
-        } else if (arg == "--thorough-admission-search") {
+            continue;
+        }
+        if (arg == "--thorough-admission-search") {
             legacy_cache_flag                               = "--thorough-admission-search";
             options.context_cache.thorough_admission_search = true;
             context_capacity_explicit                       = true;
-        } else if (arg == "--recency-eviction") {
+            continue;
+        }
+        if (arg == "--recency-eviction") {
             legacy_cache_flag                      = "--recency-eviction";
             options.context_cache.recency_eviction = true;
             context_capacity_explicit              = true;
-        } else if (arg == "--value-aware-demote") {
+            continue;
+        }
+        if (arg == "--value-aware-demote") {
             legacy_cache_flag                        = "--value-aware-demote";
             options.context_cache.value_aware_demote = true;
             context_capacity_explicit                = true;
-        } else if (arg == "--kv-lease-growth") {
+            continue;
+        }
+        if (arg == "--kv-lease-growth") {
             options.context_cache.kv_lease_growth = true;
             context_capacity_explicit             = true;
-        } else if (arg == "--max-private-continuations") {
+            continue;
+        }
+        if (arg == "--max-private-continuations") {
             legacy_cache_flag = "--max-private-continuations";
             options.context_cache.max_private_continuations =
                 static_cast<std::uint32_t>(parse_nonnegative_int(
                     require_value("--max-private-continuations"), "max-private-continuations"));
             context_capacity_explicit = true;
-        } else if (arg == "--max-shared-prefixes") {
+            continue;
+        }
+        if (arg == "--max-shared-prefixes") {
             legacy_cache_flag = "--max-shared-prefixes";
             options.context_cache.max_shared_prefixes =
                 static_cast<std::uint32_t>(parse_nonnegative_int(
                     require_value("--max-shared-prefixes"), "max-shared-prefixes"));
             context_capacity_explicit = true;
-        } else if (arg == "--max-long-anchors-per-continuation") {
+            continue;
+        }
+        if (arg == "--max-long-anchors-per-continuation") {
             legacy_cache_flag = "--max-long-anchors-per-continuation";
             options.context_cache.max_long_anchors_per_continuation = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-long-anchors-per-continuation"),
                                       "max-long-anchors-per-continuation"));
             context_capacity_explicit = true;
-        } else if (arg == "--auto-long-anchors") {
+            continue;
+        }
+        if (arg == "--auto-long-anchors") {
             legacy_cache_flag                            = "--auto-long-anchors";
             options.context_cache.automatic_long_anchors = true;
             context_capacity_explicit                    = true;
-        } else if (arg == "--branch-anchors") {
+            continue;
+        }
+        if (arg == "--branch-anchors") {
             legacy_cache_flag                    = "--branch-anchors";
             options.context_cache.branch_anchors = true;
-        } else if (arg == "--long-anchor-spacing") {
+            continue;
+        }
+        if (arg == "--long-anchor-spacing") {
             legacy_cache_flag                                    = "--long-anchor-spacing";
             options.context_cache.long_anchor_min_spacing_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--long-anchor-spacing"),
                                       "long-anchor-spacing"));
             long_anchor_spacing_explicit = true;
-        } else if (arg == "--max-cache-markers-per-request") {
+            continue;
+        }
+        if (arg == "--max-cache-markers-per-request") {
             options.context_cache.max_cache_markers_per_request = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-cache-markers-per-request"),
                                       "max-cache-markers-per-request"));
             context_capacity_explicit = true;
-        } else if (arg == "--request-log-jsonl") {
+            continue;
+        }
+        if (arg == "--request-log-jsonl") {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
             }
-        } else if (arg == "--request-log-max-mib") {
+            continue;
+        }
+        if (arg == "--request-log-max-mib") {
             options.request_log_max_mib = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--request-log-max-mib"), "request-log-max-mib"));
-        } else if (arg == "--request-log-keep") {
+            continue;
+        }
+        if (arg == "--request-log-keep") {
             options.request_log_keep = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--request-log-keep"), "request-log-keep"));
-        } else if (arg == "--response-store-max-records") {
+            continue;
+        }
+        if (arg == "--response-store-max-records") {
             const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
                                                       "response-store-max-records");
             if (records == 0) {
                 throw std::invalid_argument("--response-store-max-records must be positive");
             }
             options.response_store_max_records = static_cast<std::size_t>(records);
-        } else if (arg == "--response-store-max-mib") {
+            continue;
+        }
+        if (arg == "--response-store-max-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--response-store-max-mib"), "response-store-max-mib");
             if (mib == 0 || mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
                 throw std::invalid_argument("--response-store-max-mib is out of range");
             }
             options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
-        } else if (arg == "--device") {
+            continue;
+        }
+        if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
             device_explicit = true;
-        } else if (arg == "--devices") {
+            continue;
+        }
+        if (arg == "--devices") {
             options.devices = parse_device_list(require_value("--devices"));
-        } else if (arg == "--stage-layers") {
+            continue;
+        }
+        if (arg == "--stage-layers") {
             options.stage_layers = parse_stage_layers(require_value("--stage-layers"));
-        } else if (arg == "--kv-dtype") {
+            continue;
+        }
+        if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
-        } else if (arg == "--spec") {
+            continue;
+        }
+        if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
-        } else if (arg == "--draft-tokens") {
+            continue;
+        }
+        if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
-        } else if (arg == "--ngram-draft-tokens") {
+            continue;
+        }
+        if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--ngram-draft-tokens"), "ngram-draft-tokens"));
             ngram_width_explicit = true;
-        } else if (arg == "--ngram-min-match") {
+            continue;
+        }
+        if (arg == "--ngram-min-match") {
             options.speculative.ngram_min_match = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--ngram-min-match"), "ngram-min-match"));
-        } else if (arg == "--ngram-archive-mib" || arg == "--ngram-session-mib") {
+            continue;
+        }
+        if (arg == "--ngram-archive-mib" || arg == "--ngram-session-mib") {
             const auto mib = parse_u64(require_value(arg.c_str()), arg.c_str());
             if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
                 throw std::invalid_argument("ngram archive capacity is out of range");
@@ -811,19 +947,27 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             auto& bytes = arg == "--ngram-archive-mib" ? options.speculative.ngram_archive_bytes
                                                        : options.speculative.ngram_session_bytes;
             bytes       = static_cast<std::size_t>(mib << 20);
-        } else if (arg == "--ngram-native-sessions") {
+            continue;
+        }
+        if (arg == "--ngram-native-sessions") {
             options.ngram_native_sessions = true;
-        } else if (arg == "--default-max-tokens") {
+            continue;
+        }
+        if (arg == "--default-max-tokens") {
             options.default_max_tokens =
                 parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
-        } else if (arg == "--default-thinking-budget") {
+            continue;
+        }
+        if (arg == "--default-thinking-budget") {
             const std::uint64_t budget =
                 parse_u64(require_value("--default-thinking-budget"), "default-thinking-budget");
             if (budget == 0 || budget > std::numeric_limits<std::uint32_t>::max()) {
                 throw std::invalid_argument("--default-thinking-budget is out of range");
             }
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
-        } else if (arg == "--default-reasoning-effort") {
+            continue;
+        }
+        if (arg == "--default-reasoning-effort") {
             const std::string value = require_value("--default-reasoning-effort");
             const auto effort       = parse_requested_reasoning_effort(value);
             if (!effort) {
@@ -831,14 +975,20 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                             "medium, high, xhigh, or max");
             }
             options.default_reasoning_effort = *effort;
-        } else if (arg == "--thinking-budget-message") {
+            continue;
+        }
+        if (arg == "--thinking-budget-message") {
             options.thinking_budget_message = require_value("--thinking-budget-message");
             if (options.thinking_budget_message.empty()) {
                 throw std::invalid_argument("--thinking-budget-message must not be empty");
             }
-        } else if (arg == "--vision") {
+            continue;
+        }
+        if (arg == "--vision") {
             options.enable_vision = true;
-        } else if (arg == "--vision-residency") {
+            continue;
+        }
+        if (arg == "--vision-residency") {
             const std::string_view mode = require_value("--vision-residency");
             if (mode == "resident") {
                 options.vision_residency = VisionResidency::Resident;
@@ -849,11 +999,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("--vision-residency must be resident, overlay or cpu");
             }
-        } else if (arg == "--vision-cpu") {
+            continue;
+        }
+        if (arg == "--vision-cpu") {
             // The gzenz fork's switch for Vision on CPU threads.
             options.enable_vision    = true;
             options.vision_residency = VisionResidency::Cpu;
-        } else if (arg == "--vision-offload") {
+            continue;
+        }
+        if (arg == "--vision-offload") {
             // The Wallawalla47 fork's switch for the same overlay residency.
             const std::string_view mode = require_value("--vision-offload");
             if (mode == "off") {
@@ -863,7 +1017,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("--vision-offload must be on or off");
             }
-        } else if (arg == "--vision-max-merged") {
+            continue;
+        }
+        if (arg == "--vision-max-merged") {
             const std::uint64_t merged =
                 parse_u64(require_value("--vision-max-merged"), "vision-max-merged");
             if (merged < 64 || merged > 16384) {
@@ -871,89 +1027,151 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.vision_max_merged_tokens = static_cast<std::uint32_t>(merged);
             vision_max_merged_explicit       = true;
-        } else if (arg == "--no-cuda-graph") {
+            continue;
+        }
+        if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
-        } else if (arg == "--cuda-graph-allowance-mib") {
+            continue;
+        }
+        if (arg == "--cuda-graph-allowance-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--cuda-graph-allowance-mib"), "cuda-graph-allowance-mib");
             if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
                 throw std::invalid_argument("--cuda-graph-allowance-mib is out of range");
             }
             options.cuda_graph_allowance_mib = mib;
-        } else if (arg == "--no-prefix-reuse") {
+            continue;
+        }
+        if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
-        } else if (arg == "--lenient-assistant-history") {
+            continue;
+        }
+        if (arg == "--lenient-assistant-history") {
             options.lenient_assistant_history = true;
-        } else if (arg == "--derive-session-keys") {
+            continue;
+        }
+        if (arg == "--derive-session-keys") {
             legacy_cache_flag           = "--derive-session-keys";
             options.derive_session_keys = true;
-        } else if (arg == "--slot-save-path") {
+            continue;
+        }
+        if (arg == "--slot-save-path") {
             // Slots are the checkpoint catalog's private continuation cells.
             legacy_cache_flag      = "--slot-save-path";
             options.slot_save_path = require_value("--slot-save-path");
             if (options.slot_save_path.empty()) {
                 throw std::invalid_argument("--slot-save-path must not be empty");
             }
-        } else if (arg == "--auto-save-evicted") {
+            continue;
+        }
+        if (arg == "--auto-save-evicted") {
             legacy_cache_flag         = "--auto-save-evicted";
             options.auto_save_evicted = true;
-        } else if (arg == "--auto-prefix-grid") {
+            continue;
+        }
+        if (arg == "--auto-prefix-grid") {
             legacy_cache_flag        = "--auto-prefix-grid";
             options.auto_prefix_grid = true;
-        } else if (arg == "--lm-head-draft") {
+            continue;
+        }
+        if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
-        } else if (arg == "--adaptive-mtp") {
+            continue;
+        }
+        if (arg == "--adaptive-mtp") {
             options.speculative.mtp_policy = MtpDraftPolicy::Adaptive;
-        } else if (arg == "--mtp-attention-window") {
+            continue;
+        }
+        if (arg == "--mtp-attention-window") {
             options.speculative.mtp_attention_window =
                 static_cast<std::uint32_t>(parse_nonnegative_int(
                     require_value("--mtp-attention-window"), "mtp-attention-window"));
-        } else if (arg == "--lm-head-q4") {
+            continue;
+        }
+        if (arg == "--lm-head-q4") {
             options.lm_head_q4 = true;
-        } else if (arg == "--lm-head-q6") {
+            continue;
+        }
+        if (arg == "--lm-head-q6") {
             options.lm_head_q6 = true;
-        } else if (arg == "--embedding-q4") {
+            continue;
+        }
+        if (arg == "--embedding-q4") {
             options.embedding_q4 = true;
-        } else if (arg == "--embedding-q6") {
+            continue;
+        }
+        if (arg == "--embedding-q6") {
             options.embedding_q6 = true;
-        } else if (arg == "--mtp-experts-q4") {
+            continue;
+        }
+        if (arg == "--mtp-experts-q4") {
             options.mtp_experts_q4 = true;
-        } else if (arg == "--gdn-state-fp16") {
+            continue;
+        }
+        if (arg == "--gdn-state-fp16") {
             options.gdn_state_fp16 = true;
-        } else if (arg == "--rope-yarn") {
+            continue;
+        }
+        if (arg == "--rope-yarn") {
             options.rope_yarn = true;
-        } else if (arg == "--rope-yarn-factor") {
+            continue;
+        }
+        if (arg == "--rope-yarn-factor") {
             options.rope_yarn_factor =
                 product::parse_rope_yarn_factor(require_value("--rope-yarn-factor"));
-        } else if (arg == "--rope-scaling-factor") {
+            continue;
+        }
+        if (arg == "--rope-scaling-factor") {
             options.rope_scaling_factor =
                 product::parse_rope_scaling_factor(require_value("--rope-scaling-factor"));
-        } else if (arg == "--rope-scaling-original-context") {
+            continue;
+        }
+        if (arg == "--rope-scaling-original-context") {
             options.rope_scaling_original_context = product::parse_rope_scaling_original_context(
                 require_value("--rope-scaling-original-context"));
-        } else if (arg == "--wddm-evictable-budget") {
+            continue;
+        }
+        if (arg == "--wddm-evictable-budget") {
             options.wddm_evictable_budget = true;
-        } else if (arg == "--mlp-a8-decode") {
+            continue;
+        }
+        if (arg == "--mlp-a8-decode") {
             options.mlp_a8_decode = true;
-        } else if (arg == "--no-prefill-a8") {
+            continue;
+        }
+        if (arg == "--no-prefill-a8") {
             options.prefill_a8 = false;
-        } else if (arg == "--lookup-ngram") {
+            continue;
+        }
+        if (arg == "--lookup-ngram") {
             options.speculative.lookup_ngram = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--lookup-ngram"), "lookup-ngram"));
-        } else if (arg == "--prefill-cublas") {
+            continue;
+        }
+        if (arg == "--prefill-cublas") {
             options.prefill_cublas = true;
-        } else if (arg == "--no-prefill-cublas-projections") {
+            continue;
+        }
+        if (arg == "--no-prefill-cublas-projections") {
             options.prefill_cublas_projections = false;
-        } else if (arg == "--chat-template") {
+            continue;
+        }
+        if (arg == "--chat-template") {
             options.chat_template_path = require_value("--chat-template");
             if (options.chat_template_path.empty()) {
                 throw std::invalid_argument("--chat-template must not be empty");
             }
-        } else if (arg == "--no-thinking") {
+            continue;
+        }
+        if (arg == "--no-thinking") {
             options.enable_thinking = false;
-        } else if (arg == "--preserve-thinking") {
+            continue;
+        }
+        if (arg == "--preserve-thinking") {
             options.preserve_thinking = true;
-        } else if (arg == "--graft") {
+            continue;
+        }
+        if (arg == "--graft") {
             const std::string_view spec = require_value("--graft");
             const std::size_t equals    = spec.find('=');
             if (equals == 0 || equals == std::string_view::npos || equals + 1 == spec.size()) {
@@ -961,67 +1179,107 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.grafts.push_back(GraftSource{.name = std::string(spec.substr(0, equals)),
                                                  .path = std::string(spec.substr(equals + 1))});
-        } else if (arg == "--default-graft") {
+            continue;
+        }
+        if (arg == "--default-graft") {
             options.default_graft = require_value("--default-graft");
             if (options.default_graft.empty()) {
                 throw std::invalid_argument("--default-graft needs a graft name");
             }
-        } else if (arg == "--cors") {
+            continue;
+        }
+        if (arg == "--cors") {
             options.enable_cors = true;
-        } else if (arg == "--no-webui") {
+            continue;
+        }
+        if (arg == "--no-webui") {
             options.enable_webui = false;
-        } else if (arg == "--webui-mcp-proxy") {
+            continue;
+        }
+        if (arg == "--webui-mcp-proxy") {
             options.webui_mcp_proxy = true;
-        } else if (arg == "--structured-output") {
+            continue;
+        }
+        if (arg == "--structured-output") {
             options.structured_output = true;
-        } else if (arg == "--unconstrained-response-format") {
+            continue;
+        }
+        if (arg == "--unconstrained-response-format") {
             options.unconstrained_response_format = true;
-        } else if (arg == "--assistant-prefill") {
+            continue;
+        }
+        if (arg == "--assistant-prefill") {
             options.assistant_prefill = true;
-        } else if (arg == "--usage-chunk-choice") {
+            continue;
+        }
+        if (arg == "--usage-chunk-choice") {
             options.usage_chunk_choice = true;
-        } else if (arg == "--temperature") {
+            continue;
+        }
+        if (arg == "--temperature") {
             options.sampling_overrides.temperature =
                 parse_float_in(require_value("--temperature"), "temperature", 0.0f, 2.0f);
-        } else if (arg == "--top-p") {
+            continue;
+        }
+        if (arg == "--top-p") {
             options.sampling_overrides.top_p =
                 parse_float_in(require_value("--top-p"), "top-p", 0.0f, 1.0f);
-        } else if (arg == "--top-k") {
+            continue;
+        }
+        if (arg == "--top-k") {
             const int top_k = parse_nonnegative_int(require_value("--top-k"), "top-k");
             if (top_k > 20) { throw std::invalid_argument("top-k must be in [0,20]"); }
             options.sampling_overrides.top_k = top_k;
-        } else if (arg == "--min-p") {
+            continue;
+        }
+        if (arg == "--min-p") {
             options.sampling_overrides.min_p =
                 parse_float_in(require_value("--min-p"), "min-p", 0.0f, 1.0f);
-        } else if (arg == "--presence-penalty") {
+            continue;
+        }
+        if (arg == "--presence-penalty") {
             options.sampling_overrides.presence_penalty = parse_float_in(
                 require_value("--presence-penalty"), "presence-penalty", -2.0f, 2.0f);
-        } else if (arg == "--frequency-penalty") {
+            continue;
+        }
+        if (arg == "--frequency-penalty") {
             options.sampling_overrides.frequency_penalty = parse_float_in(
                 require_value("--frequency-penalty"), "frequency-penalty", -2.0f, 2.0f);
-        } else if (arg == "--seed") {
+            continue;
+        }
+        if (arg == "--seed") {
             options.sampling_overrides.seed = parse_u64(require_value("--seed"), "seed");
-        } else if (arg == "--greedy") {
+            continue;
+        }
+        if (arg == "--greedy") {
             options.greedy = true;
-        } else if (arg == "--post-thinking") {
+            continue;
+        }
+        if (arg == "--post-thinking") {
             if (!options.post_thinking_overrides) { options.post_thinking_overrides.emplace(); }
-        } else if (arg == "--post-thinking-temperature" || arg == "--post-thinking-top-p" ||
-                   arg == "--post-thinking-top-k") {
+            continue;
+        }
+        if (arg == "--post-thinking-temperature" || arg == "--post-thinking-top-p" ||
+            arg == "--post-thinking-top-k") {
             const std::string_view key = arg == "--post-thinking-temperature" ? "temp"
                                          : arg == "--post-thinking-top-p"     ? "top_p"
                                                                               : "top_k";
             if (!options.post_thinking_overrides) { options.post_thinking_overrides.emplace(); }
             product::set_post_thinking_field(*options.post_thinking_overrides, key,
                                              require_value(arg.c_str()));
-        } else if (arg == "--post-thinking-sampler") {
+            continue;
+        }
+        if (arg == "--post-thinking-sampler") {
             if (!options.post_thinking_overrides) { options.post_thinking_overrides.emplace(); }
             product::apply_post_thinking_sampler(require_value("--post-thinking-sampler"),
                                                  *options.post_thinking_overrides);
-        } else if (arg == "--log-level") {
-            options.log_level = product::parse_log_level(require_value("--log-level"));
-        } else {
-            throw std::invalid_argument("unknown argument: " + arg);
+            continue;
         }
+        if (arg == "--log-level") {
+            options.log_level = product::parse_log_level(require_value("--log-level"));
+            continue;
+        }
+        throw std::invalid_argument("unknown argument: " + arg);
     }
     if (!options.default_graft.empty() &&
         std::none_of(options.grafts.begin(), options.grafts.end(), [&](const GraftSource& source) {
