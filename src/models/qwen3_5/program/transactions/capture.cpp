@@ -940,7 +940,12 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
             sequence.rewrite_state.reset();
             sequence.rewrite_checkpoint        = {};
             sequence.rewrite_checkpoint_hidden = {};
-            removed.device.state_slots         = 1;
+            // Accumulate: `removed` already holds the shared replacement released at preparation.
+            // Assigning 1 dropped its StateImage and failed the effect check below whenever a
+            // recycled rewrite capture also replaced a shared prefix.
+            detail::PhysicalResources recycled;
+            recycled.device.state_slots = 1;
+            removed                     = checked_resource_sum(removed, recycled);
         }
         removed = checked_resource_sum(
             removed, install_private_capture(sequence, transaction.group, transaction.source_state,
