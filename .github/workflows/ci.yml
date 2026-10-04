@@ -119,9 +119,12 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
+      # This job publishes the toolchain image when its definition changes, and only this one, so a
+      # change leaves one version behind rather than one per job.
       - name: Toolchain image
         id: toolchain
         env:
+          GH_TOKEN: ${{ github.token }}
           PUSH: ${{ github.event_name == 'push' && '1' || '0' }}
         run: echo "ref=$(.github/scripts/toolchain-image.sh)" >> "$GITHUB_OUTPUT"
       - name: Run tests/test_docker_build_cache.sh
@@ -135,7 +138,7 @@ jobs:
     timeout-minutes: 350
     permissions:
       contents: read
-      packages: write
+      packages: read
       statuses: write
     strategy:
       fail-fast: false
@@ -155,12 +158,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
-      # Published once per change of the toolchain stage and pulled after that. Rebuilding it took
-      # 3-4 minutes a job, and keeping its layers in the Actions cache saved nothing while it filled
-      # the 10 GB budget that ccache needs.
+      # Published once per change of the toolchain stage (by the build-cache job) and pulled after
+      # that; a run that finds it missing builds it for itself. Rebuilding it took 3-4 minutes a job,
+      # and keeping its layers in the Actions cache saved nothing while it filled the 10 GB budget
+      # that ccache needs.
       - name: Toolchain image
-        env:
-          PUSH: ${{ github.event_name == 'push' && '1' || '0' }}
         run: .github/scripts/toolchain-image.sh
       - name: Restore ccache
         uses: actions/cache/restore@v4
