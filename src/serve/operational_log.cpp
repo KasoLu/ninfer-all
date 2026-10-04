@@ -119,6 +119,8 @@ std::string_view requested_effort_name(const RequestLogContext& context) noexcep
 
 const char* protocol_name(std::string_view protocol) noexcept {
     if (protocol == "openai_chat_completions") { return "openai-chat"; }
+    if (protocol == "openai_completions") { return "openai-completions"; }
+    if (protocol == "llamacpp_completion") { return "llama.cpp-completion"; }
     if (protocol == "openai_responses") { return "openai-responses"; }
     if (protocol == "anthropic_messages") { return "anthropic"; }
     if (protocol == "openai_responses_input_tokens") { return "openai-input-tokens"; }

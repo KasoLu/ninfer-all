@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 #include <string_view>
 
 namespace ninfer::serve {
@@ -43,9 +44,19 @@ struct ModelDescription {
     std::uint32_t max_model_len = 0; // --max-context, each sequence's ceiling
     bool vision                 = false;
     ninfer::ModelMetadata metadata;
+    // llama.cpp router status: loaded, sleeping, loading, unloading or unloaded. A model that is
+    // not loaded has no metadata to report; its object carries the id, path and status only.
+    std::string status = "loaded";
+    bool loaded_facts  = true;
+    std::string path;
+    std::vector<std::string> args;
+    std::vector<std::string> aliases;
+    bool failed = false;
+    std::string last_error;
 };
 
 std::string make_models_list(const ModelDescription& model, std::int64_t created);
+std::string make_models_list(const std::vector<ModelDescription>& models, std::int64_t created);
 std::string make_model_object(const ModelDescription& model, std::int64_t created);
 // The /v1 discovery document: startup announces the API base as a URL, so the bare base answers
 // with the configured model alias and the endpoints this build serves instead of a 404.
@@ -56,6 +67,7 @@ std::int64_t unix_time_now();
 void validate_openai_model(std::string_view requested, std::string_view available);
 
 std::string new_openai_chat_completion_id();
+std::string new_openai_completion_id();
 std::string new_openai_chat_tool_call_id();
 std::string new_openai_request_id();
 std::string new_openai_response_id();

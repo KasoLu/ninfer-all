@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -25,6 +26,8 @@ public:
 
     [[nodiscard]] const PromptSummary& summary() const noexcept;
     [[nodiscard]] const PromptPreparationStats& preparation_stats() const noexcept;
+    // The prompt's token ids as the model reads them, media placeholders included.
+    [[nodiscard]] std::span<const TokenId> token_ids() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept;
 
 private:
@@ -75,11 +78,17 @@ public:
                                          const PreparationControl& control = {}) const;
 
     // Raw token input is retained for repeatable correctness and performance measurement.
+    // `anchor_prompt_end` also retains a private checkpoint one token short of the prompt's end, so
+    // the same prompt sent again (a regenerated raw completion) resumes from it; a raw prompt has
+    // no message structure to anchor otherwise. It costs a prefill split and a StateImage.
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
-                                                bool allow_prefix_identity = true) const;
+                                                bool allow_prefix_identity = true,
+                                                bool anchor_prompt_end     = false) const;
 
-    // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
-    [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
+    // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added;
+    // special-token text in `text` encodes as that token unless `parse_special` is false.
+    [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text,
+                                                     bool parse_special = true) const;
 
     // The bytes one token decodes to, special tokens included; they need not be whole UTF-8.
     [[nodiscard]] std::string token_bytes(TokenId token) const;

@@ -20,7 +20,8 @@ void HttpServer::handle_count_tokens(const httplib::Request& req, httplib::Respo
     try {
         const AnthropicCountTokensRequest request =
             parse_anthropic_count_tokens_request(parse_json_body(req));
-        const int input_tokens = service_->count_prompt_tokens(
+        const ModelRegistry::Lease lease = lease_model(anthropic_model(request.model), req);
+        const int input_tokens           = lease.service().count_prompt_tokens(
             request.generation, [&req] { return client_disconnected(req); });
         res.set_content(make_anthropic_count_tokens_response(input_tokens), "application/json");
     } catch (const ApiException& exception) {
@@ -60,16 +61,25 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         return;
     }
 
+    ModelRegistry::Lease lease;
+    try {
+        lease = lease_model(anthropic_model(request.model), req);
+    } catch (const ApiException& exception) {
+        write_anthropic_error(res, normalize_anthropic_error(exception.error()), request_id);
+        return;
+    }
+    GenerationService* const service = &lease.service();
     const std::uint64_t req_id = ++request_seq_;
     const RequestLogMetadata metadata{.model                  = request.model,
                                       .stream                 = request.stream,
                                       .output_tokens_explicit = request.output_tokens_explicit};
     PreparedRequest prepared;
     try {
-        prepared = service_->prepare(request.generation,
-                                     request.stream ? GenerationConsumerMode::Streaming
-                                                    : GenerationConsumerMode::Aggregate,
-                                     {}, [&req] { return client_disconnected(req); });
+        prepared            = service->prepare(request.generation,
+                                               request.stream ? GenerationConsumerMode::Streaming
+                                                              : GenerationConsumerMode::Aggregate,
+                                               {}, [&req] { return client_disconnected(req); });
+        prepared.model_hold = std::make_shared<ModelRegistry::Lease>(std::move(lease));
     } catch (const ApiException& exception) {
         const ApiError error = normalize_anthropic_error(exception.error());
         record_request_rejected(make_request_rejection_log_context(
@@ -97,7 +107,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     if (!request.stream) {
         GenerationOutcome outcome;
         try {
-            outcome = service_->run(prepared, nullptr, [&req] { return client_disconnected(req); });
+            outcome = service->run(prepared, nullptr, [&req] { return client_disconnected(req); });
         } catch (const ApiException& exception) {
             const ApiError error = normalize_anthropic_error(exception.error());
             lifecycle->failure(make_generation_request_failure(error));
@@ -147,7 +157,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
         prepare_sse_response(res);
         res.set_chunked_content_provider(
             "text/event-stream",
-            [this, stream, encoder, lifecycle](std::size_t, httplib::DataSink& sink) -> bool {
+            [this, service, stream, encoder, lifecycle](std::size_t,
+                                                        httplib::DataSink& sink) -> bool {
                 if (stream->started.exchange(true, std::memory_order_acq_rel)) {
                     sink.done();
                     return true;
@@ -188,7 +199,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     };
                     output.is_cancelled = [&] { return transport.poll(); };
 
-                    outcome = service_->run(stream->prepared, &output);
+                    outcome = service->run(stream->prepared, &output);
                 } catch (const ClientDisconnected&) {
                     lifecycle->failure(
                         make_client_disconnected_failure(RequestFailurePhase::Transport));

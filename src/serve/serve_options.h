@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -84,6 +85,21 @@ struct ServeOptions {
     // --model-suspend and its options: the residency API (suspend, resume) over fixed-address
     // device memory.
     ModelSuspendOptions suspend;
+    // Router mode: no artifact argument; --models-dir and/or --models-preset name the models, which
+    // load on demand. Every other option on the command line applies to each model.
+    std::optional<std::filesystem::path> models_dir;
+    std::optional<std::filesystem::path> models_preset;
+    std::uint32_t models_max = 1;
+    bool models_autoload     = true;
+    // Seconds a model may sit idle before it is put to sleep (needs --model-suspend) or unloaded;
+    // zero keeps it loaded. Both modes.
+    std::uint32_t sleep_idle_seconds  = 0;
+    std::uint32_t unload_idle_seconds = 0;
+    // The arguments after the artifact path, router options removed: what router mode starts each
+    // model with.
+    std::vector<std::string> model_arguments;
+
+    [[nodiscard]] bool router() const noexcept { return models_dir || models_preset; }
     bool mlp_a8_decode      = false;
     bool prefill_a8         = true;
     bool prefill_cublas     = false;

@@ -203,9 +203,21 @@ inline constexpr int kSamplerTopKCap = 20;
     return top_k > kSamplerTopKCap ? kSamplerTopKCap : top_k;
 }
 
+// One piece of a raw prompt: text the artifact's tokenizer encodes, or a token id used as it is.
+struct RawPromptPiece {
+    std::string text;
+    std::optional<ninfer::TokenId> token;
+};
+
 struct GenerationRequest {
     NgramSessionHints ngram_session;
     std::vector<ChatTurn> messages;
+    // A raw prompt (llama.cpp's /completion, OpenAI's legacy /v1/completions) instead of messages:
+    // generation continues it directly, with no chat template and no reasoning block.
+    std::optional<std::vector<RawPromptPiece>> raw_prompt;
+    // llama.cpp's cache_prompt: false keeps the request out of the context cache, neither reusing
+    // a cached prefix nor retaining its own.
+    bool cache_prompt = true;
     std::vector<ToolDefinition> tools;
     std::size_t tool_name_max_length = kMaximumToolNameLength;
     ToolChoice tool_choice;

@@ -76,6 +76,24 @@ filled to it, both models find two of the three needles.
   host`). Greedy output and prefix reuse are identical before and after, on one device, across
   pipeline stages, with MTP, with the hybrid prefix cache and with overlay Vision. See
   [Model suspend](docs/serving.md#model-suspend).
+- **Several models behind one server.** Started with `--models-dir` or a llama.cpp-style
+  `--models-preset` INI instead of an artifact, `ninfer-serve` is a router with llama.cpp's API:
+  `GET /models`, `POST /models/load` and `/models/unload`, `GET /models/sse`, the `model` field
+  choosing the model of each request, and `--models-max` loaded at once. A model started with
+  `--model-suspend` makes room by going to sleep rather than unloading, and wakes with its retained
+  conversations: on an RTX 3090 with two 27B models swapping in one 24 GB card, a wake took 1.8 s
+  where a cold load took 11.6 s, with identical output. See
+  [Several models](docs/serving.md#several-models-router).
+- **llama.cpp's native endpoints.** `POST /completion` and OpenAI's legacy `POST /v1/completions`
+  continue a raw prompt (text, token ids, or both mixed) with llama.cpp's response objects and
+  streams, and `POST /tokenize`, `/detokenize` and `/apply-template` expose the tokenizer and the
+  chat template. Greedy completion of the prompt `/apply-template` renders gives the very text
+  `/v1/chat/completions` gives for the same messages. See
+  [Raw-prompt completion](docs/serving.md#raw-prompt-completion-and-the-tokenizer).
+- **Rerank.** `POST /v1/rerank` (Jina's and llama.cpp's shape, TEI's too) ranks documents with the
+  served model as the judge, in Qwen3-Reranker's yes/no formulation, scoring each by
+  P(yes) / (P(yes) + P(no)) from the answer token's exact log probabilities. See
+  [Rerank](docs/serving.md#rerank).
 - **GGUF block formats.** Qwen3.8-27B GGUF releases that choose a ggml quantization type per tensor,
   such as ISTA-DASLab's GSQ-RCO models, import without requantization: the converter recipe
   `qwen3_8_27b_gguf` copies every quantized tensor's blocks unchanged, and the runtime multiplies

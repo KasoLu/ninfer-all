@@ -2,6 +2,8 @@
 #include "product/logging/engine_diagnostics.h"
 #include "product/logging/logging.h"
 #include "product/logging/startup_log.h"
+#include "serve/model_catalog.h"
+#include "serve/model_registry.h"
 #include "serve/operational_log.h"
 #include "serve/generation_service.h"
 #include "serve/http_server.h"
@@ -17,10 +19,12 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -332,32 +336,108 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
-        ninfer::serve::GenerationService service(
-            options, startup_log.observer(), ninfer::product::engine_diagnostic_observer(logger),
-            [&operational_log](const ninfer::SlotAutoSaveEvent& event) {
-                operational_log.slot_auto_save(event);
-            });
-        startup_log.engine_ready(service.load_summary());
-        operational_log.engine_capacity(service);
+        // One model's service: its Engine loaded and warmed up. Single-model mode builds it before
+        // the registry exists, to learn the model's public id; router mode builds each on demand.
+        const auto make_service = [&](const ninfer::serve::ServeOptions& model_options) {
+            auto service = std::make_unique<ninfer::serve::GenerationService>(
+                model_options, startup_log.observer(),
+                ninfer::product::engine_diagnostic_observer(logger),
+                [&operational_log](const ninfer::SlotAutoSaveEvent& event) {
+                    operational_log.slot_auto_save(event);
+                });
+            startup_log.engine_ready(service->load_summary());
+            operational_log.engine_capacity(*service);
+            using Clock                            = std::chrono::steady_clock;
+            const Clock::time_point warmup_started = Clock::now();
+            operational_log.warmup_started();
+            try {
+                service->warmup();
+            } catch (const std::exception& exception) {
+                const double seconds =
+                    std::chrono::duration<double>(Clock::now() - warmup_started).count();
+                operational_log.warmup_failure(seconds, exception.what());
+                throw;
+            }
+            operational_log.warmup_complete(
+                std::chrono::duration<double>(Clock::now() - warmup_started).count());
+            return service;
+        };
 
-        using Clock                            = std::chrono::steady_clock;
-        const Clock::time_point warmup_started = Clock::now();
-        operational_log.warmup_started();
+        std::vector<ninfer::serve::ModelDefinition> definitions;
+        std::unique_ptr<ninfer::serve::GenerationService> first;
+        if (!options.router()) {
+            try {
+                first = make_service(options);
+            } catch (const std::exception&) { return 1; }
+            definitions.push_back(
+                ninfer::serve::ModelDefinition{.id = ninfer::serve::resolve_public_model_id(
+                                                   options, first->load_summary().model_name),
+                                               .options         = options,
+                                               .arguments       = options.model_arguments,
+                                               .load_on_startup = true});
+        } else {
+            std::optional<ninfer::serve::PresetFile> preset;
+            if (options.models_preset) {
+                std::ifstream file(*options.models_preset);
+                if (!file) {
+                    operational_log.server_failure(false, "cannot read --models-preset " +
+                                                              options.models_preset->string());
+                    return 1;
+                }
+                std::stringstream text;
+                text << file.rdbuf();
+                preset = ninfer::serve::parse_preset_file(text.str());
+            }
+            for (ninfer::serve::CatalogModel& model : ninfer::serve::build_catalog(
+                     options.models_dir, preset, options.model_arguments)) {
+                std::vector<std::string> words{argv[0], model.artifact.string()};
+                words.insert(words.end(), model.arguments.begin(), model.arguments.end());
+                std::vector<char*> model_argv;
+                for (std::string& word : words) { model_argv.push_back(word.data()); }
+                ninfer::serve::ServeOptions model_options = ninfer::serve::parse_serve_options(
+                    static_cast<int>(model_argv.size()), model_argv.data());
+                // The router owns the address, the key and the logs; a model never binds its own.
+                model_options.host              = options.host;
+                model_options.port              = options.port;
+                model_options.api_key           = options.api_key;
+                model_options.model_id_override = model.id;
+                definitions.push_back(
+                    ninfer::serve::ModelDefinition{.id              = model.id,
+                                                   .aliases         = model.aliases,
+                                                   .options         = std::move(model_options),
+                                                   .arguments       = model.arguments,
+                                                   .load_on_startup = model.load_on_startup});
+            }
+        }
+        ninfer::serve::ModelRegistry registry(
+            std::move(definitions),
+            ninfer::serve::RegistryPolicy{
+                .models_max  = options.models_max,
+                .autoload    = options.models_autoload,
+                .sleep_idle  = std::chrono::seconds(options.sleep_idle_seconds),
+                .unload_idle = std::chrono::seconds(options.unload_idle_seconds)},
+            [&](const ninfer::serve::ModelDefinition& definition)
+                -> std::unique_ptr<ninfer::serve::ModelService> {
+                if (first) {
+                    return std::make_unique<ninfer::serve::EngineModelService>(std::move(first));
+                }
+                return std::make_unique<ninfer::serve::EngineModelService>(
+                    make_service(definition.options));
+            },
+            options.router());
         try {
-            service.warmup();
+            registry.load_startup_models();
         } catch (const std::exception& exception) {
-            const double seconds =
-                std::chrono::duration<double>(Clock::now() - warmup_started).count();
-            operational_log.warmup_failure(seconds, exception.what());
+            operational_log.server_failure(false, exception.what());
             return 1;
         }
-        operational_log.warmup_complete(
-            std::chrono::duration<double>(Clock::now() - warmup_started).count());
-        server.attach(service);
+        server.attach(registry);
         const ServingScope serving_scope(stop_control, server);
 
         serving = true;
-        operational_log.server_ready(options.host, options.port, server.public_model_id(),
+        operational_log.server_ready(options.host, options.port,
+                                     options.router() ? std::string("router")
+                                                      : server.public_model_id(),
                                      !options.api_key.empty());
         operational_log.server_urls(options.host, options.port, server.webui_enabled());
 

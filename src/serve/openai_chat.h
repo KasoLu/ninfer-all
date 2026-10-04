@@ -43,6 +43,16 @@ OpenAIChatResponseIdentity make_openai_chat_response_identity(std::string model)
 std::string make_chat_completion_response(const OpenAIChatResponseIdentity& identity,
                                           const GenerationOutcome& outcome);
 
+// Pieces the text-completion endpoints share with Chat Completions: llama.cpp's `timings` object of
+// a finished generation and the live snapshot of one under way, its `prompt_progress` object, and
+// the OpenAI `usage` object and finish_reason of a finished generation.
+nlohmann::json completion_timings_json(const GenerationOutcome& outcome);
+nlohmann::json completion_timings_json(std::uint32_t prompt_tokens, std::uint32_t cached_tokens,
+                                       const ninfer::GenerationTimingObservation& observation);
+nlohmann::json completion_prompt_progress_json(const ninfer::PromptProgress& progress);
+nlohmann::json openai_usage_json(const GenerationOutcome& outcome);
+const char* openai_finish_reason(ninfer::FinishReason reason) noexcept;
+
 class OpenAIChatStream {
 public:
     OpenAIChatStream(OpenAIChatResponseIdentity identity, bool include_usage,

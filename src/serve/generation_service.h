@@ -14,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::serve {
@@ -73,6 +74,7 @@ struct FirstTokenLogprobsView {
 };
 
 struct GenerationOutcome {
+    std::vector<ninfer::TokenId> tokens; // the generated token ids
     // The catalog cell and session digest the finished session was retained under; -1 and empty
     // when it was not retained.
     std::int32_t id_slot = -1;
@@ -134,6 +136,8 @@ struct PreparedRequest {
     // False trims the finished response to a single tool call. See GenerationRequest.
     bool parallel_tool_calls = true;
     std::shared_ptr<RequestLifetime> lifetime;
+    // Keeps the serving model loaded while the request lives: the router's lease on it.
+    std::shared_ptr<void> model_hold;
 };
 
 // The Engine configuration a serve invocation selects. Separate from the service so the mapping
@@ -164,6 +168,20 @@ public:
     [[nodiscard]] ninfer::RuntimeStats runtime_stats() const { return engine_->runtime_stats(); }
 
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
+
+    // The artifact tokenizer, for /tokenize and /detokenize.
+    [[nodiscard]] std::vector<ninfer::TokenId> tokenize(std::string_view text,
+                                                        bool parse_special = true) const {
+        return engine_->tokenize_text(text, parse_special);
+    }
+
+    [[nodiscard]] std::string token_bytes(ninfer::TokenId token) const {
+        return engine_->token_bytes(token);
+    }
+
+    // The prompt a chat request renders to, as text (/apply-template); generation does not run.
+    [[nodiscard]] std::string render_prompt(const GenerationRequest& request,
+                                            std::function<bool()> is_cancelled) const;
 
     // Model residency (--model-suspend).
     ninfer::ResidencyStatus suspend(std::optional<bool> auto_resume) {

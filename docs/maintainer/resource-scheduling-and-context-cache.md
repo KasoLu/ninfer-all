@@ -541,6 +541,14 @@ token 0 重新 prefill。它们是 candidates 而非 markers：不计入显式 m
 合并，并使单请求 prepared candidates 上限增加 `N`；保留数量仍受 `max_long_anchors_per_continuation` 限制，满额时替换最浅的
 anchor。
 
+原始 token prompt（`Engine::prepare_tokens`，serving 的 `/completion` 与 `/v1/completions`）没有 message
+结构，因此没有 rewrite checkpoint，也没有 message boundary 可供锚定；它的 endpoint 仍让续写该 prompt 及其输出的请求
+复用。`prepare_tokens(..., anchor_prompt_end = true)` 在 `prompt - 1` 处提出一个 `PrivateLongAnchor` candidate
+（`EngineStructural`）和一个 `GenerationOpener` tap hint，使同一 prompt 再次到来（重新生成）时从该处恢复，只重算最后一个
+token。它不进入 prompt identity，所以不妨碍 endpoint 复用；代价是一次额外的 prefill pass 与一个 StateImage。
+`ninfer-serve` 只对至少 512 token 的 raw prompt 打开它（RTX 3090、27B：额外 pass 约 20 ms，重复的 1,602-token prompt
+TTFT 从 615 ms 降到 26 ms）；benchmark 与测试的 `prepare_tokens` 默认不打开，执行分解保持不变。
+
 Shared catalog 是 Engine-wide 公共容量，不是每条 lineage 的配额。启用 context cache 时，默认 logical
 capacity 同时覆盖 active concurrency 下限和单请求最多七个 prepared candidates，即
 `max(max_concurrency, kMaximumPreparedPromptCacheCandidatesPerRequest)`；显式配置仍完整覆盖默认值。这个下限允许较早的

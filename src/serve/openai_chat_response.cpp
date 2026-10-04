@@ -134,7 +134,7 @@ Json prompt_progress_json(std::uint32_t total, std::uint32_t cached, std::uint32
                 {"time_ms", elapsed_ns / 1000000ULL}};
 }
 
-const char* finish_reason(ninfer::FinishReason reason) {
+const char* finish_reason(ninfer::FinishReason reason) noexcept {
     switch (reason) {
     case ninfer::FinishReason::OutputLimit:
     case ninfer::FinishReason::ContextCapacity:
@@ -307,6 +307,26 @@ void require_prefix(std::string_view complete, std::string_view streamed, const 
 }
 
 } // namespace
+
+Json completion_timings_json(const GenerationOutcome& outcome) {
+    return timings_json(outcome_timings(outcome));
+}
+
+Json completion_timings_json(std::uint32_t prompt_tokens, std::uint32_t cached_tokens,
+                             const ninfer::GenerationTimingObservation& observation) {
+    return timings_json(observation_timings(prompt_tokens, cached_tokens, observation));
+}
+
+Json completion_prompt_progress_json(const ninfer::PromptProgress& progress) {
+    return prompt_progress_json(progress.total_prompt_tokens, progress.reused_prompt_tokens,
+                                progress.processed_prompt_tokens, progress.elapsed_ns);
+}
+
+Json openai_usage_json(const GenerationOutcome& outcome) { return usage_json(usage_from(outcome)); }
+
+const char* openai_finish_reason(ninfer::FinishReason reason) noexcept {
+    return finish_reason(reason);
+}
 
 OpenAIChatResponseIdentity make_openai_chat_response_identity(std::string model) {
     return OpenAIChatResponseIdentity{

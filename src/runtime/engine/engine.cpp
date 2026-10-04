@@ -125,6 +125,10 @@ const PromptPreparationStats& PreparedPrompt::preparation_stats() const noexcept
     return impl_ != nullptr ? impl_->prepare : empty;
 }
 
+std::span<const TokenId> PreparedPrompt::token_ids() const noexcept {
+    return impl_ != nullptr ? impl_->value.token_ids() : std::span<const TokenId>{};
+}
+
 PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
 
 class GenerationHandle::Impl {
@@ -535,8 +539,8 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
                                                                  std::move(prepared)));
 }
 
-PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
-                                      bool allow_prefix_identity) const {
+PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity,
+                                      bool anchor_prompt_end) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime,
                                     static_cast<std::uint64_t>(token_ids.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
@@ -544,8 +548,8 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
         throw RequestError(RequestErrorKind::ContextLengthExceeded,
                            context_capacity_error(token_ids.size(), impl_->active->capacity));
     }
-    auto prepared =
-        impl_->active->frontend.prepare_tokens(std::move(token_ids), allow_prefix_identity);
+    auto prepared = impl_->active->frontend.prepare_tokens(
+        std::move(token_ids), allow_prefix_identity, anchor_prompt_end);
     PromptSummary info = prepared.summary();
     if (info.prompt_tokens > impl_->active->capacity) {
         throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
@@ -555,9 +559,9 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
         info, preparation, SamplingMode::Thinking, std::move(prepared)));
 }
 
-std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {
+std::vector<TokenId> Engine::tokenize_text(std::string_view text, bool parse_special) const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return impl_->active->frontend.tokenize_text(text);
+    return impl_->active->frontend.tokenize_text(text, parse_special);
 }
 
 std::string Engine::token_bytes(TokenId token) const {

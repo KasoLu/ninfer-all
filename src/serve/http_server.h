@@ -3,12 +3,14 @@
 #include "serve/console_stats.h"
 #include "serve/generation_service.h"
 #include "serve/load_report.h"
+#include "serve/model_registry.h"
 #include "serve/openai_common.h"
 #include "serve/operational_log.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request_log.h"
 #include "serve/serve_metrics.h"
 #include "serve/serve_options.h"
+#include "serve/text_completion.h"
 
 #include <httplib.h>
 
@@ -17,6 +19,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <map>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -60,10 +63,12 @@ public:
     HttpServer(const HttpServer&)            = delete;
     HttpServer& operator=(const HttpServer&) = delete;
 
-    // Reserves the configured address before model loading. The service is attached only after its
-    // Engine is ready, then listen() enters the blocking accept loop on the already-bound socket.
+    // Reserves the configured address before model loading. The registry is attached once the
+    // models that load at startup are ready, then listen() enters the blocking accept loop on the
+    // already-bound socket. In single-model mode the registry holds the one model, loaded; in
+    // router mode it holds every model of the catalog, loaded or not.
     bool bind();
-    void attach(GenerationService& service);
+    void attach(ModelRegistry& registry);
     bool listen();
     // Closes the listening sockets and stops the attached service's Engine, whose queued and
     // running requests then fail, so listen() returns within about one unit of Engine work.
@@ -143,11 +148,53 @@ private:
     void handle_model_residency(const httplib::Request& req, httplib::Response& res) const;
     void handle_model_suspend(const httplib::Request& req, httplib::Response& res);
     void handle_model_resume(const httplib::Request& req, httplib::Response& res);
+    // llama.cpp router API: GET /models, POST /models/load and /models/unload, GET /models/sse; and
+    // NInfer's POST /models/sleep.
+    void handle_router_models(const httplib::Request& req, httplib::Response& res) const;
+    void handle_models_action(const httplib::Request& req, httplib::Response& res,
+                              std::string_view action);
+    void handle_models_sse(const httplib::Request& req, httplib::Response& res);
     void handle_slot_action(const httplib::Request& req, httplib::Response& res);
+    // llama.cpp's native endpoints: POST /tokenize, /detokenize, /apply-template and /completion;
+    // and OpenAI's legacy POST /v1/completions, the same raw-prompt completion.
+    void handle_tokenize(const httplib::Request& req, httplib::Response& res) const;
+    void handle_detokenize(const httplib::Request& req, httplib::Response& res) const;
+    void handle_apply_template(const httplib::Request& req, httplib::Response& res) const;
+    void handle_text_completion(const httplib::Request& req, httplib::Response& res,
+                                TextCompletionDialect dialect);
+    // POST /rerank, /reranking, /v1/rerank and /v1/reranking: the documents scored by the model.
+    void handle_rerank(const httplib::Request& req, httplib::Response& res);
     void handle_props(const httplib::Request& req, httplib::Response& res) const;
     void handle_webui(const httplib::Request& req, httplib::Response& res) const;
-    [[nodiscard]] LoadSample load_sample() const;
-    [[nodiscard]] ModelDescription model_description() const;
+
+    // What the server reports about one loaded model, computed once per Engine instance: an
+    // unload and a later load start a new one.
+    struct ModelFacts {
+        const GenerationService* service = nullptr;
+        LoadCapacity capacity;
+        ninfer::ModelMetadata metadata;
+        bool vision               = false;
+        std::uint32_t max_context = 0;
+    };
+
+    // The model a request names (empty names the default model), leased for the call: loaded or
+    // woken when autoload allows (the `autoload` query parameter overrides the server's choice).
+    // Throws ApiException: 404 for an unknown model, 503 when it is not loaded and may not be or
+    // failed to load.
+    [[nodiscard]] ModelRegistry::Lease lease_model(std::string_view model,
+                                                   const httplib::Request& req) const;
+    // An Anthropic client names its own model families (Claude Code sends claude-*): a name no
+    // model or alias answers to selects the default model instead of failing.
+    [[nodiscard]] std::string anthropic_model(const std::string& requested) const;
+    // The model of a request that only runs on the host (tokenizing, rendering a template): a
+    // loaded or sleeping model serves it without waking; one not loaded loads as for generation.
+    [[nodiscard]] ModelRegistry::Lease lease_host_model(std::string_view model,
+                                                        const httplib::Request& req) const;
+    // The `model` query parameter of a GET endpoint, leased the same way.
+    [[nodiscard]] ModelRegistry::Lease lease_query_model(const httplib::Request& req) const;
+    [[nodiscard]] ModelFacts model_facts(const ModelRegistry::Lease& lease) const;
+    [[nodiscard]] LoadSample load_sample(GenerationService& service) const;
+    [[nodiscard]] ModelDescription model_description(const ModelRegistry::Lease& lease) const;
     void handle_models(const httplib::Request& req, httplib::Response& res) const;
     void handle_model(const httplib::Request& req, httplib::Response& res) const;
 
@@ -162,20 +209,21 @@ private:
 
     // Written once by attach() on the main thread and read by request handlers on httplib's worker
     // threads, so the publication has to be ordered. Handlers only ever test readiness through
-    // ready_; service_ itself is not read until ready_ has been observed true.
-    GenerationService* service_ = nullptr;
+    // ready_; registry_ itself is not read until ready_ has been observed true.
+    ModelRegistry* registry_ = nullptr;
     std::atomic<bool> ready_{false};
     std::thread startup_listener_;
     std::atomic<bool> startup_listener_result_{false};
     ServeOptions options_;
+    // The one model's id in single-model mode; empty in router mode, where requests name models.
     std::string public_model_id_;
-    // Written by attach() together with service_, before ready_ is published.
-    LoadCapacity load_capacity_;
     std::chrono::steady_clock::time_point attached_at_;
-    ninfer::ModelMetadata model_metadata_;
+    mutable std::mutex facts_mutex_;
+    mutable std::map<std::string, ModelFacts> facts_;
     OpenAIResponsesStore openai_responses_store_;
     OperationalLog operational_log_;
-    JsonlRequestLog request_jsonl_;
+    // Mutable: a model's server_start record is written when a const handler first sees it.
+    mutable JsonlRequestLog request_jsonl_;
     ServeMetrics metrics_;
     std::unique_ptr<ConsoleStatsPanel> console_stats_;
     httplib::Server server_;

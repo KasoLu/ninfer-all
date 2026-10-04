@@ -977,6 +977,11 @@ PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
     };
 }
 
+std::span<const TokenId> PreparedPrompt::token_ids() const noexcept {
+    if (data_ == nullptr) { return {}; }
+    return data_->token_ids;
+}
+
 PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }
 
 Frontend::Frontend(std::shared_ptr<const Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -1307,8 +1312,8 @@ MediaCacheSummary Frontend::media_cache_summary() const {
     };
 }
 
-PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
-                                        bool allow_prefix_identity) const {
+PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity,
+                                        bool anchor_prompt_end) const {
     const auto start = Clock::now();
     if (token_ids.size() > impl_->max_context) {
         throw_context_length_exceeded(impl_->max_context);
@@ -1335,13 +1340,25 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     result.identity.reusable                  = allow_prefix_identity;
     result.context_cache.retention            = runtime::RetentionClass::RecentPrivate;
     result.context_cache.update_session_index = false;
+    if (allow_prefix_identity && anchor_prompt_end && result.token_ids.size() > 1) {
+        // The furthest point the same prompt sent again can resume from: its last token has to
+        // run again for the logits. Not part of the prompt identity, so the retained endpoint
+        // still serves a later prompt that continues this one.
+        const auto frontier = static_cast<std::uint32_t>(result.token_ids.size() - 1U);
+        result.context_cache.opportunities.push_back(
+            PreparedCacheOpportunity{.kind     = PromptCacheMarkerKind::PrivateLongAnchor,
+                                     .evidence = SharedCandidateEvidence::EngineStructural,
+                                     .frontier = frontier});
+        result.tap_hints.hints.push_back(runtime::prefix_cache::TapHint{
+            .position = frontier, .kind = runtime::prefix_cache::TapHintKind::GenerationOpener});
+    }
     result.prepare.seconds = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
 
-std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
+std::vector<TokenId> Frontend::tokenize_text(std::string_view text, bool parse_special) const {
     if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
-    return impl_->tokenizer->encode(text);
+    return impl_->tokenizer->encode(text, {.parse_added_tokens = parse_special});
 }
 
 std::string Frontend::token_bytes(TokenId token) const {

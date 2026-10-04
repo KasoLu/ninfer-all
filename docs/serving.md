@@ -1,7 +1,8 @@
 # HTTP serving
 
-`build/apps/ninfer-serve` loads one v3 `.ninfer` artifact and exposes OpenAI- and
-Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
+`build/apps/ninfer-serve` loads one v3 `.ninfer` artifact and exposes OpenAI-, Anthropic- and
+llama.cpp-compatible HTTP endpoints over one resident NInfer Engine, or serves a catalog of
+artifacts as a [router](#several-models-router), one Engine per loaded model.
 
 ## Start the server
 
@@ -132,6 +133,58 @@ The CPU encoder computes in FP32 where the device encoder rounds activations to 
 agree closely but not bit for bit. It reads the tower's weights in the official artifacts' grouped
 formats as well as BF16, FP8 and NVFP4; a projection stored with a Hadamard rotation or an input
 gather is refused at load.
+
+## Several models (router)
+
+Started with `--models-dir` or `--models-preset` and no artifact path, the server is a router in
+llama.cpp's sense: it serves every model of a catalog at one address, loads each on demand, and
+keeps at most `--models-max` loaded at once (default 1, 0 for no limit). Where llama.cpp's router
+starts one server process per model, every model here is an Engine in the one process.
+
+```bash
+./build/apps/ninfer-serve --models-dir models --models-max 1 --model-suspend \
+  --max-context 65536 --sleep-idle-seconds 600
+```
+
+- `--models-dir DIR` serves every `.ninfer` directly in `DIR` under its file stem, and every
+  subdirectory holding exactly one `.ninfer` under the subdirectory's name.
+- `--models-preset FILE` is an INI file in llama.cpp's preset format. `[*]` holds options for every
+  model; any other section is a model: `model = PATH` (or `artifact`), `alias = a, b` for further
+  names, `load-on-startup = true`, and any serve option without its leading dashes
+  (`kv-capacity = 65536`; a flag is `model-suspend = true`). A section named after a model of
+  `--models-dir` configures that model and needs no path. Comments start with `;` or `#`.
+- Serve options given on the command line apply to every model and win over the preset; a model's
+  own section wins over `[*]`. Each model is configured exactly as a single-model server started
+  with those options would be, except that the host, port and API key are the router's.
+
+A request names its model in the body's `model` field (POST) or in the `model` query parameter
+(GET); a request that names none gets the most recently used loaded model. A model that is not
+loaded is loaded first, or woken when it sleeps, unless `--no-models-autoload` is set (per request,
+`?autoload=0|1` overrides it); the request then fails with 503 `model_not_loaded`. An unknown name
+is a 404 `model_not_found`, and a failed load a 503 `model_load_failed`.
+
+To make room, the least recently used model without requests in flight goes to sleep when it was
+started with [`--model-suspend`](#model-suspend), and is unloaded otherwise. A sleeping model keeps
+its Engine, host caches and retained conversations and gives back its device memory; it wakes in
+about two seconds where a cold load takes over ten (27B, RTX 3090: 1.8 s against 11.6 s), and its
+retained conversations reuse their prefixes as before. A model with requests in flight is never put
+to sleep or unloaded under them: the request that needs the room waits for them to finish (up to
+ten minutes, then 503). `--sleep-idle-seconds N` puts a model idle for N seconds to sleep (it needs
+`--model-suspend`) and `--unload-idle-seconds N` unloads one; both apply to a single-model server
+too.
+
+| Method and path | Behavior |
+|---|---|
+| `GET /models` | every catalog model: `status.value` (`unloaded`, `loading`, `loaded`, `sleeping`, `unloading`), `status.args` (its serve arguments), `status.failed` and `status.error` after a failed load, `aliases`, `path`; a loaded or sleeping model adds the fields of [`GET /v1/models`](#models) |
+| `POST /models/load` | `{"model": "<id>"}`: load the model, or wake it when it sleeps |
+| `POST /models/unload` | `{"model": "<id>"}`: unload it once its requests have finished |
+| `POST /models/sleep` | `{"model": "<id>"}`: NInfer's addition, put an idle model to sleep; `409 model_busy` while it has requests |
+| `GET /models/sse` | one event per status change: `{"model": "<id>", "event": "model_status", "data": {"status": "<state>"}}`, with `failed` and `error` after a failed load |
+
+Read-only endpoints (`/props`, `/slots`, `/v1/load`, `/metrics`, `/v1/models/{id}/residency`) report
+a sleeping model as it is and neither load nor wake it. Neither do `/tokenize`, `/detokenize` and
+`/apply-template`, which run on the host. The `/models` routes exist on a single-model server too,
+whose catalog is its one model.
 
 ## Structured output
 
@@ -277,6 +330,12 @@ tier must be saved. Before the server is ready, one Ctrl+C ends startup at once.
 | `GET /v1/models/{id}/residency` | whether the model is resident or suspended, what a suspend releases and holds (see [Model suspend](#model-suspend)) |
 | `POST /v1/models/{id}/suspend`, `POST /v1/models/{id}/resume` | give the model's device memory back while idle, and take it again (`--model-suspend`) |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
+| `POST /v1/completions` | OpenAI legacy completion of a raw prompt (see [Raw-prompt completion](#raw-prompt-completion-and-the-tokenizer)) |
+| `POST /completion`, `POST /completions` | llama.cpp's native completion of a raw prompt |
+| `POST /tokenize`, `POST /detokenize` | the model's tokenizer, in llama.cpp's shape |
+| `POST /apply-template` | the prompt a chat request renders to, as text, without generation |
+| `POST /v1/rerank`, `POST /rerank` (and `/reranking`) | documents ranked by relevance to a query, scored by the model (see [Rerank](#rerank)) |
+| `GET /models`, `POST /models/load\|unload\|sleep`, `GET /models/sse` | llama.cpp's router API: the catalog and its lifecycle (see [Several models](#several-models-router)) |
 | `POST /v1/responses` | OpenAI Responses Core generation, state, typed Items, and SSE |
 | `POST /v1/responses/input_tokens` | Responses prompt-token count without generation |
 | `GET /v1/responses/{id}` | retrieve a locally stored terminal Response |
@@ -975,6 +1034,98 @@ the prepared token count and configured context ceiling. A media preprocessing r
 returns HTTP 400 `media_budget_exceeded`. HTTP 413 `request_too_large` is reserved for a raw request
 body that exceeds `--max-request-mib` before JSON parsing; it is not used for model-context or media
 resource errors.
+
+## Raw-prompt completion and the tokenizer
+
+llama.cpp's native `POST /completion` (also `/completions`) and OpenAI's legacy
+`POST /v1/completions` continue a raw prompt: no chat template, no reasoning block, no tool
+parsing. The text the model generates is returned as it is, `<think>` tags included, and its
+special tokens are not. The prompt is a string, an array of token ids, or token ids and strings
+mixed (`[248045, "user\nHi"]`); special-token text in a string encodes as that token. llama.cpp's
+array of several prompts is refused (`multiple_prompts_not_supported`): one request produces one
+completion. A one-element array is that one prompt.
+
+```bash
+curl http://127.0.0.1:8080/completion -d '{"prompt": "The capital of France is", "n_predict": 16,
+  "temperature": 0, "stop": ["\n"]}'
+curl http://127.0.0.1:8080/v1/completions -d '{"prompt": "The capital of France is",
+  "max_tokens": 16, "stream": true, "stream_options": {"include_usage": true}}'
+```
+
+Both accept `temperature` (below zero samples greedily), `top_k` (zero or below is the widest
+candidate set, 20), `top_p`, `min_p`, `presence_penalty`, `frequency_penalty`, `seed` (negative
+for a random one), `stop` (a string or up to 32 strings), `ignore_eos`, `stream`,
+`timings_per_token`, `response_format`, and llama.cpp's `cache_prompt` (`false` keeps the request
+out of the context cache). The output limit is llama.cpp's `n_predict` (then `max_tokens`) on
+`/completion`, where any negative value is no limit, and `max_tokens` on `/v1/completions`, where
+`-1` is; omitted, it is the [default output limit](#default-output-limit). llama.cpp sampler
+controls NInfer does not have are accepted at their neutral values and refused otherwise, each
+with `<field>_not_supported`: `repeat_penalty` (1), `typical_p` (1), `tfs_z` (1), `dynatemp_range`
+(0), `mirostat` (0), `xtc_probability` (0), `dry_multiplier` (0), `top_n_sigma` (0 or below),
+`n_probs` (0), `n_indent` (0) and `t_max_predict_ms` (0 or below); a non-empty `grammar`, `lora` or
+nonzero `logit_bias` is refused too. `samplers`, `n_keep`, `min_keep`, `id_slot` and the parameters
+of the controls above are accepted without effect.
+
+`/completion` adds llama.cpp's `json_schema` (the bare schema; `{}` admits any JSON object; needs
+`--structured-output`), `return_tokens`, `return_progress` and `response_fields` (the response
+keeps only the named fields; `generation_settings/n_predict` names a nested one and is reported
+under that path). Its response is llama.cpp's object: `content`, `tokens` (with `return_tokens`),
+`stop`, `stop_type` (`eos`, `word` with `stopping_word`, `limit`, or `none`), `tokens_predicted`
+(the stop token included), `tokens_evaluated` (the prompt), `tokens_cached` (prompt tokens the
+context cache supplied), `prompt` (as text), `generation_settings` (the settings the request
+resolved to), `has_new_line`, `truncated` (always false: NInfer never shifts the context),
+`id_slot`, `model` and `timings`. Streamed, each event carries the next `content` with the running
+`tokens_predicted`, and the last is the full object with an empty `content`; the generated token
+ids, which the chunks do not carry, come in that last object's `tokens`. There is no `[DONE]`.
+
+`/v1/completions` adds OpenAI's `echo` (the prompt text precedes the completion, and opens the
+stream) and `stream_options.include_usage`, accepts `n`, `best_of` and `logprobs` only at 1, 1 and
+0, and refuses a non-empty `suffix` (fill-in-the-middle, `suffix_not_supported`). Its response is a
+`text_completion` object with `choices[0].text` and `finish_reason` (`stop` or `length`), `usage`,
+and llama.cpp's `timings`; a stream ends with the finish chunk, the usage chunk when asked for, and
+`[DONE]`.
+
+The context cache retains a raw request's state at its end, so a prompt that continues an earlier
+prompt and its completion (a client resending the conversation with the next turn) resumes from
+it. A raw prompt has no message structure to checkpoint inside it, so a prompt of at least 512
+tokens also keeps a private checkpoint one token short of its end, from which the same prompt sent
+again (a regenerated completion) resumes: measured on an RTX 3090 with a 27B model, a repeated
+1,602-token prompt reused 1,601 tokens and its time to first token fell from 615 ms to 26 ms. The
+checkpoint costs one more prefill pass, about 20 ms there, which is why shorter prompts go without.
+
+The tokenizer endpoints answer from the host, so they do not wake a sleeping model:
+
+| Method and path | Request | Response |
+|---|---|---|
+| `POST /tokenize` | `content`; `parse_special` (default true: special-token text encodes as that token); `with_pieces`; `add_special` (accepted; Qwen checkpoints add no BOS) | `{"tokens": [ids]}`, or `[{"id", "piece"}]` with `with_pieces`, a piece that is not whole UTF-8 given as its bytes |
+| `POST /detokenize` | `tokens` | `{"content": text}`, special tokens included |
+| `POST /apply-template` | a Chat Completions body | `{"prompt": text}`: the prompt the request renders to, the assistant opener included |
+
+## Rerank
+
+`POST /v1/rerank` (also `/rerank`, `/v1/reranking`, `/reranking`) ranks documents by their
+relevance to a query, in the shape of Jina's and llama.cpp's rerank API, with the served chat model
+as the judge. Each document becomes one prompt in Qwen3-Reranker's formulation -- a system turn
+asking whether the document meets the requirements of the instruction and the query, answered only
+"yes" or "no", thinking off -- and its `relevance_score` is P(yes) / (P(yes) + P(no)) over the
+first answer token's exact log probabilities ("Yes" and "No" counted with them). A general chat
+model is not trained as a reranker, so its scores order documents well but are not calibrated
+across queries. No startup option is needed.
+
+```bash
+curl http://127.0.0.1:8080/v1/rerank -d '{"query": "What is a panda?", "top_n": 2,
+  "documents": ["The giant panda is a bear species endemic to China.", "Paris is in France."]}'
+```
+
+The request takes `query`, `documents` (strings or `{"text": ...}` objects, at most 1000), `top_n`
+(every document by default), `return_documents` (default true) and NInfer's `instruction`, which
+says what relevance means (Qwen3-Reranker's default: "Given a web search query, retrieve relevant
+passages that answer the query"). The response is a list of `results`, best first, each with its
+`index`, `relevance_score` and `document.text`, and `usage.prompt_tokens` over all judgements. A
+request with `texts` instead of `documents` follows TEI, as llama.cpp's `/rerank` does: a bare
+array of `{"index", "score"}`, with `text` when `return_text` is set. The judgements run a lane's
+worth (`--max-concurrency`) at a time and share the cached judging prefix; on an RTX 3090 with a 27B
+model and two lanes, four short documents took 0.4 s.
 
 ## OpenAI Responses Core
 

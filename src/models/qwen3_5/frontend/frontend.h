@@ -70,6 +70,7 @@ public:
 
     [[nodiscard]] PromptSummary summary() const;
     [[nodiscard]] PromptPreparationStats preparation_stats() const noexcept;
+    [[nodiscard]] std::span<const TokenId> token_ids() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] std::unique_ptr<NgramArchive::Request> bind_ngram(NgramArchive& archive,
                                                                     const NgramSessionHints& hints);
@@ -96,8 +97,10 @@ public:
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
-                                                bool allow_prefix_identity = true) const;
-    [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
+                                                bool allow_prefix_identity = true,
+                                                bool anchor_prompt_end     = false) const;
+    [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text,
+                                                     bool parse_special = true) const;
     [[nodiscard]] std::string token_bytes(TokenId token) const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession

@@ -208,7 +208,27 @@ namespace {
 // llama.cpp's `meta` carries facts about the registered artifact behind the alias: n_ctx is the
 // per-request context ceiling, n_ctx_train the model's native context, ftype the registered
 // weights profile.
+Json model_status_json(const ModelDescription& model) {
+    Json status = {{"value", model.status}};
+    if (!model.args.empty()) { status["args"] = model.args; }
+    if (model.failed) {
+        status["failed"] = true;
+        if (!model.last_error.empty()) { status["error"] = model.last_error; }
+    }
+    return status;
+}
+
 Json model_json(const ModelDescription& model, std::int64_t created) {
+    if (!model.loaded_facts) {
+        Json out = {{"id", model.id},
+                    {"object", "model"},
+                    {"created", created},
+                    {"owned_by", "ninfer"},
+                    {"status", model_status_json(model)}};
+        if (!model.path.empty()) { out["path"] = model.path; }
+        if (!model.aliases.empty()) { out["aliases"] = model.aliases; }
+        return out;
+    }
     Json input = Json::array({"text"});
     if (model.vision) {
         input.push_back("image");
@@ -223,24 +243,28 @@ Json model_json(const ModelDescription& model, std::int64_t created) {
                 {"context_window", model.max_model_len},
                 {"context_length", model.max_model_len},
                 {"modalities", Json{{"vision", model.vision}}},
-                {"architecture",
-                 Json{{"input_modalities", std::move(input)},
-                      {"output_modalities", Json::array({"text"})}}},
-                {"status", Json{{"value", "loaded"}}},
-                {"meta",
-                 Json{{"n_vocab", metadata.vocab_size},
-                      {"n_ctx", model.max_model_len},
-                      {"n_ctx_train", metadata.native_context},
-                      {"n_embd", metadata.embedding_size},
-                      {"n_params", metadata.parameters},
-                      {"size", metadata.weight_bytes},
-                      {"ftype", metadata.weights_id}}}};
+                {"architecture", Json{{"input_modalities", std::move(input)},
+                                      {"output_modalities", Json::array({"text"})}}},
+                {"status", model_status_json(model)},
+                {"meta", Json{{"n_vocab", metadata.vocab_size},
+                              {"n_ctx", model.max_model_len},
+                              {"n_ctx_train", metadata.native_context},
+                              {"n_embd", metadata.embedding_size},
+                              {"n_params", metadata.parameters},
+                              {"size", metadata.weight_bytes},
+                              {"ftype", metadata.weights_id}}}};
 }
 
 } // namespace
 
 std::string make_models_list(const ModelDescription& model, std::int64_t created) {
     return Json{{"object", "list"}, {"data", Json::array({model_json(model, created)})}}.dump();
+}
+
+std::string make_models_list(const std::vector<ModelDescription>& models, std::int64_t created) {
+    Json data = Json::array();
+    for (const ModelDescription& model : models) { data.push_back(model_json(model, created)); }
+    return Json{{"object", "list"}, {"data", std::move(data)}}.dump();
 }
 
 Json make_api_index(const std::string& model_id) {
@@ -263,6 +287,15 @@ Json make_api_index(const std::string& model_id) {
               endpoint("GET", "/v1/models", "configured OpenAI model alias"),
               endpoint("GET", "/v1/models/{id}", "lookup of the configured alias"),
               endpoint("POST", "/v1/chat/completions", "OpenAI-style chat generation"),
+              endpoint("POST", "/v1/completions", "OpenAI legacy raw-prompt completion"),
+              endpoint("POST", "/completion", "llama.cpp raw-prompt completion"),
+              endpoint("POST", "/tokenize", "llama.cpp tokenization with the model's tokenizer"),
+              endpoint("POST", "/detokenize", "llama.cpp token ids back to text"),
+              endpoint("POST", "/apply-template", "llama.cpp chat template rendering"),
+              endpoint("POST", "/v1/rerank", "documents ranked by relevance to a query"),
+              endpoint("GET", "/models", "llama.cpp router: every configured model and its state"),
+              endpoint("POST", "/models/load|unload|sleep", "llama.cpp router model lifecycle"),
+              endpoint("GET", "/models/sse", "llama.cpp router model state events"),
               endpoint("POST", "/v1/responses", "OpenAI Responses generation, state, and SSE"),
               endpoint("POST", "/v1/responses/input_tokens",
                        "Responses prompt-token count without generation"),
@@ -306,6 +339,8 @@ void validate_openai_model(std::string_view requested, std::string_view availabl
 }
 
 std::string new_openai_chat_completion_id() { return chat_identifier("chatcmpl-"); }
+
+std::string new_openai_completion_id() { return chat_identifier("cmpl-"); }
 
 std::string new_openai_chat_tool_call_id() { return chat_identifier("call_"); }
 

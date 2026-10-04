@@ -31,7 +31,10 @@ constexpr std::string_view kCorsAllowedHeaders =
 // router owns paths the server has no file for.
 bool is_api_path(std::string_view path) {
     return path == "/v1" || path.starts_with("/v1/") || path == "/health" || path == "/metrics" ||
-           path == "/stats" || path == "/slots" || path == "/props" || path == kMcpProxyPath;
+           path == "/stats" || path == "/slots" || path == "/props" || path == "/models" ||
+           path.starts_with("/models/") || path == "/completion" || path == "/completions" ||
+           path == "/tokenize" || path == "/detokenize" || path == "/apply-template" ||
+           path == "/rerank" || path == "/reranking" || path == kMcpProxyPath;
 }
 
 
@@ -153,6 +156,15 @@ bool report_has_activity(const ThroughputReport& report) {
 const char* endpoint_name(std::string_view request_path) noexcept {
     const std::string_view path = canonical_api_path(request_path);
     if (path == "/v1/chat/completions") { return "openai_chat_completions"; }
+    if (path == "/v1/completions") { return "openai_completions"; }
+    if (path == "/completion" || path == "/completions") { return "llamacpp_completion"; }
+    if (path == "/tokenize" || path == "/detokenize" || path == "/apply-template") {
+        return "llamacpp_tokenizer";
+    }
+    if (path == "/rerank" || path == "/reranking" || path == "/v1/rerank" ||
+        path == "/v1/reranking") {
+        return "rerank";
+    }
     if (path == "/v1/responses") { return "openai_responses"; }
     if (path == "/v1/responses/input_tokens") { return "openai_responses_input_tokens"; }
     if (path == "/v1/messages") { return "anthropic_messages"; }
@@ -160,6 +172,7 @@ const char* endpoint_name(std::string_view request_path) noexcept {
     if (path == "/v1/load") { return "load"; }
     if (path == "/stats") { return "stats"; }
     if (path == "/slots" || path.starts_with("/slots/")) { return "slots"; }
+    if (path == "/models" || path.starts_with("/models/")) { return "models"; }
     return "http_route";
 }
 
@@ -351,12 +364,47 @@ void HttpServer::record_throughput(const ThroughputReport& report) {
 }
 
 void HttpServer::run_stats_reporter() {
-    using Clock                     = std::chrono::steady_clock;
-    ninfer::RuntimeStats previous   = service_->runtime_stats();
-    Clock::time_point previous_time = Clock::now();
-    const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
-    Clock::time_point next_deadline = previous_time + interval;
+    using Clock = std::chrono::steady_clock;
 
+    // Each model's counters since the previous report. A model whose Engine changed (unloaded and
+    // loaded again) starts over, since its counters did.
+    struct Previous {
+        const GenerationService* service = nullptr;
+        ninfer::RuntimeStats stats;
+        Clock::time_point time;
+    };
+
+    std::map<std::string, Previous> previous;
+    const auto sample = [&](bool tail) {
+        registry_->for_each_service([&](const std::string& id, GenerationService& service) {
+            const ninfer::RuntimeStats current = service.runtime_stats();
+            const Clock::time_point now        = Clock::now();
+            auto found                         = previous.find(id);
+            if (found == previous.end() || found->second.service != &service) {
+                previous[id] = Previous{&service, current, now};
+                return;
+            }
+            const ThroughputReport report = make_throughput_report(
+                found->second.stats, current,
+                std::chrono::duration<double>(now - found->second.time).count());
+            if (report_has_activity(report)) {
+                // The exact partial interval remains useful to measurement consumers. Pretty
+                // throughput is a fixed-cadence operational record without an irregular tail.
+                if (tail) {
+                    request_jsonl_.write_throughput(report);
+                } else {
+                    record_throughput(report);
+                }
+            }
+            if (!tail && console_stats_ && (public_model_id_.empty() || id == public_model_id_)) {
+                console_stats_->runtime(current);
+            }
+            found->second = Previous{&service, current, now};
+        });
+    };
+    sample(false);
+    const auto interval             = std::chrono::milliseconds(options_.log_stats_interval_ms);
+    Clock::time_point next_deadline = Clock::now() + interval;
     for (;;) {
         {
             std::unique_lock lock(stats_mutex_);
@@ -364,27 +412,12 @@ void HttpServer::run_stats_reporter() {
                 break;
             }
         }
-
-        const ninfer::RuntimeStats current = service_->runtime_stats();
-        const Clock::time_point now        = Clock::now();
-        const ThroughputReport report      = make_throughput_report(
-            previous, current, std::chrono::duration<double>(now - previous_time).count());
-        if (report_has_activity(report)) { record_throughput(report); }
-        if (console_stats_) { console_stats_->runtime(current); }
-        previous      = current;
-        previous_time = now;
+        sample(false);
         next_deadline += interval;
         const Clock::time_point after_write = Clock::now();
         if (next_deadline <= after_write) { next_deadline = after_write + interval; }
     }
-
-    const ninfer::RuntimeStats current = service_->runtime_stats();
-    const Clock::time_point now        = Clock::now();
-    const ThroughputReport tail        = make_throughput_report(
-        previous, current, std::chrono::duration<double>(now - previous_time).count());
-    // The exact partial interval remains useful to measurement consumers. Pretty throughput is a
-    // fixed-cadence operational record and deliberately has no irregular shutdown tail.
-    if (report_has_activity(tail)) { request_jsonl_.write_throughput(tail); }
+    sample(true);
 }
 
 void HttpServer::stop_stats_reporter() {
@@ -549,13 +582,29 @@ void HttpServer::register_routes() {
     });
     for (const char* base : {"/v1", "/v1/"}) {
         server_.Get(base, [this](const httplib::Request&, httplib::Response& res) {
-            res.set_content(make_api_index(public_model_id_).dump(), "application/json");
+            res.set_content(
+                make_api_index(public_model_id_.empty() ? std::string("router") : public_model_id_)
+                    .dump(),
+                "application/json");
         });
     }
     server_.Get(api_route_pattern("/models"),
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_models(req, res);
                 });
+    // llama.cpp's router API, in single-model mode too: one model is still a catalog.
+    server_.Get("/models", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_router_models(req, res);
+    });
+    server_.Get("/models/sse", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_models_sse(req, res);
+    });
+    for (const char* action : {"load", "unload", "sleep"}) {
+        server_.Post(std::string("/models/") + action,
+                     [this, action](const httplib::Request& req, httplib::Response& res) {
+                         handle_models_action(req, res, action);
+                     });
+    }
     // Before the single-model route below, which would take "<id>/residency" for a model id.
     server_.Get(api_route_pattern(R"(/models/(.+)/residency)"),
                 [this](const httplib::Request& req, httplib::Response& res) {
@@ -577,6 +626,31 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_chat_completions(req, res);
                  });
+    server_.Post(api_route_pattern("/completions"),
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_text_completion(req, res, TextCompletionDialect::OpenAI);
+                 });
+    for (const char* path : {"/completion", "/completions"}) {
+        server_.Post(path, [this](const httplib::Request& req, httplib::Response& res) {
+            handle_text_completion(req, res, TextCompletionDialect::LlamaCpp);
+        });
+    }
+    server_.Post("/tokenize", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_tokenize(req, res);
+    });
+    server_.Post("/detokenize", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_detokenize(req, res);
+    });
+    server_.Post("/apply-template", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_apply_template(req, res);
+    });
+    for (const char* endpoint : {"/rerank", "/reranking"}) {
+        const auto rerank = [this](const httplib::Request& req, httplib::Response& res) {
+            handle_rerank(req, res);
+        };
+        server_.Post(endpoint, rerank);
+        server_.Post(api_route_pattern(endpoint), rerank);
+    }
     server_.Post(api_route_pattern("/responses"),
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_responses(req, res);
@@ -664,9 +738,19 @@ void HttpServer::handle_webui(const httplib::Request& req, httplib::Response& re
 // llama.cpp-shaped slot listing: one entry per private context-cache catalog cell. A cell an
 // active request will publish into reports that request's prompt and reused tokens; a retained
 // cell reports the session depth as both, with its session digest and restorable checkpoints.
-void HttpServer::handle_slots(const httplib::Request&, httplib::Response& res) const {
-    const bool speculative = options_.speculative.backend != ninfer::SpeculativeBackend::None;
-    const std::vector<ninfer::SlotState> states = service_->slot_states();
+void HttpServer::handle_slots(const httplib::Request& req, httplib::Response& res) const {
+    ModelRegistry::Lease lease;
+    try {
+        lease = lease_query_model(req);
+    } catch (const ApiException& exception) {
+        write_openai_error(res, exception.error());
+        return;
+    }
+    GenerationService& service = lease.service();
+    const bool speculative =
+        service.options().speculative.backend != ninfer::SpeculativeBackend::None;
+    const std::uint32_t context                 = service.options().max_context;
+    const std::vector<ninfer::SlotState> states = service.slot_states();
     nlohmann::json slots                        = nlohmann::json::array();
     for (std::size_t index = 0; index < states.size(); ++index) {
         const ninfer::SlotState& state = states[index];
@@ -680,7 +764,7 @@ void HttpServer::handle_slots(const httplib::Request&, httplib::Response& res) c
                          {"retained", state.retained},
                          {"session_digest", state.session_digest},
                          {"checkpoints", std::move(checkpoints)},
-                         {"n_ctx", options_.max_context},
+                         {"n_ctx", context},
                          {"n_prompt_tokens", state.prompt_tokens},
                          {"n_prompt_tokens_cache", state.cached_tokens},
                          {"speculative", speculative}});
@@ -706,6 +790,14 @@ void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Respon
              "this server was started without --slot-save-path; slot save/restore is disabled");
         return;
     }
+    ModelRegistry::Lease lease;
+    try {
+        lease = lease_query_model(req);
+    } catch (const ApiException& exception) {
+        write_openai_error(res, exception.error());
+        return;
+    }
+    GenerationService& service = lease.service();
     const std::string id_text = req.matches.size() > 1 ? req.matches[1].str() : std::string();
     unsigned long long parsed = 0;
     try {
@@ -715,7 +807,7 @@ void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Respon
         return;
     }
     // Range-checked before narrowing, so an id past 2^32 is refused rather than wrapped.
-    const std::size_t slot_count = service_->slot_states().size();
+    const std::size_t slot_count = service.slot_states().size();
     if (parsed >= slot_count) {
         fail(400, "invalid_slot",
              "slot " + id_text + " is outside this server's " + std::to_string(slot_count) +
@@ -741,7 +833,7 @@ void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Respon
 
     try {
         if (action == "erase") {
-            const std::uint32_t erased = service_->slot_erase(slot, if_digest);
+            const std::uint32_t erased = service.slot_erase(slot, if_digest);
             operational_log_.slot_erased(slot, erased);
             res.set_content(nlohmann::json{{"id_slot", slot}, {"n_erased", erased}}.dump(),
                             "application/json");
@@ -761,7 +853,7 @@ void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Respon
         }
         const std::string path = (options_.slot_save_path / *sanitized).string();
         if (action == "save") {
-            const ninfer::SlotSaveResult saved = service_->slot_save(slot, path, if_digest);
+            const ninfer::SlotSaveResult saved = service.slot_save(slot, path, if_digest);
             operational_log_.slot_saved(slot, *sanitized, saved);
             res.set_content(nlohmann::json{{"id_slot", slot},
                                            {"filename", *sanitized},
@@ -772,7 +864,7 @@ void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Respon
                                 .dump(),
                             "application/json");
         } else {
-            const ninfer::SlotRestoreResult restored = service_->slot_restore(slot, path);
+            const ninfer::SlotRestoreResult restored = service.slot_restore(slot, path);
             operational_log_.slot_restored(slot, *sanitized, restored);
             res.set_content(
                 nlohmann::json{{"id_slot", slot},
@@ -793,24 +885,33 @@ void HttpServer::handle_slot_action(const httplib::Request& req, httplib::Respon
     }
 }
 
-LoadSample HttpServer::load_sample() const {
+LoadSample HttpServer::load_sample(GenerationService& service) const {
     LoadSample sample;
     sample.uptime_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - attached_at_).count();
-    sample.admitted_requests      = service_->admitted_requests();
-    sample.peak_admitted_requests = service_->peak_admitted_requests();
-    sample.stats             = service_->runtime_stats();
+    sample.admitted_requests      = service.admitted_requests();
+    sample.peak_admitted_requests = service.peak_admitted_requests();
+    sample.stats                  = service.runtime_stats();
     return sample;
 }
 
-void HttpServer::handle_load(const httplib::Request&, httplib::Response& res) const {
-    res.set_header("Cache-Control", "no-store");
-    res.set_content(make_load_report(load_capacity_, load_sample()), "application/json");
+void HttpServer::handle_load(const httplib::Request& req, httplib::Response& res) const {
+    try {
+        const ModelRegistry::Lease lease = lease_query_model(req);
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(make_load_report(model_facts(lease).capacity, load_sample(lease.service())),
+                        "application/json");
+    } catch (const ApiException& exception) { write_openai_error(res, exception.error()); }
 }
 
-void HttpServer::handle_stats(const httplib::Request&, httplib::Response& res) const {
-    res.set_header("Cache-Control", "no-store");
-    res.set_content(make_stats_report(load_capacity_, load_sample()), "application/json");
+void HttpServer::handle_stats(const httplib::Request& req, httplib::Response& res) const {
+    try {
+        const ModelRegistry::Lease lease = lease_query_model(req);
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(
+            make_stats_report(model_facts(lease).capacity, load_sample(lease.service())),
+            "application/json");
+    } catch (const ApiException& exception) { write_openai_error(res, exception.error()); }
 }
 
 // The pollers' own listener: one worker and no generation routes, so a dashboard or watchdog is
@@ -837,30 +938,55 @@ void HttpServer::register_stats_routes() {
 }
 
 void HttpServer::handle_health(httplib::Response& res) const {
-    const bool available = service_ != nullptr && service_->is_available();
+    // A router is healthy while it runs: its models load on demand. One model is healthy while its
+    // Engine serves, which includes a model that sleeps but wakes for the next request.
+    bool available = registry_ != nullptr;
+    if (available && !registry_->router()) {
+        const auto status = registry_->status(public_model_id_);
+        available = status && !status->held &&
+                    (status->state == ModelState::Loaded || status->state == ModelState::Sleeping);
+        if (available && status->state == ModelState::Loaded) {
+            if (auto lease = registry_->observe(public_model_id_)) {
+                available = lease->service().is_available();
+            }
+        }
+    }
     res.status           = available ? 200 : 503;
     res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
                     "application/json");
 }
 
-void HttpServer::handle_metrics(const httplib::Request&, httplib::Response& res) const {
-    res.set_header("Cache-Control", "no-store");
-    res.set_content(metrics_.render(load_capacity_, load_sample()),
-                    "text/plain; version=0.0.4; charset=utf-8");
+void HttpServer::handle_metrics(const httplib::Request& req, httplib::Response& res) const {
+    try {
+        const ModelRegistry::Lease lease = lease_query_model(req);
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(metrics_.render(model_facts(lease).capacity, load_sample(lease.service())),
+                        "text/plain; version=0.0.4; charset=utf-8");
+    } catch (const ApiException& exception) { write_openai_error(res, exception.error()); }
 }
 
-void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) const {
-    const ninfer::SamplingPreset preset = service_->sampling_defaults().for_mode(
-        options_.enable_thinking == false ? ninfer::SamplingMode::NonThinking
-                                          : ninfer::SamplingMode::Thinking);
-    const ninfer::SamplingOverrides& overrides = options_.sampling_overrides;
+void HttpServer::handle_props(const httplib::Request& req, httplib::Response& res) const {
+    ModelRegistry::Lease lease;
+    try {
+        lease = lease_query_model(req);
+    } catch (const ApiException& exception) {
+        write_openai_error(res, exception.error());
+        return;
+    }
+    GenerationService& service          = lease.service();
+    const ServeOptions& options         = service.options();
+    const ModelFacts facts              = model_facts(lease);
+    const ninfer::SamplingPreset preset = service.sampling_defaults().for_mode(
+        options.enable_thinking == false ? ninfer::SamplingMode::NonThinking
+                                         : ninfer::SamplingMode::Thinking);
+    const ninfer::SamplingOverrides& overrides = options.sampling_overrides;
     // llama.cpp's -1 means "no fixed cap": without --default-max-tokens each request's budget is
     // derived from its prompt and the lane share, so no single number applies.
-    const int n_predict   = options_.default_max_tokens.value_or(-1);
+    const int n_predict   = options.default_max_tokens.value_or(-1);
     nlohmann::json params = {
         {"n_predict", n_predict},
         {"max_tokens", n_predict},
-        {"temperature", options_.greedy ? 0.0F : overrides.temperature.value_or(preset.temperature)},
+        {"temperature", options.greedy ? 0.0F : overrides.temperature.value_or(preset.temperature)},
         {"top_k", overrides.top_k.value_or(preset.top_k)},
         {"top_p", overrides.top_p.value_or(preset.top_p)},
         {"min_p", overrides.min_p.value_or(preset.min_p)},
@@ -870,13 +996,14 @@ void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) c
     params["seed"] = overrides.seed ? nlohmann::json(*overrides.seed) : nlohmann::json(-1);
     const nlohmann::json props = {
         {"default_generation_settings",
-         {{"n_ctx", load_capacity_.max_context},
-          {"speculative", options_.speculative.backend != ninfer::SpeculativeBackend::None},
+         {{"n_ctx", facts.capacity.max_context},
+          {"speculative", options.speculative.backend != ninfer::SpeculativeBackend::None},
           {"params", std::move(params)}}},
-        {"total_slots", load_capacity_.max_concurrency},
-        {"model_alias", public_model_id_},
-        {"model_path", options_.artifact_path},
-        {"modalities", {{"vision", options_.enable_vision}, {"audio", false}}},
+        {"total_slots", facts.capacity.max_concurrency},
+        {"model_alias", lease.model()},
+        {"model_path", options.artifact_path},
+        {"modalities", {{"vision", options.enable_vision}, {"audio", false}}},
+        {"is_sleeping", service.residency().state == ninfer::ModelResidency::Suspended},
         {"endpoint_slots", true},
         {"endpoint_props", true},
         {"endpoint_metrics", true},
@@ -886,15 +1013,40 @@ void HttpServer::handle_props(const httplib::Request&, httplib::Response& res) c
     res.set_content(props.dump(), "application/json");
 }
 
-ModelDescription HttpServer::model_description() const {
-    return ModelDescription{.id            = public_model_id_,
-                            .max_model_len = options_.max_context,
-                            .vision        = service_->engine_options().enable_vision,
-                            .metadata      = model_metadata_};
+ModelDescription HttpServer::model_description(const ModelRegistry::Lease& lease) const {
+    const ModelFacts facts = model_facts(lease);
+    ModelDescription out{.id            = lease.model(),
+                         .max_model_len = facts.max_context,
+                         .vision        = facts.vision,
+                         .metadata      = facts.metadata};
+    if (const auto status = registry_->status(lease.model())) {
+        out.status  = model_state_name(status->state);
+        out.aliases = status->aliases;
+    }
+    out.path = lease.service().options().artifact_path;
+    return out;
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_models_list(model_description(), unix_time_now()), "application/json");
+    std::vector<ModelDescription> models;
+    for (const ModelStatusSnapshot& status : registry_->status()) {
+        if (auto lease = registry_->observe(status.id)) {
+            ModelDescription description = model_description(*lease);
+            description.args             = status.arguments;
+            description.failed           = status.failed;
+            description.last_error       = status.last_error;
+            models.push_back(std::move(description));
+            continue;
+        }
+        models.push_back(ModelDescription{.id           = status.id,
+                                          .status       = model_state_name(status.state),
+                                          .loaded_facts = false,
+                                          .args         = status.arguments,
+                                          .aliases      = status.aliases,
+                                          .failed       = status.failed,
+                                          .last_error   = status.last_error});
+    }
+    res.set_content(make_models_list(models, unix_time_now()), "application/json");
 }
 
 namespace {
@@ -934,7 +1086,8 @@ nlohmann::json residency_json(const std::string& model, const ninfer::ResidencyS
 void HttpServer::handle_model_residency(const httplib::Request& req,
                                         httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (id != public_model_id_) {
+    const auto resolved  = registry_->resolve(id);
+    if (!resolved) {
         ApiError error;
         error.status  = 404;
         error.type    = "invalid_request_error";
@@ -943,21 +1096,38 @@ void HttpServer::handle_model_residency(const httplib::Request& req,
         write_openai_error(res, error);
         return;
     }
-    res.set_content(residency_json(id, service_->residency()).dump(), "application/json");
+    if (auto lease = registry_->observe(*resolved)) {
+        nlohmann::json out = residency_json(*resolved, lease->service().residency());
+        out["status"]      = model_state_name(registry_->status(*resolved)->state);
+        res.set_content(out.dump(), "application/json");
+        return;
+    }
+    res.set_content(nlohmann::json{{"object", "model.residency"},
+                                   {"model", *resolved},
+                                   {"status", "unloaded"},
+                                   {"state", "unloaded"}}
+                        .dump(),
+                    "application/json");
 }
 
+namespace {
+
+void fail_residency(httplib::Response& res, int status, std::string code, std::string message) {
+    ApiError error;
+    error.status  = status;
+    error.type    = status >= 500 ? "server_error" : "invalid_request_error";
+    error.code    = std::move(code);
+    error.message = std::move(message);
+    write_openai_error(res, error);
+}
+
+} // namespace
+
 void HttpServer::handle_model_suspend(const httplib::Request& req, httplib::Response& res) {
-    const auto fail = [&res](int status, std::string code, std::string message) {
-        ApiError error;
-        error.status  = status;
-        error.type    = status >= 500 ? "server_error" : "invalid_request_error";
-        error.code    = std::move(code);
-        error.message = std::move(message);
-        write_openai_error(res, error);
-    };
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (id != public_model_id_) {
-        fail(404, "model_not_found", "model '" + id + "' not found");
+    const auto resolved  = registry_->resolve(id);
+    if (!resolved) {
+        fail_residency(res, 404, "model_not_found", "model '" + id + "' not found");
         return;
     }
     std::optional<bool> auto_resume;
@@ -972,38 +1142,42 @@ void HttpServer::handle_model_suspend(const httplib::Request& req, httplib::Resp
             auto_resume = value.get<bool>();
         }
     } catch (const std::exception&) {
-        fail(400, "invalid_request",
-             "request body must be a JSON object with at most a boolean auto_resume");
+        fail_residency(res, 400, "invalid_request",
+                       "request body must be a JSON object with at most a boolean auto_resume");
         return;
     }
     try {
-        const ninfer::ResidencyStatus status = service_->suspend(auto_resume);
-        res.set_content(residency_json(id, status).dump(), "application/json");
+        // Held when the body says so, or the model was started with --no-auto-resume.
+        bool hold = auto_resume.has_value() && !*auto_resume;
+        if (!auto_resume) {
+            if (auto lease = registry_->observe(*resolved)) {
+                hold = !lease->service().engine_options().suspend.auto_resume;
+            }
+        }
+        registry_->sleep(*resolved, hold, /*wait=*/false);
+        handle_model_residency(req, res);
+    } catch (const ModelBusy& error) {
+        fail_residency(res, 409, "model_busy", error.what());
+    } catch (const ModelNotLoaded& error) {
+        fail_residency(res, 400, "model_suspend_unavailable", error.what());
     } catch (const ninfer::RequestError& error) {
         if (error.kind() == ninfer::RequestErrorKind::Overloaded) {
-            fail(409, "model_busy", error.what());
+            fail_residency(res, 409, "model_busy", error.what());
         } else {
-            fail(503, "model_unavailable", error.what());
+            fail_residency(res, 503, "model_unavailable", error.what());
         }
     } catch (const std::invalid_argument& error) {
-        fail(400, "model_suspend_disabled", error.what());
+        fail_residency(res, 400, "model_suspend_disabled", error.what());
     } catch (const std::exception& error) {
-        fail(500, "model_residency_error", error.what());
+        fail_residency(res, 500, "model_residency_error", error.what());
     }
 }
 
 void HttpServer::handle_model_resume(const httplib::Request& req, httplib::Response& res) {
-    const auto fail = [&res](int status, std::string code, std::string message) {
-        ApiError error;
-        error.status  = status;
-        error.type    = status >= 500 ? "server_error" : "invalid_request_error";
-        error.code    = std::move(code);
-        error.message = std::move(message);
-        write_openai_error(res, error);
-    };
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (id != public_model_id_) {
-        fail(404, "model_not_found", "model '" + id + "' not found");
+    const auto resolved  = registry_->resolve(id);
+    if (!resolved) {
+        fail_residency(res, 404, "model_not_found", "model '" + id + "' not found");
         return;
     }
     if (!req.body.empty()) {
@@ -1013,23 +1187,24 @@ void HttpServer::handle_model_resume(const httplib::Request& req, httplib::Respo
                 throw std::invalid_argument("unexpected body");
             }
         } catch (const std::exception&) {
-            fail(400, "invalid_request", "request body must be empty or {}");
+            fail_residency(res, 400, "invalid_request", "request body must be empty or {}");
             return;
         }
     }
     try {
-        const ninfer::ResidencyStatus status = service_->resume();
-        res.set_content(residency_json(id, status).dump(), "application/json");
-    } catch (const std::invalid_argument& error) {
-        fail(400, "model_suspend_disabled", error.what());
+        registry_->load(*resolved);
+        handle_model_residency(req, res);
+    } catch (const ModelLoadFailed& error) {
+        fail_residency(res, 500, "model_residency_error", error.what());
     } catch (const std::exception& error) {
-        fail(500, "model_residency_error", error.what());
+        fail_residency(res, 500, "model_residency_error", error.what());
     }
 }
 
 void HttpServer::handle_model(const httplib::Request& req, httplib::Response& res) const {
     const std::string id = req.matches.size() > 1 ? req.matches[1].str() : std::string();
-    if (id != public_model_id_) {
+    const auto resolved  = registry_->resolve(id);
+    if (!resolved) {
         ApiError error;
         error.status  = 404;
         error.type    = "invalid_request_error";
@@ -1038,7 +1213,178 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         write_openai_error(res, error);
         return;
     }
-    res.set_content(make_model_object(model_description(), unix_time_now()), "application/json");
+    if (auto lease = registry_->observe(*resolved)) {
+        res.set_content(make_model_object(model_description(*lease), unix_time_now()),
+                        "application/json");
+        return;
+    }
+    const auto status = registry_->status(*resolved);
+    res.set_content(make_model_object(ModelDescription{.id     = *resolved,
+                                                       .status = model_state_name(status->state),
+                                                       .loaded_facts = false,
+                                                       .args         = status->arguments,
+                                                       .aliases      = status->aliases,
+                                                       .failed       = status->failed,
+                                                       .last_error   = status->last_error},
+                                      unix_time_now()),
+                    "application/json");
+}
+
+ModelRegistry::Lease HttpServer::lease_model(std::string_view model,
+                                             const httplib::Request& req) const {
+    std::optional<bool> autoload;
+    if (req.has_param("autoload")) {
+        const std::string value = req.get_param_value("autoload");
+        autoload                = value == "1" || value == "true";
+    }
+    try {
+        ModelRegistry::Lease lease = registry_->acquire(model, autoload);
+        (void)model_facts(lease);
+        return lease;
+    } catch (const ModelUnknown& error) {
+        ApiError api;
+        api.status  = 404;
+        api.param   = "model";
+        api.code    = "model_not_found";
+        api.message = error.what();
+        throw ApiException(std::move(api));
+    } catch (const ModelNotLoaded& error) {
+        ApiError api;
+        api.status  = 503;
+        api.type    = "server_error";
+        api.param   = "model";
+        api.code    = "model_not_loaded";
+        api.message = error.what();
+        throw ApiException(std::move(api));
+    } catch (const ModelLoadFailed& error) {
+        ApiError api;
+        api.status  = 503;
+        api.type    = "server_error";
+        api.param   = "model";
+        api.code    = "model_load_failed";
+        api.message = error.what();
+        throw ApiException(std::move(api));
+    }
+}
+
+std::string HttpServer::anthropic_model(const std::string& requested) const {
+    return registry_->resolve(requested) ? requested : std::string();
+}
+
+ModelRegistry::Lease HttpServer::lease_query_model(const httplib::Request& req) const {
+    const std::string model = req.has_param("model") ? req.get_param_value("model") : std::string();
+    // Observing a model never loads or wakes it (llama.cpp exempts these endpoints too): a sleeping
+    // model reports its state as it is.
+    try {
+        if (auto lease = registry_->observe(model)) { return std::move(*lease); }
+    } catch (const ModelUnknown& error) {
+        ApiError api;
+        api.status  = 404;
+        api.param   = "model";
+        api.code    = "model_not_found";
+        api.message = error.what();
+        throw ApiException(std::move(api));
+    }
+    ApiError api;
+    api.status  = 503;
+    api.type    = "server_error";
+    api.param   = "model";
+    api.code    = "model_not_loaded";
+    api.message = model.empty() ? "no model is loaded; name one with ?model="
+                                : "model '" + model + "' is not loaded";
+    throw ApiException(std::move(api));
+}
+
+HttpServer::ModelFacts HttpServer::model_facts(const ModelRegistry::Lease& lease) const {
+    GenerationService& service = lease.service();
+    {
+        std::lock_guard lock(facts_mutex_);
+        const auto found = facts_.find(lease.model());
+        if (found != facts_.end() && found->second.service == &service) { return found->second; }
+    }
+    // memory_summary() takes the Engine execution lock: computed once per Engine instance.
+    ModelFacts facts;
+    facts.service                      = &service;
+    facts.metadata                     = service.model_metadata();
+    facts.vision                       = service.engine_options().enable_vision;
+    facts.max_context                  = service.options().max_context;
+    const ninfer::MemorySummary memory = service.memory_summary();
+    facts.capacity = make_load_capacity(lease.model(), service.engine_options(), memory);
+    request_jsonl_.write_server_start(service.options(), service.engine_options(),
+                                      service.sampling_defaults(), lease.model(),
+                                      service.load_summary(), memory);
+    std::lock_guard lock(facts_mutex_);
+    facts_[lease.model()] = facts;
+    return facts;
+}
+
+void HttpServer::handle_router_models(const httplib::Request& req, httplib::Response& res) const {
+    handle_models(req, res);
+}
+
+void HttpServer::handle_models_action(const httplib::Request& req, httplib::Response& res,
+                                      std::string_view action) {
+    std::string model;
+    try {
+        const nlohmann::json body = nlohmann::json::parse(req.body.empty() ? "{}" : req.body);
+        if (!body.is_object() || !body.contains("model") || !body.at("model").is_string()) {
+            throw std::invalid_argument("model");
+        }
+        model = body.at("model").get<std::string>();
+    } catch (const std::exception&) {
+        fail_residency(res, 400, "invalid_request",
+                       "request body must be a JSON object with a string model");
+        return;
+    }
+    const auto resolved = registry_->resolve(model);
+    if (!resolved) {
+        fail_residency(res, 404, "model_not_found", "model '" + model + "' not found");
+        return;
+    }
+    try {
+        if (action == "load") {
+            registry_->load(*resolved);
+        } else if (action == "unload") {
+            registry_->unload(*resolved);
+        } else {
+            registry_->sleep(*resolved, false, /*wait=*/false);
+        }
+        res.set_content(R"({"success":true})", "application/json");
+    } catch (const ModelBusy& error) {
+        fail_residency(res, 409, "model_busy", error.what());
+    } catch (const ModelNotLoaded& error) {
+        fail_residency(res, 400, "model_not_loaded", error.what());
+    } catch (const ModelLoadFailed& error) {
+        fail_residency(res, 500, "model_load_failed", error.what());
+    } catch (const std::exception& error) {
+        fail_residency(res, 500, "model_residency_error", error.what());
+    }
+}
+
+void HttpServer::handle_models_sse(const httplib::Request&, httplib::Response& res) {
+    prepare_sse_response(res);
+    auto cursor = std::make_shared<std::uint64_t>(0);
+    res.set_chunked_content_provider(
+        "text/event-stream", [this, cursor](std::size_t, httplib::DataSink& sink) -> bool {
+            std::vector<ModelEvent> events;
+            *cursor = registry_->events(*cursor, std::chrono::seconds(5), events);
+            std::string out;
+            for (const ModelEvent& event : events) {
+                nlohmann::json data{{"status", model_state_name(event.state)}};
+                if (event.failed) {
+                    data["failed"] = true;
+                    data["error"]  = event.error;
+                }
+                out += "data: " +
+                       nlohmann::json{{"model", event.model},
+                                      {"event", "model_status"},
+                                      {"data", std::move(data)}}
+                           .dump() +
+                       "\n\n";
+            }
+            if (out.empty()) { out = ": keep-alive\n\n"; }
+            return sink.write(out.data(), out.size());
+        });
 }
 
 bool HttpServer::bind() {
@@ -1092,28 +1438,24 @@ bool HttpServer::await_startup_listener() {
     return startup_listener_result_.load(std::memory_order_acquire);
 }
 
-void HttpServer::attach(GenerationService& service) {
-    if (service_ != nullptr) {
-        throw std::logic_error("HTTP generation service is already attached");
+void HttpServer::attach(ModelRegistry& registry) {
+    if (registry_ != nullptr) { throw std::logic_error("HTTP model registry is already attached"); }
+    registry_ = &registry;
+    if (!registry.router()) { public_model_id_ = registry.status().front().id; }
+    attached_at_ = std::chrono::steady_clock::now();
+    // The server_start record of every model already loaded; later loads write theirs when a
+    // request first leases them (model_facts).
+    for (const ModelStatusSnapshot& status : registry.status()) {
+        if (auto lease = registry.observe(status.id)) { (void)model_facts(*lease); }
     }
-    const ninfer::LoadSummary load = service.load_summary();
-    public_model_id_               = resolve_public_model_id(options_, load.model_name);
-    model_metadata_                = service.model_metadata();
-    service_                       = &service;
-    // memory_summary() takes the Engine execution lock; read it once here, never per /v1/load poll.
-    const ninfer::MemorySummary memory = service.memory_summary();
-    request_jsonl_.write_server_start(options_, service.engine_options(),
-                                      service.sampling_defaults(), public_model_id_, load, memory);
-    load_capacity_ = make_load_capacity(public_model_id_, service.engine_options(), memory);
-    attached_at_   = std::chrono::steady_clock::now();
     // Release: everything above must be visible to a handler that observes ready_ as true. This is
-    // the only write, and handlers acquire it in the pre-routing guard before touching service_.
+    // the only write, and handlers acquire it in the pre-routing guard before touching registry_.
     ready_.store(true, std::memory_order_release);
 }
 
 bool HttpServer::listen() {
-    if (service_ == nullptr) { throw std::logic_error("HTTP generation service is not attached"); }
-    if (public_model_id_.empty()) {
+    if (registry_ == nullptr) { throw std::logic_error("HTTP model registry is not attached"); }
+    if (!registry_->router() && public_model_id_.empty()) {
         throw std::logic_error("HTTP public model id is not resolved");
     }
     if (console_stats_) { console_stats_->show(); }
@@ -1136,9 +1478,9 @@ bool HttpServer::listen() {
         stop_stats_reporter();
         // Stop and join the startup listener before this exception unwinds past us. attach() has
         // already run by the time listen() can be called, so that thread is live against
-        // service_; the caller (main.cpp) destroys the attached GenerationService, constructed
-        // after this HttpServer, before this object -- leaving that thread dereferencing a
-        // dangling pointer for however long stack unwinding takes if it is still running then.
+        // registry_; the caller (main.cpp) destroys the attached registry, constructed after this
+        // HttpServer, before this object -- leaving that thread dereferencing a dangling pointer
+        // for however long stack unwinding takes if it is still running then.
         if (startup_listener_.joinable()) {
             server_.stop();
             startup_listener_.join();
@@ -1150,7 +1492,11 @@ bool HttpServer::listen() {
 void HttpServer::stop() {
     stats_server_.stop();
     server_.stop();
-    if (service_ != nullptr) { service_->stop(); }
+    if (registry_ != nullptr) {
+        registry_->for_each_service(
+            [](const std::string&, GenerationService& service) { service.stop(); });
+        registry_->stop();
+    }
 }
 
 HttpServer::~HttpServer() {
