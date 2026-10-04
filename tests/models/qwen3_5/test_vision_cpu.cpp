@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <numbers>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -281,7 +282,7 @@ std::vector<double> reference_encode(const CpuVisionWeights& w,
                               norm(x[p], layer.norm2_weight, layer.norm2_bias), w.intermediate);
             for (double& value : up) {
                 value = 0.5 * value *
-                        (1.0 + std::tanh(std::sqrt(2.0 / M_PI) *
+                        (1.0 + std::tanh(std::sqrt(2.0 / std::numbers::pi) *
                                          (value + 0.044715 * value * value * value)));
             }
             const auto down = project(layer.fc2, layer.fc2_bias, up, H);
