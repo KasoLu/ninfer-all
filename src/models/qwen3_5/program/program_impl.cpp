@@ -562,7 +562,6 @@ void ProgramImpl::synchronize_transfer_streams() const {
 }
 
 ProgramImpl::~ProgramImpl() noexcept {
-    flush_disk_tier();
     for (std::size_t rank = 0; rank < transfer_streams.size(); ++rank) {
         (void)cudaStreamSynchronize(transfer_streams[rank]);
         (void)cudaStreamSynchronize(compute_streams[rank]);

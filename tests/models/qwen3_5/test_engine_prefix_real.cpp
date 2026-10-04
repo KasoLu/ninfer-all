@@ -13,6 +13,7 @@
 #include <mutex>
 #include <limits>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -763,6 +764,94 @@ int exercise_host_restore(const char* artifact) {
 
     // The uncached pressure request and checkpoint resume use different valid prefill splits, so
     // the pressure result is a completion and transfer trigger rather than an exact-token oracle.
+    return 0;
+}
+
+// A conversation finished while resident must reach the disk tier at the orderly stop: the first
+// Engine's teardown writes its catalogued continuation, and a second Engine with restore enabled
+// must seed the follow-up from it instead of re-prefilling.
+int exercise_disk_kv_shutdown_restore(const char* artifact) {
+    const std::filesystem::path root =
+        std::filesystem::temp_directory_path() /
+        ("ninfer_disk_kv_shutdown_" + std::to_string(std::random_device{}()));
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() {
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+        }
+    } cleanup{root};
+    std::error_code create_error;
+    std::filesystem::create_directories(root, create_error);
+    if (create_error) {
+        std::cerr << "disk KV shutdown: could not create the tier directory: "
+                  << create_error.message() << '\n';
+        return 1;
+    }
+    auto options = [&](bool restore) {
+        ninfer::EngineOptions value;
+        value.artifact_path                    = artifact;
+        value.max_context                      = 512;
+        value.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(512);
+        value.prefill_chunk                    = 256;
+        value.speculative.backend              = ninfer::SpeculativeBackend::Mtp;
+        value.speculative.draft_tokens         = 3;
+        value.speculative.proposal_head        = ninfer::ProposalHead::Optimized;
+        value.max_concurrency                  = 1;
+        value.max_pending_requests             = 1;
+        value.context_cache.device_state_slots = 1;
+        value.context_cache.disk_kv_path       = root;
+        value.context_cache.disk_kv_restore    = restore;
+        return value;
+    };
+    auto request_options = [] {
+        ninfer::RequestOptions value;
+        value.execution.requested_output_tokens = 5;
+        value.execution.sampling.temperature    = 0.0F;
+        value.execution.allow_prefix_reuse      = true;
+        value.stop.include_model_defaults       = false;
+        return value;
+    };
+
+    const std::vector<ninfer::TokenId> prompt{248045, 846, 198, 5834, 248046, 198};
+    std::vector<ninfer::TokenId> first_generated;
+    std::uint32_t first_prompt_tokens = 0;
+    {
+        ninfer::Engine engine(options(false));
+        const ninfer::GenerationResult first =
+            engine.generate(engine.prepare_tokens(prompt), request_options());
+        if (first.generated_token_ids.size() != 5) {
+            std::cerr << "disk KV shutdown: source request did not generate five tokens\n";
+            return 1;
+        }
+        first_generated     = first.generated_token_ids;
+        first_prompt_tokens = first.prompt.prompt_tokens;
+    }
+    // The scope end is the orderly stop: the still-resident continuation must be written before
+    // its memory is released, or the second Engine finds an empty tier.
+
+    std::vector<ninfer::TokenId> continuation = prompt;
+    continuation.insert(continuation.end(), first_generated.begin(), first_generated.end());
+    continuation.push_back(198);
+
+    {
+        ninfer::Engine engine(options(true));
+        const ninfer::GenerationResult restored =
+            engine.generate(engine.prepare_tokens(continuation), request_options());
+        // The final sampled token was never executed, so the stored continuation stops one
+        // short of the full ledger: the follow-up re-executes that last token.
+        const std::uint32_t expected_reuse = first_prompt_tokens + first_generated.size() - 1U;
+        if (restored.reused_prompt_tokens != expected_reuse ||
+            restored.prefix_reuse_path != ninfer::PrefixReusePath::Root ||
+            restored.generated_token_ids.size() != 5) {
+            std::cerr << "disk KV shutdown: the resident continuation was not restorable after "
+                         "restart: reused="
+                      << restored.reused_prompt_tokens << '/' << expected_reuse << " path="
+                      << static_cast<int>(restored.prefix_reuse_path) << " outputs="
+                      << restored.generated_token_ids.size() << '\n';
+            return 1;
+        }
+    }
     return 0;
 }
 
@@ -3127,6 +3216,9 @@ int exercise_artifact(const char* artifact) {
         if (const int result = exercise_vision(engine); result != 0) { return result; }
     }
     if (const int result = exercise_host_restore(artifact); result != 0) { return result; }
+    if (const int result = exercise_disk_kv_shutdown_restore(artifact); result != 0) {
+        return result;
+    }
     {
         // Production C=1/H=1 topology: repeated exact use promotes the shared prefix under one
         // cache Device slot; its Fork/Restore and the later ResponseReplay must then rotate
@@ -4008,6 +4100,8 @@ int run() {
             result = exercise_artifact(artifact);
         } else if (scenario == "host-restore") {
             result = exercise_host_restore(artifact);
+        } else if (scenario == "disk-kv-shutdown") {
+            result = exercise_disk_kv_shutdown_restore(artifact);
         } else if (scenario == "concurrent") {
             result = exercise_concurrent_resource_settlement(artifact);
         } else if (scenario == "anthropic-prefix-regression") {

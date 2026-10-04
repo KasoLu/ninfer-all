@@ -939,6 +939,11 @@ ProgramImpl::fail_all_cleanup(ProgramCleanup cleanup) noexcept {
         }
         hybrid_->clear();
     }
+    // The orderly stop writes the catalogued continuations still resident to the disk tier before
+    // the release below drops their owners without writing them. A failure cleanup may leave state
+    // an invariant throw corrupted, and a CRC-valid page would keep it restorable, so only the
+    // orderly stop persists.
+    if (cleanup == ProgramCleanup::Shutdown) { flush_disk_tier(); }
     for (std::uint32_t index = 0; index < continuation_capacity; ++index) {
         if (continuation_slots[index].role != ContinuationSlotRole::Free) {
             release_continuation_slot_best_effort(index);
