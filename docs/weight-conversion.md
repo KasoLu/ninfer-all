@@ -653,10 +653,11 @@ Use your own Jinja file to change the artifact's default template. A startup
 `generation_config.json` is preserved; sampling presets remain determined by the architecture
 and explicit application/request settings.
 
-The default maximum file size is 32,000,000,000 bytes, including framing. Smaller artifacts remain
-one file. Larger artifacts use an entry such as `models/my_qwen.ninfer` plus
-`my_qwen.ninfer.part-0001`, `my_qwen.ninfer.part-0002`, and so on in the same directory. Pass only the
-entry path to NInfer and keep all its recorded parts together. `--max-file-bytes` changes the limit.
+An artifact is one file, whatever its size: the runtime reads what each placement needs from it.
+`--max-file-bytes N` splits it, where a file system or a transfer limits file sizes, into an entry
+such as `models/my_qwen.ninfer` plus `my_qwen.ninfer.part-0001`, `my_qwen.ninfer.part-0002`, and so on
+in the same directory, each at most N bytes including framing. Pass only the entry path to NInfer and
+keep all its recorded parts together.
 
 Conversion writes `models/my_qwen.ninfer.conversion.json` alongside the artifact, recording sources,
 methods, formats, component configs, files and timing. Existing output files are not overwritten.

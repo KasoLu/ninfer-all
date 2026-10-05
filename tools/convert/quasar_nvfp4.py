@@ -29,7 +29,7 @@ import time
 from tools.artifact.reader import Artifact
 from tools.artifact.schema import ResourceSpec, TensorSpec
 from tools.artifact.tensor_output import TensorOutput
-from tools.artifact.writer import ArtifactWriter, DEFAULT_MAX_FILE_BYTES
+from tools.artifact.writer import ArtifactWriter
 from tools.convert.methods import cast_direct, grouped_absmax, import_encoded
 from tools.convert.pipeline import _json_default
 from tools.convert.proposal import DEFAULT_RANKING, add_official_proposal
@@ -218,7 +218,9 @@ def main() -> None:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--rows-per-chunk", type=int, default=512)
     parser.add_argument(
-        "--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES
+        "--max-file-bytes",
+        type=int,
+        help="split the artifact into files of at most this many bytes (default: one file)",
     )
     args = parser.parse_args()
 

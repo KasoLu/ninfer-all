@@ -158,7 +158,12 @@ def main(argv=None):
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--rows-per-chunk", type=int, default=512)
-    parser.add_argument("--max-file-bytes", type=int, default=32_000_000_000)
+    parser.add_argument(
+        "--max-file-bytes",
+        type=int,
+        help="split the artifact into an entry and .part-NNNN files of at most this many bytes "
+        "(default: one file)",
+    )
     args = parser.parse_args(argv)
     components = tuple(args.components.split(","))
     if len(components) != len(set(components)):

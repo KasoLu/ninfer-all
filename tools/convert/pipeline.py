@@ -12,7 +12,7 @@ import torch
 
 from tools.artifact.schema import ResourceSpec
 from tools.artifact.tensor_output import TensorOutput
-from tools.artifact.writer import ArtifactWriter, DEFAULT_MAX_FILE_BYTES
+from tools.artifact.writer import ArtifactWriter
 
 from .model import Model
 from .recipe import Recipe, WeightJob
@@ -33,7 +33,7 @@ def convert(
     provenance: dict | None = None,
     device: str = "cuda",
     rows_per_chunk: int = 512,
-    max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+    max_file_bytes: int | None = None,
     progress: Callable[[int, int, WeightJob], None] | None = None,
 ) -> dict:
     path = Path(output)

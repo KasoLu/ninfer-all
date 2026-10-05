@@ -91,14 +91,15 @@ flowchart LR
 对象可以跨越文件边界。它仍是一个对象，其 format/layout 以完整对象的逻辑起点计算。
 分片边界也可以位于某个 plane 内部；读取与复制保持原始字节顺序。
 
-### 2.3 默认 32 GB 分片上限
+### 2.3 默认单文件与显式分片上限
 
-Writer 默认采用 **32 GB = 32,000,000,000 字节**的单文件大小上限，计入文件头、JSON、
-payload 前的对齐区和该文件的 payload。这里 GB 使用十进制单位。
+Writer 默认**不分片**：无论大小，artifact 只生成入口文件，模型所需的一切都在这一个带索引的
+文件中，运行时只读取当前放置所需的对象。
 
-Writer 可接受其他显式上限。上限是生成策略，文件中只保存实际分片结果，reader 按目录读取。
-若 `entry_payload_start + payload_bytes <= limit`，writer 只生成入口文件。
-超过上限时，入口先容纳第一段，剩余数据依次进入续卷。
+只有显式给出单文件大小上限（`--max-file-bytes`）时才分片，例如文件系统或传输限制单文件大小。
+上限计入文件头、JSON、payload 前的对齐区和该文件的 payload。上限是生成策略，文件中只保存
+实际分片结果，reader 按目录读取。若 `entry_payload_start + payload_bytes <= limit`，writer 只
+生成入口文件。超过上限时，入口先容纳第一段，剩余数据依次进入续卷。
 
 对给定的 entry_payload_start，当前 writer 的分片容量为：
 
@@ -616,13 +617,13 @@ Norm、embedding、主 head、attention output 与 FFN down 分别绑定其对�
 
 四项资源的长度取自本地已核对的 Qwen3.8 Text 资源。示例 JSON 提供完整目录，资源和权重 payload
 本身不作为文档附件。编码该目录时取 json_bytes=65504，在实际 JSON 后补合法空白，得到
-entry_payload_start=65536。示例默认按 32 GB 上限生成单文件。
+entry_payload_start=65536。示例按默认方式生成单文件。
 
 ### 12.2 同一模型的混合格式与文件分片
 
 [混合格式分片示例](examples/artifact-v3-mixed-sharded.json)沿用上述 config、资源角色和逻辑参数。
 Attention 改为 q4 的 Q/K parent 与 q5 的 gate/V parent；uses 继续采用 A16Only。
-示例显式将文件上限设为 64,000,000 字节以演示分片，生产默认值仍为 32 GB。
+示例显式将文件上限设为 64,000,000 字节以演示分片；默认不分片。
 
 入口 payload_start 同样为 65536，续卷为 4096。Embedding 等对象跨越文件边界；它们的对象
 shape 和 format/layout 保持完整。两份例子的变化分别落在对象表示、Part 引用和 files 表中。

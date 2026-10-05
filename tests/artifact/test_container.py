@@ -186,7 +186,7 @@ def test_unknown_codec_is_deferred_until_object_is_consumed(tmp_path):
             reader.read_object("w")
 
 
-def test_default_file_limit_accounts_for_framing():
+def test_an_artifact_is_one_file_unless_a_limit_splits_it():
     size = 32_000_000_000
     description = {
         "components": {"text": {"config": {}}},
@@ -202,13 +202,18 @@ def test_default_file_limit_accounts_for_framing():
             }
         ],
     }
-    directory, _, start = layout_directory("large.ninfer", description, size)
+    directory, _, _ = layout_directory("large.ninfer", description, size)
+    assert [file.payload_bytes for file in directory.files] == [size]
+    # A limit counts the framing: the entry's header and directory share its bytes.
+    directory, _, start = layout_directory(
+        "large.ninfer", description, size, max_file_bytes=size
+    )
     assert len(directory.files) == 2
     assert start + directory.files[0].payload_bytes <= size
     assert 4096 + directory.files[1].payload_bytes <= size
     description["objects"][0]["bytes"] = size - start
     directory, _, same_start = layout_directory(
-        "small.ninfer", description, size - start
+        "small.ninfer", description, size - start, max_file_bytes=size
     )
     assert same_start == start and len(directory.files) == 1
     with pytest.raises(ArtifactError):

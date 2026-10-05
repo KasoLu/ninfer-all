@@ -24,7 +24,6 @@ from .schema import (
     plan_objects,
 )
 
-DEFAULT_MAX_FILE_BYTES = 32_000_000_000
 ZERO_CHUNK_BYTES = 1024 * 1024
 
 
@@ -33,11 +32,15 @@ def layout_directory(
     description: dict,
     payload_bytes: int,
     *,
-    max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+    max_file_bytes: int | None = None,
 ) -> tuple[Directory, bytes, int]:
-    """Resolve JSON reserve and file segments before any payload is generated."""
+    """Resolve JSON reserve and file segments before any payload is generated.
+
+    An artifact is one file unless `max_file_bytes` caps the size of each file; the entry and its
+    `.part-NNNN` files then each hold at most that many bytes, framing included."""
     integer(payload_bytes, "payload bytes", positive=True)
-    integer(max_file_bytes, "maximum file bytes", positive=True)
+    if max_file_bytes is not None:
+        integer(max_file_bytes, "maximum file bytes", positive=True)
     value = deepcopy(description)
     value["files"] = [{"path": None, "payload_bytes": payload_bytes}]
     reserve = (
@@ -46,11 +49,11 @@ def layout_directory(
     )
     while True:
         entry_start = integer(HEADER.size + reserve, "entry payload offset")
-        if entry_start >= max_file_bytes:
+        if max_file_bytes is not None and entry_start >= max_file_bytes:
             raise ArtifactError(
                 "maximum file bytes cannot contain the entry metadata and payload"
             )
-        if entry_start + payload_bytes <= max_file_bytes:
+        if max_file_bytes is None or entry_start + payload_bytes <= max_file_bytes:
             files = [{"path": None, "payload_bytes": payload_bytes}]
         else:
             entry_capacity = (
@@ -119,7 +122,7 @@ class ArtifactWriter:
         uses: Sequence[dict] = (),
         metadata: dict | None = None,
         provenance: dict | None = None,
-        max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+        max_file_bytes: int | None = None,
     ) -> None:
         self.path = Path(path)
         self.objects = plan_objects(specs)
