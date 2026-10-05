@@ -1766,7 +1766,8 @@ void launch_sparse_moe_prefill_nvfp4(const __nv_bfloat16* input, const SparseMoe
                 nvfp4_w4a4_mma_kernel<Nvfp4RoutedGateUpGeometry, Schedule,
                                       Nvfp4SourceDivisorEpilogue, Nvfp4RoutedGateUpOutput, Rows,
                                       true, Nvfp4RoutedGatherTokens, Raster>;
-            kernel<<<grid, Schedule::kThreads, nvfp4_w4a4_shared_bytes<Schedule>(kernel), stream>>>(
+            const std::size_t shared_bytes = nvfp4_w4a4_shared_bytes<Schedule, kernel>();
+            kernel<<<grid, Schedule::kThreads, shared_bytes, stream>>>(
                 chunk, static_cast<const std::uint8_t*>(weights.routed_gate_up.qdata),
                 static_cast<const std::uint8_t*>(weights.routed_gate_up.scales), assignments, scale,
                 epilogue, output, Rows{jobs}, token_policy, Raster{jobs});
@@ -1792,7 +1793,8 @@ void launch_sparse_moe_prefill_nvfp4(const __nv_bfloat16* input, const SparseMoe
                 nvfp4_w4a4_mma_kernel<Nvfp4RoutedDownGeometry, Schedule,
                                       Nvfp4SourceDivisorEpilogue, Nvfp4RoutedDownOutput,
                                       Nvfp4W4a4IdentityRows, false, Nvfp4RoutedPackedTokens, Raster>;
-            kernel<<<grid, Schedule::kThreads, nvfp4_w4a4_shared_bytes<Schedule>(kernel), stream>>>(
+            const std::size_t shared_bytes = nvfp4_w4a4_shared_bytes<Schedule, kernel>();
+            kernel<<<grid, Schedule::kThreads, shared_bytes, stream>>>(
                     routed_middle, static_cast<const std::uint8_t*>(weights.routed_down.qdata),
                     static_cast<const std::uint8_t*>(weights.routed_down.scales), assignments,
                     scale, epilogue, output, Nvfp4W4a4IdentityRows{}, token_policy, Raster{jobs});
@@ -1821,7 +1823,8 @@ void launch_sparse_moe_prefill_nvfp4(const __nv_bfloat16* input, const SparseMoe
                 nvfp4_w4a4_mma_kernel<Nvfp4SharedGateUpGeometry, Schedule,
                                       Nvfp4SourceDivisorEpilogue, Nvfp4SharedGateUpOutput, Rows,
                                       true>;
-            kernel<<<grid, Schedule::kThreads, nvfp4_w4a4_shared_bytes<Schedule>(kernel), stream>>>(
+            const std::size_t shared_bytes = nvfp4_w4a4_shared_bytes<Schedule, kernel>();
+            kernel<<<grid, Schedule::kThreads, shared_bytes, stream>>>(
                     chunk, static_cast<const std::uint8_t*>(weights.shared_gate_up.qdata),
                     static_cast<const std::uint8_t*>(weights.shared_gate_up.scales), tokens, scale,
                     epilogue, output, Rows{}, Nvfp4W4a4IdentityTokens{},
@@ -1847,7 +1850,8 @@ void launch_sparse_moe_prefill_nvfp4(const __nv_bfloat16* input, const SparseMoe
             constexpr auto kernel = nvfp4_w4a4_mma_kernel<Nvfp4SharedDownGeometry, Schedule,
                                                           Nvfp4SourceDivisorEpilogue,
                                                           Nvfp4SharedDownOutput>;
-            kernel<<<grid, Schedule::kThreads, nvfp4_w4a4_shared_bytes<Schedule>(kernel), stream>>>(
+            const std::size_t shared_bytes = nvfp4_w4a4_shared_bytes<Schedule, kernel>();
+            kernel<<<grid, Schedule::kThreads, shared_bytes, stream>>>(
                 shared_middle, static_cast<const std::uint8_t*>(weights.shared_down.qdata),
                 static_cast<const std::uint8_t*>(weights.shared_down.scales), tokens, scale,
                 epilogue, output, Nvfp4W4a4IdentityRows{}, Nvfp4W4a4IdentityTokens{},

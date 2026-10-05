@@ -101,7 +101,8 @@ void launch_nvfp4_a4_mma(const Weight& weight, Tensor& out, Nvfp4W4a4Workspace w
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
     constexpr auto kernel =
         nvfp4_w4a4_mma_kernel<Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4ContiguousOutput>;
-    kernel<<<grid, Schedule::kThreads, nvfp4_w4a4_shared_bytes<Schedule>(kernel), stream>>>(
+    const std::size_t shared_bytes = nvfp4_w4a4_shared_bytes<Schedule, kernel>();
+    kernel<<<grid, Schedule::kThreads, shared_bytes, stream>>>(
         activation, static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
         output, Nvfp4W4a4IdentityRows{}, Nvfp4W4a4IdentityTokens{}, Nvfp4W4a4MmaRasterRowFast{});

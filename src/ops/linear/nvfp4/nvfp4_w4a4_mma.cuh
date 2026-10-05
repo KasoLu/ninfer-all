@@ -101,14 +101,15 @@ struct Nvfp4W4a4SharedStorage {
         std::uint8_t b_scales[Schedule::kStages][Schedule::kBlockN * Schedule::kK64PerStage * 4];
 };
 
-// The dynamic shared memory a launch of `kernel` over `Schedule` passes; the first call per
-// device opts the kernel in above 48 KiB where the schedule needs it.
-template <class Schedule, class Kernel>
-std::size_t nvfp4_w4a4_shared_bytes(Kernel kernel) {
+// The dynamic shared memory a launch of `Kernel` over `Schedule` passes; the first call per
+// device opts that kernel in above 48 KiB where the schedule needs it. The kernel is a template
+// argument so each kernel keeps its own opt-in: kernels of different geometries share a type.
+template <class Schedule, auto Kernel>
+std::size_t nvfp4_w4a4_shared_bytes() {
     constexpr std::size_t bytes = sizeof(Nvfp4W4a4SharedStorage<Schedule>);
     if constexpr (bytes > 48 * 1024) {
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        configure_cuda_device_once([] {
+            return cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                         static_cast<int>(bytes));
         });
     }
