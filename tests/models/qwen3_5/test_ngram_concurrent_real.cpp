@@ -239,6 +239,33 @@ int main(int argc, char** argv) {
                 engine.submit(engine.prepare(copy_prompt(source_b, seed_b)), copy_request(256));
             const auto result_a = handle_a.wait();
             const auto result_b = handle_b.wait();
+            // Where a lane left its source, what it wrote there instead and how it finished; then
+            // the same request alone, which puts the fault on the concurrent round when it copies
+            // exactly and on the artifact when it does not.
+            const auto report = [&](const char* lane, int seed, const std::string& source,
+                                    const ninfer::GenerationResult& result) {
+                const std::string produced = assistant_prefix(seed) + result.content;
+                const std::size_t at       = first_source_difference(source, produced);
+                if (at == produced.size()) { return; }
+                const std::size_t from = at < 40 ? 0 : at - 40;
+                std::cout << "c2-concurrent lane " << lane << " leaves its source at byte " << at
+                          << " of " << produced.size() << " (finish "
+                          << static_cast<int>(result.finish_reason) << "): source \""
+                          << source.substr(from, at + 40 - from) << "\" produced \""
+                          << produced.substr(from, at + 40 - from) << "\"\n";
+                const auto alone = engine.generate(engine.prepare(copy_prompt(source, seed)),
+                                                   copy_request(256, false));
+                const std::string single = assistant_prefix(seed) + alone.content;
+                const std::size_t single_at = first_source_difference(source, single);
+                std::cout << "c2-concurrent lane " << lane << " alone: "
+                          << (single_at == single.size()
+                                  ? std::string("exact")
+                                  : "leaves its source at byte " + std::to_string(single_at))
+                          << ", " << single.size() << " bytes (finish "
+                          << static_cast<int>(alone.finish_reason) << ")\n";
+            };
+            report("A", seed_a, source_a, result_a);
+            report("B", seed_b, source_b, result_b);
             require(source_a.starts_with(assistant_prefix(seed_a) + result_a.content),
                     "concurrent copy lane A is not an exact source prefix");
             require(source_b.starts_with(assistant_prefix(seed_b) + result_b.content),
