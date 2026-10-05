@@ -11,6 +11,7 @@
 #include "core/device.h"
 #include "core/stage_plan.h"
 #include "core/startup.h"
+#include "models/qwen3_5/auxiliary_replicas.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/weights.h"
@@ -153,8 +154,6 @@ private:
           std::vector<BoundWeight> bound, FrontendResources resources, InstanceInfo info,
           artifact::MaterializedArtifact backing);
 
-    void replicate_auxiliaries(DeviceContext& device);
-
     // Destroy every borrower before the backing.
     artifact::MaterializedArtifact backing_;
     TextConfig config_;
@@ -165,12 +164,7 @@ private:
     FrontendResources resources_;
     InstanceInfo info_;
     std::vector<std::filesystem::path> files_;
-    // The device rank of every weight, by WeightId: its layer's stage, 0 when nothing placed it.
-    std::vector<std::size_t> ranks_;
-    // An artifact stores identical auxiliaries once (one input gather serves every Gated DeltaNet
-    // output projection), so one object can serve Uses on several stages. It is materialized on
-    // rank 0; every other rank whose Uses read it holds a copy, by (auxiliary, rank).
-    std::map<std::pair<std::size_t, std::size_t>, DeviceBuffer> replicas_;
+    qwen3_5::AuxiliaryReplicas replicas_;
 };
 
 // Whether the artifact's text component is this family.

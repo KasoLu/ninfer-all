@@ -39,6 +39,8 @@ struct BoundWeight {
     std::vector<std::string> source_objects;
     WeightView view;
     std::vector<WeightUse> uses;
+    // The device rank the weight is materialized on: its layer's pipeline stage, 0 unless placed.
+    std::size_t rank = 0;
 };
 
 // Byte extent inside the pinned Host weight block.

@@ -273,10 +273,12 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
         vision_overlay =
             loading::vision_overlay_layout(*data->weights.vision, bound, backing.pinned_block());
     }
+    AuxiliaryReplicas replicas(bound, device);
     return std::unique_ptr<Model>(
         new Model(std::move(data->config), data->options, std::move(data->weights),
-                  std::move(bound), std::move(data->resources), std::move(data->info),
-                  std::move(backing), std::move(vision_overlay), std::move(data->cpu_vision)));
+                  std::move(bound), std::move(replicas), std::move(data->resources),
+                  std::move(data->info), std::move(backing), std::move(vision_overlay),
+                  std::move(data->cpu_vision)));
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

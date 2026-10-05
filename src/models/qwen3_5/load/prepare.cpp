@@ -211,6 +211,7 @@ void Bindings::place(WeightId id, std::size_t rank) {
     for (const auto& part : parameter.reference.binding.parts) {
         binder.device_rank(part.object, rank);
     }
+    weights.at(id.index).rank = rank;
 }
 
 bool Bindings::transcode(WeightId id, QType target, std::string_view option) {
@@ -238,7 +239,7 @@ std::vector<BoundWeight> resolve_weights(std::vector<PendingWeight>&& pending,
     for (auto& item : pending) {
         auto view = artifact::bind_view(item.reference, materialized);
         out.push_back({std::move(item.reference.name), std::move(item.source_objects),
-                       std::move(view), std::move(item.uses)});
+                       std::move(view), std::move(item.uses), item.rank});
     }
     return out;
 }

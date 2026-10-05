@@ -2,6 +2,7 @@
 
 #include "artifact/framing.h"
 #include "artifact/materializer.h"
+#include "models/qwen3_5/auxiliary_replicas.h"
 #include "models/qwen3_5/config.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/weights.h"
@@ -42,7 +43,8 @@ public:
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
 
     // A Use whose matrix is Hadamard-rotated is only admitted where the execution layer rotates
-    // the activation: input() refuses it, rotated_input() carries its sign vector.
+    // the activation: input() refuses it, rotated_input() carries its sign vector. Auxiliaries
+    // (sign vectors, input gathers) are read on the weight's own device.
     [[nodiscard]] ops::WeightInput input(WeightUseId id) const;
     [[nodiscard]] ops::WeightInput input(WeightId id) const;
     [[nodiscard]] ops::WeightInput rotated_input(WeightUseId id) const;
@@ -103,7 +105,8 @@ private:
                                                     const StartupObserver*,
                                                     const artifact::MaterializeOptions&);
     Model(Config config, LoadOptions options, ModelWeights weights, std::vector<BoundWeight> bound,
-          FrontendResources resources, InstanceInfo info, artifact::MaterializedArtifact backing,
+          AuxiliaryReplicas replicas, FrontendResources resources, InstanceInfo info,
+          artifact::MaterializedArtifact backing,
           std::optional<VisionOverlayLayout> vision_overlay,
           std::shared_ptr<const CpuVisionWeights> cpu_vision);
 
@@ -113,6 +116,7 @@ private:
     LoadOptions options_;
     ModelWeights weights_;
     std::vector<BoundWeight> bound_;
+    AuxiliaryReplicas replicas_;
     FrontendResources resources_;
     InstanceInfo info_;
     std::optional<VisionOverlayLayout> vision_overlay_;

@@ -18,6 +18,7 @@ struct PendingWeight {
     artifact::ParameterReference reference;
     std::vector<WeightUse> uses;
     std::vector<std::string> source_objects;
+    std::size_t rank = 0; // see BoundWeight::rank
 };
 
 class Bindings {

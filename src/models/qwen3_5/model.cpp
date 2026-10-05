@@ -6,14 +6,15 @@
 namespace ninfer::models::qwen3_5 {
 
 Model::Model(Config config, LoadOptions options, ModelWeights weights,
-             std::vector<BoundWeight> bound, FrontendResources resources, InstanceInfo info,
+             std::vector<BoundWeight> bound, AuxiliaryReplicas replicas,
+             FrontendResources resources, InstanceInfo info,
              artifact::MaterializedArtifact backing,
              std::optional<VisionOverlayLayout> vision_overlay,
              std::shared_ptr<const CpuVisionWeights> cpu_vision)
     : backing_(std::move(backing)), config_(std::move(config)), options_(options),
-      weights_(std::move(weights)), bound_(std::move(bound)), resources_(std::move(resources)),
-      info_(std::move(info)), vision_overlay_(std::move(vision_overlay)),
-      cpu_vision_(std::move(cpu_vision)) {}
+      weights_(std::move(weights)), bound_(std::move(bound)), replicas_(std::move(replicas)),
+      resources_(std::move(resources)), info_(std::move(info)),
+      vision_overlay_(std::move(vision_overlay)), cpu_vision_(std::move(cpu_vision)) {}
 
 Model::~Model() = default;
 
@@ -26,8 +27,7 @@ ops::WeightInput Model::input(WeightUseId id) const {
     }
     ops::WeightInput result{parameter.view, use.policy, use.activation_input_divisor};
     if (use.input_columns) {
-        const auto& columns  = weight(*use.input_columns).view;
-        result.input_columns = weight_tensor(columns, {static_cast<std::int32_t>(columns.shape[0])});
+        result.input_columns = replicas_.on_rank(bound_, *use.input_columns, parameter.rank);
     }
     return result;
 }
@@ -50,11 +50,10 @@ ops::WeightInput Model::rotated_input(WeightUseId id) const {
             throw std::invalid_argument(parameter.name + "@" + use.input +
                                         ": Hadamard signs must cover the input width");
         }
-        result.hadamard_signs = weight_tensor(signs, {static_cast<std::int32_t>(signs.shape[0])});
+        result.hadamard_signs = replicas_.on_rank(bound_, *use.hadamard_signs, parameter.rank);
     }
     if (use.input_columns) {
-        const auto& columns  = weight(*use.input_columns).view;
-        result.input_columns = weight_tensor(columns, {static_cast<std::int32_t>(columns.shape[0])});
+        result.input_columns = replicas_.on_rank(bound_, *use.input_columns, parameter.rank);
     }
     return result;
 }

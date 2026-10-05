@@ -288,31 +288,9 @@ ops::WeightInput Model::input(WeightId id) const {
     }
     ops::WeightInput result{parameter.view, use.policy, use.activation_input_divisor};
     if (use.input_columns) {
-        const auto& columns = weight(*use.input_columns).view;
-        result.input_columns =
-            weight_tensor(columns, {static_cast<std::int32_t>(columns.shape[0])});
-        const auto replica = replicas_.find({use.input_columns->index, ranks_.at(id.index)});
-        if (replica != replicas_.end()) { result.input_columns.data = replica->second.p; }
+        result.input_columns = replicas_.on_rank(bound_, *use.input_columns, parameter.rank);
     }
     return result;
-}
-
-void Model::replicate_auxiliaries(DeviceContext& device) {
-    for (std::size_t i = 0; i < bound_.size(); ++i) {
-        const std::size_t rank = ranks_[i];
-        for (const auto& use : bound_[i].uses) {
-            if (!use.input_columns) { continue; }
-            const std::size_t auxiliary = use.input_columns->index;
-            if (ranks_[auxiliary] == rank || replicas_.contains({auxiliary, rank})) { continue; }
-            const auto& view    = bound_[auxiliary].view;
-            const Tensor source = weight_tensor(view, {static_cast<std::int32_t>(view.shape[0])});
-            RankBinding bind(device, rank);
-            DeviceBuffer copy(source.bytes());
-            CUDA_CHECK(cudaMemcpyPeer(copy.p, device.rank(rank).device, source.data,
-                                      device.rank(ranks_[auxiliary]).device, source.bytes()));
-            replicas_.emplace(std::pair{auxiliary, rank}, std::move(copy));
-        }
-    }
 }
 
 bool is_qwen4_exp(const artifact::Reader& reader) {
@@ -367,11 +345,6 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     // The stage split: what was asked, or the even split of the bytes each device would hold.
     const bool device_experts = options.experts == ExpertResidency::Device;
     StagePlan stages(config.num_hidden_layers);
-    std::vector<std::size_t> ranks(b.weights.size(), 0);
-    const auto place = [&](WeightId id, std::size_t rank) {
-        b.place(id, rank);
-        ranks.at(id.index) = rank;
-    };
     if (options.ranks > 1) {
         if (!options.stage_layers.empty()) {
             if (options.stage_layers.size() != options.ranks) {
@@ -394,13 +367,13 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
             const std::size_t rank = stages.placement(i).stage;
             for (const WeightId id : layer_weights(weights.layers[i], device_experts)) {
-                place(id, rank);
+                b.place(id, rank);
             }
         }
-        place(weights.token_embedding, 0);
+        b.place(weights.token_embedding, 0);
         for (const WeightId id : {weights.output_head, weights.final_mixer.norm,
                                   weights.final_mixer.down, weights.final_mixer.up}) {
-            place(id, stages.stages() - 1);
+            b.place(id, stages.stages() - 1);
         }
     } else if (!options.stage_layers.empty()) {
         throw std::invalid_argument("--stage-layers needs --devices naming more than one device");
@@ -423,9 +396,8 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     auto model           = std::unique_ptr<Model>(
         new Model(std::move(config), options, std::move(weights), std::move(stages),
                   std::move(bound), std::move(resources), std::move(info), std::move(backing)));
-    model->files_ = std::move(files);
-    model->ranks_ = std::move(ranks);
-    model->replicate_auxiliaries(device);
+    model->files_    = std::move(files);
+    model->replicas_ = qwen3_5::AuxiliaryReplicas(model->bound_, device);
     return model;
 }
 
