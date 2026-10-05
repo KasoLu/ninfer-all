@@ -31,7 +31,10 @@ constexpr std::uint64_t kAlign = 256;
 constexpr std::size_t kStagingHalf = 128ULL << 20;
 // Reads in flight at once: an NVMe drive reaches its bandwidth only with several requests queued.
 constexpr std::size_t kReadThreads = 8;
-// Zero bytes after the last slot of a pool.
+// Zero bytes after every slot's down matrix. The expert matrix kernel reads whole 256-value K steps
+// past a 640-value down row's end and decodes what follows as the down's blocks: another format's
+// bytes there (the next slot's gate, or a larger down an earlier layer left) can hold a non-finite
+// scale, which times the activation's zero padding is NaN.
 constexpr std::uint64_t kTail = 256;
 
 std::uint64_t aligned(std::uint64_t value) { return (value + kAlign - 1) / kAlign * kAlign; }
@@ -117,6 +120,9 @@ struct Slot {
     std::int32_t expert = -1;
     std::uint64_t call  = 0; // the last prepare() that needed it
     bool referenced     = false;
+    // Bytes from the start of the down region that a down has written: past a smaller down, the
+    // tail must be zeroed again.
+    std::uint64_t down_written = 0;
 };
 
 struct Pool {
@@ -151,7 +157,8 @@ struct ExpertStream::Impl {
     ExpertStreamStats stats;
     ReadPool reads{kReadThreads - 1}; // the caller reads too
 
-    // The batch being staged in the current half: its reads, then the copies out of the half.
+    // The batch being staged in the current half: its reads, then the copies out of the half (a
+    // copy without a source zeroes its target).
     struct Copy {
         void* target            = nullptr;
         const std::byte* source = nullptr;
@@ -177,14 +184,13 @@ struct ExpertStream::Impl {
         for (const auto& [rank, sizes] : widest) {
             Pool pool;
             pool.offset     = {0, aligned(sizes[0]), aligned(sizes[0]) + aligned(sizes[1])};
-            pool.slot_bytes = aligned(sizes[0]) + aligned(sizes[1]) + aligned(sizes[2]);
+            pool.slot_bytes = aligned(sizes[0]) + aligned(sizes[1]) + aligned(sizes[2] + kTail);
             const std::uint64_t budget = rank < bytes_by_rank.size() ? bytes_by_rank[rank] : 0;
             pool.slots.resize(static_cast<std::size_t>(budget / pool.slot_bytes));
             if (!pool.slots.empty()) {
-                // Zeroed, with zeros past the last slot: the expert matrix kernel reads whole
-                // K steps past a down row's end, into the next slot or the tail.
+                // Zeroed, so each slot's tail stays zero: copies write the matrices only.
                 RankBinding bind(device, rank);
-                pool.storage = DeviceBuffer(pool.slots.size() * pool.slot_bytes + kTail);
+                pool.storage = DeviceBuffer(pool.slots.size() * pool.slot_bytes);
                 CUDA_CHECK(cudaMemset(pool.storage.p, 0, pool.storage.bytes));
             }
             stats.slots += static_cast<std::uint32_t>(pool.slots.size());
@@ -230,8 +236,12 @@ struct ExpertStream::Impl {
             read.file->read(read.offset, read.destination, read.bytes);
         });
         for (const Copy& copy : batch_copies) {
-            CUDA_CHECK(cudaMemcpyAsync(copy.target, copy.source, copy.bytes, cudaMemcpyHostToDevice,
-                                       stream));
+            if (copy.source == nullptr) {
+                CUDA_CHECK(cudaMemsetAsync(copy.target, 0, copy.bytes, stream));
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(copy.target, copy.source, copy.bytes,
+                                           cudaMemcpyHostToDevice, stream));
+            }
         }
         batch_reads.clear();
         batch_copies.clear();
@@ -321,6 +331,14 @@ struct ExpertStream::Impl {
                 }
                 std::byte* target = base + pool.offset[k];
                 batch_copies.push_back({target, buffer, static_cast<std::size_t>(location.bytes)});
+                if (k == 2) {
+                    if (slot.down_written > location.bytes) {
+                        batch_copies.push_back({target + location.bytes, nullptr,
+                                                static_cast<std::size_t>(std::min(
+                                                    slot.down_written - location.bytes, kTail))});
+                    }
+                    slot.down_written = std::max(slot.down_written, location.bytes);
+                }
                 layer.mirror[k][expert] = target;
                 stats.read_bytes += location.bytes;
             }

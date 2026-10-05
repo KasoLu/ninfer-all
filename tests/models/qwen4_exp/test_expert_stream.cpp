@@ -1,7 +1,9 @@
 // Disk-resident experts: after prepare(), every table entry of an expert the call routed to points
 // at a device slot holding exactly that expert's bytes from the files, including experts that
-// straddle the boundary between two files, whatever was evicted to make room; a call that routes to
-// more experts than the cache holds is refused; and experts already resident are not read again.
+// straddle the boundary between two files, whatever was evicted to make room, and every down matrix
+// is followed by zero bytes even where a larger down of another layer was before (the expert matrix
+// kernel reads past a down row's end); a call that routes to more experts than the cache holds is
+// refused; and experts already resident are not read again.
 #include "core/arena.h"
 #include "core/device.h"
 #include "models/qwen4_exp/expert_stream.h"
@@ -95,8 +97,9 @@ int run() {
             .experts = {locations[layer * 3], locations[layer * 3 + 1], locations[layer * 3 + 2]},
             .tables  = {tables[layer * 3].p, tables[layer * 3 + 1].p, tables[layer * 3 + 2].p}});
     }
-    // Slots are sized for the widest projections: 3072 + 3072 + 1536 bytes, ten of them.
-    const std::vector<std::uint64_t> budget = {10 * (3072 + 3072 + 1536)};
+    // Slots are sized for the widest projections and the zeros after the down: 3072 + 3072 + 1792
+    // bytes, ten of them.
+    const std::vector<std::uint64_t> budget = {10 * (3072 + 3072 + 1792)};
     ExpertStream stream(device, paths, std::move(layers), budget);
     require(stream.stats().slots == 10, "ten slots");
 
@@ -109,13 +112,17 @@ int run() {
             for (const std::int32_t e : ids) {
                 const auto& location = locations[layer * 3 + k][e];
                 const std::uint64_t offset = logical[layer * 3 + k][e];
-                std::vector<std::uint8_t> got(location.bytes);
+                const std::size_t tail     = k == 2 ? 256 : 0;
+                std::vector<std::uint8_t> got(location.bytes + tail);
                 require(entries[e] != nullptr, label + ": a routed expert has no slot");
                 require(cudaMemcpy(got.data(), entries[e], got.size(), cudaMemcpyDeviceToHost) ==
                             cudaSuccess,
                         label + ": a slot is not readable");
-                require(std::memcmp(got.data(), file_bytes.data() + offset, got.size()) == 0,
+                require(std::memcmp(got.data(), file_bytes.data() + offset, location.bytes) == 0,
                         label + ": a slot differs from the expert's bytes");
+                require(std::all_of(got.begin() + location.bytes, got.end(),
+                                    [](std::uint8_t b) { return b == 0; }),
+                        label + ": a down matrix is not followed by zeros");
             }
         }
     };

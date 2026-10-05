@@ -1,6 +1,7 @@
 // The expert cache must never change what a kernel reads: after any sequence of routes and
 // rebalances, every table entry points either at the expert's bytes in the pinned host block or at
-// a device slot holding the same bytes. It must also admit the experts a layer routes to most, keep
+// a device slot holding the same bytes, a cached down matrix followed by zeros (the expert matrix
+// kernel reads past a down row's end). It must also admit the experts a layer routes to most, keep
 // within its slots, and leave a layer without slots untouched.
 #include "core/arena.h"
 #include "core/device.h"
@@ -8,6 +9,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <random>
@@ -47,20 +49,24 @@ struct Bank {
         return {.expert_bytes = bytes, .host = pointers, .table = table.p};
     }
 
-    // Every entry's bytes equal the expert's; returns how many entries point at device memory.
-    int verify(const std::string& label) const {
+    // Every entry's bytes equal the expert's, and `tail` zero bytes follow a cached one; returns
+    // how many entries point at device memory.
+    int verify(const std::string& label, std::size_t tail = 0) const {
         std::vector<const void*> entries(kExperts);
         table.copy_to_host(entries.data(), entries.size() * sizeof(void*));
         int cached = 0;
-        std::vector<std::uint8_t> bytes_read(static_cast<std::size_t>(bytes));
+        std::vector<std::uint8_t> bytes_read(static_cast<std::size_t>(bytes) + tail);
         for (int e = 0; e < kExperts; ++e) {
             if (entries[e] == pointers[e]) { continue; }
             ++cached;
             require(cudaMemcpy(bytes_read.data(), entries[e], bytes_read.size(),
                                cudaMemcpyDeviceToHost) == cudaSuccess,
                     label + ": a cached entry is not readable");
-            require(std::memcmp(bytes_read.data(), pointers[e], bytes_read.size()) == 0,
+            require(std::memcmp(bytes_read.data(), pointers[e], std::size_t(bytes)) == 0,
                     label + ": a slot differs from its expert's bytes");
+            require(std::all_of(bytes_read.begin() + bytes, bytes_read.end(),
+                                [](std::uint8_t b) { return b == 0; }),
+                    label + ": a cached down matrix is not followed by zeros");
         }
         return cached;
     }
@@ -76,11 +82,12 @@ int run() {
         {.rank = 0, .stream = device.stream, .gate = g0.view(), .up = u0.view(), .down = d0.view()},
         {.rank = 0, .stream = device.stream, .gate = g1.view(), .up = u1.view(), .down = d1.view()},
     };
-    // Room for about 10 experts of layer 0 and 20 of layer 1 (even split of 2 * 102,400 bytes).
+    // An even split of 2 * 102,400 bytes: slots of 4096 + 4096 + 2304 bytes for layer 0 and
+    // 1536 + 3072 + 1280 for layer 1 (each down followed by its 256 zero bytes, aligned).
     const std::vector<std::uint64_t> budget = {2 * 102400};
     ExpertCache cache(device, layers, budget);
     const auto slots = cache.stats().slots;
-    require(slots == 10 + 18,
+    require(slots == 9 + 17,
             "slots per layer follow each layer's expert size: " + std::to_string(slots));
 
     // Layer 0 routes heavily to experts 5 and 7; layer 1 spreads.
@@ -98,13 +105,13 @@ int run() {
         cache.rebalance(round % 2 == 0 ? (1u << 20) : 30000);
         device.synchronize();
         const int cached0 = g0.verify("gate 0") + 0;
-        require(u0.verify("up 0") == cached0 && d0.verify("down 0") == cached0,
+        require(u0.verify("up 0") == cached0 && d0.verify("down 0", 256) == cached0,
                 "a layer's three banks cache the same experts");
-        require(cached0 <= 10, "layer 0 keeps within its slots");
+        require(cached0 <= 9, "layer 0 keeps within its slots");
         const int cached1 = g1.verify("gate 1");
-        require(u1.verify("up 1") == cached1 && d1.verify("down 1") == cached1,
+        require(u1.verify("up 1") == cached1 && d1.verify("down 1", 256) == cached1,
                 "layer 1's banks agree");
-        require(cached1 <= 18, "layer 1 keeps within its slots");
+        require(cached1 <= 17, "layer 1 keeps within its slots");
     }
     std::vector<const void*> entries(kExperts);
     g0.table.copy_to_host(entries.data(), entries.size() * sizeof(void*));

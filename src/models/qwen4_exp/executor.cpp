@@ -41,7 +41,7 @@ namespace {
 constexpr std::int32_t kAlign = 256;
 // Calls wider than this run their experts through the matrix kernel, from device memory.
 constexpr std::int32_t kVectorTokens = 8;
-// Zero bytes after the last device slot of an expert pool (see moe_experts_gguf).
+// Zero bytes after every device slot's down matrix (see expert_stream.cpp and moe_experts_gguf).
 constexpr std::uint64_t kSlotTail = 256;
 
 std::uint64_t round_up(std::uint64_t value) { return (value + kAlign - 1) / kAlign * kAlign; }
@@ -350,11 +350,14 @@ struct Executor::Impl {
     // copied into device slots and the matrix kernel reads them there; one pool and one set of
     // tables per rank, whose layers run one at a time.
     struct SlotPool {
-        DeviceBuffer storage; // zeroed slots, then kSlotTail zero bytes
+        DeviceBuffer storage; // zeroed slots, each down matrix followed by kSlotTail zero bytes
         std::uint64_t slot_bytes = 0;
         std::array<std::uint64_t, 3> offset{};
         std::uint32_t slots = 0;
         DeviceBuffer tables; // gate, up and down tables of every expert
+        // Bytes of each slot's down region a down has written: past a smaller down from another
+        // layer, the tail is zeroed again.
+        std::vector<std::uint64_t> down_written;
     };
 
     std::vector<SlotPool> slot_pools; // by rank; empty unless the experts are host resident
@@ -722,13 +725,14 @@ struct Executor::Impl {
             if (widest[0] == 0) { continue; }
             SlotPool& pool  = slot_pools[r];
             pool.offset     = {0, round_up(widest[0]), round_up(widest[0]) + round_up(widest[1])};
-            pool.slot_bytes = pool.offset[2] + round_up(widest[2]);
+            pool.slot_bytes = pool.offset[2] + round_up(widest[2] + kSlotTail);
             RankBinding bind(device, r);
             std::size_t free_bytes = 0, total = 0;
             CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total));
-            const std::uint64_t bytes = experts * pool.slot_bytes + kSlotTail;
+            const std::uint64_t bytes = experts * pool.slot_bytes;
             if (bytes > free_bytes / 2) { continue; }
             pool.slots   = static_cast<std::uint32_t>(experts);
+            pool.down_written.assign(experts, 0);
             pool.storage = DeviceBuffer(bytes);
             CUDA_CHECK(cudaMemset(pool.storage.p, 0, pool.storage.bytes));
             pool.tables = DeviceBuffer(3 * experts * sizeof(void*));
@@ -1028,13 +1032,23 @@ struct Executor::Impl {
                 continue;
             }
             if (used == pool.slots) { return false; }
+            const std::uint32_t slot = used++;
             auto* base =
-                static_cast<std::byte*>(pool.storage.p) + std::size_t(used++) * pool.slot_bytes;
+                static_cast<std::byte*>(pool.storage.p) + std::size_t(slot) * pool.slot_bytes;
             for (int k = 0; k < 3; ++k) {
-                std::byte* target = base + pool.offset[k];
-                CUDA_CHECK(cudaMemcpyAsync(target, tables[k]->pointers[e],
-                                           std::size_t(tables[k]->rows) * tables[k]->row_bytes,
+                const std::uint64_t bytes = std::uint64_t(tables[k]->rows) * tables[k]->row_bytes;
+                std::byte* target         = base + pool.offset[k];
+                CUDA_CHECK(cudaMemcpyAsync(target, tables[k]->pointers[e], std::size_t(bytes),
                                            cudaMemcpyHostToDevice, s));
+                if (k == 2) {
+                    std::uint64_t& written = pool.down_written[slot];
+                    if (written > bytes) {
+                        CUDA_CHECK(
+                            cudaMemsetAsync(target + bytes, 0,
+                                            std::size_t(std::min(written - bytes, kSlotTail)), s));
+                    }
+                    written = std::max(written, bytes);
+                }
                 entries[k * experts + e] = target;
             }
         }

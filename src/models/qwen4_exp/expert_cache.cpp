@@ -16,7 +16,8 @@ constexpr double kDecay = 0.999;
 // A candidate displaces a cached expert only when it is clearly hotter, so near-ties do not thrash.
 constexpr double kHysteresis = 1.25;
 constexpr double kFloor      = 0.5;
-// Zero bytes after the last slot.
+// Zero bytes after every slot's down matrix, which the expert matrix kernel reads past a down
+// row's end (expert_stream.cpp says why they must be zeros, not the next slot's gate).
 constexpr std::uint64_t kTail = 256;
 
 std::uint64_t aligned(std::uint64_t value) { return (value + kAlign - 1) / kAlign * kAlign; }
@@ -60,7 +61,7 @@ ExpertCache::ExpertCache(DeviceContext& device, std::vector<ExpertCacheLayer> la
         layer.banks      = std::move(banks);
         layer.slot_bytes = aligned(layer.banks.gate.expert_bytes) +
                            aligned(layer.banks.up.expert_bytes) +
-                           aligned(layer.banks.down.expert_bytes);
+                           aligned(layer.banks.down.expert_bytes + kTail);
         const std::uint64_t share =
             layer.banks.rank < bytes_by_rank.size()
                 ? bytes_by_rank[layer.banks.rank] / layers_on_rank[layer.banks.rank]
@@ -73,7 +74,7 @@ ExpertCache::ExpertCache(DeviceContext& device, std::vector<ExpertCacheLayer> la
         for (int k = 0; k < 3; ++k) { layer.current[k] = layer.bank(k).host; }
         if (layer.slots != 0) {
             RankBinding bind(device_, layer.banks.rank);
-            layer.storage = DeviceBuffer(std::size_t(layer.slots) * layer.slot_bytes + kTail);
+            layer.storage = DeviceBuffer(std::size_t(layer.slots) * layer.slot_bytes);
             CUDA_CHECK(cudaMemset(layer.storage.p, 0, layer.storage.bytes));
         }
         layer.staging = staging_bytes;

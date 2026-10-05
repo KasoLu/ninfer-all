@@ -88,11 +88,14 @@ Requests run one at a time in arrival order; `--max-concurrency` above one queue
   pass over each selected expert's rows for all of its tokens, through device tables of expert
   base pointers: an expert is read wherever the table points, in device memory, a cache slot or the
   pinned host block. Up to eight tokens run vector products; wider calls run ggml's integer
-  tensor-core matrix kernel over the routed pairs from device memory (zeros follow each down bank,
-  since the kernel reads a 640-value row in 256-value steps). With host experts, a wide call first
-  copies the routed experts the cache does not hold into a device pool (one slot per expert on each
-  GPU, 0.7 GB for Q2_0), so each expert crosses the bus once per chunk. Weighted expert outputs are
-  summed in fixed point, so the result does not depend on the order experts finish in.
+  tensor-core matrix kernel over the routed pairs from device memory. That kernel reads a 640-value
+  down row in 256-value steps, so it decodes the bytes after a down matrix as the down's blocks:
+  in a bank they are the next expert's down or zeros after the last one, and every cache or stream
+  slot keeps zeros after its down, which a smaller down from another layer does not uncover (another
+  format's bytes there can hold a non-finite scale, and NaN follows). With host experts, a wide call
+  first copies the routed experts the cache does not hold into a device pool (one slot per expert on
+  each GPU, 0.7 GB for Q2_0), so each expert crosses the bus once per chunk. Weighted expert outputs
+  are summed in fixed point, so the result does not depend on the order experts finish in.
 - The expert cache counts the routes each forward pass took (decayed per token) and, between
   passes, copies the experts it needed most into its slots and points the tables at them. With
   disk experts the cache works per layer instead: once a layer has routed its tokens, the experts
