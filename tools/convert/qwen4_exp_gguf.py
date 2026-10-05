@@ -13,12 +13,14 @@ interleaved ``attn_q`` splits into query and gate rows, and the indexer's split 
 squeezed PLE convolution keep the layout the HF adapter (qwen4_exp.py) declares.
 
 The first shard of a release holds the model; the second holds only ``per_layer_token_embd``, the
-n-gram table, which the recipe imports row for row into the same artifact as its ``ngram``
-component, so that one file carries everything the model reads.
+n-gram table, which every release shares byte for byte. The recipe imports it row for row as the
+``ngram`` component's table, into the model's artifact or into a table artifact of its own, and
+records the SHA-256 of its bytes, by which a model stored without the table names the one it reads.
 """
 
 from __future__ import annotations
 
+import hashlib
 from math import prod
 
 import numpy as np
@@ -26,7 +28,7 @@ import torch
 
 from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
-from .gguf_blocks import block_format, block_source
+from .gguf_blocks import _vision_source, block_format, block_source
 from .methods import AuxiliaryValue, cast_direct, import_encoded
 from .sources.gguf import TYPE_BF16, TYPE_F16, TYPE_F32, GGUFFile
 from .sources.logical import LogicalSource, array_source
@@ -61,6 +63,7 @@ INDEXER_HEADS = 4
 INDEXER_DIM = 128
 NGRAM_WIDTH = 160
 NGRAM_HEADS = 16
+NGRAM_TENSOR = "per_layer_token_embd.weight"
 
 EXPECTED_HEADER = {
     "general.architecture": "qwen4exp",
@@ -213,7 +216,7 @@ def validate(gguf: GGUFFile, config: dict) -> None:
         if (kind == "full_attention") != full_attention(layer):
             raise ValueError("the qwen4exp GGUF recipe needs QSA on every fourth block")
     expected = expected_tensors(tuple(config["ple_layers"]), config["num_experts"])
-    model = {name for name in gguf.tensors if name != "per_layer_token_embd.weight"}
+    model = {name for name in gguf.tensors if name != NGRAM_TENSOR}
     if model != set(expected):
         missing = sorted(set(expected) - model)[:5]
         extra = sorted(model - set(expected))[:5]
@@ -381,27 +384,46 @@ def _group_same_format(recipe, names: list[str], formats: dict[str, str]) -> Non
 
 
 def qwen3_8_flash_next_gguf(model, recipe, sources):
-    """A Qwen3.8-Flash-Next GSQ-RCO GGUF release in its own block formats, in one artifact: the
-    model shard as `--source gguf=SHARD1.gguf` and the n-gram table shard as
-    `--source ngram=SHARD2.gguf`."""
+    """A Qwen3.8-Flash-Next GSQ-RCO GGUF release in its own block formats: the model shard as
+    `--source gguf=SHARD1.gguf` (for the text component) and the n-gram table shard as
+    `--source ngram=SHARD2.gguf`, which is always read, since the model records the digest of the
+    table it reads even when the table's rows go into an artifact of their own. The Vision tower
+    comes from the release's BF16 `mmproj` GGUF (`--source vision=mmproj.gguf`) and stays BF16."""
 
+    table = sources["ngram"]
+    if not isinstance(table, GGUFFile):
+        raise ValueError("--source ngram must name the release's n-gram table shard (.gguf)")
+    descriptor = model.components["ngram"]["config"]
+    source = ngram_source(table, descriptor["rows"])
+    descriptor["format"] = source.read_encoded(0, 1).format
+    size = table.info(NGRAM_TENSOR).nbytes
+    print(f"hashing the n-gram table ({size / 1e9:.1f} GB)", flush=True)
+    descriptor["table_sha256"] = table_digest(table)
+    if "text" not in model.components:
+        recipe.assign("ngram/table", format=descriptor["format"], method=import_encoded,
+                      source=source)
+        return
     config = model.config
     if config.get("architectures") != ["Qwen4ExpForCausalLM"]:
         raise ValueError("the qwen4exp GGUF recipe requires a Qwen3.8-Flash-Next model")
     gguf = sources["gguf"]
     if not isinstance(gguf, GGUFFile):
         raise ValueError("--source gguf must name the model's first .gguf shard")
-    table = sources["ngram"]
-    if not isinstance(table, GGUFFile):
-        raise ValueError("--source ngram must name the release's n-gram table shard (.gguf)")
     validate(gguf, config)
     formats: dict[str, str] = {}
-    for name, (source, encoded) in text_sources(gguf, config).items():
-        formats[name] = _assign(recipe, name, source, encoded, model)
-    source = ngram_source(table, model.components["ngram"]["config"]["rows"])
-    formats["ngram/table"] = source.read_encoded(0, 1).format
-    recipe.assign("ngram/table", format=formats["ngram/table"], method=import_encoded,
-                  source=source)
+    for name, (text_source, encoded) in text_sources(gguf, config).items():
+        formats[name] = _assign(recipe, name, text_source, encoded, model)
+    if "ngram/table" in model.parameters:
+        formats["ngram/table"] = descriptor["format"]
+        recipe.assign("ngram/table", format=descriptor["format"], method=import_encoded,
+                      source=source)
+    if "vision" in model.components:
+        vision = _vision_source(model, sources)
+        for name, parameter in model.parameters.items():
+            if name.startswith("vision/"):
+                formats[name] = parameter.direct_format
+                recipe.assign(name, format=parameter.direct_format, method=cast_direct,
+                              source=model.source(name, vision))
     if set(formats) != set(model.parameters):
         missing = sorted(set(model.parameters) - set(formats))[:5]
         raise ValueError(f"the GGUF leaves logical parameters without a source: {missing}")
@@ -463,11 +485,21 @@ def with_gguf_expert_count(config: dict, path) -> dict:
 
 
 def ngram_source(gguf: GGUFFile, rows_count: int) -> LogicalSource:
-    tensor = "per_layer_token_embd.weight"
-    info = gguf.info(tensor)
+    info = gguf.info(NGRAM_TENSOR)
     if info.shape != (rows_count, NGRAM_WIDTH) or info.type_id not in GGUF_FORMATS_BY_TYPE:
-        raise ValueError(f"{gguf.path}: {tensor} is {info.type_name} {info.shape}")
-    return block_source(gguf, tensor, (rows_count, NGRAM_WIDTH), rows())
+        raise ValueError(f"{gguf.path}: {NGRAM_TENSOR} is {info.type_name} {info.shape}")
+    return block_source(gguf, NGRAM_TENSOR, (rows_count, NGRAM_WIDTH), rows())
+
+
+def table_digest(gguf: GGUFFile) -> str:
+    """SHA-256 of the n-gram table's bytes, which the artifact stores unchanged, row for row."""
+
+    size = gguf.info(NGRAM_TENSOR).nbytes
+    digest = hashlib.sha256()
+    step = 1 << 28
+    for begin in range(0, size, step):
+        digest.update(gguf.tensor_bytes(NGRAM_TENSOR, begin, min(begin + step, size)))
+    return digest.hexdigest()
 
 
 RECIPES = {
@@ -476,11 +508,13 @@ RECIPES = {
 
 __all__ = [
     "EXPECTED_HEADER",
+    "NGRAM_TENSOR",
     "RECIPES",
     "expected_tensors",
     "with_gguf_expert_count",
     "ngram_source",
     "qwen3_8_flash_next_gguf",
+    "table_digest",
     "text_sources",
     "validate",
 ]

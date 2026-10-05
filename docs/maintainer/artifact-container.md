@@ -184,7 +184,7 @@ Writer 将 `[32,4096)` 写零。Reader 打开续卷时核对 magic、part_index�
 
 | 字段 | 类型 / 必需性 | 含义 |
 |---|---|---|
-| components | Object，必需且含 text | 实际提供的模型组件及精简配置 |
+| components | 非空 Object，必需 | 实际提供的模型组件及精简配置 |
 | objects | 非空 Array<ObjectDescriptor>，必需 | 按逻辑 payload offset 排列的物理对象 |
 | bindings | Object，必需 | 完整逻辑参数名到 Binding 的映射 |
 | uses | Array<Use>，必需 | 按数学使用位置展开的计算许可与辅助输入 |
@@ -197,7 +197,9 @@ Framing 版本已经确定 JSON 语法，根记录直接使用上述字段。完
 ### 4.2 组件记录
 
 `components` 的键是组件 ID。`text` 是主模型；当前可选组件使用 `vision`、`mtp`、`dflash`、
-`dflash2`。新的实际架构或后端可以使用同一记录结构，由对应编译代码解释其 ID 和 config。
+`dflash2`，Qwen3.8-Flash-Next 另有 `ngram`（n-gram 表的描述，见
+[Flash-Next 说明](../qwen3-8-flash-next.md)）。只含 `ngram` 的产物是一张独立的 n-gram 表，没有
+`text`。新的实际架构或后端可以使用同一记录结构，由对应编译代码解释其 ID 和 config。
 
 | 字段 | 类型 / 必需性 | 含义 |
 |---|---|---|

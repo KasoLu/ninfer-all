@@ -43,7 +43,8 @@ python3 -m tools.convert \
   --out models/qwen3_6_27b.ninfer
 ```
 
-`--components` defaults to `text`. Include only the optional components you want to distribute.
+`--components` defaults to `text` (`text,ngram` for Qwen3.8-Flash-Next). Include only the optional
+components you want to distribute.
 `--proposal` adds the indexed proposal head used by speculative decoding; it uses the repository's
 token ranking and defaults to 131,072 rows. The ordinary full-vocabulary output head is retained.
 
@@ -62,7 +63,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 | `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses, Q8 primal embedding | `ternary` (GGUF) |
 | `qwen3_8_27b_gguf` | Every text, embedding, head and MTP tensor in its GGUF block format, byte for byte | `gguf` (GGUF), `vision` (mmproj GGUF) |
-| `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL rows in the same artifact | `gguf` (the release's first shard), `ngram` (its second shard) |
+| `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL rows in the same artifact or in a table artifact of their own | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF) |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
@@ -226,9 +227,11 @@ serve these formats are described in [GGUF block formats](gguf.md).
 model shard of a Qwen3.8-Flash-Next GSQ-RCO release the same way: every matrix keeps its block type,
 the 512-expert banks stay expert-major (one expert is one contiguous byte range), and the exporter's
 conventions are undone by row gathers and exact small-tensor transforms. The release's second
-shard, the n-gram table, goes into the same artifact as its `ngram` component, row for row; the
-runtime reads only the rows each token addresses. Commands, runtime options and measurements:
-[Qwen3.8-Flash-Next](qwen3-8-flash-next.md).
+shard, the n-gram table, is the `ngram` component: the model always records the table's hash
+constants, row format and SHA-256, and `--components` decides where the rows go -- `text,ngram`
+(the default) into the model's artifact, `text` nowhere (the model reads a table artifact at run
+time), `ngram` into a table artifact without a model. The runtime reads only the rows each token
+addresses. Commands, runtime options and measurements: [Qwen3.8-Flash-Next](qwen3-8-flash-next.md).
 
 ## Change part of a recipe
 

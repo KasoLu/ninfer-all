@@ -127,6 +127,7 @@ void invalid_directories() {
     bad([](Json& root) { root["files"][1]["path"] = "../other"; });
     bad([](Json& root) { root["files"][1]["payload_bytes"] = 1.5; });
     bad([](Json& root) { root["components"]["text"]["resources"]["tokenizer.json"] = "q5"; });
+    bad([](Json& root) { root["components"] = Json::object(); });
     rejects([] { (void)parse_json("{\"a\":{\"x\":1,\"x\":2}}", "duplicate"); },
             "duplicate JSON key accepted");
     fixture.write();

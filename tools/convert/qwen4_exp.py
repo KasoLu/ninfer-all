@@ -149,7 +149,8 @@ def mtp_config(source: dict) -> dict:
 # --- logical parameters ---------------------------------------------------------------------------
 # Names follow the Qwen3.5 adapter's where the mathematics is shared (attention, Gated DeltaNet,
 # MoE); hyper-connections, the indexer and PLE add their own. The n-gram table is the `ngram`
-# component's one parameter, in the same artifact (see the plan's section 2.5).
+# component's one parameter, stored with the model or in a table artifact of its own (see the
+# plan's section 2.5).
 
 def _hyper_connection(builder, prefix, source_prefix, store, config, *, inject):
     width = config["hc_count"] * config["hidden_size"]
@@ -197,7 +198,9 @@ def ngram_config(source: dict) -> dict:
     """The `ngram` component's config: the table and the hash that addresses it.
 
     The component carries the constants its rows were written for; the runtime derives them again
-    from the text config and refuses a table that disagrees.
+    from the text config and refuses a table that disagrees. A recipe adds the rows' `format` and
+    the `table_sha256` of their bytes, by which a model stored without its rows names the table
+    artifact it reads.
     """
     text = text_config(source)
     heads = (text["ngram_size"] - 1) * text["heads_per_ngram"]
@@ -264,21 +267,40 @@ def ngram_hash_constants(text: dict, ple_layer_index: int = 0) -> tuple[list[int
     return multipliers, head_vocab
 
 
-def build_model(base, *, components=("text",), companions=None, resource_overrides=None):
-    """The text component of a Qwen3.8-Flash-Next checkpoint (no Vision or MTP) and the `ngram`
-    component that holds its n-gram table: one artifact carries everything the model reads."""
+def build_model(base, *, components=("text", "ngram"), companions=None, resource_overrides=None):
+    """A Qwen3.8-Flash-Next checkpoint's text component (no MTP), optionally its Vision tower, and
+    its n-gram table.
+
+    The model always describes the table it reads in its `ngram` component; selecting `ngram` also
+    stores the table's rows. `text,ngram` is the self-contained model, `text` the model alone (its
+    rows come from a table artifact at run time), and `ngram` alone that table artifact; `vision`
+    adds the tower to a model.
+    """
     from .model import Model
-    from .qwen3_5 import _Builder
+    from .qwen3_5 import _Builder, vision_config
     from .resources import load_resources
 
-    if tuple(components) != ("text",):
+    selected = set(components)
+    if len(selected) != len(tuple(components)) or not (
+        selected == {"ngram"} or ("text" in selected and selected <= {"text", "ngram", "vision"})
+    ):
         raise ValueError(
-            "Qwen3.8-Flash-Next converts --components text, which includes its n-gram table"
+            "Qwen3.8-Flash-Next converts --components text,ngram (the model with its n-gram "
+            "table), text (the model alone) or ngram (the table alone), with vision optional "
+            "beside text"
         )
+    descriptor = {"config": ngram_config(base.config)}
+    if "text" not in selected:
+        model = Model({"ngram": descriptor})
+        _ngram_table(model)
+        return model
     config = text_config(base.config)
-    records = {"text": {"config": config}, "ngram": {"config": ngram_config(base.config)}}
+    records = {"text": {"config": config}, "ngram": descriptor}
+    if "vision" in selected:
+        records["vision"] = {"config": vision_config(base.config, config), "target": "text"}
     refs, resources, count, special = load_resources(
-        base.root, vocab_size=config["vocab_size"], vision_config=None,
+        base.root, vocab_size=config["vocab_size"],
+        vision_config=records["vision"]["config"] if "vision" in selected else None,
         overrides=resource_overrides)
     for component, resource_refs in refs.items():
         records[component]["resources"] = resource_refs
@@ -305,7 +327,10 @@ def build_model(base, *, components=("text",), companions=None, resource_overrid
         builder.moe(p, sp, base, config)
         if i in config["ple_layers"]:
             _ple(builder, p, sp, base, config)
-    _ngram_table(model)
+    if "vision" in selected:
+        builder.vision(base, records["vision"]["config"], h)
+    if "ngram" in selected:
+        _ngram_table(model)
     return model
 
 

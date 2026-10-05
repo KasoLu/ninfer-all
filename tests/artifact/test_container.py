@@ -166,6 +166,7 @@ def test_existing_output_is_preserved(tmp_path):
             lambda d: d["bindings"]["text/reordered"]["parts"][0].update(range=[0, 5]),
             id="binding-outside-parent",
         ),
+        pytest.param(lambda d: d.update(components={}), id="no-components"),
     ],
 )
 def test_directory_rejects_invalid_structure(tmp_path, change):

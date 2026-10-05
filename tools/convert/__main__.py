@@ -136,8 +136,10 @@ def main(argv=None):
     )
     parser.add_argument(
         "--components",
-        default="text",
-        help="comma-separated text,vision,mtp,dflash,dflash2",
+        help="comma-separated text,vision,mtp,dflash,dflash2 (default text); for "
+        "Qwen3.8-Flash-Next text,ngram (the default: the model with its n-gram table), text (the "
+        "model alone, its table read from a table artifact at run time) or ngram (that table "
+        "artifact), and vision beside text",
     )
     parser.add_argument(
         "--resource",
@@ -164,9 +166,6 @@ def main(argv=None):
         "(default: one file)",
     )
     args = parser.parse_args(argv)
-    components = tuple(args.components.split(","))
-    if len(components) != len(set(components)):
-        raise ValueError("components must not repeat")
     paths = _pairs(args.source, "source")
     if "base" in paths:
         raise ValueError("select the base source with --model")
@@ -174,17 +173,20 @@ def main(argv=None):
     with ExitStack() as stack:
         base = stack.enter_context(SafetensorsSource(args.model))
         sources = SourceInputs(base, paths, stack)
+        architectures = base.config.get("architectures") or [None]
+        flash_next = architectures[0] in QWEN4_EXP_ARCHITECTURES
+        if args.components is None:
+            components = ("text", "ngram") if flash_next else ("text",)
+        else:
+            components = tuple(args.components.split(","))
+        if len(components) != len(set(components)):
+            raise ValueError("components must not repeat")
         companions = {
             key: sources[key] for key in ("dflash", "dflash2") if key in components
         }
         if "mtp" in components and "mtp" in paths:
             companions["mtp"] = sources["mtp"]
-        architectures = base.config.get("architectures") or [None]
-        build_model = (
-            build_qwen4_exp
-            if architectures[0] in QWEN4_EXP_ARCHITECTURES
-            else build_qwen3_5
-        )
+        build_model = build_qwen4_exp if flash_next else build_qwen3_5
         if build_model is build_qwen4_exp and "gguf" in paths:
             # An expert-pruned release takes the model's config with its own expert count.
             base.config = with_gguf_expert_count(base.config, paths["gguf"])

@@ -323,8 +323,8 @@ def parse_directory(value: object, *, entry_name: str | None = None) -> Director
         index[obj.id] = obj
 
     components = root["components"]
-    if not isinstance(components, dict) or "text" not in components:
-        raise ArtifactError("components must contain text")
+    if not isinstance(components, dict) or not components:
+        raise ArtifactError("components must be a nonempty object")
     for name, component in components.items():
         identifier(name, "component id")
         members(component, {"config"}, {"target", "resources", "proposal"}, name)

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
 from tools.convert.qwen4_exp import mtp_config, text_config
 
@@ -98,7 +99,6 @@ def _tiny_config():
 
 
 def test_build_model_maps_the_text_component(tmp_path):
-    import torch
     from safetensors.torch import save_file
 
     from tools.convert.qwen4_exp import build_model
@@ -146,3 +146,50 @@ def test_build_model_maps_the_text_component(tmp_path):
         assert model.parameters["ngram/table"].shape == (424, 2)
         with pytest.raises(ValueError, match="--source ngram"):
             model.parameters["ngram/table"].source.rows(0, 1)
+        # Without `ngram` the model still describes its table, whose rows live elsewhere.
+        bare = build_model(source, components=("text",))
+        assert set(bare.components) == {"text", "ngram"}
+        assert set(bare.parameters) == names - {"ngram/table"}
+
+
+def test_build_model_adds_the_qwen3_5_vision_tower(tmp_path):
+    from safetensors.torch import save_file
+
+    from tools.convert.qwen4_exp import build_model
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    root = tmp_path / "source"
+    root.mkdir()
+    config = _tiny_config()
+    config["vision_config"] = {
+        "depth": 2, "hidden_size": 16, "intermediate_size": 32, "num_heads": 2,
+        "patch_size": 2, "temporal_patch_size": 2, "spatial_merge_size": 2,
+        "num_position_embeddings": 16, "in_channels": 3, "hidden_act": "gelu_pytorch_tanh",
+        "deepstack_visual_indexes": [], "out_hidden_size": 8, "model_type": "qwen4_exp",
+    }
+    (root / "config.json").write_text(json.dumps(config))
+    save_file({"model.language_model.layers.0.ple.conv1d.weight": torch.zeros(16, 1, 4)},
+              root / "model.safetensors")
+    for name, value in {
+        "tokenizer.json": {"model": {"vocab": {str(i): i for i in range(6)}}},
+        "tokenizer_config.json": {},
+        "generation_config.json": {},
+        "preprocessor_config.json": {"patch_size": 2, "temporal_patch_size": 2,
+                                     "merge_size": 2},
+        "video_preprocessor_config.json": {"patch_size": 2, "temporal_patch_size": 2,
+                                           "merge_size": 2},
+    }.items():
+        (root / name).write_text(json.dumps(value))
+    (root / "chat_template.jinja").write_text("{{ messages }}")
+    with SafetensorsSource(root) as source:
+        model = build_model(source, components=("text", "vision", "ngram"))
+        vision = model.components["vision"]
+        # The Qwen3.5 tower, projecting onto the text model's width.
+        assert vision["target"] == "text"
+        assert vision["config"]["model_type"] == "qwen3_5_moe_vision"
+        assert set(vision["resources"]) == {"preprocessor_config.json",
+                                            "video_preprocessor_config.json"}
+        assert model.parameters["vision/merger/fc2"].shape == (8, 64)
+        assert model.parameters["vision/layers/1/attention/query"].shape == (16, 16)
+        with pytest.raises(ValueError, match="vision optional beside text"):
+            build_model(source, components=("ngram", "vision"))

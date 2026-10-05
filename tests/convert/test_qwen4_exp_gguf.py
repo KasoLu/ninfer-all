@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 
@@ -11,6 +13,7 @@ from tools.convert import gguf_blocks, qwen4_exp, qwen4_exp_gguf
 from tools.convert.sources.gguf import GGUFFile, write_gguf
 
 TYPE_Q2_0 = 42
+TYPE_IQ4_NL = 20
 
 _FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "qwen4_exp"
 
@@ -86,15 +89,64 @@ def test_ngram_config_has_the_reference_constants():
     assert config["architectures"] == ["Qwen4ExpNgramTable"]
 
 
-def test_flash_next_converts_the_text_component_alone(tmp_path):
-    # The text component carries the n-gram table; nothing converts without it or beside it.
+def test_flash_next_converts_a_model_a_table_or_both(tmp_path):
+    # Nothing converts beside the text model and its n-gram table.
     class Base:
         config = _checkpoint()
         root = tmp_path
 
-    for components in (("ngram",), ("text", "ngram"), ("text", "mtp")):
-        with pytest.raises(ValueError, match="--components text"):
+    for components in (("text", "mtp"), ("vision",), ("text", "ngram", "mtp"), ()):
+        with pytest.raises(ValueError, match="--components text,ngram"):
             qwen4_exp.build_model(Base(), components=components)
+    # The table alone: its descriptor and its rows, no text component.
+    table = qwen4_exp.build_model(Base(), components=("ngram",))
+    assert set(table.components) == {"ngram"} and set(table.parameters) == {"ngram/table"}
+    assert table.parameters["ngram/table"].shape == (320001536, 160)
+
+
+def _tiny_table_config():
+    # Four hash heads of 101, 103, 107 and 109 rows (padded to 424), 160 values per row as in the
+    # release.
+    config = deepcopy(_checkpoint())
+    text = config["text_config"]
+    text.update(ngram_vocab_size_base=100, make_ngram_vocab_size_divisible_by=8,
+                heads_per_ngram=2, ple_embed_dim=640)
+    return config
+
+
+def test_the_table_artifact_stores_the_rows_and_their_digest(tmp_path):
+    from tools.artifact.reader import Artifact
+    from tools.convert.pipeline import convert
+    from tools.convert.recipe import Recipe
+
+    class Base:
+        config = _tiny_table_config()
+        root = tmp_path
+
+    generator = np.random.default_rng(8)
+    rows = 424
+    blocks = generator.integers(0, 256, size=(rows, 5, 18), dtype=np.uint8)
+    blocks[:, :, :2] = generator.uniform(0.01, 0.02, size=(rows, 5)).astype(np.float16).view(
+        np.uint8).reshape(rows, 5, 2)
+    shard = tmp_path / "shard2.gguf"
+    write_gguf(shard, {"general.architecture": "qwen4exp"},
+               [(qwen4_exp_gguf.NGRAM_TENSOR, (rows, 160), TYPE_IQ4_NL, blocks.tobytes())])
+    expected = hashlib.sha256(blocks.tobytes()).hexdigest()
+    with GGUFFile(shard) as table:
+        assert qwen4_exp_gguf.table_digest(table) == expected
+        model = qwen4_exp.build_model(Base(), components=("ngram",))
+        recipe = Recipe(model)
+        qwen4_exp_gguf.qwen3_8_flash_next_gguf(model, recipe, {"ngram": table})
+        output = tmp_path / "table.ninfer"
+        convert(model, recipe, output, device="cpu")
+    with Artifact(output) as artifact:
+        directory = artifact.directory
+        descriptor = directory.components["ngram"]["config"]
+        assert set(directory.components) == {"ngram"}
+        assert descriptor["format"] == "gguf_iq4_nl" and descriptor["table_sha256"] == expected
+        assert descriptor["rows"] == rows and descriptor["row_width"] == 160
+        stored = directory.bindings["ngram/table"]["object"]
+        assert hashlib.sha256(artifact.read_object(stored)).hexdigest() == expected
 
 
 def test_an_expert_pruned_release_takes_its_own_expert_count(tmp_path):
