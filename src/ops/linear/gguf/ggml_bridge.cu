@@ -67,6 +67,86 @@ __launch_bounds__(kQuantizeThreads) __global__
 }
 
 using VectorLaunch = void (*)(const VecArgs&, int, bool, cudaStream_t);
+using MoeLaunch    = void (*)(const MoeVecArgs&, int, int, bool, cudaStream_t);
+
+MoeLaunch moe_launcher(GgmlType type) {
+    switch (type) {
+    case GgmlType::Q8_0:
+        return moe_launch<GGML_TYPE_Q8_0>;
+    case GgmlType::Q4_0:
+        return moe_launch<GGML_TYPE_Q4_0>;
+    case GgmlType::Q5_0:
+        return moe_launch<GGML_TYPE_Q5_0>;
+    case GgmlType::Q2_0:
+        return moe_launch<GGML_TYPE_Q2_0>;
+    case GgmlType::Q2_K:
+        return moe_launch<GGML_TYPE_Q2_K>;
+    case GgmlType::Q3_K:
+        return moe_launch<GGML_TYPE_Q3_K>;
+    case GgmlType::Q4_K:
+        return moe_launch<GGML_TYPE_Q4_K>;
+    case GgmlType::Q5_K:
+        return moe_launch<GGML_TYPE_Q5_K>;
+    case GgmlType::Q6_K:
+        return moe_launch<GGML_TYPE_Q6_K>;
+    case GgmlType::IQ2_XXS:
+        return moe_launch<GGML_TYPE_IQ2_XXS>;
+    case GgmlType::IQ2_XS:
+        return moe_launch<GGML_TYPE_IQ2_XS>;
+    case GgmlType::IQ2_S:
+        return moe_launch<GGML_TYPE_IQ2_S>;
+    case GgmlType::IQ3_XXS:
+        return moe_launch<GGML_TYPE_IQ3_XXS>;
+    case GgmlType::IQ3_S:
+        return moe_launch<GGML_TYPE_IQ3_S>;
+    case GgmlType::IQ1_S:
+        return moe_launch<GGML_TYPE_IQ1_S>;
+    case GgmlType::IQ1_M:
+        return moe_launch<GGML_TYPE_IQ1_M>;
+    case GgmlType::IQ4_NL:
+        return moe_launch<GGML_TYPE_IQ4_NL>;
+    case GgmlType::IQ4_XS:
+        return moe_launch<GGML_TYPE_IQ4_XS>;
+    }
+    throw std::invalid_argument("gguf moe product: unsupported block type");
+}
+
+// One block: the pairs of each expert counted, scanned into bounds, then placed. The experts with
+// pairs are listed in ascending order.
+constexpr int kSortThreads = 1024;
+
+__launch_bounds__(kSortThreads) __global__
+    void moe_sort_kernel(const std::int32_t* __restrict__ ids, int pairs, int experts,
+                         std::int32_t* __restrict__ bounds, std::int32_t* __restrict__ sorted,
+                         std::int32_t* __restrict__ active,
+                         std::int32_t* __restrict__ active_count) {
+    extern __shared__ int shared[];
+    int* count  = shared;
+    int* cursor = shared + experts;
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) { count[e] = 0; }
+    __syncthreads();
+    for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+        const int e = ids[p];
+        if (e >= 0 && e < experts) { atomicAdd(count + e, 1); }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int run = 0, listed = 0;
+        for (int e = 0; e < experts; ++e) {
+            bounds[e] = run;
+            cursor[e] = run;
+            run += count[e];
+            if (count[e] != 0) { active[listed++] = e; }
+        }
+        bounds[experts] = run;
+        *active_count   = listed;
+    }
+    __syncthreads();
+    for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+        const int e = ids[p];
+        if (e >= 0 && e < experts) { sorted[atomicAdd(cursor + e, 1)] = p; }
+    }
+}
 
 VectorLaunch vector_launch(GgmlType type) {
     switch (type) {
@@ -209,23 +289,32 @@ cublasHandle_t blas_handle() {
     return handles[device];
 }
 
+// Types whose blocks are narrower than the 256-value super-block one kernel block decodes: their
+// rows need only be whole blocks, so the last super-block of a row may be partial.
+template <ggml_type type>
+inline constexpr bool kSmallBlocks =
+    type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q5_0 ||
+    type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ4_NL;
+
 template <ggml_type type, int threads, typename dst_t>
 __global__ void dequantize_rows_kernel(const char* __restrict__ weight, std::int64_t row_bytes,
                                        const std::int32_t* __restrict__ row_ids,
-                                       dst_t* __restrict__ out, std::int64_t out_row_stride) {
+                                       dst_t* __restrict__ out, std::int64_t out_row_stride,
+                                       int k) {
     const int row          = blockIdx.y;
     const std::int64_t src = row_ids != nullptr ? row_ids[row] : row;
     const void* x          = weight + src * row_bytes;
     dst_t* y               = out + std::int64_t(row) * out_row_stride + std::int64_t(blockIdx.x) * QK_K;
+    const int count        = min(QK_K, k - int(blockIdx.x) * QK_K);
     if constexpr (type == GGML_TYPE_Q8_0) {
         const block_q8_0* blocks = static_cast<const block_q8_0*>(x) + blockIdx.x * (QK_K / QK8_0);
-        for (int i = threadIdx.x; i < QK_K; i += threads) {
+        for (int i = threadIdx.x; i < count; i += threads) {
             const block_q8_0& b = blocks[i / QK8_0];
             y[i] = ggml_cuda_cast<dst_t>(__half2float(b.d) * b.qs[i % QK8_0]);
         }
     } else if constexpr (type == GGML_TYPE_Q4_0) {
         const block_q4_0* blocks = static_cast<const block_q4_0*>(x) + blockIdx.x * (QK_K / QK4_0);
-        for (int i = threadIdx.x; i < QK_K; i += threads) {
+        for (int i = threadIdx.x; i < count; i += threads) {
             const block_q4_0& b = blocks[i / QK4_0];
             const int j         = i % QK4_0;
             const int code      = j < QK4_0 / 2 ? (b.qs[j] & 0xF) : (b.qs[j - QK4_0 / 2] >> 4);
@@ -233,7 +322,7 @@ __global__ void dequantize_rows_kernel(const char* __restrict__ weight, std::int
         }
     } else if constexpr (type == GGML_TYPE_Q5_0) {
         const block_q5_0* blocks = static_cast<const block_q5_0*>(x) + blockIdx.x * (QK_K / QK5_0);
-        for (int i = threadIdx.x; i < QK_K; i += threads) {
+        for (int i = threadIdx.x; i < count; i += threads) {
             const block_q5_0& b = blocks[i / QK5_0];
             const int j         = i % QK5_0;
             std::uint32_t qh;
@@ -244,7 +333,7 @@ __global__ void dequantize_rows_kernel(const char* __restrict__ weight, std::int
         }
     } else if constexpr (type == GGML_TYPE_Q2_0) {
         const block_q2_0* blocks = static_cast<const block_q2_0*>(x) + blockIdx.x * (QK_K / QK2_0);
-        for (int i = threadIdx.x; i < QK_K; i += threads) {
+        for (int i = threadIdx.x; i < count; i += threads) {
             const block_q2_0& b = blocks[i / QK2_0];
             const int j         = i % QK2_0;
             const int code      = (b.qs[j / 4] >> (2 * (j % 4))) & 3;
@@ -275,7 +364,14 @@ __global__ void dequantize_rows_kernel(const char* __restrict__ weight, std::int
     } else if constexpr (type == GGML_TYPE_IQ1_M) {
         dequantize_iq1_m(x, blockIdx.x, y, threadIdx.x);
     } else if constexpr (type == GGML_TYPE_IQ4_NL) {
-        dequantize_iq4_nl(x, blockIdx.x, y, threadIdx.x);
+        const block_iq4_nl* blocks =
+            static_cast<const block_iq4_nl*>(x) + blockIdx.x * (QK_K / QK4_NL);
+        for (int i = threadIdx.x; i < count; i += threads) {
+            const block_iq4_nl& b = blocks[i / QK4_NL];
+            const int j           = i % QK4_NL;
+            const int code        = j < QK4_NL / 2 ? (b.qs[j] & 0xF) : (b.qs[j - QK4_NL / 2] >> 4);
+            y[i] = ggml_cuda_cast<dst_t>(__half2float(b.d) * float(kvalues_iq4nl[code]));
+        }
     } else if constexpr (type == GGML_TYPE_IQ4_XS) {
         dequantize_iq4_xs(x, blockIdx.x, y, threadIdx.x);
     }
@@ -285,11 +381,13 @@ template <ggml_type type, int threads, typename dst_t>
 void launch_dequantize(const void* weight, std::int64_t row_bytes, int k,
                        const std::int32_t* row_ids, int rows, dst_t* out,
                        std::int64_t out_row_stride, cudaStream_t stream) {
-    if (k % QK_K != 0 || rows <= 0) {
-        throw std::invalid_argument("gguf dequantize: K must be whole 256-value blocks");
+    if (k <= 0 || k % (kSmallBlocks<type> ? ggml_cuda_type_traits<type>::qk : QK_K) != 0 ||
+        rows <= 0) {
+        throw std::invalid_argument("gguf dequantize: K must be whole blocks of the type");
     }
-    dequantize_rows_kernel<type, threads, dst_t><<<dim3(k / QK_K, rows, 1), threads, 0, stream>>>(
-        static_cast<const char*>(weight), row_bytes, row_ids, out, out_row_stride);
+    dequantize_rows_kernel<type, threads, dst_t>
+        <<<dim3((k + QK_K - 1) / QK_K, rows, 1), threads, 0, stream>>>(
+            static_cast<const char*>(weight), row_bytes, row_ids, out, out_row_stride, k);
     check(cudaGetLastError(), "dequantize launch");
 }
 
@@ -367,11 +465,12 @@ std::size_t vector_activation_bytes(int k, int columns) {
 void quantize_vector_activation(const __nv_bfloat16* x, int k, int columns,
                                 const std::int32_t* input_columns, void* out,
                                 cudaStream_t stream) {
-    if (k <= 0 || k % detail::kQuantizeThreads != 0 || columns <= 0) {
-        throw std::invalid_argument("gguf vector activation: K must be whole 256-value groups");
+    // Whole warps of 32 values: a warp past K leaves as one, before its reductions.
+    if (k <= 0 || k % QK8_1 != 0 || columns <= 0 || columns > 65535) {
+        throw std::invalid_argument("gguf vector activation: K must be whole 32-value blocks");
     }
     auto* base = static_cast<std::uint8_t*>(out);
-    const dim3 blocks(k / detail::kQuantizeThreads, columns, 1);
+    const dim3 blocks((k + detail::kQuantizeThreads - 1) / detail::kQuantizeThreads, columns, 1);
     detail::quantize_vector_kernel<<<blocks, detail::kQuantizeThreads, 0, stream>>>(
         x, input_columns, reinterpret_cast<std::int8_t*>(base),
         reinterpret_cast<half2*>(base + detail::vec_scales_offset(k, columns)), k);
@@ -399,6 +498,87 @@ void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, in
     detail::vector_launch(type)(
         detail::vector_args(weight, row_bytes, rows, k, activation, columns, store), columns,
         true, stream);
+}
+
+std::size_t moe_routing_bytes(int experts, int pairs) {
+    return (std::size_t(experts) + 1 + std::size_t(pairs) + std::size_t(experts) + 1) *
+               sizeof(std::int32_t) +
+           256;
+}
+
+MoeRouting moe_sort_routes(const std::int32_t* ids, int pairs, int experts, void* workspace,
+                           cudaStream_t stream) {
+    if (pairs <= 0 || experts <= 0 || experts > 8192 || workspace == nullptr) {
+        throw std::invalid_argument("gguf moe routing: invalid pairs or experts");
+    }
+    auto* base                 = static_cast<std::int32_t*>(workspace);
+    std::int32_t* bounds       = base;
+    std::int32_t* sorted       = bounds + experts + 1;
+    std::int32_t* active       = sorted + pairs;
+    std::int32_t* active_count = active + experts;
+    detail::moe_sort_kernel<<<1, detail::kSortThreads, 2 * experts * sizeof(int), stream>>>(
+        ids, pairs, experts, bounds, sorted, active, active_count);
+    detail::check(cudaGetLastError(), "moe routing launch");
+    return MoeRouting{bounds, sorted, active, active_count};
+}
+
+namespace {
+
+detail::MoeVecArgs moe_args(const MoeTable& first, const MoeTable* second,
+                            const MoeRouting& routing, int column_group, int per_token,
+                            const void* activation, int columns) {
+    if (first.experts == nullptr || first.rows <= 0 || first.k <= 0 || column_group <= 0 ||
+        per_token <= 0 || columns <= 0 || activation == nullptr || routing.bounds == nullptr ||
+        (second != nullptr && (second->experts == nullptr || second->rows != first.rows ||
+                               second->k != first.k || second->row_bytes != first.row_bytes))) {
+        throw std::invalid_argument("gguf moe product: invalid tables or routing");
+    }
+    const auto* base = static_cast<const std::uint8_t*>(activation);
+    detail::MoeVecArgs args{};
+    args.first = reinterpret_cast<const std::uint8_t* const*>(first.experts);
+    args.second =
+        second != nullptr ? reinterpret_cast<const std::uint8_t* const*>(second->experts) : nullptr;
+    args.row_bytes    = first.row_bytes;
+    args.rows         = first.rows;
+    args.k            = first.k;
+    args.bounds       = routing.bounds;
+    args.sorted       = routing.sorted;
+    args.active       = routing.active;
+    args.active_count = routing.active_count;
+    args.column_group = column_group;
+    args.per_token    = per_token;
+    args.qs           = reinterpret_cast<const std::int8_t*>(base);
+    args.ds = reinterpret_cast<const half2*>(base + detail::vec_scales_offset(first.k, columns));
+    return args;
+}
+
+} // namespace
+
+void moe_vector_product(GgmlType type, const MoeTable& table, const MoeRouting& routing,
+                        int max_active, int column_group, int per_token, const void* activation,
+                        int columns, const MoeOutput& out, int chunk, cudaStream_t stream) {
+    const int targets =
+        int(out.bf16 != nullptr) + int(out.f32 != nullptr) + int(out.weighted != nullptr);
+    if (targets != 1 || (out.weighted != nullptr && out.weights == nullptr)) {
+        throw std::invalid_argument("gguf moe product: invalid output");
+    }
+    auto args     = moe_args(table, nullptr, routing, column_group, per_token, activation, columns);
+    args.out_bf16 = out.bf16;
+    args.out_f32  = out.f32;
+    args.weighted = out.weighted;
+    args.weights  = out.weights;
+    args.gate     = out.gate;
+    detail::moe_launcher(type)(args, max_active, chunk, false, stream);
+}
+
+void moe_vector_swiglu(GgmlType type, const MoeTable& gate, const MoeTable& up,
+                       const MoeRouting& routing, int max_active, int column_group,
+                       const void* activation, int columns, __nv_bfloat16* out, int chunk,
+                       cudaStream_t stream) {
+    if (out == nullptr) { throw std::invalid_argument("gguf moe swiglu: invalid output"); }
+    auto args     = moe_args(gate, &up, routing, column_group, 1, activation, columns);
+    args.out_bf16 = out;
+    detail::moe_launcher(type)(args, max_active, chunk, true, stream);
 }
 
 int matrix_activation_layout(GgmlType type) {

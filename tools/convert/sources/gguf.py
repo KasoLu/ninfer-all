@@ -245,11 +245,11 @@ class GGUFFile:
         return self._map[start:stop]
 
     def _row_bytes(self, info: TensorInfo) -> int:
-        if len(info.shape) != 2:
+        if len(info.shape) < 2:
             raise ValueError(
-                f"{info.name}: row access requires rank 2, got {info.shape}"
+                f"{info.name}: row access requires rank 2 or more, got {info.shape}"
             )
-        rows, columns = info.shape
+        columns = info.shape[-1]
         block_elements, block_bytes = BLOCK_GEOMETRY[info.type_id]
         if columns % block_elements:
             raise ValueError(f"{info.name}: {columns} columns are not whole blocks")
@@ -282,12 +282,16 @@ class GGUFFile:
     def read_blocks(
         self, name: str, row_begin: int = 0, row_end: int | None = None
     ) -> np.ndarray:
-        """Rows ``[row_begin, row_end)`` of a ggml block matrix as ``uint8 [rows, row_bytes]``."""
+        """Rows ``[row_begin, row_end)`` of a ggml block matrix as ``uint8 [rows, row_bytes]``.
+
+        A stack of matrices (an expert bank ``[experts, rows, k]``) is addressed by its flattened
+        rows, matrix-major, as the file stores them.
+        """
 
         info = self.info(name)
         if info.type_id not in BLOCK_FORMATS:
             raise ValueError(f"{name}: {info.type_name} is not a stored block format")
-        rows = info.shape[0]
+        rows = prod(info.shape[:-1])
         end = rows if row_end is None else row_end
         if not 0 <= row_begin <= end <= rows:
             raise ValueError(f"{name}: row range [{row_begin},{end}) is outside {rows}")

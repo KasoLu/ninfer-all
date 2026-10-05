@@ -12,6 +12,7 @@ set(ninfer_op_tests
   sparse_attention
   moe_route
   moe_experts
+  moe_experts_gguf
   rmsnorm
   rmsnorm_pack_tail
   gated_rmsnorm

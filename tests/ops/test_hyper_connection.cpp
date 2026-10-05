@@ -1,6 +1,7 @@
 // hyper_connection_read/write against an FP64 oracle of the Qwen3.8-Flash-Next gated residual, at
 // the model's shapes (4 streams, hidden 2560, lowrank 320) and decode, verify and prefill widths,
-// with and without the inject rows (the final mixer has none), eagerly and under graph replay.
+// with and without the inject rows (the final mixer has none), eagerly and under graph replay; and
+// hyper_connection_expand, which must widen the embedding into every stream exactly.
 #include "core/arena.h"
 #include "core/device.h"
 #include "ninfer/ops/hyper_connection.h"
@@ -201,6 +202,34 @@ int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed) {
     return failures;
 }
 
+int run_expand(int tokens, std::uint32_t seed) {
+    std::vector<float> x(static_cast<std::size_t>(kHidden) * tokens);
+    std::uint32_t state = seed;
+    for (auto& v : x) {
+        state = state * 1664525u + 1013904223u;
+        v = bf16_to_f32(f32_to_bf16(static_cast<float>(static_cast<std::int32_t>(state)) * 1e-9f));
+    }
+    const auto bits = encode_bf16(x);
+    GuardedDeviceBuffer d_x(bits.size() * 2), d_stack(x.size() * kStreams * 4);
+    d_x.copy_from_host(bits.data(), bits.size() * 2);
+    Tensor t_x(d_x.data(), DType::BF16, {kHidden, tokens});
+    Tensor t_stack(d_stack.data(), DType::FP32, {kHidden, kStreams, tokens});
+    ops::hyper_connection_expand(t_x, t_stack, nullptr);
+    cuda_synchronize();
+    const auto got = from_device<float>(d_stack.data(), x.size() * kStreams);
+    std::vector<float> want(got.size());
+    for (int t = 0; t < tokens; ++t)
+        for (int c = 0; c < kStreams; ++c)
+            for (int d = 0; d < kHidden; ++d)
+                want[(static_cast<std::size_t>(t) * kStreams + c) * kHidden + d] =
+                    x[static_cast<std::size_t>(t) * kHidden + d];
+    const std::string label = "expand T=" + std::to_string(tokens);
+    int failures            = verify_exact(label.c_str(), got, want);
+    failures += d_x.verify_guards("expand input");
+    failures += d_stack.verify_guards("expand stack");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -215,6 +244,8 @@ int main() {
     failures += run_case(1, false, false, 4200u);
     failures += run_case(5, false, false, 4201u);
     failures += run_case(4, true, true, 4300u);
+    failures += run_expand(1, 4400u);
+    failures += run_expand(7, 4401u);
     // Refusals: an unsupported geometry and an inject output without inject rows.
     bool refused = false;
     try {

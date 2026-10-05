@@ -167,6 +167,17 @@ __global__ void __launch_bounds__(256)
     stack[i] = fmaf(to_float(y[t * kHidden + d]), inject_weights[column], stack[i]);
 }
 
+__global__ void __launch_bounds__(256)
+    hc_expand_kernel(const __nv_bfloat16* __restrict__ x, float* __restrict__ stack,
+                     std::int64_t elements) {
+    const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= elements) return;
+    // stack element i is stream (i / hidden) % streams of token i / width.
+    const std::int64_t token = i / kWidth;
+    const std::int64_t d     = i % kHidden;
+    stack[i]                 = __bfloat162float(x[token * kHidden + d]);
+}
+
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("hyper_connection: ") + message); }
 }
@@ -274,6 +285,22 @@ void hyper_connection_write(Tensor& stack, const Tensor& y, const Tensor& inject
             static_cast<float*>(stack.data), static_cast<const __nv_bfloat16*>(y.data),
             static_cast<const float*>(inject_weights.data), elements);
     }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void hyper_connection_expand(const Tensor& x, Tensor& stack, cudaStream_t stream) {
+    require(stack.dtype == DType::FP32 && stack.is_contiguous() && stack.data != nullptr &&
+                stack.ne[0] == kHidden && stack.ne[1] == kStreams && stack.ne[3] == 1,
+            "stack must be contiguous FP32 [2560, 4, tokens]");
+    const std::int32_t tokens = stack.ne[2];
+    require(tokens > 0, "tokens must be positive");
+    require(x.dtype == DType::BF16 && x.is_contiguous() && x.data != nullptr &&
+                x.ne[0] == kHidden && x.ne[1] == tokens,
+            "x must be contiguous BF16 [2560, tokens]");
+    const std::int64_t elements = static_cast<std::int64_t>(kWidth) * tokens;
+    hc_expand_kernel<<<static_cast<unsigned>(div_up(elements, std::int64_t{256})), 256, 0,
+                       stream>>>(static_cast<const __nv_bfloat16*>(x.data),
+                                 static_cast<float*>(stack.data), elements);
     CUDA_CHECK(cudaGetLastError());
 }
 

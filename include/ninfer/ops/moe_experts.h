@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "core/weight.h"
 
 #include <cuda_runtime.h> // cudaStream_t
 
@@ -29,5 +30,35 @@ void moe_experts_bf16(const Tensor& m, const Tensor& ids, const Tensor& weights,
                       const Tensor& shared, const Tensor& gate_up, const Tensor& down,
                       const Tensor& shared_gate_up, const Tensor& shared_down,
                       WorkspaceArena& workspace, Tensor& y, cudaStream_t stream);
+
+/**
+ * The same experts over GGUF block banks (an imported GSQ-RCO release), reached through tables of
+ * expert base pointers, so an expert may sit in a device bank, a cache slot or mapped host memory.
+ * `gate` and `up` hold each expert's 640 rows of 2560 values, `down` its 2560 rows of 640; each
+ * table has 512 entries, the shared expert's tables one. Every entry points at device-readable
+ * memory in the table's block type, rows `row_bytes` apart.
+ *
+ * The products quantize their activation to ggml's q8_1 as llama.cpp does (the format's
+ * arithmetic): m once per token, the middle silu(gate . m) * (up . m) after its BF16 store. Each
+ * expert's contribution weights[k] * e (shared * e_shared for the shared expert) is accumulated in
+ * 2^-32 fixed point, so y does not depend on the order the experts run in, and stored as FP32.
+ * The oracle decodes every stored block exactly and evaluates in FP64 with the activation rounded
+ * as the products round it; y is compared as FP32 by relative L2 and gross error.
+ */
+struct GgufExpertTable {
+    QType format               = QType::GGUF_Q8_0;
+    const void* const* experts = nullptr; // device array of expert base pointers
+    std::int64_t row_bytes     = 0;
+};
+
+struct GgufMoeWeights {
+    GgufExpertTable gate, up, down;
+    GgufExpertTable shared_gate, shared_up, shared_down;
+};
+
+[[nodiscard]] std::size_t moe_experts_gguf_workspace_bytes(std::int32_t tokens);
+void moe_experts_gguf(const Tensor& m, const Tensor& ids, const Tensor& weights,
+                      const Tensor& shared, const GgufMoeWeights& banks, WorkspaceArena& workspace,
+                      Tensor& y, cudaStream_t stream);
 
 } // namespace ninfer::ops

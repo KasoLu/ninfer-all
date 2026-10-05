@@ -170,7 +170,26 @@ def block_format(gguf: GGUFFile, tensor: str) -> str:
     return GGUF_FORMATS_BY_TYPE[gguf.info(tensor).type_id].name
 
 
+GGML_Q2_0 = 42
+
+
+def dequantize_q2_0(blocks: np.ndarray) -> np.ndarray:
+    """ggml Q2_0 rows: 64 values per 18-byte block, a binary16 d then 16 code bytes; value j is
+    d * (c - 1) with c the bit pair 2 (j % 4) of byte j / 4. gguf-py predates the type."""
+
+    rows = blocks.shape[0]
+    b = np.ascontiguousarray(blocks).reshape(rows, -1, 18)
+    d = b[..., :2].copy().view("<f2").astype(np.float32)
+    q = b[..., 2:]
+    codes = np.stack([(q >> (2 * i)) & 3 for i in range(4)], axis=-1).reshape(rows, b.shape[1], 64)
+    return ((codes.astype(np.float32) - 1.0) * d).reshape(rows, -1)
+
+
 def _dequantize(gguf: GGUFFile, tensor: str, first: int, last: int) -> torch.Tensor:
+    blocks = gguf.read_blocks(tensor, first, last)
+    if gguf.info(tensor).type_id == GGML_Q2_0:
+        values = dequantize_q2_0(blocks)
+        return torch.from_numpy(np.ascontiguousarray(values)).reshape(last - first, -1)
     try:
         from gguf import GGMLQuantizationType
         from gguf.quants import dequantize
@@ -179,7 +198,6 @@ def _dequantize(gguf: GGUFFile, tensor: str, first: int, last: int) -> torch.Ten
             "reading the values of a GGUF block matrix needs the `gguf` package; "
             "storing its blocks does not"
         ) from error
-    blocks = gguf.read_blocks(tensor, first, last)
     kind = GGMLQuantizationType(gguf.info(tensor).type_id)
     values = dequantize(np.ascontiguousarray(blocks), kind)
     return torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32)).reshape(

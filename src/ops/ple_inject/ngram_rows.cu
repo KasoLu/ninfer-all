@@ -33,6 +33,27 @@ __global__ void __launch_bounds__(kRowWidth)
     embedding[row * kRowWidth + j] = __float2bfloat16_rn(static_cast<float>(code) * scale);
 }
 
+// ggml's IQ4_NL codebook.
+__constant__ std::int8_t kIq4NlValues[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
+                                             1,    13,   25,  38,  53,  69,  89,  113};
+constexpr std::int32_t kIq4NlBlockBytes   = 18;
+
+__global__ void __launch_bounds__(kRowWidth)
+    ngram_iq4nl_rows_kernel(const std::uint8_t* __restrict__ rows, std::int64_t row_count,
+                            __nv_bfloat16* __restrict__ embedding) {
+    const std::int64_t row = blockIdx.x;
+    const int j            = threadIdx.x;
+    if (row >= row_count) return;
+    const std::uint8_t* block =
+        rows + row * (kRowWidth / 32 * kIq4NlBlockBytes) + (j / 32) * kIq4NlBlockBytes;
+    __half_raw scale_raw;
+    scale_raw.x                    = static_cast<unsigned short>(block[0] | (block[1] << 8));
+    const float scale              = __half2float(__half(scale_raw));
+    const int i                    = j % 32;
+    const int code                 = i < 16 ? (block[2 + i] & 0xF) : (block[2 + i - 16] >> 4);
+    embedding[row * kRowWidth + j] = __float2bfloat16_rn(scale * float(kIq4NlValues[code]));
+}
+
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("ngram_embed_rows: ") + message); }
 }
@@ -45,6 +66,8 @@ std::uint32_t ngram_row_bytes(NgramRowFormat format) {
         return kRowWidth * 2;
     case NgramRowFormat::Fp8E4M3RowScale:
         return kRowWidth + 2;
+    case NgramRowFormat::Iq4Nl:
+        return kRowWidth / 32 * kIq4NlBlockBytes;
     }
     throw std::invalid_argument("ngram_row_bytes: unknown format");
 }
@@ -70,9 +93,15 @@ void ngram_embed_rows(const Tensor& rows, NgramRowFormat format, std::int32_t he
                                    cudaMemcpyDeviceToDevice, stream));
         return;
     }
-    ngram_fp8_rows_kernel<<<static_cast<unsigned>(row_count), kRowWidth, 0, stream>>>(
-        static_cast<const std::uint8_t*>(rows.data), row_count,
-        static_cast<__nv_bfloat16*>(embedding.data));
+    if (format == NgramRowFormat::Iq4Nl) {
+        ngram_iq4nl_rows_kernel<<<static_cast<unsigned>(row_count), kRowWidth, 0, stream>>>(
+            static_cast<const std::uint8_t*>(rows.data), row_count,
+            static_cast<__nv_bfloat16*>(embedding.data));
+    } else {
+        ngram_fp8_rows_kernel<<<static_cast<unsigned>(row_count), kRowWidth, 0, stream>>>(
+            static_cast<const std::uint8_t*>(rows.data), row_count,
+            static_cast<__nv_bfloat16*>(embedding.data));
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

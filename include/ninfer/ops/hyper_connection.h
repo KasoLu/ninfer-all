@@ -53,4 +53,8 @@ void hyper_connection_read(const Tensor& stack, const HyperConnectionWeights& we
 void hyper_connection_write(Tensor& stack, const Tensor& y, const Tensor& inject_weights,
                             cudaStream_t stream);
 
+// The stack's start (transformers repeats the embedding into every stream): stack[c, d] = x[d] for
+// each stream c, x BF16 [hidden, tokens] widened exactly to FP32.
+void hyper_connection_expand(const Tensor& x, Tensor& stack, cudaStream_t stream);
+
 } // namespace ninfer::ops

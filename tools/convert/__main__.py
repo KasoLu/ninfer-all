@@ -12,7 +12,10 @@ from collections.abc import Mapping
 from .official_recipes import RECIPES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
-from .qwen3_5 import build_model
+from .qwen3_5 import build_model as build_qwen3_5
+from .qwen4_exp import _ARCHITECTURES as QWEN4_EXP_ARCHITECTURES
+from .qwen4_exp import build_model as build_qwen4_exp
+from .qwen4_exp_gguf import RECIPES as QWEN4_EXP_GGUF_RECIPES
 from .recipe import Recipe
 from .sources.gguf import GGUFFile
 from .sources.safetensors import SafetensorsSource
@@ -23,7 +26,7 @@ from .ternary import RECIPES as TERNARY_RECIPES
 def _open_named_source(name: str, path: Path):
     if path.suffix == ".gguf":
         # The ternary and GGUF block recipes read their block formats themselves, without gguf-py.
-        if name in ("ternary", "gguf"):
+        if name in ("ternary", "gguf", "ngram"):
             return GGUFFile(path)
         from .sources.gguf_source import GGUFSource
 
@@ -85,7 +88,7 @@ def _recipe_parts(value: str):
 
 
 def _function(value: str):
-    recipes = {**RECIPES, **TERNARY_RECIPES, **GGUF_RECIPES}
+    recipes = {**RECIPES, **TERNARY_RECIPES, **GGUF_RECIPES, **QWEN4_EXP_GGUF_RECIPES}
     if value in recipes:
         return recipes[value]
     filename, function = _recipe_parts(value)
@@ -133,7 +136,8 @@ def main(argv=None):
     parser.add_argument(
         "--components",
         default="text",
-        help="comma-separated text,vision,mtp,dflash,dflash2",
+        help="comma-separated text,vision,mtp,dflash,dflash2; ngram alone writes the "
+        "n-gram companion of a Qwen3.8-Flash-Next model",
     )
     parser.add_argument(
         "--resource",
@@ -170,6 +174,12 @@ def main(argv=None):
         }
         if "mtp" in components and "mtp" in paths:
             companions["mtp"] = sources["mtp"]
+        architectures = base.config.get("architectures") or [None]
+        build_model = (
+            build_qwen4_exp
+            if architectures[0] in QWEN4_EXP_ARCHITECTURES
+            else build_qwen3_5
+        )
         model = build_model(
             base,
             components=components,

@@ -682,7 +682,181 @@ void launch_columns(const VecArgs& args, int columns, cudaStream_t stream) {
     throw std::invalid_argument("gguf vector product: columns must be 1..8");
 }
 
+// The MoE form: block (x, y) takes rows of the y-th active expert for every pair routed to it, T of
+// them per pass over the rows. A pair's activation column is pair / column_group. Fused: the first
+// table holds the gate rows and the second the up rows, and each output row is silu(gate) * up.
+template <ggml_type type, int T, bool Fused>
+__launch_bounds__(kVecWarps * 32) __global__ void moe_kernel(MoeVecArgs p) {
+    using D                 = Decoder<type>;
+    constexpr int kTable    = D::kTableWords > 0 ? D::kTableWords : 4;
+    constexpr int kPerBlock = D::kBlockElems / 32;
+    constexpr int kRows     = 2;
+    // Uniform per block, so it may leave before the barrier below.
+    if (int(blockIdx.y) >= *p.active_count) { return; }
+    __shared__ __align__(16) std::uint32_t table[kTable];
+    if constexpr (D::kTableWords > 0) {
+        const std::uint32_t* src = D::table();
+        for (int i = threadIdx.x; i < D::kTableWords; i += kVecWarps * 32) { table[i] = src[i]; }
+        __syncthreads();
+    }
+    const int expert               = p.active[blockIdx.y];
+    const int begin                = p.bounds[expert];
+    const int end                  = p.bounds[expert + 1];
+    const std::uint8_t* first      = p.first[expert];
+    const std::uint8_t* second     = Fused ? p.second[expert] : nullptr;
+    const int warp                 = threadIdx.x >> 5;
+    const int lane                 = threadIdx.x & 31;
+    const int k                    = p.k;
+    const int slices               = k / 32;
+    const int step                 = Fused ? 1 : kRows;
+    const std::int64_t lane_offset = std::int64_t(lane / kPerBlock) * D::kBlockBytes;
+    const int sub                  = lane % kPerBlock;
+
+    for (int row0 = (blockIdx.x * kVecWarps + warp) * step; row0 < p.rows;
+         row0 += gridDim.x * kVecWarps * step) {
+        const std::uint8_t* rowp[kRows];
+        if constexpr (Fused) {
+            rowp[0] = first + std::int64_t(row0) * p.row_bytes + lane_offset;
+            rowp[1] = second + std::int64_t(row0) * p.row_bytes + lane_offset;
+        } else {
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+                rowp[r] =
+                    first + std::int64_t(min(row0 + r, p.rows - 1)) * p.row_bytes + lane_offset;
+            }
+        }
+        for (int c0 = begin; c0 < end; c0 += T) {
+            const int n = min(T, end - c0);
+            int pair[T], column[T];
+#pragma unroll
+            for (int j = 0; j < T; ++j) {
+                pair[j]   = p.sorted[c0 + min(j, n - 1)];
+                column[j] = pair[j] / p.column_group;
+            }
+            float acc[kRows][T];
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+#pragma unroll
+                for (int j = 0; j < T; ++j) { acc[r][j] = 0.0f; }
+            }
+            for (int it = 0; lane + 32 * it < slices; ++it) {
+                const int s = lane + 32 * it;
+                int a[T][8];
+                float d[T], sum[T];
+#pragma unroll
+                for (int j = 0; j < T; ++j) {
+                    const float2 ds = __half22float2(p.ds[std::int64_t(column[j]) * slices + s]);
+                    d[j]            = ds.x;
+                    sum[j]          = ds.y;
+                    const auto* q =
+                        reinterpret_cast<const int4*>(p.qs + std::int64_t(column[j]) * k + 32 * s);
+                    const int4 v0 = q[0], v1 = q[1];
+                    a[j][0] = v0.x;
+                    a[j][1] = v0.y;
+                    a[j][2] = v0.z;
+                    a[j][3] = v0.w;
+                    a[j][4] = v1.x;
+                    a[j][5] = v1.y;
+                    a[j][6] = v1.z;
+                    a[j][7] = v1.w;
+                }
+#pragma unroll
+                for (int r = 0; r < kRows; ++r) {
+                    Slice sl;
+                    D::decode(rowp[r] + std::int64_t(32 / kPerBlock) * it * D::kBlockBytes, sub,
+                              table, sl);
+#pragma unroll
+                    for (int j = 0; j < T; ++j) { acc[r][j] += D::dot(sl, a[j], d[j], sum[j]); }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < kRows; ++r) {
+#pragma unroll
+                for (int j = 0; j < T; ++j) {
+#pragma unroll
+                    for (int o = 16; o > 0; o >>= 1) {
+                        acc[r][j] += __shfl_xor_sync(0xFFFFFFFFu, acc[r][j], o);
+                    }
+                }
+            }
+            if (lane != 0) { continue; }
+#pragma unroll
+            for (int j = 0; j < T; ++j) {
+                if (j >= n) { break; }
+                if constexpr (Fused) {
+                    p.out_bf16[std::int64_t(pair[j]) * p.rows + row0] =
+                        __float2bfloat16(vec_silu(acc[0][j]) * acc[1][j]);
+                } else {
+#pragma unroll
+                    for (int r = 0; r < kRows; ++r) {
+                        const int row = row0 + r;
+                        if (row >= p.rows) { break; }
+                        const std::int64_t at = std::int64_t(pair[j]) * p.rows + row;
+                        float value           = acc[r][j];
+                        if (p.gate != nullptr) { value *= vec_silu(p.gate[at]); }
+                        if (p.weighted != nullptr) {
+                            // 2^-32 fixed point, saturated far beyond any real activation.
+                            const double scaled =
+                                fmin(fmax(double(value) * double(p.weights[pair[j]]) * 4294967296.0,
+                                          -4.0e18),
+                                     4.0e18);
+                            atomicAdd(p.weighted + std::int64_t(pair[j] / p.per_token) * p.rows +
+                                          row,
+                                      static_cast<unsigned long long>(__double2ll_rn(scaled)));
+                        } else if (p.out_f32 != nullptr) {
+                            p.out_f32[at] = value;
+                        } else {
+                            p.out_bf16[at] = __float2bfloat16(value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+template <ggml_type type, int T, bool Fused>
+void moe_launch_chunk(const MoeVecArgs& args, int max_active, cudaStream_t stream) {
+    const int per_block = kVecWarps * (Fused ? 1 : 2);
+    const int groups    = (args.rows + per_block - 1) / per_block;
+    moe_kernel<type, T, Fused><<<dim3(groups, max_active, 1), kVecWarps * 32, 0, stream>>>(args);
+    check(cudaGetLastError(), "moe product launch");
+}
+
+template <ggml_type type, bool Fused>
+void moe_launch_fused(const MoeVecArgs& args, int max_active, int chunk, cudaStream_t stream) {
+    switch (chunk) {
+    case 1:
+        return moe_launch_chunk<type, 1, Fused>(args, max_active, stream);
+    case 2:
+        return moe_launch_chunk<type, 2, Fused>(args, max_active, stream);
+    case 4:
+        return moe_launch_chunk<type, 4, Fused>(args, max_active, stream);
+    case 8:
+        return moe_launch_chunk<type, 8, Fused>(args, max_active, stream);
+    default:
+        break;
+    }
+    throw std::invalid_argument("gguf moe product: chunk must be 1, 2, 4 or 8");
+}
+
 } // namespace vec
+
+template <ggml_type type>
+void moe_launch(const MoeVecArgs& args, int max_active, int chunk, bool fused,
+                cudaStream_t stream) {
+    using D = vec::Decoder<type>;
+    if (args.k % D::kBlockElems != 0 || args.row_bytes % D::kBlockBytes != 0 ||
+        args.row_bytes < std::int64_t(args.k / D::kBlockElems) * D::kBlockBytes || args.rows <= 0 ||
+        max_active <= 0 || max_active > 65535) {
+        throw std::invalid_argument("gguf moe product: unsupported geometry");
+    }
+    if (fused) {
+        vec::moe_launch_fused<type, true>(args, max_active, chunk, stream);
+    } else {
+        vec::moe_launch_fused<type, false>(args, max_active, chunk, stream);
+    }
+}
 
 template <ggml_type type>
 void vec_launch(const VecArgs& args, int columns, bool fused, cudaStream_t stream) {
@@ -702,4 +876,6 @@ void vec_launch(const VecArgs& args, int columns, bool fused, cudaStream_t strea
 
 #define NINFER_GGUF_VECTOR_INSTANCE(TYPE)                                                          \
     template void ninfer::ops::gguf::detail::vec_launch<TYPE>(                                     \
-        const ninfer::ops::gguf::detail::VecArgs&, int, bool, cudaStream_t)
+        const ninfer::ops::gguf::detail::VecArgs&, int, bool, cudaStream_t);                       \
+    template void ninfer::ops::gguf::detail::moe_launch<TYPE>(                                     \
+        const ninfer::ops::gguf::detail::MoeVecArgs&, int, int, bool, cudaStream_t)

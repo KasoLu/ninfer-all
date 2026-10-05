@@ -119,6 +119,62 @@ void dequantized_product(GgmlType type, const void* weight, std::int64_t row_byt
                          std::int64_t out_column_stride, void* scratch, std::size_t scratch_bytes,
                          cudaStream_t stream);
 
+// --- Mixture of experts -------------------------------------------------------------------------
+// A product over the experts a router selected: pair p (token p / per_token, its slot p %
+// per_token) multiplies the rows of expert ids[p]. Experts are reached through a device table of
+// base pointers, so an expert may live in a device bank, a cache slot or mapped host memory.
+
+// The pairs grouped by expert: `sorted` lists the pairs of expert e at [bounds[e], bounds[e + 1]),
+// and `active` the `*active_count` experts that have any, ascending. Device arrays.
+struct MoeRouting {
+    const std::int32_t* bounds       = nullptr; // [experts + 1]
+    const std::int32_t* sorted       = nullptr; // [pairs]
+    const std::int32_t* active       = nullptr; // [experts]
+    const std::int32_t* active_count = nullptr; // [1]
+};
+
+[[nodiscard]] std::size_t moe_routing_bytes(int experts, int pairs);
+// Groups the pairs of `ids` ([pairs], each in [0, experts)) into `workspace` (moe_routing_bytes).
+// Within one expert the pairs keep no particular order; every product below writes each pair's
+// result to its own place, so the order changes no value.
+[[nodiscard]] MoeRouting moe_sort_routes(const std::int32_t* ids, int pairs, int experts,
+                                         void* workspace, cudaStream_t stream);
+
+// One projection of every expert: expert e's `rows` rows of `k` values start at experts[e].
+struct MoeTable {
+    const void* const* experts = nullptr; // device array [experts]
+    std::int64_t row_bytes     = 0;
+    int rows                   = 0;
+    int k                      = 0;
+};
+
+// Where a product over experts puts pair p's row r.
+struct MoeOutput {
+    __nv_bfloat16* bf16 = nullptr; // [pairs][rows], or
+    float* f32          = nullptr; // [pairs][rows], or
+    // sum over a token's pairs of weights[p] * value, as 2^-32 fixed point in two's complement:
+    // [tokens][rows] where token = p / per_token. Integer addition is associative, so the sum does
+    // not depend on the order the experts finish in. The caller zeroes it first.
+    unsigned long long* weighted = nullptr;
+    const float* weights         = nullptr; // [pairs], with `weighted`
+    // Multiplies the value by silu(gate[p][r]) first ([pairs][rows]).
+    const float* gate = nullptr;
+};
+
+// Activation column of pair p is p / column_group: the token's (column_group = per_token) for the
+// first projection, the pair's own middle (column_group = 1) for the second. `max_active` bounds
+// *routing.active_count (min(pairs, experts)); `chunk` is how many of an expert's columns share one
+// pass over its rows (1, 2, 4 or 8).
+void moe_vector_product(GgmlType type, const MoeTable& table, const MoeRouting& routing,
+                        int max_active, int column_group, int per_token, const void* activation,
+                        int columns, const MoeOutput& out, int chunk, cudaStream_t stream);
+// silu(gate . x) * (up . x) of each pair into out [pairs][rows] (BF16): gate and up are two tables
+// of one block type.
+void moe_vector_swiglu(GgmlType type, const MoeTable& gate, const MoeTable& up,
+                       const MoeRouting& routing, int max_active, int column_group,
+                       const void* activation, int columns, __nv_bfloat16* out, int chunk,
+                       cudaStream_t stream);
+
 // out[i, :] = dequantize(W[row_ids ? row_ids[i] : i, :]) as BF16, rows `out_row_stride` apart.
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, __nv_bfloat16* out,

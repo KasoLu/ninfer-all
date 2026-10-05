@@ -193,12 +193,88 @@ def _ple(builder, prefix, source_prefix, store, config):
                 (hc * h, taps), source_shape=(hc * h, 1, taps))
 
 
-def build_model(base, *, resource_overrides=None):
-    """The text component of a Qwen3.8-Flash-Next checkpoint (no Vision, MTP or n-gram table)."""
+def ngram_config(source: dict) -> dict:
+    """The n-gram companion artifact's config: the table and the hash that addresses it.
+
+    The companion carries the constants its rows were written for; the runtime derives them again
+    from the model's text config and refuses a companion that disagrees.
+    """
+    text = text_config(source)
+    heads = (text["ngram_size"] - 1) * text["heads_per_ngram"]
+    multipliers, head_vocab = ngram_hash_constants(text)
+    offsets = [sum(head_vocab[:h]) for h in range(heads)]
+    divisible = text["make_ngram_vocab_size_divisible_by"]
+    rows = -(-sum(head_vocab) // divisible) * divisible
+    return {
+        "architectures": ["Qwen4ExpNgramTable"],
+        "model_type": "qwen4_exp_ngram",
+        "vocab_size": text["vocab_size"],
+        "eos_token_id": text["eos_token_id"],
+        "ngram_size": text["ngram_size"],
+        "heads_per_ngram": text["heads_per_ngram"],
+        "row_width": text["ple_embed_dim"] // heads,
+        "rows": rows,
+        "multipliers": multipliers,
+        "head_vocab": head_vocab,
+        "head_offset": offsets,
+    }
+
+
+def _splitmix64(value: int) -> int:
+    mask = (1 << 64) - 1
+    value = (value + 0x9E3779B97F4A7C15) & mask
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & mask
+    return value ^ (value >> 31)
+
+
+def _is_prime(n: int) -> bool:
+    if n < 2:
+        return False
+    if n % 2 == 0:
+        return n == 2
+    i = 3
+    while i * i <= n:
+        if n % i == 0:
+            return False
+        i += 2
+    return True
+
+
+def ngram_hash_constants(text: dict, ple_layer_index: int = 0) -> tuple[list[int], list[int]]:
+    """The reference's multipliers (newest context position first) and per-head table sizes."""
+
+    vocab, order = text["vocab_size"], text["ngram_size"]
+    half = ((2**63 - 1) // vocab) // 2
+    base_seed = text["ngram_seed"] + 10007 * ple_layer_index
+    multipliers = [
+        2 * (_splitmix64((base_seed + 0x9E3779B97F4A7C15 * (i + 1)) % (1 << 64)) % half) + 1
+        for i in range(order)
+    ]
+    heads = (order - 1) * text["heads_per_ngram"]
+    head_vocab, candidate = [], text["ngram_vocab_size_base"] - 1
+    skip = ple_layer_index * heads
+    while len(head_vocab) < heads:
+        candidate += 1
+        if _is_prime(candidate):
+            if skip:
+                skip -= 1
+                continue
+            head_vocab.append(candidate)
+    return multipliers, head_vocab
+
+
+def build_model(base, *, components=("text",), companions=None, resource_overrides=None):
+    """The text component of a Qwen3.8-Flash-Next checkpoint (no Vision or MTP), or with
+    `components=("ngram",)` the n-gram companion that holds only the table."""
     from .model import Model
     from .qwen3_5 import _Builder
     from .resources import load_resources
 
+    if tuple(components) == ("ngram",):
+        return _build_ngram(base)
+    if tuple(components) != ("text",):
+        raise ValueError("Qwen3.8-Flash-Next converts --components text or --components ngram")
     config = text_config(base.config)
     records = {"text": {"config": config}}
     refs, resources, count, special = load_resources(
@@ -229,4 +305,19 @@ def build_model(base, *, resource_overrides=None):
         builder.moe(p, sp, base, config)
         if i in config["ple_layers"]:
             _ple(builder, p, sp, base, config)
+    return model
+
+
+def _build_ngram(base):
+    from .model import Model, Parameter
+    from .sources.logical import LogicalSource
+
+    config = ngram_config(base.config)
+    model = Model({"text": {"config": config}})
+    shape = (config["rows"], config["row_width"])
+
+    def unavailable(begin, end):
+        raise ValueError("the n-gram table has no default source: provide --source ngram")
+
+    model.add(Parameter("text/ngram_table", shape, LogicalSource(shape, "ngram", unavailable)))
     return model

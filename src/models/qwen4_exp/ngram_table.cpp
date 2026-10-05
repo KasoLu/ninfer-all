@@ -96,32 +96,58 @@ struct NgramTableReader::File {
 };
 
 NgramTableReader::NgramTableReader(NgramTableLayout layout, NgramResidency residency)
-    : layout_(std::move(layout)), residency_(residency),
-      file_(std::make_unique<File>(layout_.path)) {
-    if (layout_.row_bytes == 0 || layout_.rows == 0) {
+    : layout_(std::move(layout)), residency_(residency) {
+    if (layout_.row_bytes == 0 || layout_.rows == 0 || layout_.segments.empty()) {
         throw std::invalid_argument("n-gram table: empty layout");
     }
-    if (layout_.rows > (std::numeric_limits<std::uint64_t>::max() - layout_.payload_offset) /
-                           layout_.row_bytes) {
+    if (layout_.rows > std::numeric_limits<std::uint64_t>::max() / layout_.row_bytes) {
         throw std::invalid_argument("n-gram table: payload size overflows");
     }
-    const std::uint64_t end = layout_.payload_offset + layout_.rows * layout_.row_bytes;
-    if (file_->size() < end) {
-        throw std::runtime_error("n-gram table: " + layout_.path.string() + " holds " +
-                                 std::to_string(file_->size()) + " bytes, the table needs " +
-                                 std::to_string(end));
+    const std::uint64_t table_bytes = layout_.rows * layout_.row_bytes;
+    std::uint64_t covered           = 0;
+    for (const auto& segment : layout_.segments) {
+        files_.push_back(std::make_unique<File>(segment.path));
+        if (segment.bytes == 0 ||
+            segment.file_offset > std::numeric_limits<std::uint64_t>::max() - segment.bytes ||
+            files_.back()->size() < segment.file_offset + segment.bytes) {
+            throw std::runtime_error("n-gram table: " + segment.path.string() + " holds " +
+                                     std::to_string(files_.back()->size()) +
+                                     " bytes, short of its table segment");
+        }
+        starts_.push_back(covered);
+        covered += segment.bytes;
+    }
+    if (covered < table_bytes) {
+        throw std::runtime_error("n-gram table: the files hold " + std::to_string(covered) +
+                                 " table bytes, the table needs " + std::to_string(table_bytes));
     }
     if (residency_ == NgramResidency::Ram) {
-        const std::uint64_t bytes = layout_.rows * layout_.row_bytes;
-        if (bytes > std::numeric_limits<std::size_t>::max()) {
+        if (table_bytes > std::numeric_limits<std::size_t>::max()) {
             throw std::runtime_error("n-gram table: payload exceeds the address space");
         }
-        resident_.resize(static_cast<std::size_t>(bytes));
-        file_->read(layout_.payload_offset, resident_.data(), resident_.size());
+        resident_.resize(static_cast<std::size_t>(table_bytes));
+        read(0, resident_.data(), resident_.size());
     }
 }
 
 NgramTableReader::~NgramTableReader() = default;
+
+void NgramTableReader::read(std::uint64_t offset, std::uint8_t* destination,
+                            std::size_t bytes) const {
+    auto segment = static_cast<std::size_t>(
+        std::upper_bound(starts_.begin(), starts_.end(), offset) - starts_.begin() - 1);
+    while (bytes > 0) {
+        const auto& layout        = layout_.segments[segment];
+        const std::uint64_t local = offset - starts_[segment];
+        const std::size_t count =
+            static_cast<std::size_t>(std::min<std::uint64_t>(bytes, layout.bytes - local));
+        files_[segment]->read(layout.file_offset + local, destination, count);
+        destination += count;
+        offset += count;
+        bytes -= count;
+        ++segment;
+    }
+}
 
 void NgramTableReader::read_rows(std::span<const std::uint64_t> row_ids,
                                  std::span<std::uint8_t> out) const {
@@ -139,7 +165,7 @@ void NgramTableReader::read_rows(std::span<const std::uint64_t> row_ids,
         if (residency_ == NgramResidency::Ram) {
             std::memcpy(destination, resident_.data() + row * row_bytes, row_bytes);
         } else {
-            file_->read(layout_.payload_offset + row * row_bytes, destination, row_bytes);
+            read(row * row_bytes, destination, row_bytes);
         }
     }
 }

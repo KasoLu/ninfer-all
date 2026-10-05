@@ -61,6 +61,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/sparse_attention/sparse_attention.cu"
   "${CMAKE_CURRENT_LIST_DIR}/moe_route/moe_route.cu"
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/moe_experts_bf16.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/moe_experts/moe_experts_gguf.cu"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/silu_mul.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/target_logprobs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/vision_pos_embed.cpp"
