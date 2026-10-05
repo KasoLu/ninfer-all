@@ -82,6 +82,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const artifact::Reader reader(options.artifact_path);
     inspect.complete();
     models::qwen4_exp::LoadOptions load;
+    load.artifact     = options.artifact_path;
     load.ranks        = device.size();
     load.stage_layers = options.stage_layers;
     load.experts      = options.expert_residency;
@@ -125,6 +126,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                                        : models::qwen4_exp::NgramResidency::Disk;
     executor.expert_cache_bytes =
         options.expert_cache_bytes.value_or(models::qwen4_exp::ExecutorOptions::kAutoExpertCache);
+    executor.cuda_graphs = options.use_cuda_graph;
     instance->executor = std::make_unique<models::qwen4_exp::Executor>(*model, device, executor);
     device.synchronize();
     program.complete();
@@ -132,11 +134,18 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                        "Qwen3.8-Flash-Next: %zu stage(s), experts in %s memory, n-gram table %s "
                        "(%s), state %.0f MiB, workspace %.0f MiB, expert cache %.0f MiB",
                        model->stages().stages(),
-                       options.expert_residency == ExpertResidency::Host ? "pinned host" : "device",
+                       options.expert_residency == ExpertResidency::Host   ? "pinned host"
+                       : options.expert_residency == ExpertResidency::Disk ? "the artifact's files"
+                                                                           : "device",
                        companion.string().c_str(), options.ngram_table.ram ? "RAM" : "disk",
                        double(instance->executor->memory().state_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0,
                        double(instance->executor->memory().expert_cache_bytes) / 1048576.0);
+    if (options.kv_cache != KvCacheStorage::BFloat16) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                           "Qwen3.8-Flash-Next keeps its KV in BF16; the requested KV storage does "
+                           "not apply");
+    }
 
     ConstructedQwen4Exp out;
     const auto& stats     = model->storage_stats();

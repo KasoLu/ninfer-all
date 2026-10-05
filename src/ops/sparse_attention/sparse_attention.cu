@@ -32,7 +32,7 @@ __device__ __forceinline__ int position_at(const int* blocks, int count, int tai
 }
 
 __global__ void __launch_bounds__(kThreads)
-    sparse_attention_kernel(const __nv_bfloat16* __restrict__ q, int first_position,
+    sparse_attention_kernel(const __nv_bfloat16* __restrict__ q, const int* __restrict__ first,
                             const int* __restrict__ selected, const int* __restrict__ counts,
                             const __nv_bfloat16* __restrict__ k_pages,
                             const __nv_bfloat16* __restrict__ v_pages,
@@ -47,7 +47,7 @@ __global__ void __launch_bounds__(kThreads)
     const int warp     = threadIdx.x >> 5;
     const int lane     = threadIdx.x & 31;
     const int q_head   = kv_head * kGroup + warp;
-    const int position = first_position + t;
+    const int position   = *first + t;
     const int count    = counts[t];
     const int tail_begin = (position + 1) / 4 * 4;
     const int total      = 4 * count + (position + 1 - tail_begin);
@@ -136,14 +136,16 @@ void require(bool condition, const char* message) {
 
 } // namespace
 
-void sparse_softmax_attention(const Tensor& q, std::int32_t first_position, const Tensor& selected,
+void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, const Tensor& selected,
                               const Tensor& counts, const PagedKVLayerView& cache, float scale,
                               Tensor& out, cudaStream_t stream) {
     require(q.dtype == DType::BF16 && q.is_contiguous() && q.data != nullptr &&
                 q.ne[0] == kHeadDim && q.ne[1] == kQueryHeads && q.ne[2] > 0 && q.ne[3] == 1,
             "q must be contiguous BF16 [256, 24, tokens]");
     const std::int32_t tokens = q.ne[2];
-    require(first_position >= 0, "first_position must be non-negative");
+    require(first_position.dtype == DType::I32 && first_position.data != nullptr &&
+                first_position.numel() >= 1,
+            "first_position must be a device I32 word");
     require(selected.dtype == DType::I32 && selected.is_contiguous() && selected.data != nullptr &&
                 selected.ne[0] == kTopBlocks && selected.ne[1] == tokens,
             "selected must be contiguous I32 [512, tokens]");
@@ -158,12 +160,9 @@ void sparse_softmax_attention(const Tensor& q, std::int32_t first_position, cons
                 cache.v_pages.dtype == DType::BF16 && cache.block_table.dtype == DType::I32 &&
                 cache.block_table.data != nullptr,
             "cache must be a BF16 paged layer of 2 heads of 256");
-    const std::int64_t last = static_cast<std::int64_t>(first_position) + tokens - 1;
-    require(last < static_cast<std::int64_t>(cache.block_table.ne[0]) * kPagedKVPageSize,
-            "the block table does not cover the last position");
     require(std::isfinite(scale) && scale > 0.0f, "scale must be positive and finite");
     sparse_attention_kernel<<<dim3(tokens, kKvHeads), kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data), first_position,
+        static_cast<const __nv_bfloat16*>(q.data), static_cast<const int*>(first_position.data),
         static_cast<const int*>(selected.data), static_cast<const int*>(counts.data),
         static_cast<const __nv_bfloat16*>(cache.k_pages.data),
         static_cast<const __nv_bfloat16*>(cache.v_pages.data),

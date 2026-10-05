@@ -88,7 +88,7 @@ int run(int first_position, int tokens, std::uint32_t seed) {
         return bits;
     };
     GuardedDeviceBuffer d_k(k.size() * 2), d_v(v.size() * 2), d_q(q.size() * 2), d_out(q.size() * 2),
-        d_selected(selected.size() * 4), d_counts(counts.size() * 4), d_table(table.size() * 4);
+        d_selected(selected.size() * 4), d_counts(counts.size() * 4), d_table(table.size() * 4), d_first(4);
     const auto kb = encode(k), vb = encode(v), qb = encode(q);
     d_k.copy_from_host(kb.data(), d_k.bytes());
     d_v.copy_from_host(vb.data(), d_v.bytes());
@@ -96,6 +96,7 @@ int run(int first_position, int tokens, std::uint32_t seed) {
     d_selected.copy_from_host(selected.data(), d_selected.bytes());
     d_counts.copy_from_host(counts.data(), d_counts.bytes());
     d_table.copy_from_host(table.data(), d_table.bytes());
+    d_first.copy_from_host(&first_position, 4);
     PagedKVLayerView cache{};
     cache.k_pages      = Tensor(d_k.data(), DType::BF16, {kDim, kPage, kKvHeads, pages});
     cache.v_pages      = Tensor(d_v.data(), DType::BF16, {kDim, kPage, kKvHeads, pages});
@@ -107,12 +108,13 @@ int run(int first_position, int tokens, std::uint32_t seed) {
     Tensor t_out(d_out.data(), DType::BF16, {kDim, kQHeads, tokens});
     Tensor t_selected(d_selected.data(), DType::I32, {kTop, tokens});
     Tensor t_counts(d_counts.data(), DType::I32, {tokens});
-    ops::sparse_softmax_attention(t_q, first_position, t_selected, t_counts, cache, scale, t_out, nullptr);
+    const Tensor t_first(d_first.data(), DType::I32, {1});
+    ops::sparse_softmax_attention(t_q, t_first, t_selected, t_counts, cache, scale, t_out, nullptr);
     cuda_synchronize();
     const std::string label = "sparse attention p=" + std::to_string(first_position) + " T=" + std::to_string(tokens);
     int failures = verify_reduction(label, from_device_bf16(d_out.data(), q.size()), expected,
                                     {4.0e-3, 1.0e-4, 2.0 * 3.90625e-3});
-    for (auto* buffer : {&d_k, &d_v, &d_q, &d_out, &d_selected, &d_counts, &d_table}) {
+    for (auto* buffer : {&d_k, &d_v, &d_q, &d_out, &d_selected, &d_counts, &d_table, &d_first}) {
         failures += buffer->verify_guards(label.c_str());
     }
     return failures;

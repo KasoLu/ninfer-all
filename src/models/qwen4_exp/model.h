@@ -7,6 +7,7 @@
 // block where the GPU reads them across the bus.
 
 #include "artifact/materializer.h"
+#include "core/arena.h"
 #include "core/device.h"
 #include "core/stage_plan.h"
 #include "core/startup.h"
@@ -17,7 +18,10 @@
 #include "ninfer/ops/weight_input.h"
 #include "ninfer/types.h"
 
+#include <array>
 #include <cstdint>
+#include <filesystem>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -51,9 +55,27 @@ struct GdnWeights {
     WeightId convolution, norm, output;
 };
 
+// Where one expert's rows of one projection sit in the artifact's files (disk-resident experts):
+// one run of one file, or two when the rows straddle the boundary between two files.
+struct ExpertLocation {
+    struct Run {
+        std::size_t file     = 0; // index into Model::files()
+        std::uint64_t offset = 0; // byte offset in that file
+        std::uint64_t bytes  = 0; // 0: unused
+    };
+
+    std::array<Run, 2> runs{};
+    std::uint64_t bytes    = 0; // of all runs
+    QType format           = QType::GGUF_Q8_0;
+    std::int64_t row_bytes = 0;
+    std::int32_t rows      = 0;
+};
+
 struct MoeWeights {
     WeightId router, shared_score;
-    std::vector<WeightId> gate, up, down; // one per expert
+    // One per expert; empty when the experts stay in the files, which `located` then describes.
+    std::vector<WeightId> gate, up, down;
+    std::vector<ExpertLocation> located_gate, located_up, located_down;
     WeightId shared_gate, shared_up, shared_down;
 };
 
@@ -76,6 +98,8 @@ struct TextWeights {
 
 
 struct LoadOptions {
+    // The artifact's entry file; its part files sit next to it.
+    std::filesystem::path artifact;
     // Pipeline stages, one per device rank; `stage_layers` lists each one's layer count (empty:
     // balanced by the bytes each stage holds).
     std::size_t ranks = 1;
@@ -105,10 +129,16 @@ public:
 
     [[nodiscard]] std::span<const BoundWeight> weight_data() const noexcept { return bound_; }
 
-    // The weight's one mathematical use, as a projection operand.
+    // The weight's one mathematical use, as a projection operand, its auxiliaries on the weight's
+    // device.
     [[nodiscard]] ops::WeightInput input(WeightId id) const;
 
     [[nodiscard]] const FrontendResources& resources() const noexcept { return resources_; }
+
+    // The artifact's files, in its order (disk-resident experts are read from them).
+    [[nodiscard]] const std::vector<std::filesystem::path>& files() const noexcept {
+        return files_;
+    }
 
     [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }
 
@@ -123,6 +153,8 @@ private:
           std::vector<BoundWeight> bound, FrontendResources resources, InstanceInfo info,
           artifact::MaterializedArtifact backing);
 
+    void replicate_auxiliaries(DeviceContext& device);
+
     // Destroy every borrower before the backing.
     artifact::MaterializedArtifact backing_;
     TextConfig config_;
@@ -132,6 +164,13 @@ private:
     std::vector<BoundWeight> bound_;
     FrontendResources resources_;
     InstanceInfo info_;
+    std::vector<std::filesystem::path> files_;
+    // The device rank of every weight, by WeightId: its layer's stage, 0 when nothing placed it.
+    std::vector<std::size_t> ranks_;
+    // An artifact stores identical auxiliaries once (one input gather serves every Gated DeltaNet
+    // output projection), so one object can serve Uses on several stages. It is materialized on
+    // rank 0; every other rank whose Uses read it holds a copy, by (auxiliary, rank).
+    std::map<std::pair<std::size_t, std::size_t>, DeviceBuffer> replicas_;
 };
 
 // Whether the artifact's text component is this family.

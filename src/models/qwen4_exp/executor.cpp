@@ -1,9 +1,11 @@
 #include "models/qwen4_exp/executor.h"
 
 #include "core/arena.h"
+#include "core/decode_graph.h"
 #include "core/paged_kv_cache.h"
 #include "core/weight_view.h"
 #include "models/qwen4_exp/ngram_hash.h"
+#include "models/qwen4_exp/expert_stream.h"
 #include "models/qwen4_exp/ngram_table.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
@@ -199,6 +201,26 @@ ExpertTable make_table(const Model& model, std::span<const WeightId> ids) {
     return out;
 }
 
+// A layer's table for experts that stay in the artifact's files: every entry null until the
+// expert stream makes the expert resident.
+ExpertTable make_located_table(std::span<const ExpertLocation> locations) {
+    ExpertTable out;
+    for (const auto& location : locations) {
+        if (out.row_bytes == 0) {
+            out.format    = location.format;
+            out.row_bytes = location.row_bytes;
+            out.rows      = location.rows;
+        } else if (location.format != out.format || location.row_bytes != out.row_bytes ||
+                   location.rows != out.rows) {
+            throw std::invalid_argument("every expert of a bank must share its block type");
+        }
+    }
+    out.pointers.assign(locations.size(), nullptr);
+    out.table = DeviceBuffer(out.pointers.size() * sizeof(void*));
+    out.table.copy_from_host(out.pointers.data(), out.pointers.size() * sizeof(void*));
+    return out;
+}
+
 struct MoePlan {
     Tensor router, shared_gate;
     ExpertTable gate, up, down, shared_gate_table, shared_up_table, shared_down_table;
@@ -234,6 +256,20 @@ struct SequenceState {
     std::uint32_t position = 0;
     NgramContext context;
     std::vector<LayerState> layers;
+    // One decode graph per segment, captured at the sequence's second decode step: the first runs
+    // eagerly, so every lazy initialization of the ops it reaches happens outside capture. The
+    // graphs read the token, its position and n-gram rows from the ranks' staged planes and stay
+    // valid for the sequence's lifetime, across resets.
+    std::vector<DecodeGraphExecutable> decode;
+    std::uint32_t decode_steps = 0;
+};
+
+// Consecutive layers on one rank, in pass order. The first segment also embeds the tokens, the
+// segment on the head rank after the last layer also runs the final mixer and the head.
+struct Segment {
+    std::size_t rank  = 0;
+    std::size_t begin = 0, end = 0; // layers
+    bool embed = false, head = false;
 };
 
 // What one device holds for the layers it runs: activation planes sized for a full chunk and a
@@ -283,6 +319,7 @@ struct Executor::Impl {
     Projection head;
     HcPlan final_mixer;
     std::vector<LayerPlan> layers;
+    std::vector<Segment> segments;
     std::vector<RankState> ranks;
     std::vector<SequenceState> sequences;
     std::uint32_t pages          = 0; // KV pages per sequence and attention layer
@@ -294,6 +331,8 @@ struct Executor::Impl {
     // Expert cache (host-resident experts): every layer's routes of the last pass, on its device
     // and in pinned host memory, and how many tokens they cover.
     std::unique_ptr<ExpertCache> cache;
+    // Disk-resident experts: made resident before each layer's experts run.
+    std::unique_ptr<ExpertStream> stream;
     std::vector<DeviceBuffer> route_records;
     std::unique_ptr<PinnedHostBuffer> route_host;
     std::uint32_t pending_routes = 0;
@@ -310,12 +349,19 @@ struct Executor::Impl {
         pages          = (options.max_context + kPagedKVPageSize - 1) / kPagedKVPageSize;
         pooled_slots   = options.max_context / config.indexer_compress_ratio + 1;
         plan_weights();
+        plan_segments();
         allocate_ranks();
         allocate_sequences();
         allocate_cache();
     }
 
     ~Impl() {
+        for (auto& sequence : sequences) {
+            for (std::size_t i = 0; i < sequence.decode.size(); ++i) {
+                RankBinding bind(device, segments[i].rank);
+                sequence.decode[i].reset();
+            }
+        }
         for (auto& rank : ranks) {
             RankBinding bind(device, rank.rank);
             if (rank.staged != nullptr) { cudaEventDestroy(rank.staged); }
@@ -390,14 +436,38 @@ struct Executor::Impl {
             plan.moe.router =
                 direct(model, lw.moe.router, {h, static_cast<std::int32_t>(config.num_experts)});
             plan.moe.shared_gate       = direct(model, lw.moe.shared_score, {h});
-            plan.moe.gate              = make_table(model, lw.moe.gate);
-            plan.moe.up                = make_table(model, lw.moe.up);
-            plan.moe.down              = make_table(model, lw.moe.down);
+            if (lw.moe.gate.empty()) {
+                plan.moe.gate = make_located_table(lw.moe.located_gate);
+                plan.moe.up   = make_located_table(lw.moe.located_up);
+                plan.moe.down = make_located_table(lw.moe.located_down);
+            } else {
+                plan.moe.gate = make_table(model, lw.moe.gate);
+                plan.moe.up   = make_table(model, lw.moe.up);
+                plan.moe.down = make_table(model, lw.moe.down);
+            }
             plan.moe.shared_gate_table = make_table(model, std::span(&lw.moe.shared_gate, 1));
             plan.moe.shared_up_table   = make_table(model, std::span(&lw.moe.shared_up, 1));
             plan.moe.shared_down_table = make_table(model, std::span(&lw.moe.shared_down, 1));
             layers.push_back(std::move(plan));
         }
+    }
+
+    void plan_segments() {
+        Segment current{.rank = 0, .begin = 0, .end = 0, .embed = true};
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            if (layers[i].rank != current.rank) {
+                segments.push_back(current);
+                current = Segment{.rank = layers[i].rank, .begin = i, .end = i};
+            }
+            current.end = i + 1;
+        }
+        if (current.rank != model.head_rank()) {
+            segments.push_back(current);
+            current =
+                Segment{.rank = model.head_rank(), .begin = layers.size(), .end = layers.size()};
+        }
+        current.head = true;
+        segments.push_back(current);
     }
 
     [[nodiscard]] std::size_t workspace_bytes(std::size_t rank) const {
@@ -550,7 +620,9 @@ struct Executor::Impl {
         }
         route_host =
             std::make_unique<PinnedHostBuffer>(layers.size() * pairs * sizeof(std::int32_t));
-        if (model.options().experts != ExpertResidency::Host || options.expert_cache_bytes == 0) {
+        const ExpertResidency residency = model.options().experts;
+        if (residency == ExpertResidency::Device ||
+            (residency == ExpertResidency::Host && options.expert_cache_bytes == 0)) {
             return;
         }
         // What each rank lends: the request split evenly, or what is free less a margin for the
@@ -566,6 +638,25 @@ struct Executor::Impl {
                            ? available
                            : std::min<std::uint64_t>(available,
                                                      options.expert_cache_bytes / device.size());
+        }
+        if (residency == ExpertResidency::Disk) {
+            if (options.expert_cache_bytes == 0) {
+                throw std::invalid_argument("disk-resident experts need a device expert cache");
+            }
+            std::vector<ExpertStreamLayer> stream_layers;
+            for (std::size_t i = 0; i < layers.size(); ++i) {
+                const auto& moe = model.weights().layers[i].moe;
+                stream_layers.push_back(ExpertStreamLayer{
+                    .rank    = layers[i].rank,
+                    .stream  = ranks[layers[i].rank].stream,
+                    .experts = {moe.located_gate, moe.located_up, moe.located_down},
+                    .tables  = {layers[i].moe.gate.table.p, layers[i].moe.up.table.p,
+                                layers[i].moe.down.table.p}});
+            }
+            stream = std::make_unique<ExpertStream>(device, model.files(), std::move(stream_layers),
+                                                    bytes);
+            for (const auto value : bytes) { memory.expert_cache_bytes += value; }
+            return;
         }
         std::vector<ExpertCacheLayer> cache_layers;
         for (const auto& plan : layers) {
@@ -746,8 +837,7 @@ struct Executor::Impl {
         project(g.output, gated, y, ws, s);
     }
 
-    void run_qsa(const LayerPlan& plan, LayerState& state, RankState& rank, std::int32_t t,
-                 std::int32_t first) {
+    void run_qsa(const LayerPlan& plan, LayerState& state, RankState& rank, std::int32_t t) {
         const QsaPlan& a     = *plan.qsa;
         WorkspaceArena& ws   = *rank.workspace;
         const cudaStream_t s = rank.stream;
@@ -792,6 +882,8 @@ struct Executor::Impl {
         Tensor tail(state.tail.p, DType::FP32,
                     {di, static_cast<std::int32_t>(config.indexer_compress_ratio - 1)});
         const ops::QsaIndexerWeights iw{&a.index_query_norm, &a.index_key_norm};
+        // The call's first position is the first staged one, read on the device.
+        const Tensor first(rank.positions, DType::I32, {1});
         ops::qsa_indexer_append(index, first, iw, config.rms_norm_eps, pooled, tail, s);
         Tensor selected(rank.selected, DType::I32,
                         {static_cast<std::int32_t>(config.indexer_block_budget()), t});
@@ -847,9 +939,85 @@ struct Executor::Impl {
         Tensor weights(rank.route_weights, DType::FP32, {top, t});
         Tensor shared(rank.route_shared, DType::FP32, {t});
         ops::moe_route(mixed, m.router, m.shared_gate, ids, weights, shared, s);
+        if (stream) {
+            // The routes reach the host before the layer's experts can be made resident.
+            auto* host = static_cast<std::int32_t*>(route_host->data()) +
+                         index * std::size_t(top) * options.prefill_chunk;
+            CUDA_CHECK(cudaMemcpyAsync(host, ids.data, std::size_t(top) * t * 4,
+                                       cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaStreamSynchronize(s));
+            stream->prepare(index, std::span<const std::int32_t>(host, std::size_t(top) * t));
+        }
         Tensor y(rank.y, DType::FP32, {h, t});
         auto scope = ws.scope();
         ops::moe_experts_gguf(mixed, ids, weights, shared, m.banks(), ws, y, s);
+    }
+
+    // Queues one segment of the pass for `t` tokens on its rank's stream; with `head`, the logits
+    // of the last `logit_rows` tokens.
+    void run_segment(SequenceState& sequence, const Segment& segment, std::int32_t t,
+                     std::uint32_t logit_rows) {
+        RankState& rank = ranks[segment.rank];
+        const auto h    = static_cast<std::int32_t>(config.hidden_size);
+        const auto hc   = static_cast<std::int32_t>(config.hc_count);
+        Tensor stack(rank.stack, DType::FP32, {h, hc, t});
+        Tensor mixed(rank.mixed, DType::BF16, {h, t});
+        if (segment.embed) {
+            const Tensor ids(rank.ids, DType::I32, {t});
+            ops::embedding(ids, embedding_table, mixed, rank.stream);
+            ops::hyper_connection_expand(mixed, stack, rank.stream);
+        }
+        for (std::size_t i = segment.begin; i < segment.end; ++i) {
+            const LayerPlan& plan = layers[i];
+            LayerState& state     = sequence.layers[i];
+            if (plan.ple) { run_ple(plan, state, rank, t, stack); }
+            Tensor inject(rank.inject, DType::FP32, {hc, t});
+            {
+                auto scope = rank.workspace->scope();
+                ops::hyper_connection_read(stack, plan.attn_hc.weights(), config.rms_norm_eps,
+                                           *rank.workspace, mixed, &inject, rank.stream);
+            }
+            if (plan.gdn) {
+                run_gdn(plan, state, rank, t);
+            } else {
+                run_qsa(plan, state, rank, t);
+            }
+            ops::hyper_connection_write(stack, Tensor(rank.y, DType::BF16, {h, t}), inject,
+                                        rank.stream);
+            {
+                auto scope = rank.workspace->scope();
+                ops::hyper_connection_read(stack, plan.mlp_hc.weights(), config.rms_norm_eps,
+                                           *rank.workspace, mixed, &inject, rank.stream);
+            }
+            run_moe(plan, rank, t, i);
+            ops::hyper_connection_write(stack, Tensor(rank.y, DType::FP32, {h, t}), inject,
+                                        rank.stream);
+        }
+        if (!segment.head) { return; }
+        const auto n = static_cast<std::int32_t>(logit_rows);
+        const Tensor last(rank.stack + std::size_t(hc) * h * (t - n), DType::FP32, {h, hc, n});
+        Tensor head_mixed(rank.mixed, DType::BF16, {h, n});
+        {
+            auto scope = rank.workspace->scope();
+            ops::hyper_connection_read(last, final_mixer.weights(), config.rms_norm_eps,
+                                       *rank.workspace, head_mixed, nullptr, rank.stream);
+        }
+        Tensor logits(rank.logits, DType::BF16, {static_cast<std::int32_t>(config.vocab_size), n});
+        project(head, head_mixed, logits, *rank.workspace, rank.stream);
+    }
+
+    void capture_decode(SequenceState& sequence) {
+        std::vector<DecodeGraphExecutable> graphs;
+        for (const Segment& segment : segments) {
+            RankBinding bind(device, segment.rank);
+            DecodeGraphDefinition definition;
+            definition.capture(ranks[segment.rank].stream,
+                               [&] { run_segment(sequence, segment, 1, 1); });
+            DecodeGraphExecutable graph;
+            graph.instantiate(definition);
+            graphs.push_back(std::move(graph));
+        }
+        sequence.decode = std::move(graphs);
     }
 
     void forward(std::uint32_t s, std::span<const std::int32_t> tokens, std::uint32_t logit_rows) {
@@ -869,69 +1037,24 @@ struct Executor::Impl {
                 throw std::invalid_argument("qwen4_exp forward: token outside the vocabulary");
             }
         }
-        const auto first = static_cast<std::int32_t>(sequence.position);
         settle_routes();
         stage_inputs(sequence, tokens);
-        const auto h        = static_cast<std::int32_t>(config.hidden_size);
-        const auto hc       = static_cast<std::int32_t>(config.hc_count);
-        std::size_t current = 0;
-        {
-            RankState& rank = ranks[0];
-            RankBinding bind(device, 0);
-            const Tensor ids(rank.ids, DType::I32, {t});
-            Tensor x(rank.mixed, DType::BF16, {h, t});
-            ops::embedding(ids, embedding_table, x, rank.stream);
-            Tensor stack(rank.stack, DType::FP32, {h, hc, t});
-            ops::hyper_connection_expand(x, stack, rank.stream);
+        // Disk-resident experts need the host between a layer's routing and its experts, so their
+        // passes stay eager.
+        const bool graph = options.cuda_graphs && t == 1 && !stream;
+        if (graph && sequence.decode.empty() && sequence.decode_steps++ > 0) {
+            capture_decode(sequence);
         }
-        for (std::size_t i = 0; i < layers.size(); ++i) {
-            const LayerPlan& plan = layers[i];
-            if (plan.rank != current) {
-                cross(current, plan.rank, t);
-                current = plan.rank;
-            }
-            RankState& rank = ranks[current];
-            RankBinding bind(device, current);
-            LayerState& state = sequence.layers[i];
-            Tensor stack(rank.stack, DType::FP32, {h, hc, t});
-            if (plan.ple) { run_ple(plan, state, rank, t, stack); }
-            Tensor mixed(rank.mixed, DType::BF16, {h, t});
-            Tensor inject(rank.inject, DType::FP32, {hc, t});
-            {
-                auto scope = rank.workspace->scope();
-                ops::hyper_connection_read(stack, plan.attn_hc.weights(), config.rms_norm_eps,
-                                           *rank.workspace, mixed, &inject, rank.stream);
-            }
-            if (plan.gdn) {
-                run_gdn(plan, state, rank, t);
+        for (std::size_t i = 0; i < segments.size(); ++i) {
+            const Segment& segment = segments[i];
+            if (i > 0) { cross(segments[i - 1].rank, segment.rank, t); }
+            RankBinding bind(device, segment.rank);
+            if (graph && !sequence.decode.empty()) {
+                sequence.decode[i].launch(ranks[segment.rank].stream);
             } else {
-                run_qsa(plan, state, rank, t, first);
+                run_segment(sequence, segment, t, logit_rows);
             }
-            ops::hyper_connection_write(stack, Tensor(rank.y, DType::BF16, {h, t}), inject,
-                                        rank.stream);
-            {
-                auto scope = rank.workspace->scope();
-                ops::hyper_connection_read(stack, plan.mlp_hc.weights(), config.rms_norm_eps,
-                                           *rank.workspace, mixed, &inject, rank.stream);
-            }
-            run_moe(plan, rank, t, i);
-            ops::hyper_connection_write(stack, Tensor(rank.y, DType::FP32, {h, t}), inject,
-                                        rank.stream);
         }
-        const std::size_t head_rank = model.head_rank();
-        if (current != head_rank) { cross(current, head_rank, t); }
-        RankState& rank = ranks[head_rank];
-        RankBinding bind(device, head_rank);
-        const auto n = static_cast<std::int32_t>(logit_rows);
-        const Tensor last(rank.stack + std::size_t(hc) * h * (t - n), DType::FP32, {h, hc, n});
-        Tensor mixed(rank.mixed, DType::BF16, {h, n});
-        {
-            auto scope = rank.workspace->scope();
-            ops::hyper_connection_read(last, final_mixer.weights(), config.rms_norm_eps,
-                                       *rank.workspace, mixed, nullptr, rank.stream);
-        }
-        Tensor logits(rank.logits, DType::BF16, {static_cast<std::int32_t>(config.vocab_size), n});
-        project(head, mixed, logits, *rank.workspace, rank.stream);
         sequence.position += static_cast<std::uint32_t>(t);
         record_routes(static_cast<std::uint32_t>(t));
     }
@@ -966,6 +1089,14 @@ Tensor Executor::logits(std::uint32_t rows) const {
 std::size_t Executor::head_rank() const noexcept { return impl_->model.head_rank(); }
 
 ExpertCacheStats Executor::expert_cache_stats() const noexcept {
+    if (impl_->stream) {
+        const auto stream = impl_->stream->stats();
+        return ExpertCacheStats{.routes       = stream.routes,
+                                .hits         = stream.hits,
+                                .admitted     = stream.routes - stream.hits,
+                                .copied_bytes = stream.read_bytes,
+                                .slots        = stream.slots};
+    }
     return impl_->cache ? impl_->cache->stats() : ExpertCacheStats{};
 }
 

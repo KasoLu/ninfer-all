@@ -98,18 +98,58 @@ SparseAttentionWeights bind_attention(Bindings& b, const TextConfig& c, const st
     return out;
 }
 
+// Where a parameter's rows sit in the artifact's files, without demanding its object.
+ExpertLocation locate(const artifact::Reader& reader, const std::string& name, std::uint64_t rows,
+                      std::uint64_t k) {
+    const auto& bindings = reader.directory().bindings;
+    const auto found     = bindings.find(name);
+    if (found == bindings.end() || found->second.parts.size() != 1) {
+        throw artifact::ArtifactError(name + ": a disk-resident expert must be one stored region");
+    }
+    const auto& part     = found->second.parts.front();
+    const auto& geometry = reader.geometry(part.object);
+    if (!is_gguf(geometry.format) || geometry.shape.size() != 2 || geometry.shape[1] != k ||
+        part.end - part.begin != rows * k || part.begin % k != 0) {
+        throw artifact::ArtifactError(name + ": disk-resident experts must be GGUF block rows");
+    }
+    const auto block              = gguf_block_shape(geometry.format);
+    const std::uint64_t row_bytes = k / block.elements * block.bytes;
+    const std::uint64_t logical =
+        reader.directory().tensor(part.object).offset + part.begin / k * row_bytes;
+    const auto segments = reader.segments(logical, rows * row_bytes);
+    if (segments.empty() || segments.size() > 2) {
+        throw artifact::ArtifactError(name + ": a disk-resident expert spans more than two files");
+    }
+    ExpertLocation out{.runs      = {},
+                       .bytes     = rows * row_bytes,
+                       .format    = geometry.format,
+                       .row_bytes = static_cast<std::int64_t>(row_bytes),
+                       .rows      = static_cast<std::int32_t>(rows)};
+    for (std::size_t i = 0; i < segments.size(); ++i) {
+        out.runs[i] = {segments[i].file_index, segments[i].file_offset, segments[i].bytes};
+    }
+    return out;
+}
+
 MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
-                    artifact::Residency experts) {
+                    ExpertResidency residency) {
     const std::uint64_t h = c.hidden_size, w = c.moe_intermediate_size;
     const std::string m = p + "moe/", input = p + "ffn_input";
     MoeWeights out;
     out.router       = b.parameter(m + "router", {c.num_experts, h}, {input});
     out.shared_score = b.parameter(m + "shared_score", {1, h}, {input});
-    out.gate.reserve(c.num_experts);
-    out.up.reserve(c.num_experts);
-    out.down.reserve(c.num_experts);
+    const artifact::Residency experts = residency == ExpertResidency::Host
+                                            ? artifact::Residency::Pinned
+                                            : artifact::Residency::Device;
     for (std::uint32_t e = 0; e < c.num_experts; ++e) {
         const std::string x = m + "experts/" + std::to_string(e) + "/";
+        if (residency == ExpertResidency::Disk) {
+            const auto& reader = b.binder.reader();
+            out.located_gate.push_back(locate(reader, x + "gate", w, h));
+            out.located_up.push_back(locate(reader, x + "up", w, h));
+            out.located_down.push_back(locate(reader, x + "down", h, w));
+            continue;
+        }
         out.gate.push_back(b.parameter(x + "gate", {w, h}, {input}, {}, experts));
         out.up.push_back(b.parameter(x + "up", {w, h}, {input}, {}, experts));
         out.down.push_back(b.parameter(x + "down", {h, w}, {x + "product"}, {}, experts));
@@ -237,8 +277,28 @@ ops::WeightInput Model::input(WeightId id) const {
         const auto& columns = weight(*use.input_columns).view;
         result.input_columns =
             weight_tensor(columns, {static_cast<std::int32_t>(columns.shape[0])});
+        const auto replica = replicas_.find({use.input_columns->index, ranks_.at(id.index)});
+        if (replica != replicas_.end()) { result.input_columns.data = replica->second.p; }
     }
     return result;
+}
+
+void Model::replicate_auxiliaries(DeviceContext& device) {
+    for (std::size_t i = 0; i < bound_.size(); ++i) {
+        const std::size_t rank = ranks_[i];
+        for (const auto& use : bound_[i].uses) {
+            if (!use.input_columns) { continue; }
+            const std::size_t auxiliary = use.input_columns->index;
+            if (ranks_[auxiliary] == rank || replicas_.contains({auxiliary, rank})) { continue; }
+            const auto& view    = bound_[auxiliary].view;
+            const Tensor source = weight_tensor(view, {static_cast<std::int32_t>(view.shape[0])});
+            RankBinding bind(device, rank);
+            DeviceBuffer copy(source.bytes());
+            CUDA_CHECK(cudaMemcpyPeer(copy.p, device.rank(rank).device, source.data,
+                                      device.rank(ranks_[auxiliary]).device, source.bytes()));
+            replicas_.emplace(std::pair{auxiliary, rank}, std::move(copy));
+        }
+    }
 }
 
 bool is_qwen4_exp(const artifact::Reader& reader) {
@@ -263,9 +323,6 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     artifact::Binder binder(reader);
     FrontendResources resources = bind_resources(binder, config);
     Bindings b(binder);
-    const artifact::Residency experts = options.experts == ExpertResidency::Host
-                                            ? artifact::Residency::Pinned
-                                            : artifact::Residency::Device;
 
     TextWeights weights;
     weights.token_embedding =
@@ -285,7 +342,7 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         } else {
             layer.mixer = bind_attention(b, config, p);
         }
-        layer.moe = bind_moe(b, config, p, experts);
+        layer.moe = bind_moe(b, config, p, options.experts);
         if (std::find(config.ple_layers.begin(), config.ple_layers.end(), i) !=
             config.ple_layers.end()) {
             layer.ple = bind_ple(b, config, p);
@@ -296,6 +353,11 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     // The stage split: what was asked, or the even split of the bytes each device would hold.
     const bool device_experts = options.experts == ExpertResidency::Device;
     StagePlan stages(config.num_hidden_layers);
+    std::vector<std::size_t> ranks(b.weights.size(), 0);
+    const auto place = [&](WeightId id, std::size_t rank) {
+        b.place(id, rank);
+        ranks.at(id.index) = rank;
+    };
     if (options.ranks > 1) {
         if (!options.stage_layers.empty()) {
             if (options.stage_layers.size() != options.ranks) {
@@ -318,13 +380,13 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
             const std::size_t rank = stages.placement(i).stage;
             for (const WeightId id : layer_weights(weights.layers[i], device_experts)) {
-                b.place(id, rank);
+                place(id, rank);
             }
         }
-        b.place(weights.token_embedding, 0);
+        place(weights.token_embedding, 0);
         for (const WeightId id : {weights.output_head, weights.final_mixer.norm,
                                   weights.final_mixer.down, weights.final_mixer.up}) {
-            b.place(id, stages.stages() - 1);
+            place(id, stages.stages() - 1);
         }
     } else if (!options.stage_layers.empty()) {
         throw std::invalid_argument("--stage-layers needs --devices naming more than one device");
@@ -335,13 +397,22 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     info.metadata_json   = reader.directory().metadata.dump();
     info.provenance_json = reader.directory().provenance.dump();
     info.artifact_id     = reader.artifact_id();
+    std::vector<std::filesystem::path> files;
+    for (const auto& record : reader.directory().files) {
+        files.push_back(record.path ? options.artifact.parent_path() / *record.path
+                                    : options.artifact);
+    }
     auto pending         = std::move(b.weights);
     auto materialization = std::move(binder).finish();
     auto backing = artifact::materialize(reader, std::move(materialization), device, observer);
     auto bound   = qwen3_5::loading::resolve_weights(std::move(pending), backing);
-    return std::unique_ptr<Model>(
+    auto model           = std::unique_ptr<Model>(
         new Model(std::move(config), options, std::move(weights), std::move(stages),
                   std::move(bound), std::move(resources), std::move(info), std::move(backing)));
+    model->files_ = std::move(files);
+    model->ranks_ = std::move(ranks);
+    model->replicate_auxiliaries(device);
+    return model;
 }
 
 } // namespace ninfer::models::qwen4_exp

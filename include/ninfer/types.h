@@ -456,6 +456,10 @@ enum class ExpertResidency : std::uint8_t {
     // In page-locked host memory, read by the expert kernels across the bus: the model then needs
     // only its dense weights in device memory.
     Host,
+    // Left in the artifact's files and copied into a device cache when a pass routes to them,
+    // through the OS page cache: the least host memory, at the cost of a wait for every expert a
+    // pass needs that the cache does not hold.
+    Disk,
 };
 
 // Qwen3.8-Flash-Next: the n-gram table of its per-layer embedding, a companion artifact

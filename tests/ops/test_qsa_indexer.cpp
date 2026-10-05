@@ -1,7 +1,8 @@
 // qsa_indexer_append/select against an FP64 oracle of Qwen3.8-Flash-Next's block indexer: a
 // sequence long enough for the selection to bind (650 blocks), fed as a prefill chunk that starts
 // mid-block, decode steps across block boundaries and a verify-width chunk; the pooled keys
-// pointwise and every selection as a set, up to near-ties of the 512th score.
+// pointwise and every selection as a set, up to near-ties of the 512th score. The decode steps
+// replay one captured CUDA graph, the position advancing only in the device word the ops read.
 #include "core/arena.h"
 #include "core/device.h"
 #include "ninfer/ops/qsa_indexer.h"
@@ -132,7 +133,7 @@ int run(std::uint32_t seed) {
     const int capacity = 700;
     GuardedDeviceBuffer d_projection(seq.projection.size() * 2), d_qn(kDim * 2), d_kn(kDim * 2),
         d_pooled(static_cast<std::size_t>(capacity) * kDim * 4), d_tail(3 * kDim * 4),
-        d_selected(static_cast<std::size_t>(kTop) * 64 * 4), d_counts(64 * 4);
+        d_selected(kProjection * 2 + static_cast<std::size_t>(kTop) * 64 * 4), d_counts(64 * 4);
     const auto bits = encode_bf16(seq.projection);
     d_projection.copy_from_host(bits.data(), d_projection.bytes());
     const auto qn = encode_bf16(seq.query_norm), kn = encode_bf16(seq.key_norm);
@@ -143,8 +144,13 @@ int run(std::uint32_t seed) {
     Tensor t_qn(d_qn.data(), DType::BF16, {kDim}), t_kn(d_kn.data(), DType::BF16, {kDim});
     Tensor t_pooled(d_pooled.data(), DType::FP32, {kDim, capacity});
     Tensor t_tail(d_tail.data(), DType::FP32, {kDim, 3});
+    GuardedDeviceBuffer d_first(4);
+    const Tensor t_first(d_first.data(), DType::I32, {1});
     const ops::QsaIndexerWeights weights{&t_qn, &t_kn};
     WorkspaceArena workspace(ops::qsa_indexer_select_workspace_bytes(64, capacity));
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    cudaGraphExec_t decode = nullptr;
 
     int failures = 0;
     // Chunks: a prefill that ends mid-block, decode steps across block edges, a verify width, the
@@ -153,15 +159,40 @@ int run(std::uint32_t seed) {
     int begin = 0;
     for (const int count : chunks) {
         if (begin + count > seq.length) break;
-        Tensor t_projection(static_cast<std::uint16_t*>(d_projection.data()) + static_cast<std::size_t>(begin) * kProjection,
-                            DType::BF16, {kProjection, count});
-        ops::qsa_indexer_append(t_projection, begin, weights, kEps, t_pooled, t_tail, nullptr);
+        // Decode steps read their projection column from one fixed place, as a graph replay does.
+        auto* column = static_cast<std::uint16_t*>(d_projection.data()) + static_cast<std::size_t>(begin) * kProjection;
+        if (count == 1) {
+            CUDA_CHECK(cudaMemcpyAsync(d_selected.data(), column, kProjection * 2, cudaMemcpyDeviceToDevice, stream));
+            column = static_cast<std::uint16_t*>(d_selected.data());
+        }
+        CUDA_CHECK(cudaMemcpyAsync(d_first.data(), &begin, 4, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        Tensor t_projection(column, DType::BF16, {kProjection, count});
+        Tensor t_selected(static_cast<std::byte*>(d_selected.data()) + (count == 1 ? kProjection * 2 : 0), DType::I32, {kTop, count});
+        Tensor t_counts(d_counts.data(), DType::I32, {count});
+        const auto step = [&] {
+            ops::qsa_indexer_append(t_projection, t_first, weights, kEps, t_pooled, t_tail, stream);
+            if (count <= 64) {
+                ops::qsa_indexer_select(t_projection, t_first, weights, kEps, t_pooled, workspace, t_selected, t_counts, stream);
+            }
+        };
+        if (count == 1) {
+            if (decode == nullptr) {
+                cudaGraph_t graph = nullptr;
+                CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+                step();
+                CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+                CUDA_CHECK(cudaGraphInstantiate(&decode, graph, 0));
+                CUDA_CHECK(cudaGraphDestroy(graph));
+            }
+            CUDA_CHECK(cudaGraphLaunch(decode, stream));
+        } else {
+            step();
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
         if (count <= 64) {
-            Tensor t_selected(d_selected.data(), DType::I32, {kTop, count});
-            Tensor t_counts(d_counts.data(), DType::I32, {count});
-            ops::qsa_indexer_select(t_projection, begin, weights, kEps, t_pooled, workspace, t_selected, t_counts, nullptr);
-            cuda_synchronize();
-            const auto selected = from_device<int>(d_selected.data(), static_cast<std::size_t>(kTop) * count);
+            const std::byte* selected_base = static_cast<const std::byte*>(t_selected.data);
+            const auto selected = from_device<int>(selected_base, static_cast<std::size_t>(kTop) * count);
             const auto counts   = from_device<int>(d_counts.data(), count);
             for (int t = 0; t < count; ++t) {
                 failures += check_selection("qsa select p=" + std::to_string(begin + t), seq, pooled, begin + t,
@@ -170,13 +201,14 @@ int run(std::uint32_t seed) {
         }
         begin += count;
     }
-    cuda_synchronize();
+    if (decode != nullptr) CUDA_CHECK(cudaGraphExecDestroy(decode));
+    CUDA_CHECK(cudaStreamDestroy(stream));
     const int complete = begin / 4;
     const auto got = from_device<float>(d_pooled.data(), static_cast<std::size_t>(complete) * kDim);
     std::vector<double> expected;
     for (int b = 0; b < complete; ++b) expected.insert(expected.end(), pooled[b].begin(), pooled[b].end());
     failures += verify_pointwise("qsa pooled keys", std::vector<double>(got.begin(), got.end()), expected, {2e-5, 2e-5});
-    for (auto* buffer : {&d_projection, &d_qn, &d_kn, &d_pooled, &d_tail, &d_selected, &d_counts}) {
+    for (auto* buffer : {&d_projection, &d_qn, &d_kn, &d_pooled, &d_tail, &d_selected, &d_counts, &d_first}) {
         failures += buffer->verify_guards("qsa_indexer");
     }
     return failures;

@@ -102,11 +102,13 @@ std::string serve_usage_text(const char* argv0) {
            "                                (Linux); excludes --device\n"
            "  --stage-layers A,B,...        layers per stage in --devices order (default:\n"
            "                                split by free memory)\n"
-           "  --expert-residency device|host  Qwen3.8-Flash-Next: expert banks in GPU memory\n"
-           "                                (default) or in pinned host memory, read across\n"
-           "                                the bus\n"
-           "  --expert-cache-mib N|auto     with host experts: device memory for the most\n"
-           "                                used experts (default auto: what is free; 0 off)\n"
+           "  --expert-residency device|host|disk  Qwen3.8-Flash-Next: expert banks in GPU\n"
+           "                                memory (default), in pinned host memory read\n"
+           "                                across the bus, or left in the artifact's files\n"
+           "                                and streamed into the device expert cache\n"
+           "  --expert-cache-mib N|auto     with host or disk experts: device memory for the\n"
+           "                                most used experts (default auto: what is free;\n"
+           "                                0 turns the host cache off; disk needs one)\n"
            "  --ngram-table PATH            Qwen3.8-Flash-Next n-gram companion artifact\n"
            "                                (default: found next to the model)\n"
            "  --ngram-ram                   load the n-gram table into RAM instead of\n"
@@ -969,8 +971,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 options.expert_residency = ExpertResidency::Device;
             } else if (residency == "host") {
                 options.expert_residency = ExpertResidency::Host;
+            } else if (residency == "disk") {
+                options.expert_residency = ExpertResidency::Disk;
             } else {
-                throw std::invalid_argument("--expert-residency must be device or host");
+                throw std::invalid_argument("--expert-residency must be device, host or disk");
             }
             continue;
         }

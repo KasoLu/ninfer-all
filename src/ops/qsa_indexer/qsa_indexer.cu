@@ -61,15 +61,17 @@ __device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float 
 }
 
 // One 128-thread CTA per block completing in the call: mean of its four raw keys (from the tail
-// or the projection), norm, rope at the block's first position.
+// or the projection), norm, rope at the block's first position. The grid covers every block a call
+// of `tokens` can complete; a CTA past the call's completed blocks has nothing to do.
 __global__ void __launch_bounds__(kHeadDim)
-    qsa_pool_kernel(const __nv_bfloat16* __restrict__ projection, int first_position, int tokens,
-                    const __nv_bfloat16* __restrict__ key_norm, float eps,
-                    const float* __restrict__ tail, int first_block,
-                    float* __restrict__ pooled) {
+    qsa_pool_kernel(const __nv_bfloat16* __restrict__ projection, const int* __restrict__ first,
+                    int tokens, const __nv_bfloat16* __restrict__ key_norm, float eps,
+                    const float* __restrict__ tail, int capacity, float* __restrict__ pooled) {
     __shared__ float row[kHeadDim];
     __shared__ float reduce[4];
-    const int block = first_block + static_cast<int>(blockIdx.x);
+    const int first_position = *first;
+    const int block          = first_position / kBlock + static_cast<int>(blockIdx.x);
+    if (block >= (first_position + tokens) / kBlock || block >= capacity) { return; }
     const int d     = threadIdx.x;
     float sum       = 0.0f;
 #pragma unroll
@@ -81,7 +83,6 @@ __global__ void __launch_bounds__(kHeadDim)
                                                      kProjection +
                                                  kHeads * kHeadDim + d]);
     }
-    (void)tokens;
     row[d] = sum * 0.25f;
     __syncthreads();
     norm_rope_row(row, key_norm, eps, block * kBlock, d, reduce);
@@ -90,8 +91,10 @@ __global__ void __launch_bounds__(kHeadDim)
 
 // The raw keys of the incomplete block after the call, at slot position mod 4. Positions of that
 // block before the call are already in place.
-__global__ void qsa_tail_kernel(const __nv_bfloat16* __restrict__ projection, int first_position,
-                                int tokens, float* __restrict__ tail) {
+__global__ void qsa_tail_kernel(const __nv_bfloat16* __restrict__ projection,
+                                const int* __restrict__ first, int tokens,
+                                float* __restrict__ tail) {
+    const int first_position = *first;
     const int last      = first_position + tokens - 1;
     const int start     = (last + 1) / kBlock * kBlock; // first position of the incomplete block
     const int d         = threadIdx.x;
@@ -109,7 +112,7 @@ __device__ __forceinline__ unsigned order_key(float value) {
 }
 
 __global__ void __launch_bounds__(kThreads)
-    qsa_select_kernel(const __nv_bfloat16* __restrict__ projection, int first_position,
+    qsa_select_kernel(const __nv_bfloat16* __restrict__ projection, const int* __restrict__ first,
                       const __nv_bfloat16* __restrict__ query_norm, float eps,
                       const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
                       int capacity, int* __restrict__ selected, int* __restrict__ counts) {
@@ -123,8 +126,8 @@ __global__ void __launch_bounds__(kThreads)
     __shared__ int carry;
 
     const int t        = blockIdx.x;
-    const int position = first_position + t;
-    const int blocks   = (position + 1) / kBlock;
+    const int position = *first + t;
+    const int blocks   = min((position + 1) / kBlock, capacity);
     int* out           = selected + static_cast<std::int64_t>(t) * kTopBlocks;
     const int tid      = threadIdx.x;
     if (blocks <= kTopBlocks) {
@@ -242,12 +245,18 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("qsa_indexer: ") + message); }
 }
 
-void require_projection(const Tensor& projection, std::int32_t first_position) {
+void require_projection(const Tensor& projection) {
     require(projection.dtype == DType::BF16 && projection.is_contiguous() &&
                 projection.data != nullptr && projection.ne[0] == kProjection &&
                 projection.ne[1] > 0 && projection.ne[2] == 1 && projection.ne[3] == 1,
             "projection must be contiguous BF16 [640, tokens]");
-    require(first_position >= 0, "first_position must be non-negative");
+}
+
+const int* require_position(const Tensor& first_position) {
+    require(first_position.dtype == DType::I32 && first_position.data != nullptr &&
+                first_position.numel() >= 1,
+            "first_position must be a device I32 word");
+    return static_cast<const int*>(first_position.data);
 }
 
 void require_norm(const Tensor* norm, const char* message) {
@@ -256,38 +265,34 @@ void require_norm(const Tensor* norm, const char* message) {
             message);
 }
 
-void require_pooled(const Tensor& pooled, std::int64_t blocks) {
+void require_pooled(const Tensor& pooled) {
     require(pooled.dtype == DType::FP32 && pooled.is_contiguous() && pooled.data != nullptr &&
-                pooled.ne[0] == kHeadDim && pooled.ne[1] >= blocks && pooled.ne[2] == 1,
-            "pooled must be contiguous FP32 [128, capacity] covering every complete block");
+                pooled.ne[0] == kHeadDim && pooled.ne[1] > 0 && pooled.ne[2] == 1,
+            "pooled must be contiguous FP32 [128, capacity]");
 }
 
 } // namespace
 
-void qsa_indexer_append(const Tensor& projection, std::int32_t first_position,
-                        const QsaIndexerWeights& weights, float eps, Tensor& pooled,
-                        Tensor& tail, cudaStream_t stream) {
-    require_projection(projection, first_position);
+void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
+                        const QsaIndexerWeights& weights, float eps, Tensor& pooled, Tensor& tail,
+                        cudaStream_t stream) {
+    require_projection(projection);
+    const int* first = require_position(first_position);
     require_norm(weights.key_norm, "key_norm must be BF16 [128]");
     require(eps > 0.0f, "eps must be positive");
-    const std::int32_t tokens = projection.ne[1];
-    const std::int64_t end    = static_cast<std::int64_t>(first_position) + tokens;
-    require_pooled(pooled, end / kBlock);
+    require_pooled(pooled);
     require(tail.dtype == DType::FP32 && tail.is_contiguous() && tail.data != nullptr &&
                 tail.ne[0] == kHeadDim && tail.ne[1] == kBlock - 1,
             "tail must be contiguous FP32 [128, 3]");
-    const int first_block = first_position / kBlock; // the block containing first_position
-    const int end_block   = static_cast<int>(end / kBlock); // blocks below this are complete
-    if (end_block > first_block) {
-        qsa_pool_kernel<<<end_block - first_block, kHeadDim, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(projection.data), first_position, tokens,
-            static_cast<const __nv_bfloat16*>(weights.key_norm->data), eps,
-            static_cast<const float*>(tail.data), first_block, static_cast<float*>(pooled.data));
-        CUDA_CHECK(cudaGetLastError());
-    }
+    const std::int32_t tokens = projection.ne[1];
+    // A call of `tokens` positions completes at most tokens / 4 + 1 blocks, wherever it starts.
+    qsa_pool_kernel<<<tokens / kBlock + 1, kHeadDim, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(projection.data), first, tokens,
+        static_cast<const __nv_bfloat16*>(weights.key_norm->data), eps,
+        static_cast<const float*>(tail.data), pooled.ne[1], static_cast<float*>(pooled.data));
+    CUDA_CHECK(cudaGetLastError());
     qsa_tail_kernel<<<1, kHeadDim, 0, stream>>>(static_cast<const __nv_bfloat16*>(projection.data),
-                                                first_position, tokens,
-                                                static_cast<float*>(tail.data));
+                                                first, tokens, static_cast<float*>(tail.data));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -298,15 +303,16 @@ std::size_t qsa_indexer_select_workspace_bytes(std::int32_t tokens, std::int32_t
     return layout.peak_bytes(1);
 }
 
-void qsa_indexer_select(const Tensor& projection, std::int32_t first_position,
+void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                         const QsaIndexerWeights& weights, float eps, const Tensor& pooled,
                         WorkspaceArena& workspace, Tensor& selected, Tensor& counts,
                         cudaStream_t stream) {
-    require_projection(projection, first_position);
+    require_projection(projection);
+    const int* first = require_position(first_position);
     require_norm(weights.query_norm, "query_norm must be BF16 [128]");
     require(eps > 0.0f, "eps must be positive");
+    require_pooled(pooled);
     const std::int32_t tokens = projection.ne[1];
-    require_pooled(pooled, (static_cast<std::int64_t>(first_position) + tokens) / kBlock);
     require(selected.dtype == DType::I32 && selected.is_contiguous() && selected.data != nullptr &&
                 selected.ne[0] == kTopBlocks && selected.ne[1] == tokens,
             "selected must be contiguous I32 [512, tokens]");
@@ -317,7 +323,7 @@ void qsa_indexer_select(const Tensor& projection, std::int32_t first_position,
     auto scope                  = workspace.scope();
     Tensor keys                 = workspace.alloc(DType::I32, {capacity, tokens});
     qsa_select_kernel<<<tokens, kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(projection.data), first_position,
+        static_cast<const __nv_bfloat16*>(projection.data), first,
         static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
         static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), capacity,
         static_cast<int*>(selected.data), static_cast<int*>(counts.data));

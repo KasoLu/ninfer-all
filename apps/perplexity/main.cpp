@@ -51,6 +51,12 @@ struct Options {
     std::uint32_t stride      = 2048;
     bool disjoint             = false;
     int device                = 0;
+    // Qwen3.8-Flash-Next: a pipeline over several devices, host-resident experts and their
+    // device cache, and the n-gram companion.
+    std::vector<int> devices;
+    ninfer::ExpertResidency expert_residency = ninfer::ExpertResidency::Device;
+    std::optional<std::uint64_t> expert_cache_bytes;
+    ninfer::NgramTableOptions ngram_table;
 #if defined(NINFER_SM8X_COMPAT)
     // FP8 E4M3 KV attention has no SM86 implementation, so the upstream default would fail at
     // engine construction on this fork. INT8 group-64 is the qualified quantized profile here.
@@ -80,7 +86,9 @@ struct Options {
 std::string usage_text() {
     return "usage: ninfer-perplexity <model.ninfer> "
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
-           "       [--context N] [--stride N | --disjoint] [--device N]\n"
+           "       [--context N] [--stride N | --disjoint] [--device N | --devices A,B,...]\n"
+           "       [--expert-residency device|host|disk] [--expert-cache-mib N|auto]\n"
+           "       [--ngram-table PATH] [--ngram-ram]   (Qwen3.8-Flash-Next)\n"
            "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4] [--output "
            "<directory>]\n"
            "       [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -181,6 +189,38 @@ Options parse_options(int argc, char** argv) {
             out.mtp_experts_q4 = true;
         } else if (option == "--gdn-state-fp16") {
             out.gdn_state_fp16 = true;
+        } else if (option == "--devices") {
+            const std::string list(value("--devices"));
+            std::size_t begin = 0;
+            while (begin <= list.size()) {
+                const std::size_t end = std::min(list.find(',', begin), list.size());
+                out.devices.push_back(
+                    parse_integer<int>(list.substr(begin, end - begin), "devices"));
+                begin = end + 1;
+            }
+        } else if (option == "--expert-residency") {
+            const std::string residency(value("--expert-residency"));
+            if (residency == "device") {
+                out.expert_residency = ninfer::ExpertResidency::Device;
+            } else if (residency == "host") {
+                out.expert_residency = ninfer::ExpertResidency::Host;
+            } else if (residency == "disk") {
+                out.expert_residency = ninfer::ExpertResidency::Disk;
+            } else {
+                throw std::invalid_argument("--expert-residency must be device, host or disk");
+            }
+        } else if (option == "--expert-cache-mib") {
+            const std::string mib(value("--expert-cache-mib"));
+            if (mib == "auto") {
+                out.expert_cache_bytes.reset();
+            } else {
+                out.expert_cache_bytes =
+                    std::uint64_t(parse_integer<std::uint32_t>(mib, "expert-cache-mib")) << 20;
+            }
+        } else if (option == "--ngram-table") {
+            out.ngram_table.path = value("--ngram-table");
+        } else if (option == "--ngram-ram") {
+            out.ngram_table.ram = true;
         } else if (option == "--rope-yarn") {
             out.rope_yarn = true;
         } else if (option == "--rope-yarn-factor") {
@@ -273,11 +313,12 @@ std::string timestamp() {
 
 std::filesystem::path prepare_output_directory(const Options& options,
                                                const ninfer::LoadSummary& load,
+                                               ninfer::KvCacheStorage kv,
                                                const CorpusSelection& corpus) {
     std::filesystem::path output = options.output.value_or(
         std::filesystem::path("profiles/perplexity") / safe_component(load.model_name) /
-        safe_component(load.prefill_signature) / kv_name(options.kv) /
-        safe_component(corpus.corpus_id) / safe_component(corpus.mode) / timestamp());
+        safe_component(load.prefill_signature) / kv_name(kv) / safe_component(corpus.corpus_id) /
+        safe_component(corpus.mode) / timestamp());
     if (std::filesystem::exists(output)) {
         if (!std::filesystem::is_directory(output) ||
             std::filesystem::directory_iterator(output) != std::filesystem::directory_iterator()) {
@@ -315,6 +356,10 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.artifact_path    = options.artifact;
     engine_options.purpose          = ninfer::EnginePurpose::CausalScoring;
     engine_options.device           = options.device;
+    engine_options.devices                       = options.devices;
+    engine_options.expert_residency              = options.expert_residency;
+    engine_options.expert_cache_bytes            = options.expert_cache_bytes;
+    engine_options.ngram_table                   = options.ngram_table;
     engine_options.max_context      = options.context;
     engine_options.kv_cache         = options.kv;
     engine_options.lm_head_q4       = options.lm_head_q4;
@@ -336,6 +381,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.diagnostic_observer        = ninfer::product::engine_diagnostic_observer(logger);
     ninfer::Engine engine(std::move(engine_options));
     const ninfer::LoadSummary load = engine.load_summary();
+    // What the engine runs, which a family with one KV format keeps whatever was asked.
+    const ninfer::KvCacheStorage kv = engine.memory_summary().kv_cache;
     startup_log.engine_ready(load);
 
     const Clock::time_point preflight_started = Clock::now();
@@ -374,7 +421,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                  ninfer::product::format_pretty_count(total_windows),
                  ninfer::product::format_pretty_duration(preflight_seconds));
 
-    const std::filesystem::path output_directory = prepare_output_directory(options, load, corpus);
+    const std::filesystem::path output_directory =
+        prepare_output_directory(options, load, kv, corpus);
     const Clock::time_point scoring_started      = Clock::now();
     logger->info("scoring | {} streams | {} tokens | {} windows",
                  ninfer::product::format_pretty_count(streams.size()),
@@ -515,7 +563,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"windows", options.disjoint ? "disjoint" : "sliding"},
           {"prefill_chunk_tokens", 1024},
           {"score_tile_tokens", 1024},
-          {"kv_dtype", kv_name(options.kv)}}},
+          {"kv_dtype", kv_name(kv)}}},
         {"timing",
          {{"load_seconds", load.load_seconds},
           {"read_and_tokenize_seconds", preflight_seconds},
@@ -541,8 +589,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
 
     std::cout << "Perplexity result\n"
               << "artifact: " << load.model_name << '\n'
-              << "kv: " << kv_name(options.kv) << ", corpus: " << corpus.corpus_id << " / "
-              << corpus.mode << ", context/stride: " << options.context << '/'
+              << "kv: " << kv_name(kv) << ", corpus: " << corpus.corpus_id << " / " << corpus.mode
+              << ", context/stride: " << options.context << '/'
               << (options.disjoint ? options.context : options.stride)
               << (options.disjoint ? " (disjoint windows)" : "") << "\n\n";
     std::cout << std::left << std::setw(24) << "domain" << std::right << std::setw(16) << "tokens"

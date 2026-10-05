@@ -30,6 +30,9 @@ struct ExecutorOptions {
     // ranks; kAutoExpertCache takes what each device has free less a margin, 0 none.
     static constexpr std::uint64_t kAutoExpertCache = ~std::uint64_t{0};
     std::uint64_t expert_cache_bytes                = kAutoExpertCache;
+    // Decode steps (one token) of device- and host-resident experts replay a CUDA graph per
+    // segment of consecutive layers on one device.
+    bool cuda_graphs = true;
 };
 
 struct ExecutorMemory {

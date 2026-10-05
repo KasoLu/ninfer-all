@@ -28,9 +28,12 @@ namespace ninfer::ops {
  * attended by every query and is not part of the selection.
  *
  * `projection` is BF16 [640, tokens] (4 query heads of 128, then the key) for the consecutive
- * positions `first_position` .. `first_position + tokens - 1`; `pooled` FP32 [128, capacity] the
- * sequence's pooled keys by block; `tail` FP32 [128, 3] the raw keys of the incomplete block
- * before `first_position` (slot = position mod 4). The oracle evaluates in FP64 from the
+ * positions `first_position` .. `first_position + tokens - 1`; `first_position` is a device I32
+ * word, so a call captured in a graph replays at whatever position the word holds. `pooled` is
+ * FP32 [128, capacity], the sequence's pooled keys by block, sized by the caller for every
+ * position it will reach (blocks at or past `capacity` are neither pooled nor selected); `tail`
+ * FP32 [128, 3] the raw keys of the incomplete block before `first_position` (slot = position
+ * mod 4). The oracle evaluates in FP64 from the
  * represented inputs (angles as above); pooled keys are compared as FP32, and a selection must
  * equal the oracle's up to blocks whose FP64 scores tie the 512th within 1e-5 relative.
  */
@@ -41,16 +44,16 @@ struct QsaIndexerWeights {
 
 // Pools every block that completes in [first_position, first_position + tokens) into `pooled`
 // and leaves the incomplete block's raw keys in `tail`.
-void qsa_indexer_append(const Tensor& projection, std::int32_t first_position,
-                        const QsaIndexerWeights& weights, float eps, Tensor& pooled,
-                        Tensor& tail, cudaStream_t stream);
+void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
+                        const QsaIndexerWeights& weights, float eps, Tensor& pooled, Tensor& tail,
+                        cudaStream_t stream);
 
 [[nodiscard]] std::size_t qsa_indexer_select_workspace_bytes(std::int32_t tokens,
                                                              std::int32_t capacity);
 
 // Writes each query's selected blocks in increasing order into `selected` I32 [512, tokens] and
 // their number into `counts` I32 [tokens]. Run after qsa_indexer_append for the same tokens.
-void qsa_indexer_select(const Tensor& projection, std::int32_t first_position,
+void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
                         const QsaIndexerWeights& weights, float eps, const Tensor& pooled,
                         WorkspaceArena& workspace, Tensor& selected, Tensor& counts,
                         cudaStream_t stream);

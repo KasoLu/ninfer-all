@@ -331,12 +331,12 @@ void qsa(Context& c, int layer, const Tensor& a, Tensor& y) {
     Tensor t_pooled(pooled.buffer.p, DType::FP32, {128, capacity}), t_tail(tail.buffer.p, DType::FP32, {128, 3}),
         t_selected(selected.buffer.p, DType::I32, {512, T}), t_counts(counts.buffer.p, DType::I32, {T});
     const ops::QsaIndexerWeights iw{&t_iqn, &t_ikn};
-    ops::qsa_indexer_append(t_index, 0, iw, kEps, t_pooled, t_tail, c.device.stream);
+    ops::qsa_indexer_append(t_index, c.positions, iw, kEps, t_pooled, t_tail, c.device.stream);
     WorkspaceArena sws(ops::qsa_indexer_select_workspace_bytes(T, capacity));
-    ops::qsa_indexer_select(t_index, 0, iw, kEps, t_pooled, sws, t_selected, t_counts, c.device.stream);
+    ops::qsa_indexer_select(t_index, c.positions, iw, kEps, t_pooled, sws, t_selected, t_counts, c.device.stream);
     Device attn(static_cast<std::size_t>(6144) * T * 2);
     Tensor t_attn(attn.buffer.p, DType::BF16, {256, 24, T});
-    ops::sparse_softmax_attention(qo, 0, t_selected, t_counts, cache, 1.0f / 16.0f, t_attn, c.device.stream);
+    ops::sparse_softmax_attention(qo, c.positions, t_selected, t_counts, cache, 1.0f / 16.0f, t_attn, c.device.stream);
     Tensor flat_attn(attn.buffer.p, DType::BF16, {6144, T});
     ops::sigmoid_mul(t_gate, flat_attn, c.device.stream);
     c.device.synchronize();
