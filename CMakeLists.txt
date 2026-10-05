@@ -19,13 +19,15 @@ endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
 
-# CUDA 12.8's ptxas miscompiles sm_120a code: it reads a register under one predicate that it only
-# wrote under another. On an RTX 5090 the PLE convolution then loads from an address it never
-# computed, and the PLE injection, convolution and attention tests fail, upstream's convolution test
-# included; CUDA 12.9 builds the same sources correctly.
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a" AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.9)
+# CUDA 12.8 and 12.9 miscompile sm_120a code. 12.8's ptxas reads a register under one predicate
+# that it only wrote under another: on an RTX 5090 the PLE convolution then loads from an address it
+# never computed, and the PLE injection, convolution and attention tests fail, upstream's convolution
+# test included. With 12.9 the NVFP4 small-T attention kernels still go wrong, with no change in
+# the sources: a wide verification's split reduce reads from a wild address, and two requests
+# decoded together over an NVFP4 KV cache draw from corrupt logits. CUDA 13.1 builds them correctly.
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a" AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
   message(FATAL_ERROR
-    "A 120a build needs CUDA 12.9 or newer; CUDA ${CMAKE_CUDA_COMPILER_VERSION} miscompiles sm_120a "
+    "A 120a build needs CUDA 13.1 or newer; CUDA ${CMAKE_CUDA_COMPILER_VERSION} miscompiles sm_120a "
     "kernels")
 endif()
 

@@ -175,7 +175,7 @@ Assessed and not taken:
 - Already in the base or in this line under another name: #61's per-image Vision budget
   (`--vision-max-merged`), #152's shared-prefix candidate at the system/developer frontier (the
   Engine's structural candidate, kept enabled for OpenAI requests), #221's MTP topology classes (Mykhailo Dementii),
-  #235's lower CUDA floor (12.8 here, 12.9 for a `120a` build), the Windows builds of #59, #84 and #233, and #173's
+  #235's lower CUDA floor (12.8 here, 13.1 for a `120a` build), the Windows builds of #59, #84 and #233, and #173's
   `rk2v4-e8` (Daniel Parker's upstream PR of the E8-root codec that UDPSendToFailed's NInfer-4090 carried first).
 - #274 raises a context-cache default; `--max-shared-prefixes 7` gives the same capacity. #300 is
   an RFC bag whose items are in the base, taken above, or declined.
