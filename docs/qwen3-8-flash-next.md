@@ -111,10 +111,10 @@ that prompt in 512-token chunks.
 
 | Hardware and placement | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
 |---|---:|---:|---:|---:|---:|
-| 2× RTX 3090 Ti (PCIe, no P2P), experts on the GPUs (`--devices 0,1`) | 18.4 + 19.4 GB | 0.7 GB | 90.4 tok/s | 107 tok/s | 1,127 tok/s |
-| RTX 3090, experts in pinned host memory, 18.4 GB expert cache | 22.6 GB | 34 GB pinned | 48.4 tok/s | 42.4 tok/s | 378 tok/s |
-| RTX 3090, experts on disk, artifact in the page cache | 22.6 GB | 0.9 GB + page cache | 47.0 tok/s | 40.4 tok/s | 526 tok/s |
-| RTX 3090, experts on disk, page cache dropped every second (NVMe, 4.3 GB/s) | 22.6 GB | 0.9 GB | 16.0 tok/s | 11.0 tok/s | 174 tok/s |
+| 2× RTX 3090 Ti (PCIe, no P2P), experts on the GPUs (`--devices 0,1`) | 18.4 + 19.4 GB | 0.7 GB | 90.2 tok/s | 107 tok/s | 1,504 tok/s |
+| RTX 3090, experts in pinned host memory, 17.7 GB expert cache | 22.6 GB | 34 GB pinned | 48.9 tok/s | 42.1 tok/s | 842 tok/s |
+| RTX 3090, experts on disk, artifact in the page cache | 22.6 GB | 0.9 GB + page cache | 47.0 tok/s | 39.1 tok/s | 630 tok/s |
+| RTX 3090, experts on disk, page cache dropped every second (NVMe) | 22.6 GB | 0.9 GB | 17.2 tok/s | 11.3 tok/s | 195 tok/s |
 
 Host memory is the process's peak resident set (the pinned bank for host experts). Decode after
 the long prompt covers its first five tokens only. CUDA graphs add 11% to the short-answer decode on
