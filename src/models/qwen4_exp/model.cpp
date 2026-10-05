@@ -19,9 +19,10 @@ namespace {
 using qwen3_5::loading::Bindings;
 using Shape = artifact::Shape;
 
-FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& config) {
-    const auto resource = [&](std::string_view role) {
-        const auto bytes = binder.host_object(binder.resource("text", role));
+FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& config,
+                                 bool vision) {
+    const auto resource = [&](std::string_view role, const char* component = "text") {
+        const auto bytes = binder.host_object(binder.resource(component, role));
         return std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size());
     };
     FrontendResources out;
@@ -29,6 +30,10 @@ FrontendResources bind_resources(artifact::Binder& binder, const TextConfig& con
     out.tokenizer_config_json  = resource("tokenizer_config.json");
     out.chat_template_jinja    = resource("chat_template.jinja");
     out.generation_config_json = resource("generation_config.json");
+    if (vision) {
+        out.preprocessor_config_json       = resource("preprocessor_config.json", "vision");
+        out.video_preprocessor_config_json = resource("video_preprocessor_config.json", "vision");
+    }
     out.tokenizer =
         std::make_shared<const qwen3_5::frontend::Tokenizer>(qwen3_5::frontend::TokenizerResources{
             out.tokenizer_json, out.tokenizer_config_json, out.generation_config_json});
@@ -313,7 +318,16 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     }
     TextConfig config = parse_text_config(reader.directory().component("text").config);
     artifact::Binder binder(reader);
-    FrontendResources resources = bind_resources(binder, config);
+    std::optional<qwen3_5::VisionConfig> vision_config;
+    if (options.vision) {
+        const auto& components = reader.directory().components;
+        if (!components.contains("vision")) {
+            throw std::invalid_argument("Vision needs an artifact converted with its tower "
+                                        "(--components text,vision)");
+        }
+        vision_config = qwen3_5::parse_vision_config(reader.directory());
+    }
+    FrontendResources resources = bind_resources(binder, config, options.vision);
     Bindings b(binder);
 
     TextWeights weights;
@@ -340,6 +354,12 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
             layer.ple = bind_ple(b, config, p);
         }
         weights.layers.push_back(std::move(layer));
+    }
+    // The tower stays on rank 0, with the token embedding its output joins.
+    std::optional<qwen3_5::VisionWeights> vision_weights;
+    if (vision_config) {
+        vision_weights = qwen3_5::loading::bind_vision(b, *vision_config, config.hidden_size,
+                                                       artifact::Residency::Device);
     }
 
     // The stage split: what was asked, or the even split of the bytes each device would hold.
@@ -396,8 +416,10 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     auto model           = std::unique_ptr<Model>(
         new Model(std::move(config), options, std::move(weights), std::move(stages),
                   std::move(bound), std::move(resources), std::move(info), std::move(backing)));
-    model->files_    = std::move(files);
-    model->replicas_ = qwen3_5::AuxiliaryReplicas(model->bound_, device);
+    model->files_          = std::move(files);
+    model->replicas_       = qwen3_5::AuxiliaryReplicas(model->bound_, device);
+    model->vision_config_  = std::move(vision_config);
+    model->vision_weights_ = std::move(vision_weights);
     return model;
 }
 

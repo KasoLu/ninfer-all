@@ -4,9 +4,14 @@
 // own load and execution (models/qwen4_exp) and shares the Qwen3.5 frontend: prompts are prepared,
 // and output is decoded, stopped and split into reasoning and content exactly as for Qwen3.5.
 //
-// Requests run one at a time in FIFO order on one executor sequence: a request's prompt is
-// prefilled in chunks, then each round samples one token on the head device and feeds it (with any
-// thinking-budget control suffix the frontend asks for) back in. Concurrency above one queues.
+// Up to max_concurrency requests run at once, each on its own executor sequence, admitted in FIFO
+// order. A prompt is prefilled in chunks, one request at a time; between its chunks every decoding
+// request advances one token, all of them in one batched pass whose experts read their weights
+// once, and each feeds its sampled token (with any thinking-budget control suffix the frontend asks
+// for) back in. With the context cache on, a sequence keeps its state when its request ends, and
+// a snapshot of it where the prompt's last user turn closes: a later prompt that starts with what
+// the sequence holds, or with the prompt up to that point, resumes there instead of prefilling it
+// again.
 
 #include "core/device.h"
 #include "models/qwen3_5/frontend/frontend.h"
@@ -28,6 +33,9 @@ struct Qwen4ExpInstance {
     models::qwen3_5::Frontend frontend;
     std::unique_ptr<models::qwen4_exp::Executor> executor;
     std::uint32_t capacity = 0;
+    // Free memory of the primary device once the weights were placed, and after startup.
+    std::size_t free_after_weights = 0;
+    std::size_t free_after_startup = 0;
 };
 
 struct ConstructedQwen4Exp {

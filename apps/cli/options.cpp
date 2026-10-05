@@ -177,8 +177,14 @@ std::string usage_text(const char* argv0) {
            "  --expert-cache-mib N|auto     with host or disk experts: device memory for the\n"
            "                                most used experts (default auto: what is free;\n"
            "                                0 turns the host cache off; disk needs one)\n"
+           "  --ngram-table PATH            Qwen3.8-Flash-Next: the n-gram table artifact,\n"
+           "                                for a model published without its table\n"
            "  --ngram-ram                   Qwen3.8-Flash-Next: load the n-gram table into\n"
-           "                                RAM instead of reading its rows from the artifact\n"
+           "                                RAM instead of reading its rows from the file\n"
+           "  --no-ngram-table              Qwen3.8-Flash-Next: run without the n-gram table.\n"
+           "                                Non-standard experimental mode: the model was\n"
+           "                                trained with the table and degrades badly\n"
+           "                                without it (WikiText-2 perplexity 2.66 -> 5.01)\n"
            "  --no-cuda-graph               decode without CUDA Graphs\n"
            "\n"
            "KV CACHE\n"
@@ -372,8 +378,12 @@ Options parse_options(int argc, char** argv) {
                 options.expert_cache_bytes =
                     std::uint64_t(parse_u32(mib.c_str(), "expert-cache-mib", true)) << 20;
             }
+        } else if (arg == "--ngram-table") {
+            options.ngram_table.path = value(arg);
         } else if (arg == "--ngram-ram") {
-            options.ngram_ram = true;
+            options.ngram_table.ram = true;
+        } else if (arg == "--no-ngram-table") {
+            options.ngram_table.disabled = true;
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {

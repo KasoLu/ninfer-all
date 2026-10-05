@@ -106,6 +106,9 @@ struct LoadOptions {
     std::size_t ranks = 1;
     std::vector<std::uint32_t> stage_layers;
     ExpertResidency experts = ExpertResidency::Device;
+    // Loads the Vision tower the artifact carries (its `vision` component, the Qwen3.5 tower) onto
+    // the first stage's device, beside the token embedding its output joins.
+    bool vision = false;
 };
 
 class Model {
@@ -143,6 +146,14 @@ public:
 
     [[nodiscard]] const InstanceInfo& info() const noexcept { return info_; }
 
+    // The Vision tower when the model was loaded with it.
+    [[nodiscard]] const std::optional<qwen3_5::VisionConfig>& vision_config() const noexcept {
+        return vision_config_;
+    }
+    [[nodiscard]] const std::optional<qwen3_5::VisionWeights>& vision_weights() const noexcept {
+        return vision_weights_;
+    }
+
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept {
         return backing_.stats();
     }
@@ -165,6 +176,8 @@ private:
     InstanceInfo info_;
     std::vector<std::filesystem::path> files_;
     qwen3_5::AuxiliaryReplicas replicas_;
+    std::optional<qwen3_5::VisionConfig> vision_config_;
+    std::optional<qwen3_5::VisionWeights> vision_weights_;
 };
 
 // Whether the artifact's text component is this family.

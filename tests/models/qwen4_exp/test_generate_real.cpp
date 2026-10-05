@@ -7,8 +7,11 @@
 //   NINFER_QWEN4_EXP_ARTIFACT  the model's .ninfer (required; skips without it)
 //   NINFER_QWEN4_EXP_DEVICES   comma-separated device ids, one pipeline stage each (default 0)
 //   NINFER_QWEN4_EXP_EXPERTS   device | host | disk (default device)
+//   NINFER_QWEN4_EXP_NGRAM_TABLE  the n-gram table artifact of a model stored without its table
 //   NINFER_QWEN4_EXP_NGRAM_RAM 1 loads the n-gram table into RAM
 //   NINFER_QWEN4_EXP_PREFILL_CHUNK  tokens per prefill call (default 512)
+//   NINFER_QWEN4_EXP_EXPERT_CACHE_MIB  host or disk experts: the device expert cache (default: what
+//                                      the devices have free)
 #include "artifact/reader.h"
 #include "core/device.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
@@ -23,6 +26,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -133,6 +137,101 @@ std::vector<std::vector<int>> generate(const Model& model, DeviceContext& device
     return out;
 }
 
+// Prefills `text` into `sequence` and returns its first greedy token.
+int prefill(Executor& executor, const Model& model, std::uint32_t sequence, const std::string& text,
+            std::uint32_t chunk, std::vector<__nv_bfloat16>& logits) {
+    const auto ids = model.resources().tokenizer->encode(text, {.parse_added_tokens = true});
+    const std::vector<std::int32_t> tokens(ids.begin(), ids.end());
+    for (std::size_t at = 0; at < tokens.size(); at += chunk) {
+        const std::size_t n = std::min<std::size_t>(chunk, tokens.size() - at);
+        executor.forward(sequence, std::span(tokens).subspan(at, n), 1);
+    }
+    read_logits(executor, logits);
+    return argmax(logits, model.resources().public_token_count);
+}
+
+// Greedy tokens of `steps` decode steps of one sequence, alone.
+std::vector<int> decode_alone(Executor& executor, const Model& model, std::uint32_t sequence,
+                              int first, int steps, std::vector<__nv_bfloat16>& logits) {
+    std::vector<int> out{first};
+    for (int step = 1; step < steps; ++step) {
+        const std::int32_t token = out.back();
+        executor.forward(sequence, std::span(&token, 1), 1);
+        read_logits(executor, logits);
+        out.push_back(argmax(logits, model.resources().public_token_count));
+    }
+    return out;
+}
+
+// Several sequences decoded together in one batched pass per step must produce the greedy tokens
+// each produces alone (the experts read their weights once for the batch, each sequence's mixers
+// run on its own state), and a sequence restored from a snapshot must continue as it did before.
+int check_batch_and_snapshot(const Model& model, DeviceContext& device, ExecutorOptions options) {
+    const std::vector<std::string> texts = {
+        "<|im_start|>user\nName three primary colors.<|im_end|>\n<|im_start|>assistant\n"
+        "<think>\n\n</think>\n\n",
+        "<|im_start|>user\nCount from one to ten in words.<|im_end|>\n<|im_start|>assistant\n"
+        "<think>\n\n</think>\n\n",
+        "<|im_start|>user\nWhat is the boiling point of water in Celsius?<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"};
+    constexpr int kSteps = 24;
+    options.sequences    = static_cast<std::uint32_t>(texts.size());
+    Executor executor(model, device, options);
+    std::vector<__nv_bfloat16> logits(model.config().vocab_size);
+    std::vector<std::vector<int>> alone;
+    for (std::uint32_t s = 0; s < texts.size(); ++s) {
+        executor.reset(s);
+        alone.push_back(decode_alone(executor, model, s,
+                                     prefill(executor, model, s, texts[s], options.prefill_chunk,
+                                             logits),
+                                     kSteps, logits));
+    }
+    std::vector<std::vector<int>> together(texts.size());
+    for (std::uint32_t s = 0; s < texts.size(); ++s) {
+        executor.reset(s);
+        together[s].push_back(prefill(executor, model, s, texts[s], options.prefill_chunk, logits));
+    }
+    const std::size_t domain = model.resources().public_token_count;
+    std::vector<__nv_bfloat16> batch_logits(logits.size() * texts.size());
+    std::vector<std::uint32_t> sequences(texts.size());
+    std::iota(sequences.begin(), sequences.end(), 0U);
+    for (int step = 1; step < kSteps; ++step) {
+        std::vector<std::int32_t> tokens;
+        for (const auto& row : together) { tokens.push_back(row.back()); }
+        executor.decode(sequences, tokens);
+        if (cudaStreamSynchronize(executor.head_stream()) != cudaSuccess ||
+            cudaMemcpy(batch_logits.data(), executor.logits(std::uint32_t(texts.size())).data,
+                       batch_logits.size() * 2, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            throw std::runtime_error("reading the batch logits failed");
+        }
+        for (std::size_t s = 0; s < texts.size(); ++s) {
+            const std::vector<__nv_bfloat16> column(
+                batch_logits.begin() + std::ptrdiff_t(s * logits.size()),
+                batch_logits.begin() + std::ptrdiff_t((s + 1) * logits.size()));
+            together[s].push_back(argmax(column, domain));
+        }
+    }
+    int failures = 0;
+    for (std::size_t s = 0; s < texts.size(); ++s) {
+        const bool same = together[s] == alone[s];
+        std::cout << (same ? "OK   " : "FAIL ") << "batched decode of sequence " << s << ": \""
+                  << model.resources().tokenizer->decode(together[s]) << "\"\n";
+        failures += same ? 0 : 1;
+    }
+    // A snapshot after the prompt, a detour of decode steps, then the restored sequence.
+    SequenceSnapshot snapshot;
+    executor.reset(0);
+    const int first = prefill(executor, model, 0, texts[0], options.prefill_chunk, logits);
+    executor.snapshot(0, snapshot);
+    const auto before = decode_alone(executor, model, 0, first, kSteps, logits);
+    executor.restore(0, snapshot);
+    const auto after = decode_alone(executor, model, 0, first, kSteps, logits);
+    const bool same  = before == after && before == alone[0];
+    std::cout << (same ? "OK   " : "FAIL ") << "restored sequence continues as before\n";
+    failures += same ? 0 : 1;
+    return failures;
+}
+
 int run(const char* artifact_path) {
     const auto start   = Clock::now();
     const auto devices = device_list();
@@ -160,13 +259,19 @@ int run(const char* artifact_path) {
     options.max_context   = 8192;
     const char* chunk     = std::getenv("NINFER_QWEN4_EXP_PREFILL_CHUNK");
     options.prefill_chunk = chunk != nullptr ? static_cast<std::uint32_t>(std::stoul(chunk)) : 512;
-    options.ngram         = ngram_table_source(reader, artifact_path, model->config());
+    if (const char* cache = std::getenv("NINFER_QWEN4_EXP_EXPERT_CACHE_MIB")) {
+        options.expert_cache_bytes = std::uint64_t(std::stoull(cache)) << 20;
+    }
+    const char* table     = std::getenv("NINFER_QWEN4_EXP_NGRAM_TABLE");
+    options.ngram         = ngram_table_source(reader, artifact_path, model->config(),
+                                               table != nullptr ? table : "");
     const char* ram       = std::getenv("NINFER_QWEN4_EXP_NGRAM_RAM");
     options.ngram_residency =
         ram != nullptr && std::string(ram) == "1" ? NgramResidency::Ram : NgramResidency::Disk;
-    std::cout << "n-gram table: " << options.ngram.layout.rows << " rows of "
-              << options.ngram.layout.row_bytes << " bytes in "
-              << options.ngram.layout.segments.size() << " file segment(s)\n";
+    std::cout << "n-gram table: " << options.ngram->layout.rows << " rows of "
+              << options.ngram->layout.row_bytes << " bytes in "
+              << options.ngram->layout.segments.size() << " file segment(s) of "
+              << options.ngram->layout.segments.front().path.filename().string() << "\n";
     std::vector<Prompt> prompts = {
         {"<|im_start|>user\nWhat is the capital of France? Answer in one word.<|im_end|>\n"
          "<|im_start|>assistant\n<think>\n\n</think>\n\n",
@@ -198,6 +303,7 @@ int run(const char* artifact_path) {
          "4771"});
     int failures = 0;
     const auto replayed = generate(*model, device, options, prompts, failures);
+    failures += check_batch_and_snapshot(*model, device, options);
     if (load.experts != ExpertResidency::Disk) {
         std::cout << "eager decode (no CUDA graphs):\n";
         options.cuda_graphs = false;

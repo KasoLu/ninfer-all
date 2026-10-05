@@ -4,6 +4,8 @@
 #include "artifact/reader.h"
 #include "core/arena.h"
 #include "core/startup.h"
+#include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen4_exp/ngram_component.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/target_logprobs.h"
@@ -11,6 +13,7 @@
 #include "runtime/engine/effective_thinking_budget.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/model_instance.h"
+#include "text/structured_output.h"
 
 #include <cuda_bf16.h>
 
@@ -57,9 +60,16 @@ bool is_qwen4_exp_artifact(const std::filesystem::path& path) {
     if (path.extension() != ".ninfer") { return false; }
     std::error_code error;
     if (!std::filesystem::is_regular_file(path, error)) { return false; }
+    std::optional<artifact::Reader> reader;
     try {
-        return models::qwen4_exp::is_qwen4_exp(artifact::Reader(path));
+        reader.emplace(path);
     } catch (const std::exception&) { return false; }
+    if (models::qwen4_exp::is_ngram_table_artifact(*reader)) {
+        throw std::invalid_argument(path.string() +
+                                    " is a Qwen3.8-Flash-Next n-gram table, not a model; pass it "
+                                    "with --ngram-table next to the model");
+    }
+    return models::qwen4_exp::is_qwen4_exp(*reader);
 }
 
 ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceContext& device) {
@@ -67,33 +77,52 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");
     }
-    if (options.enable_vision) {
-        throw std::invalid_argument("Qwen3.8-Flash-Next artifacts carry no Vision component yet");
+    if (options.enable_vision && options.vision_residency != VisionResidency::Resident) {
+        throw std::invalid_argument(
+            "Qwen3.8-Flash-Next runs its Vision tower resident on the device only");
     }
     if (options.speculative.backend != SpeculativeBackend::None ||
         options.speculative.ngram_draft_tokens != 0) {
         throw std::invalid_argument("speculative decoding is not available for Qwen3.8-Flash-Next");
     }
     if (options.context_cache.enabled && !options.context_cache.disk_kv_path.empty()) {
-        throw std::invalid_argument("the context cache is not available for Qwen3.8-Flash-Next");
+        throw std::invalid_argument(
+            "the context cache's disk KV tier is not available for Qwen3.8-Flash-Next");
     }
-    install_device_route_profile_for(options, device);
+    const NgramTableOptions& table = options.ngram_table;
+    if (table.disabled && (!table.path.empty() || table.ram)) {
+        throw std::invalid_argument("--no-ngram-table excludes --ngram-table and --ngram-ram");
+    }
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     const artifact::Reader reader(options.artifact_path);
-    // The n-gram table is checked before the weights load, so a model without one fails at once.
-    auto ngram = models::qwen4_exp::ngram_table_source(
-        reader, options.artifact_path,
-        models::qwen4_exp::parse_text_config(reader.directory().component("text").config));
+    // The n-gram table is located before anything else starts, so a model without one fails at
+    // once.
+    std::optional<models::qwen4_exp::NgramTableSource> ngram;
+    if (!table.disabled) {
+        ngram = models::qwen4_exp::ngram_table_source(
+            reader, options.artifact_path,
+            models::qwen4_exp::parse_text_config(reader.directory().component("text").config),
+            table.path);
+    }
     inspect.complete();
+    install_device_route_profile_for(options, device);
     models::qwen4_exp::LoadOptions load;
     load.artifact     = options.artifact_path;
     load.ranks        = device.size();
     load.stage_layers = options.stage_layers;
     load.experts      = options.expert_residency;
+    load.vision       = options.enable_vision;
     StartupPhaseScope materialize(options.startup_observer, StartupPhase::TargetPlan);
     auto model = models::qwen4_exp::load_model(reader, load, device, &options.startup_observer);
     device.synchronize();
     materialize.complete();
+    const auto free_bytes = [&] {
+        RankBinding bind(device, 0);
+        std::size_t free = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        return free;
+    };
+    const std::size_t free_after_weights = free_bytes();
 
     StartupPhaseScope frontend_phase(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<Qwen4ExpInstance>(Qwen4ExpInstance{
@@ -101,7 +130,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         .frontend = models::qwen3_5::make_frontend(
             model->resources(), {.chat_template_path      = options.chat_template_path,
                                  .architecture            = models::Architecture::Qwen4Exp,
-                                 .vision_enabled          = false,
+                                 .vision_enabled          = options.enable_vision,
                                  .max_context             = options.max_context,
                                  .media_cache_bytes       = options.media_cache_bytes,
                                  .media_live_bytes        = options.media_live_bytes,
@@ -113,16 +142,19 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     models::qwen4_exp::ExecutorOptions executor;
     executor.max_context     = options.max_context;
     executor.prefill_chunk   = std::clamp<std::uint32_t>(options.prefill_chunk, 64, 4096);
-    executor.sequences       = 1;
+    executor.sequences       = options.max_concurrency;
     executor.ngram           = std::move(ngram);
-    executor.ngram_residency = options.ngram_ram ? models::qwen4_exp::NgramResidency::Ram
-                                                 : models::qwen4_exp::NgramResidency::Disk;
+    executor.ngram_residency = table.ram ? models::qwen4_exp::NgramResidency::Ram
+                                         : models::qwen4_exp::NgramResidency::Disk;
     executor.expert_cache_bytes =
         options.expert_cache_bytes.value_or(models::qwen4_exp::ExecutorOptions::kAutoExpertCache);
     executor.cuda_graphs = options.use_cuda_graph;
+    executor.vision_max_merged_tokens = options.vision_max_merged_tokens;
     instance->executor = std::make_unique<models::qwen4_exp::Executor>(*model, device, executor);
     device.synchronize();
     program.complete();
+    instance->free_after_weights = free_after_weights;
+    instance->free_after_startup = free_bytes();
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                        "Qwen3.8-Flash-Next: %zu stage(s), experts in %s memory, n-gram table "
                        "%s, state %.0f MiB, workspace %.0f MiB, expert cache %.0f MiB",
@@ -130,10 +162,20 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                        options.expert_residency == ExpertResidency::Host   ? "pinned host"
                        : options.expert_residency == ExpertResidency::Disk ? "the artifact's files"
                                                                            : "device",
-                       options.ngram_ram ? "in RAM" : "read from the artifact",
+                       table.disabled      ? "off"
+                       : table.ram         ? "in RAM"
+                       : table.path.empty() ? "read from the artifact"
+                                            : "read from its table artifact",
                        double(instance->executor->memory().state_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0,
                        double(instance->executor->memory().expert_cache_bytes) / 1048576.0);
+    if (table.disabled) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                           "Qwen3.8-Flash-Next runs WITHOUT its n-gram table (--no-ngram-table): "
+                           "a non-standard experimental mode. The model was trained with the "
+                           "table and degrades badly without it (WikiText-2 perplexity 2.66 -> "
+                           "5.01 on GSQ-RCO Q2_0); use it only for experiments");
+    }
     if (options.kv_cache != KvCacheStorage::BFloat16) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
                            "Qwen3.8-Flash-Next keeps its KV in BF16; the requested KV storage does "
@@ -191,6 +233,7 @@ struct Qwen4ExpCore::Request {
     models::qwen3_5::OutputSession output;
     PromptSummary prompt_summary;
     double prepare_seconds = 0.0;
+    double vision_seconds  = 0.0; // the Vision tower's run over the prompt's media
     ResolvedRequestOptions options;
     OutputConsumerMode consumer_mode = OutputConsumerMode::Aggregate;
     GenerationObservationOptions observation;
@@ -207,15 +250,59 @@ struct Qwen4ExpCore::Request {
     std::exception_ptr error;
     GenerationResult result;
     std::string content, reasoning;
+
+    // Where the context cache snapshots the sequence: the prompt's turn closure (the end of the
+    // last user turn, which the next turn's prompt repeats although it renders this turn's answer
+    // differently), else the prompt's end; and whether the prompt may be reused at all.
+    std::uint32_t anchor_at = 0;
+    bool reusable           = true;
+    bool media              = false; // images or video: encoded at the prompt's first chunk
+
+    // The worker's progress with an admitted request.
+    std::uint32_t slot      = 0;
+    std::uint32_t reused    = 0; // prompt tokens its sequence already held
+    PrefixReusePath reuse_path = PrefixReusePath::Root; // where they came from
+    std::uint32_t prefilled = 0; // prompt tokens its sequence holds, the reused ones included
+    bool decoding           = false;
+    bool penalties          = false;
+    bool post_thinking      = false;
+    std::uint32_t position  = 0; // tokens fed: the logical position of the next sampled token
+    std::vector<TokenId> feed;   // what the next decode step feeds
+    std::vector<TokenId> generated;
+    std::optional<GenerationBudget> budget;
+    std::optional<FirstTokenLogprobs> first_token_logprobs;
+    Clock::time_point admitted, prefill_start, prefill_end, first_token, last_token;
 };
 
 struct Qwen4ExpCore::Impl {
+    // One executor sequence, the request it serves and what the context cache keeps of it: the
+    // tokens its live state holds, and a snapshot of its state at the end of the last prompt it
+    // prefilled, which a later prompt that starts with that one resumes from.
+    struct Slot {
+        std::shared_ptr<Request> request;
+        std::vector<TokenId> fed;
+        std::vector<TokenId> anchor;
+        models::qwen4_exp::SequenceSnapshot snapshot;
+        std::uint64_t last_used = 0;
+    };
+
+    // One row of a sampling call: the request's parameters at its position.
+    struct SampleRow {
+        const ResolvedSamplingParameters* params = nullptr;
+        std::uint32_t position                   = 0;
+        std::uint32_t slot                       = 0;
+        bool counts                              = false;
+        const text::GrammarState* grammar        = nullptr;
+    };
+
     Qwen4ExpInstance& instance;
     DeviceContext& device;
     const std::uint32_t max_context;
     const std::size_t max_outstanding;
     const std::chrono::milliseconds pending_timeout;
     const std::uint32_t domain;
+    const bool structured_output;
+    const bool reuse_prefixes;
 
     mutable std::mutex queue_mutex;
     std::condition_variable queue_cv;
@@ -228,8 +315,16 @@ struct Qwen4ExpCore::Impl {
     mutable std::mutex stats_mutex;
     RuntimeStats stats;
 
-    // Head-device sampling planes.
+    // Worker-owned.
+    std::vector<Slot> slots; // by executor sequence
+    std::uint64_t use_clock = 0;
+    bool prefill_turn       = true; // a prefill chunk and a decode step take turns
+
+    // Head-device sampling planes, a row per slot; with structured output the grammars' token
+    // bitmasks too. The host side is staged in pinned memory: configs, positions, sampled tokens.
     DeviceBuffer sample_config, sample_position, sample_out, token_counts, score_targets, score_out;
+    DeviceBuffer token_mask;
+    std::unique_ptr<PinnedHostBuffer> host_mask, host_sample;
     std::unique_ptr<WorkspaceArena> sample_workspace;
     std::vector<__nv_bfloat16> host_logits;
 
@@ -239,16 +334,28 @@ struct Qwen4ExpCore::Impl {
         : instance(i), device(d), max_context(options.max_context),
           max_outstanding(std::size_t(options.max_concurrency) + options.max_pending_requests),
           pending_timeout(options.pending_timeout_ms),
-          domain(i.model->resources().public_token_count) {
+          domain(i.model->resources().public_token_count),
+          structured_output(options.structured_output),
+          reuse_prefixes(options.context_cache.enabled), slots(i.executor->options().sequences) {
         RankBinding bind(device, i.executor->head_rank());
-        sample_config    = DeviceBuffer(sizeof(ops::SamplingConfig));
-        sample_position  = DeviceBuffer(sizeof(std::int32_t));
-        sample_out       = DeviceBuffer(sizeof(std::int32_t));
-        token_counts     = DeviceBuffer(std::size_t(domain) * sizeof(std::int32_t));
+        const std::size_t rows = slots.size();
+        if (structured_output) {
+            token_mask = DeviceBuffer(rows * mask_words() * sizeof(std::uint32_t));
+            host_mask =
+                std::make_unique<PinnedHostBuffer>(rows * mask_words() * sizeof(std::uint32_t));
+        }
+        sample_config   = DeviceBuffer(rows * sizeof(ops::SamplingConfig));
+        sample_position = DeviceBuffer(rows * sizeof(std::int32_t));
+        sample_out      = DeviceBuffer(rows * sizeof(std::int32_t));
+        host_sample     = std::make_unique<PinnedHostBuffer>(
+            rows * (sizeof(ops::SamplingConfig) + 2 * sizeof(std::int32_t)));
+        token_counts     = DeviceBuffer(rows * domain * sizeof(std::int32_t));
         score_targets    = DeviceBuffer(4096 * sizeof(std::int32_t));
         score_out        = DeviceBuffer(4096 * sizeof(float));
         sample_workspace = std::make_unique<WorkspaceArena>(std::max<std::size_t>(
-            ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(domain), 1, 1), 256));
+            ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(domain), 1,
+                                                   static_cast<std::int32_t>(rows)),
+            256));
         host_logits.resize(i.model->config().vocab_size);
         worker = std::thread([this] {
             device.bind_to_current_thread();
@@ -263,6 +370,10 @@ struct Qwen4ExpCore::Impl {
         }
         queue_cv.notify_all();
         if (worker.joinable()) { worker.join(); }
+    }
+
+    [[nodiscard]] std::size_t mask_words() const noexcept {
+        return (std::size_t(domain) + 31) / 32;
     }
 
     void complete(const std::shared_ptr<Request>& request, std::exception_ptr error) {
@@ -291,27 +402,128 @@ struct Qwen4ExpCore::Impl {
         --outstanding;
     }
 
+    [[nodiscard]] bool any_active() const {
+        return std::any_of(slots.begin(), slots.end(),
+                           [](const Slot& slot) { return slot.request != nullptr; });
+    }
+
     void loop() {
         for (;;) {
-            std::shared_ptr<Request> request;
             {
                 std::unique_lock lock(queue_mutex);
-                queue_cv.wait(lock, [&] { return stopping || !pending.empty(); });
+                queue_cv.wait(lock, [&] { return stopping || !pending.empty() || any_active(); });
                 if (stopping) {
                     auto waiting = std::move(pending);
                     pending.clear();
                     lock.unlock();
-                    for (auto& item : waiting) {
-                        complete(item, std::make_exception_ptr(
-                                           RequestError(RequestErrorKind::Unavailable,
-                                                        "inference engine is stopping")));
+                    const auto unavailable = std::make_exception_ptr(RequestError(
+                        RequestErrorKind::Unavailable, "inference engine is stopping"));
+                    for (auto& item : waiting) { complete(item, unavailable); }
+                    for (auto& slot : slots) {
+                        if (slot.request) { complete(std::exchange(slot.request, {}), unavailable); }
                     }
+                    publish_stats();
                     return;
                 }
+            }
+            try {
+                admit();
+                step();
+            } catch (...) {
+                // Not a request's own error: the device may be in an unknown state, so the Engine
+                // fails with every request it holds.
+                const auto error = std::current_exception();
+                {
+                    std::lock_guard lock(queue_mutex);
+                    failed   = true;
+                    stopping = true;
+                }
+                for (auto& slot : slots) {
+                    if (slot.request) { complete(std::exchange(slot.request, {}), error); }
+                }
+                queue_cv.notify_all();
+            }
+            publish_stats();
+        }
+    }
+
+    // The queue depth, from a submitting thread.
+    void publish_queue() {
+        std::lock_guard lock(queue_mutex);
+        std::lock_guard stats_lock(stats_mutex);
+        stats.waiting_requests = static_cast<std::uint32_t>(pending.size());
+    }
+
+    // Every request gauge, from the worker, which owns the slots.
+    void publish_stats() {
+        std::uint32_t running = 0, prefilling = 0, decoding = 0;
+        for (const Slot& slot : slots) {
+            if (!slot.request) { continue; }
+            ++running;
+            ++(slot.request->decoding ? decoding : prefilling);
+        }
+        std::lock_guard lock(queue_mutex);
+        std::lock_guard stats_lock(stats_mutex);
+        stats.waiting_requests      = static_cast<std::uint32_t>(pending.size());
+        stats.running_requests      = running;
+        stats.prefilling_requests   = prefilling;
+        stats.decode_ready_requests = decoding;
+    }
+
+    // A request failed on its own: it completes with the error, and its sequence keeps nothing
+    // for the context cache, since the sequence may have stopped anywhere.
+    void fail(const std::shared_ptr<Request>& request, std::exception_ptr error) {
+        if (!request_error(error)) { std::rethrow_exception(error); }
+        Slot& slot = slots.at(request->slot);
+        if (slot.request == request) {
+            slot.request = nullptr;
+            slot.fed.clear();
+            slot.anchor.clear();
+        }
+        complete(request, std::move(error));
+    }
+
+    // Tokens of `held` a prompt can start from: all of them when they are a strict prefix of the
+    // prompt (its last token is always fed, since the first sample needs its logits), else none.
+    static std::uint32_t prefix_reuse(const std::vector<TokenId>& held,
+                                      const std::vector<TokenId>& prompt) {
+        if (held.empty() || held.size() >= prompt.size()) { return 0; }
+        return std::equal(held.begin(), held.end(), prompt.begin())
+                   ? static_cast<std::uint32_t>(held.size())
+                   : 0;
+    }
+
+    [[nodiscard]] std::uint32_t reuse(const Slot& slot, const std::vector<TokenId>& prompt) const {
+        if (!reuse_prefixes) { return 0; }
+        return std::max(prefix_reuse(slot.fed, prompt), prefix_reuse(slot.anchor, prompt));
+    }
+
+    // Moves queued requests into free sequences, oldest first: each into the free sequence whose
+    // cached state serves the most of its prompt, else the least recently used.
+    void admit() {
+        for (;;) {
+            std::optional<std::uint32_t> best;
+            std::shared_ptr<Request> request;
+            {
+                std::lock_guard lock(queue_mutex);
+                if (pending.empty()) { return; }
+                for (std::uint32_t s = 0; s < slots.size(); ++s) {
+                    if (slots[s].request) { continue; }
+                    if (!best) {
+                        best = s;
+                        continue;
+                    }
+                    const auto& prompt   = pending.front()->prompt_tokens;
+                    const auto candidate = reuse(slots[s], prompt), current = reuse(slots[*best], prompt);
+                    if (candidate > current ||
+                        (candidate == current && slots[s].last_used < slots[*best].last_used)) {
+                        best = s;
+                    }
+                }
+                if (!best) { return; }
                 request = std::move(pending.front());
                 pending.pop_front();
             }
-            publish_queue();
             if (Clock::now() > request->deadline) {
                 complete(request, std::make_exception_ptr(
                                       RequestError(RequestErrorKind::QueueTimeout,
@@ -319,24 +531,81 @@ struct Qwen4ExpCore::Impl {
                 continue;
             }
             try {
-                complete(request, run(*request));
-            } catch (...) {
-                const auto error = std::current_exception();
-                if (!request_error(error)) {
-                    std::lock_guard lock(queue_mutex);
-                    failed   = true;
-                    stopping = true;
-                }
-                complete(request, error);
-                if (!request_error(error)) { queue_cv.notify_all(); }
-            }
+                begin(request, *best);
+            } catch (...) { fail(request, std::current_exception()); }
         }
     }
 
-    void publish_queue() {
-        std::lock_guard lock(queue_mutex);
-        std::lock_guard stats_lock(stats_mutex);
-        stats.waiting_requests = static_cast<std::uint32_t>(pending.size());
+    void begin(const std::shared_ptr<Request>& request, std::uint32_t s) {
+        Request& r          = *request;
+        Slot& slot          = slots[s];
+        auto& executor      = *instance.executor;
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        r.slot              = s;
+        if (prompt_n == 0) { throw std::invalid_argument("prepared prompt is empty"); }
+        if (prompt_n > max_context) {
+            throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                               "prepared prompt exceeds Engine max_context");
+        }
+        r.admitted = Clock::now();
+        // Resume from the sequence's live state when the prompt continues it, else from the
+        // snapshot at the end of its last prompt when the prompt continues that.
+        std::uint32_t reused = 0;
+        if (reuse_prefixes && r.reusable) {
+            const std::uint32_t live     = prefix_reuse(slot.fed, r.prompt_tokens);
+            const std::uint32_t anchored = prefix_reuse(slot.anchor, r.prompt_tokens);
+            if (anchored > live) {
+                executor.restore(s, slot.snapshot);
+                slot.fed     = slot.anchor;
+                reused       = anchored;
+                r.reuse_path = PrefixReusePath::PrivateTurnClosure;
+            } else if (live > 0) {
+                reused       = live;
+                r.reuse_path = PrefixReusePath::PrivateEndpoint;
+            }
+        }
+        if (reused == 0) {
+            executor.reset(s);
+            slot.fed.clear();
+        }
+        slot.request   = request;
+        slot.last_used = ++use_clock;
+        r.reused = r.prefilled = reused;
+        r.prefill_start        = Clock::now();
+        {
+            std::lock_guard lock(stats_mutex);
+            stats.reused_prompt_tokens += reused;
+        }
+        if (r.consumer_mode == OutputConsumerMode::Streaming) {
+            {
+                std::lock_guard lock(r.mutex);
+                r.stream_start =
+                    GenerationStart{.prompt = r.prompt_summary, .reused_prompt_tokens = reused};
+            }
+            r.cv.notify_all();
+        }
+    }
+
+    void step() {
+        std::shared_ptr<Request> prefilling;
+        bool decoding = false;
+        for (const Slot& slot : slots) {
+            if (!slot.request) { continue; }
+            if (slot.request->decoding) {
+                decoding = true;
+            } else if (!prefilling || slot.request->id < prefilling->id) {
+                prefilling = slot.request;
+            }
+        }
+        if (prefilling && (prefill_turn || !decoding)) {
+            prefill_turn = false;
+            try {
+                prefill_step(prefilling);
+            } catch (...) { fail(prefilling, std::current_exception()); }
+        } else if (decoding) {
+            prefill_turn = true;
+            decode_step();
+        }
     }
 
     void push_events(Request& r, models::qwen3_5::PublishedOutput published,
@@ -354,39 +623,83 @@ struct Qwen4ExpCore::Impl {
         if (streaming) { r.cv.notify_all(); }
     }
 
-    // Samples one token from the head logits with `params`, at logical position `position`.
-    TokenId sample(const ResolvedSamplingParameters& params, std::uint32_t position,
-                   std::int32_t purpose, bool counts) {
+    // Samples one token per row from the first rows.size() columns of the head logits; a grammar
+    // restricts its row to the tokens its current state allows.
+    void sample(std::span<const SampleRow> rows, std::int32_t purpose, std::span<TokenId> out) {
         RankBinding bind(device, instance.executor->head_rank());
         const cudaStream_t stream = instance.executor->head_stream();
-        ops::SamplingConfig config;
-        config.temperature       = params.temperature;
-        config.top_k             = params.top_k;
-        config.top_p             = params.top_p;
-        config.min_p             = params.min_p;
-        config.presence_penalty  = params.presence_penalty;
-        config.frequency_penalty = params.frequency_penalty;
-        config.seed              = params.seed;
-        config.token_counts      = counts ? static_cast<std::int32_t*>(token_counts.p) : nullptr;
-        const auto at            = static_cast<std::int32_t>(position);
-        CUDA_CHECK(cudaMemcpyAsync(sample_config.p, &config, sizeof(config), cudaMemcpyHostToDevice,
-                                   stream));
-        CUDA_CHECK(
-            cudaMemcpyAsync(sample_position.p, &at, sizeof(at), cudaMemcpyHostToDevice, stream));
-        Tensor out(sample_out.p, DType::I32, {1});
-        const Tensor positions(sample_position.p, DType::I32, {1});
-        auto scope = sample_workspace->scope();
-        ops::sample(instance.executor->logits(1), out, static_cast<std::int32_t>(domain),
-                    static_cast<const ops::SamplingConfig*>(sample_config.p), positions, purpose,
-                    *sample_workspace, stream);
-        std::int32_t token = 0;
-        CUDA_CHECK(
-            cudaMemcpyAsync(&token, sample_out.p, sizeof(token), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        if (token == ops::kSamplerNonFiniteToken || token < 0 || std::uint32_t(token) >= domain) {
-            throw std::runtime_error("Qwen3.8-Flash-Next produced non-finite logits");
+        const std::size_t n       = rows.size();
+        auto* configs             = static_cast<ops::SamplingConfig*>(host_sample->data());
+        auto* positions           = reinterpret_cast<std::int32_t*>(configs + slots.size());
+        auto* tokens              = positions + slots.size();
+        bool masked               = false;
+        for (std::size_t b = 0; b < n; ++b) {
+            const SampleRow& row = rows[b];
+            ops::SamplingConfig config;
+            config.temperature       = row.params->temperature;
+            config.top_k             = row.params->top_k;
+            config.top_p             = row.params->top_p;
+            config.min_p             = row.params->min_p;
+            config.presence_penalty  = row.params->presence_penalty;
+            config.frequency_penalty = row.params->frequency_penalty;
+            config.seed              = row.params->seed;
+            config.token_counts =
+                row.counts ? static_cast<std::int32_t*>(token_counts.p) + std::size_t(row.slot) * domain
+                           : nullptr;
+            if (row.grammar != nullptr) {
+                auto* words = static_cast<std::uint32_t*>(host_mask->data()) + b * mask_words();
+                row.grammar->fill_masks(std::span(words, mask_words()), {});
+                config.token_mask =
+                    static_cast<const std::uint32_t*>(token_mask.p) + b * mask_words();
+                config.token_mask_stride = static_cast<std::int32_t>(mask_words());
+                masked                   = true;
+            }
+            configs[b]   = config;
+            positions[b] = static_cast<std::int32_t>(row.position);
         }
-        return token;
+        if (masked) {
+            CUDA_CHECK(cudaMemcpyAsync(token_mask.p, host_mask->data(),
+                                       n * mask_words() * sizeof(std::uint32_t),
+                                       cudaMemcpyHostToDevice, stream));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(sample_config.p, configs, n * sizeof(ops::SamplingConfig),
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(sample_position.p, positions, n * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, stream));
+        const auto width = static_cast<std::int32_t>(n);
+        Tensor sampled(sample_out.p, DType::I32, {width});
+        const Tensor logical(sample_position.p, DType::I32, {width});
+        {
+            auto scope = sample_workspace->scope();
+            ops::sample(instance.executor->logits(static_cast<std::uint32_t>(n)), sampled,
+                        static_cast<std::int32_t>(domain),
+                        static_cast<const ops::SamplingConfig*>(sample_config.p), logical, purpose,
+                        *sample_workspace, stream);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(tokens, sample_out.p, n * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (std::size_t b = 0; b < n; ++b) {
+            const std::int32_t token = tokens[b];
+            if (token == ops::kSamplerNonFiniteToken || token < 0 ||
+                std::uint32_t(token) >= domain) {
+                throw std::runtime_error("Qwen3.8-Flash-Next produced non-finite logits");
+            }
+            out[b] = token;
+        }
+    }
+
+    [[nodiscard]] SampleRow sample_row(Request& r) {
+        const auto& exec = r.options.execution;
+        if (!r.post_thinking && exec.post_thinking_sampling && r.output.reasoning_closed()) {
+            r.post_thinking = true;
+        }
+        return SampleRow{.params   = r.post_thinking ? &*exec.post_thinking_sampling
+                                                     : &exec.sampling,
+                         .position = r.position,
+                         .slot     = r.slot,
+                         .counts   = r.penalties,
+                         .grammar  = r.output.grammar_state().get()};
     }
 
     FirstTokenLogprobs first_token_logprobs(TokenId selected, std::uint32_t count) {
@@ -424,188 +737,244 @@ struct Qwen4ExpCore::Impl {
         return out;
     }
 
-    GenerationResult run(Request& r) {
-        const auto admitted = Clock::now();
-        auto& executor      = *instance.executor;
-        const auto& tokens  = r.prompt_tokens;
-        const auto prompt_n = static_cast<std::uint32_t>(tokens.size());
-        if (prompt_n == 0) { throw std::invalid_argument("prepared prompt is empty"); }
-        if (prompt_n > max_context) {
-            throw RequestError(RequestErrorKind::ContextLengthExceeded,
-                               "prepared prompt exceeds Engine max_context");
-        }
+    // Frees the request's sequence (keeping its state for the context cache) and completes it.
+    void finish(const std::shared_ptr<Request>& request, FinishReason reason) {
+        Request& r = *request;
+        GenerationResult result;
+        result.prompt              = r.prompt_summary;
+        result.generated_token_ids = std::move(r.generated);
         {
-            std::lock_guard lock(stats_mutex);
-            stats.running_requests    = 1;
-            stats.prefilling_requests = 1;
+            std::lock_guard lock(r.mutex);
+            result.content   = std::move(r.content);
+            result.reasoning = std::move(r.reasoning);
         }
-        if (r.consumer_mode == OutputConsumerMode::Streaming) {
+        const auto now = Clock::now();
+        if (r.first_token == Clock::time_point{}) { r.first_token = r.last_token = now; }
+        if (r.prefill_end == Clock::time_point{}) { r.prefill_end = now; }
+        result.tool_calls                      = r.output.take_tool_calls();
+        result.tool_call_parse                 = r.output.tool_call_parse_diagnostics();
+        result.reasoning_tokens                = r.output.reasoning_tokens();
+        result.finish_reason                   = reason;
+        result.matched_stop_string             = r.output.matched_stop_string();
+        result.thinking                        = r.output.thinking_stats();
+        result.thinking.post_thinking_sampling = r.post_thinking;
+        result.first_token_logprobs            = std::move(r.first_token_logprobs);
+        result.reused_prompt_tokens            = r.reused;
+        result.prefix_reuse_path               = r.reuse_path;
+        result.timings.prepare_seconds         = r.prepare_seconds;
+        result.timings.vision_seconds          = r.vision_seconds;
+        result.timings.prefill_seconds = seconds(r.prefill_start, r.prefill_end) - r.vision_seconds;
+        result.timings.decode_seconds          = seconds(r.prefill_end, r.last_token);
+        result.timings.first_token_seconds = r.prepare_seconds + seconds(r.submitted, r.first_token);
+        if (r.observation.phase_timings) {
+            result.timings.prompt_wall_seconds     = seconds(r.admitted, r.first_token);
+            result.timings.generation_wall_seconds = seconds(r.first_token, r.last_token);
+        }
+        result.timings.total_seconds = r.prepare_seconds + seconds(r.submitted, now);
+        Slot& slot                   = slots.at(r.slot);
+        slot.request                 = nullptr;
+        if (r.media) {
+            // Its state depends on media its tokens do not identify.
+            slot.fed.clear();
+            slot.anchor.clear();
+        }
+        complete(request, std::move(result));
+    }
+
+    void finish_now(const std::shared_ptr<Request>& request, FinishReason reason) {
+        (void)request->output.preview_terminal(reason);
+        push_events(*request, request->output.commit_preview(), std::nullopt);
+        finish(request, reason);
+    }
+
+    // Feeds the next chunk of a prompt, which ends at the anchor when one lies ahead, where the
+    // sequence's state is kept for the context cache; at the prompt's end samples the first token.
+    void prefill_step(const std::shared_ptr<Request>& request) {
+        Request& r          = *request;
+        Slot& slot          = slots[r.slot];
+        auto& executor      = *instance.executor;
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        if (r.cancelled.load(std::memory_order_acquire)) {
+            finish_now(request, FinishReason::Cancelled);
+            return;
+        }
+        if (r.media && r.prefilled == 0) {
+            // The tower's embeddings stay until another prompt's media replace them; prompts
+            // prefill one at a time, so this one is done first.
+            const auto& data = models::qwen3_5::PreparedPromptAccess::view(r.prompt);
+            const auto& vision = *instance.model->vision_config();
+            const auto control = models::qwen3_5::build_vision_control(
+                data, models::qwen3_5::plan_vision_control(data, vision), 0);
+            std::vector<models::qwen4_exp::MediaItem> items;
+            for (std::size_t i = 0; i < control.items.size(); ++i) {
+                items.push_back({.patches = data.media_payloads.at(i)->span(),
+                                 .control = &control.items[i]});
+            }
+            const auto vision_start = Clock::now();
+            executor.set_media(r.slot, items, data.positions, data.rope_delta);
+            r.vision_seconds = seconds(vision_start, Clock::now());
+        }
+        const std::uint32_t until = r.prefilled < r.anchor_at ? r.anchor_at : prompt_n;
+        const std::uint32_t n     = std::min(executor.options().prefill_chunk, until - r.prefilled);
+        const auto chunk = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
+        executor.forward(r.slot, chunk, 1);
+        slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
+        r.prefilled += n;
+        if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at) {
+            executor.snapshot(r.slot, slot.snapshot);
+            slot.anchor = slot.fed;
+        }
+        if (r.observation.prompt_progress) {
+            CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
             {
                 std::lock_guard lock(r.mutex);
-                r.stream_start =
-                    GenerationStart{.prompt = r.prompt_summary, .reused_prompt_tokens = 0};
+                r.stream_progress = PromptProgress{.total_prompt_tokens     = prompt_n,
+                                                   .reused_prompt_tokens    = r.reused,
+                                                   .processed_prompt_tokens = r.prefilled,
+                                                   .elapsed_ns = elapsed_ns(r.admitted, Clock::now())};
             }
             r.cv.notify_all();
         }
-        executor.reset(0);
-        const std::uint32_t chunk = executor.options().prefill_chunk;
-        const auto prefill_start  = Clock::now();
-        for (std::uint32_t at = 0; at < prompt_n; at += chunk) {
-            if (r.cancelled.load(std::memory_order_acquire)) { break; }
-            const std::uint32_t n = std::min(chunk, prompt_n - at);
-            executor.forward(0, std::span<const TokenId>(tokens).subspan(at, n), 1);
-            if (r.observation.prompt_progress) {
-                CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
-                {
-                    std::lock_guard lock(r.mutex);
-                    r.stream_progress =
-                        PromptProgress{.total_prompt_tokens     = prompt_n,
-                                       .reused_prompt_tokens    = 0,
-                                       .processed_prompt_tokens = at + n,
-                                       .elapsed_ns = elapsed_ns(admitted, Clock::now())};
-                }
-                r.cv.notify_all();
-            }
-        }
-        GenerationResult result;
-        result.prompt = r.prompt_summary;
-        std::vector<TokenId> generated;
-        const auto finish = [&](FinishReason reason, Clock::time_point first_token,
-                                Clock::time_point last_token, Clock::time_point prefill_end) {
-            result.generated_token_ids = std::move(generated);
-            {
-                std::lock_guard lock(r.mutex);
-                result.content   = std::move(r.content);
-                result.reasoning = std::move(r.reasoning);
-            }
-            result.tool_calls              = r.output.take_tool_calls();
-            result.tool_call_parse         = r.output.tool_call_parse_diagnostics();
-            result.reasoning_tokens        = r.output.reasoning_tokens();
-            result.finish_reason           = reason;
-            result.matched_stop_string     = r.output.matched_stop_string();
-            result.thinking                = r.output.thinking_stats();
-            result.timings.prepare_seconds = r.prepare_seconds;
-            result.timings.prefill_seconds = seconds(prefill_start, prefill_end);
-            result.timings.decode_seconds  = seconds(prefill_end, last_token);
-            result.timings.first_token_seconds =
-                r.prepare_seconds + seconds(r.submitted, first_token);
-            if (r.observation.phase_timings) {
-                result.timings.prompt_wall_seconds     = seconds(admitted, first_token);
-                result.timings.generation_wall_seconds = seconds(first_token, last_token);
-            }
-            result.timings.total_seconds = r.prepare_seconds + seconds(r.submitted, Clock::now());
-            std::lock_guard lock(stats_mutex);
-            stats.running_requests      = 0;
-            stats.prefilling_requests   = 0;
-            stats.decode_ready_requests = 0;
-            return std::move(result);
-        };
-        if (r.cancelled.load(std::memory_order_acquire)) {
-            (void)r.output.preview_terminal(FinishReason::Cancelled);
-            push_events(r, r.output.commit_preview(), std::nullopt);
-            const auto now = Clock::now();
-            return finish(FinishReason::Cancelled, now, now, now);
-        }
+        if (r.prefilled < prompt_n) { return; }
         CUDA_CHECK(cudaStreamSynchronize(executor.head_stream()));
-        const auto prefill_end = Clock::now();
+        r.prefill_end = Clock::now();
         {
             std::lock_guard lock(stats_mutex);
-            stats.computed_prefill_tokens += prompt_n;
-            stats.prefill_seconds_total += seconds(prefill_start, prefill_end);
-            stats.prefilling_requests   = 0;
-            stats.decode_ready_requests = 1;
+            stats.computed_prefill_tokens += prompt_n - r.reused;
+            stats.prefill_seconds_total += seconds(r.prefill_start, r.prefill_end);
         }
         const auto& exec = r.options.execution;
         const std::uint32_t capacity =
             effective_output_capacity(exec.requested_output_tokens, max_context, prompt_n);
-        GenerationBudget budget(capacity, exec.requested_output_tokens <= capacity
-                                              ? FinishReason::OutputLimit
-                                              : FinishReason::ContextCapacity);
-        const bool penalties = exec.sampling.presence_penalty != 0.0F ||
-                               exec.sampling.frequency_penalty != 0.0F ||
-                               (exec.post_thinking_sampling &&
-                                (exec.post_thinking_sampling->presence_penalty != 0.0F ||
-                                 exec.post_thinking_sampling->frequency_penalty != 0.0F));
-        if (penalties) {
+        r.budget.emplace(capacity, exec.requested_output_tokens <= capacity
+                                       ? FinishReason::OutputLimit
+                                       : FinishReason::ContextCapacity);
+        r.penalties = exec.sampling.presence_penalty != 0.0F ||
+                      exec.sampling.frequency_penalty != 0.0F ||
+                      (exec.post_thinking_sampling &&
+                       (exec.post_thinking_sampling->presence_penalty != 0.0F ||
+                        exec.post_thinking_sampling->frequency_penalty != 0.0F));
+        if (r.penalties) {
             RankBinding bind(device, executor.head_rank());
-            CUDA_CHECK(
-                cudaMemsetAsync(token_counts.p, 0, token_counts.bytes, executor.head_stream()));
+            CUDA_CHECK(cudaMemsetAsync(static_cast<std::int32_t*>(token_counts.p) +
+                                           std::size_t(r.slot) * domain,
+                                       0, std::size_t(domain) * sizeof(std::int32_t),
+                                       executor.head_stream()));
         }
-        bool post_thinking = false;
-        Clock::time_point first_token{}, last_token = prefill_end;
-        std::uint32_t position = prompt_n;
-        std::int32_t purpose   = ops::kSamplePurposePrefill;
-        for (;;) {
-            if (!post_thinking && exec.post_thinking_sampling && r.output.reasoning_closed()) {
-                post_thinking                          = true;
-                result.thinking.post_thinking_sampling = true;
-            }
-            const ResolvedSamplingParameters& params =
-                post_thinking ? *exec.post_thinking_sampling : exec.sampling;
-            const TokenId token = sample(params, position, purpose, penalties);
-            if (purpose == ops::kSamplePurposePrefill && exec.first_token_top_logprobs != 0) {
-                result.first_token_logprobs =
-                    first_token_logprobs(token, exec.first_token_top_logprobs);
-            }
-            purpose                       = ops::kSamplePurposeDecode;
-            const OutputDecision decision = r.output.preview_model(
-                std::span<const TokenId>(&token, 1), budget.remaining(), budget.limit_reason());
-            const auto now = Clock::now();
-            if (first_token == Clock::time_point{}) { first_token = now; }
-            last_token = now;
-            if (decision.accepted_tokens > 1) {
-                throw std::logic_error("output policy accepted more than the sampled token");
-            }
-            if (decision.accepted_tokens == 1) {
-                generated.push_back(token);
-                budget.commit(1);
-            }
-            std::optional<GenerationTimingObservation> timing;
-            if (r.observation.live_timings) {
-                timing = GenerationTimingObservation{
-                    .generated_tokens      = static_cast<std::uint32_t>(generated.size()),
-                    .prompt_elapsed_ns     = elapsed_ns(admitted, first_token),
-                    .generation_elapsed_ns = elapsed_ns(first_token, now)};
-            }
-            push_events(r, r.output.commit_preview(), timing);
-            {
-                std::lock_guard lock(stats_mutex);
-                stats.committed_decode_tokens += decision.accepted_tokens;
-            }
-            if (decision.finished()) {
-                return finish(decision.finish_reason, first_token, last_token, prefill_end);
-            }
-            std::vector<TokenId> feed{token};
-            if (decision.continuation == ContinuationAction::ApplyTargetControl) {
-                const auto pending_control = r.output.pending_control_tokens();
-                const std::vector<TokenId> control(pending_control.begin(), pending_control.end());
-                const OutputDecision forced = r.output.preview_control(control, budget.remaining());
-                if (forced.accepted_tokens != control.size() || forced.finished()) {
-                    throw std::logic_error("thinking control preview returned an invalid decision");
-                }
-                generated.insert(generated.end(), control.begin(), control.end());
-                budget.commit(static_cast<std::uint32_t>(control.size()));
-                push_events(r, r.output.commit_preview(), std::nullopt);
-                feed.insert(feed.end(), control.begin(), control.end());
-            }
-            if (r.cancelled.load(std::memory_order_acquire)) {
-                (void)r.output.preview_terminal(FinishReason::Cancelled);
-                push_events(r, r.output.commit_preview(), std::nullopt);
-                return finish(FinishReason::Cancelled, first_token, last_token, prefill_end);
-            }
-            if (position + feed.size() > max_context) {
-                (void)r.output.preview_terminal(FinishReason::ContextCapacity);
-                push_events(r, r.output.commit_preview(), std::nullopt);
-                return finish(FinishReason::ContextCapacity, first_token, last_token, prefill_end);
-            }
-            const auto decode_start = Clock::now();
-            executor.forward(0, feed, 1);
-            position += static_cast<std::uint32_t>(feed.size());
+        r.position         = prompt_n;
+        r.decoding         = true;
+        const SampleRow row = sample_row(r);
+        TokenId token       = 0;
+        sample(std::span(&row, 1), ops::kSamplePurposePrefill, std::span(&token, 1));
+        if (exec.first_token_top_logprobs != 0) {
+            r.first_token_logprobs = first_token_logprobs(token, exec.first_token_top_logprobs);
+        }
+        accept(request, token);
+    }
+
+    // Applies the output policy to a sampled token: publishes what it accepts, then either
+    // finishes the request or queues what its next decode step feeds.
+    void accept(const std::shared_ptr<Request>& request, TokenId token) {
+        Request& r                    = *request;
+        const OutputDecision decision = r.output.preview_model(
+            std::span<const TokenId>(&token, 1), r.budget->remaining(), r.budget->limit_reason());
+        const auto now = Clock::now();
+        if (r.first_token == Clock::time_point{}) { r.first_token = now; }
+        r.last_token = now;
+        if (decision.accepted_tokens > 1) {
+            throw std::logic_error("output policy accepted more than the sampled token");
+        }
+        if (decision.accepted_tokens == 1) {
+            r.generated.push_back(token);
+            r.budget->commit(1);
+        }
+        std::optional<GenerationTimingObservation> timing;
+        if (r.observation.live_timings) {
+            timing = GenerationTimingObservation{
+                .generated_tokens      = static_cast<std::uint32_t>(r.generated.size()),
+                .prompt_elapsed_ns     = elapsed_ns(r.admitted, r.first_token),
+                .generation_elapsed_ns = elapsed_ns(r.first_token, now)};
+        }
+        push_events(r, r.output.commit_preview(), timing);
+        {
             std::lock_guard lock(stats_mutex);
-            stats.decode_rounds += 1;
-            stats.decode_row_rounds += 1;
-            stats.decode_seconds_total += seconds(decode_start, Clock::now());
+            stats.committed_decode_tokens += decision.accepted_tokens;
         }
+        if (decision.finished()) {
+            finish(request, decision.finish_reason);
+            return;
+        }
+        r.feed.assign(1, token);
+        if (decision.continuation == ContinuationAction::ApplyTargetControl) {
+            const auto pending_control = r.output.pending_control_tokens();
+            const std::vector<TokenId> control(pending_control.begin(), pending_control.end());
+            const OutputDecision forced = r.output.preview_control(control, r.budget->remaining());
+            if (forced.accepted_tokens != control.size() || forced.finished()) {
+                throw std::logic_error("thinking control preview returned an invalid decision");
+            }
+            r.generated.insert(r.generated.end(), control.begin(), control.end());
+            r.budget->commit(static_cast<std::uint32_t>(control.size()));
+            push_events(r, r.output.commit_preview(), std::nullopt);
+            r.feed.insert(r.feed.end(), control.begin(), control.end());
+        }
+        if (r.cancelled.load(std::memory_order_acquire)) {
+            finish_now(request, FinishReason::Cancelled);
+            return;
+        }
+        if (r.position + r.feed.size() > max_context) {
+            finish_now(request, FinishReason::ContextCapacity);
+        }
+    }
+
+    // One step of every decoding request: those that feed one token run as one batch, whose
+    // experts read their weights once; one feeding a thinking-control suffix runs alone.
+    void decode_step() {
+        auto& executor = *instance.executor;
+        std::vector<std::shared_ptr<Request>> batch, alone;
+        for (const Slot& slot : slots) {
+            if (!slot.request || !slot.request->decoding) { continue; }
+            (slot.request->feed.size() == 1 ? batch : alone).push_back(slot.request);
+        }
+        const auto start = Clock::now();
+        for (const auto& request : alone) {
+            Request& r = *request;
+            executor.forward(r.slot, r.feed, 1);
+            Slot& slot = slots[r.slot];
+            slot.fed.insert(slot.fed.end(), r.feed.begin(), r.feed.end());
+            r.position += static_cast<std::uint32_t>(r.feed.size());
+            const SampleRow row = sample_row(r);
+            TokenId token       = 0;
+            sample(std::span(&row, 1), ops::kSamplePurposeDecode, std::span(&token, 1));
+            try {
+                accept(request, token);
+            } catch (...) { fail(request, std::current_exception()); }
+        }
+        if (!batch.empty()) {
+            std::vector<std::uint32_t> sequences;
+            std::vector<TokenId> tokens;
+            for (const auto& request : batch) {
+                sequences.push_back(request->slot);
+                tokens.push_back(request->feed.front());
+            }
+            executor.decode(sequences, tokens);
+            std::vector<SampleRow> rows;
+            for (const auto& request : batch) {
+                slots[request->slot].fed.push_back(request->feed.front());
+                request->position += 1;
+                rows.push_back(sample_row(*request));
+            }
+            std::vector<TokenId> sampled(batch.size());
+            sample(rows, ops::kSamplePurposeDecode, sampled);
+            for (std::size_t b = 0; b < batch.size(); ++b) {
+                try {
+                    accept(batch[b], sampled[b]);
+                } catch (...) { fail(batch[b], std::current_exception()); }
+            }
+        }
+        std::lock_guard lock(stats_mutex);
+        stats.decode_rounds += 1;
+        stats.decode_row_rounds += batch.size() + alone.size();
+        stats.decode_seconds_total += seconds(start, Clock::now());
     }
 
     std::vector<float> score(const std::vector<TokenId>& tokens, std::uint32_t first_target) {
@@ -617,6 +986,8 @@ struct Qwen4ExpCore::Impl {
         // Logits for position p predict token p + 1; the executor keeps at most 512 logit rows.
         const std::uint32_t chunk = std::min<std::uint32_t>(executor.options().prefill_chunk, 512);
         executor.reset(0);
+        slots[0].fed.clear();
+        slots[0].anchor.clear();
         std::vector<float> out;
         out.reserve(n - first_target);
         RankBinding bind(device, executor.head_rank());
@@ -761,9 +1132,10 @@ Qwen4ExpCore::Submission Qwen4ExpCore::submit(models::qwen3_5::PreparedPrompt pr
                                               GenerationObservationOptions observation,
                                               Clock::time_point pending_deadline) {
     const auto submitted = Clock::now();
-    if (options.execution.structured_output.kind != StructuredOutputKind::None) {
+    if (options.execution.structured_output.kind != StructuredOutputKind::None &&
+        !impl_->structured_output) {
         throw std::invalid_argument(
-            "structured output is not available for Qwen3.8-Flash-Next yet");
+            "structured output requires an Engine started with structured_output");
     }
     if (pending_deadline == Clock::time_point{}) {
         pending_deadline = submitted + impl_->pending_timeout;
@@ -771,6 +1143,25 @@ Qwen4ExpCore::Submission Qwen4ExpCore::submit(models::qwen3_5::PreparedPrompt pr
     auto request = std::make_shared<Request>();
     request->prompt_tokens =
         std::vector<TokenId>(prompt.token_ids().begin(), prompt.token_ids().end());
+    {
+        const auto& data     = models::qwen3_5::PreparedPromptAccess::view(prompt);
+        const auto& identity = data.identity;
+        const auto prompt_n  = static_cast<std::uint32_t>(request->prompt_tokens.size());
+        request->media       = data.has_media();
+        if (request->media && !impl_->instance.executor->vision()) {
+            throw std::invalid_argument("media need an Engine started with Vision");
+        }
+        // A prompt's media are not part of its tokens, so a media prompt is never reused.
+        request->reusable = identity.reusable && !request->media;
+        request->anchor_at   = prompt_n;
+        if (identity.rewrite_checkpoint &&
+            identity.rewrite_checkpoint->kind ==
+                models::qwen3_5::RewriteCheckpointKind::TurnClosure &&
+            identity.rewrite_checkpoint->frontier > 0 &&
+            identity.rewrite_checkpoint->frontier < prompt_n) {
+            request->anchor_at = identity.rewrite_checkpoint->frontier;
+        }
+    }
     request->prompt_summary  = prompt_summary;
     request->prepare_seconds = prepare_seconds;
     request->consumer_mode   = consumer_mode;
@@ -833,18 +1224,35 @@ std::vector<float> Qwen4ExpCore::score(models::qwen3_5::PreparedPrompt prompt,
 }
 
 MemorySummary Qwen4ExpCore::memory_summary() const {
+    const auto& stats  = impl_->instance.model->storage_stats();
+    const auto memory  = impl_->instance.executor->memory();
+    const auto arena   = [](std::uint64_t bytes) {
+        return ArenaMemorySummary{bytes, bytes, bytes};
+    };
+    std::vector<DeviceMemorySummary> devices;
+    for (std::size_t r = 0; r < impl_->device.size(); ++r) {
+        const auto& rank = memory.ranks.at(r);
+        devices.push_back({.device    = impl_->device.rank(r).device,
+                           .weights   = arena(r < stats.device_capacity_by_rank.size()
+                                                  ? stats.device_capacity_by_rank[r]
+                                                  : 0),
+                           .sequence  = arena(rank.state_bytes),
+                           .workspace = arena(rank.workspace_bytes),
+                           .expert_cache_bytes = rank.expert_cache_bytes});
+    }
     MemorySummary out;
-    out.device                    = impl_->device.rank(0).device;
+    out.device                    = devices.front().device;
     out.max_context               = impl_->max_context;
     out.kv_capacity               = impl_->max_context;
-    const auto& stats             = impl_->instance.model->storage_stats();
-    out.weights.capacity_bytes    = stats.device_capacity_bytes;
-    out.weights.used_bytes        = stats.device_capacity_bytes;
-    out.sequence.capacity_bytes   = impl_->instance.executor->memory().state_bytes;
-    out.sequence.used_bytes       = out.sequence.capacity_bytes;
-    out.workspace.capacity_bytes  = impl_->instance.executor->memory().workspace_bytes;
-    out.workspace.used_bytes      = out.workspace.capacity_bytes;
-    out.runtime_reservation_bytes = out.sequence.capacity_bytes + out.workspace.capacity_bytes;
+    out.weights                   = devices.front().weights;
+    out.sequence                  = devices.front().sequence;
+    out.workspace                 = devices.front().workspace;
+    out.expert_cache_bytes        = memory.expert_cache_bytes;
+    out.kv_payload_bytes          = memory.kv_bytes;
+    out.runtime_reservation_bytes = memory.state_bytes + memory.workspace_bytes;
+    out.available_after_weights_bytes = impl_->instance.free_after_weights;
+    out.available_after_startup_bytes = impl_->instance.free_after_startup;
+    if (devices.size() > 1) { out.devices = std::move(devices); }
     return out;
 }
 

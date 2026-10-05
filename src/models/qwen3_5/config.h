@@ -146,5 +146,8 @@ struct Config {
 };
 
 [[nodiscard]] Config parse_config(const artifact::Directory& directory, const LoadOptions& options);
+// The config of an artifact's `vision` component, which another family that reuses this tower
+// parses too.
+[[nodiscard]] VisionConfig parse_vision_config(const artifact::Directory& directory);
 
 } // namespace ninfer::models::qwen3_5

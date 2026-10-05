@@ -29,11 +29,10 @@ struct Options {
     std::vector<int> devices;
     // Layers per pipeline stage, one count per entry of `devices`. Empty lets the engine choose.
     std::vector<std::uint32_t> stage_layers;
-    // Qwen3.8-Flash-Next: where the expert banks live, and whether its n-gram table is loaded
-    // into RAM.
+    // Qwen3.8-Flash-Next: where the expert banks live, and where its n-gram table comes from.
     ninfer::ExpertResidency expert_residency = ninfer::ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
-    bool ngram_ram = false;
+    ninfer::NgramTableOptions ngram_table;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

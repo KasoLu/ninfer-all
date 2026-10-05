@@ -8,16 +8,28 @@ active per token) from ISTA-DASLab's GSQ-RCO GGUF releases, converted without re
 - [Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF).
 
 Each release is two GGUF shards: the model, and the 28.8 GB n-gram table of the model's per-layer
-embedding (PLE), identical across releases. A NInfer artifact is one file that holds both: the
-table is its `ngram` component, which nothing reads at load; each token reads the 16 rows it
-addresses from the file, or `--ngram-ram` loads the table into RAM.
+embedding (PLE), byte for byte the same in every release, the Coder build's included. A NInfer
+model artifact describes the table it reads in its `ngram` component (the hash constants, the row
+format and the SHA-256 of the rows) and either stores the rows too, as one self-contained file, or
+leaves them to a table artifact of their own that every Flash-Next model can share. Nothing reads
+the table at load; each token reads the 16 rows it addresses from the file, or `--ngram-ram` loads
+the table into RAM. A model stored without its rows takes them from `--ngram-table PATH`, which
+must hold the table the model names; without a table the engine refuses to start
+([running without it](#without-the-n-gram-table) is an experiment, not a mode).
 
-Two conversions are published, with their measurements:
-[Q2_0](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3) and
-[IQ3_S](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-NInfer-v3).
+The published conversions store the models without the table, which is published once:
 
-The text model runs; Vision, MTP drafting, the context cache and structured output are not
-available for this family yet (the [plan](maintainer/qwen3-8-flash-next-plan.md) tracks them).
+| Artifact | Size | |
+|---|---:|---|
+| [n-gram table](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-ngram-table-NInfer-v3) | 26.82 GiB | IQ4_NL rows, read by every model below |
+| [Q2_0](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3) | 35.05 GiB | |
+| [IQ3_S](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-NInfer-v3) | 51.07 GiB | |
+| [Coder IQ1_M](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-NInfer-v3) | 27.58 GiB | 256 experts per layer |
+
+The model runs with up to eight concurrent requests, a context cache of prompt prefixes, structured
+output, and images and video through its Vision tower (`--vision`, from an artifact converted with
+the tower). MTP drafting is not available: no GSQ-RCO release carries the MTP layer (the
+[plan](maintainer/qwen3-8-flash-next-plan.md) tracks what remains).
 
 ## Convert
 
@@ -26,39 +38,69 @@ available for this family yet (the [plan](maintainer/qwen3-8-flash-next-plan.md)
 [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next).
 
 ```bash
+# The model with its n-gram table, one self-contained file (--components text,ngram, the default).
 python3 -m tools.convert --model /path/to/Qwen3.8-Flash-Next \
   --recipe qwen3_8_flash_next_gguf \
   --source gguf=/path/to/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
   --source ngram=/path/to/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf \
   --device cpu --rows-per-chunk 65536 \
   --name qwen3.8-flash-next --out models/flash-next-q2_0.ninfer
+
+# Or the table once, as an artifact of its own, and each release without it.
+python3 -m tools.convert --model /path/to/Qwen3.8-Flash-Next \
+  --recipe qwen3_8_flash_next_gguf --components ngram \
+  --source ngram=/path/to/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf \
+  --device cpu --rows-per-chunk 65536 --out models/flash-next-ngram-table.ninfer
+python3 -m tools.convert --model /path/to/Qwen3.8-Flash-Next \
+  --recipe qwen3_8_flash_next_gguf --components text \
+  --source gguf=/path/to/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
+  --source ngram=/path/to/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf \
+  --device cpu --rows-per-chunk 65536 \
+  --name qwen3.8-flash-next --out models/flash-next-q2_0.ninfer
 ```
+
+Every conversion reads the table shard once more to hash it (a minute or so for 28.8 GB), since
+the model records the digest of the table it reads whether or not it stores the rows.
+
+`--components text,vision` (with or without `ngram`) adds the Vision tower from the release's
+`mmproj-Qwen3.8-Flash-Next-BF16.gguf` (`--source vision=PATH`): the same tower as Qwen3.5/3.6
+(27 blocks of width 1152, merging 2×2 patches onto the text model's 2,560), kept in BF16, 0.9 GB.
+`--model` then also needs `preprocessor_config.json` and `video_preprocessor_config.json`.
 
 Every matrix keeps the block type the release chose (see [GGUF block formats](gguf.md)); the expert
 banks keep the exporter's expert-major layout, so one expert is one contiguous range of bytes. The
 recipe undoes llama.cpp's exporter conventions as the Qwen3.8-27B GGUF recipe does (grouped GDN
 value heads, `1 + w` norms, `A_log`, the head-interleaved query and gate). The n-gram table keeps
 the release's IQ4_NL rows, and its component carries the hash constants they were written for; the
-runtime derives them again from the model's configuration and refuses a table that disagrees.
+runtime derives them again from the model's configuration and refuses a table that disagrees, or a
+table artifact whose digest or row format differs from the one the model names.
 
 ## Run
 
 ```bash
 # Two 24 GB GPUs: every expert in device memory, one pipeline stage per GPU (Linux).
-./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --devices 0,1 --max-context 32768
+./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --ngram-table models/flash-next-ngram-table.ninfer \
+  --devices 0,1 --max-context 32768
 
 # One GPU: the experts in pinned host memory, the most used of them cached on the GPU.
-./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --expert-residency host --max-context 32768
+./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --ngram-table models/flash-next-ngram-table.ninfer \
+  --expert-residency host --max-context 32768
 
 # One GPU and little RAM: the experts stay in the artifact's files and stream into a GPU cache.
-./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --expert-residency disk --max-context 32768
+./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --ngram-table models/flash-next-ngram-table.ninfer \
+  --expert-residency disk --max-context 32768
 ```
+
+A model converted with its table needs no `--ngram-table`. `ninfer` and `ninfer-perplexity` take
+the same options.
 
 | Option | Meaning |
 |---|---|
 | `--expert-residency device\|host\|disk` | expert banks in the stage devices' memory (default); in page-locked host memory that the expert kernels read across the bus; or left in the artifact's files, each layer's routed experts read into a device cache before they run |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts: `auto` (default) takes what each device has free after startup less a margin; `0` disables the host-mode cache (disk mode needs one) |
-| `--ngram-ram` | load the 28.8 GB n-gram table into RAM instead of reading the 16 rows each token needs from the artifact |
+| `--ngram-table PATH` | the table artifact to read the n-gram rows from; required for a model stored without its table, and it must hold the table the model names (same SHA-256 and row format) |
+| `--ngram-ram` | load the 28.8 GB n-gram table into RAM instead of reading the 16 rows each token needs from its file |
+| `--no-ngram-table` | run without the n-gram table: see [below](#without-the-n-gram-table) |
 | `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides) |
 
 With host experts the GPU holds only the dense weights (3.7 GB for the Q2_0 release), the
@@ -69,10 +111,46 @@ flight, into a 256 MB page-locked staging ring, so the page cache keeps whatever
 spare and the rest comes from the disk. The n-gram rows are read the same way unless `--ngram-ram`
 is given.
 
+### Without the n-gram table
+
+The model was trained with its n-gram embedding, so the engine refuses a model whose table it
+cannot find. `--no-ngram-table` starts it anyway, without the PLE injection (exactly what an
+all-zero table gives), and warns at startup: this is a non-standard, experimental mode with no
+practical use. On the Q2_0 release it nearly doubles WikiText-2 perplexity, 2.66 to 5.01 over the
+fourteen windows of the comparison below; short factual answers survive, but nothing measured
+improves.
+
 The KV cache of the 12 sparse-attention layers is BF16 whatever `--kv-dtype` asks (the engine says
 so at startup, and reports BF16).
 
-Requests run one at a time in arrival order; `--max-concurrency` above one queues.
+`--max-concurrency N` (one to eight) runs that many requests at once, each on its own sequence with
+its own KV and recurrent state, so every sequence costs device memory (the KV of `--max-context`
+positions in BF16, about 25 KB a position, plus 74 MiB of recurrent state). Requests are admitted
+in arrival order. Prompts prefill one at a time, a chunk at a time; between two chunks every request
+that is decoding produces one token, all of them in one batched pass whose experts read their
+weights once for the whole batch, so the batch costs little more than one token while the experts
+dominate the step.
+
+With the context cache on (the default), a sequence keeps its state when its request ends, and a
+snapshot of its recurrent state where the prompt's last user turn closes (or at the prompt's end
+when the template marks no turn), 74 MiB on the device: a later prompt that continues what the
+sequence holds resumes from its live state, and one that repeats the prompt up to that point (the
+next turn of a chat, which renders the previous answer without its reasoning) resumes from the
+snapshot.
+Either way only the new tokens are prefilled; the response's prompt summary reports how many were
+reused. A request goes to the free sequence that holds the longest such prefix of its prompt.
+`--no-prefix-reuse` (ninfer-serve) prefills every prompt from scratch.
+
+Structured output (`--structured-output` for the server, `--json`/`--json-schema` for the CLI) works
+as for the Qwen3.5 family: the grammar's token mask applies to every sampled token.
+
+`--vision` loads the Vision tower of an artifact converted with it (0.9 GB of BF16 weights on the
+first device, beside the token embedding) and takes images and video as the Qwen3.5 family does:
+the frontend renders the media tokens, the tower encodes the prompt's media before its first
+chunk, and their merged embeddings replace those tokens' embeddings. A media prompt rotates its
+positions on the three RoPE axes the frontend computes (text positions on all three, then each
+later token at its index plus the prompt's offset); it prefills in a pass of its own and is not
+kept for reuse by the context cache.
 
 ## Execution
 
@@ -80,8 +158,8 @@ Requests run one at a time in arrival order; `--max-concurrency` above one queue
 - The 36 Gated DeltaNet layers run the Qwen3.5 GDN kernels with a sigmoid output gate; the 12 sparse
   attention layers run the block indexer and attend only to the blocks it selects (plain dense
   attention below 2,051 positions).
-- The PLE layer reads its 16 n-gram rows per token from the artifact (IQ4_NL rows decoded on the
-  GPU).
+- The PLE layer reads its 16 n-gram rows per token from the table's file (IQ4_NL rows decoded on
+  the GPU).
 - The 512-expert MoE groups each layer's (token, expert) pairs by expert on the GPU and runs one
   pass over each selected expert's rows for all of its tokens, through device tables of expert
   base pointers: an expert is read wherever the table points, in device memory, a cache slot or the

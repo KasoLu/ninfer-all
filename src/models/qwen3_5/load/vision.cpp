@@ -3,7 +3,7 @@
 namespace ninfer::models::qwen3_5::loading {
 
 VisionWeights bind_vision(Bindings& bindings, const VisionConfig& config,
-                          const TextConfig& target, artifact::Residency residency) {
+                          std::uint64_t output_hidden, artifact::Residency residency) {
     const auto h            = config.hidden_size;
     const auto intermediate = config.intermediate_size;
     // Every Vision parameter shares one residency; binding order defines the pinned groups.
@@ -52,9 +52,9 @@ VisionWeights bind_vision(Bindings& bindings, const VisionConfig& config,
                          b.direct("vision/merger/norm_bias", {h})};
     out.merger_fc1    = b.parameter("vision/merger/fc1", {merger, merger}, {"vision/merger/input"});
     out.merger_fc1_bias = b.direct("vision/merger/fc1_bias", {merger});
-    out.merger_fc2      = b.parameter("vision/merger/fc2", {target.hidden_size, merger},
+    out.merger_fc2      = b.parameter("vision/merger/fc2", {output_hidden, merger},
                                       {"vision/merger/activation"});
-    out.merger_fc2_bias = b.direct("vision/merger/fc2_bias", {target.hidden_size});
+    out.merger_fc2_bias = b.direct("vision/merger/fc2_bias", {output_hidden});
     return out;
 }
 

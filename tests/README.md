@@ -185,10 +185,25 @@ NINFER_TEST_ARTIFACT=$PWD/out/qwen3_6_35b_a3b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_5_moe_real_test --output-on-failure
 ```
 
-Qwen3.8-Flash-Next has no loadable artifact yet; its Ops are composed over a checkpoint slice
-instead. `tools/reference/fetch_slice.py` range-fetches the first blocks, embedding, final mixer, head
-and the needed n-gram rows (`--exclude ngram_embedding` keeps the 102 GB table out), and
-`tools/reference/qwen4_exp.py --layers 4 --head --out DIR/golden` writes the FP64 golden:
+Qwen3.8-Flash-Next runs end to end from a converted GSQ-RCO release. The generate test answers
+fact prompts and a 4,463-token needle, decodes three sequences as one batch and from a restored
+snapshot, and, where decode replays CUDA graphs, checks every token against eager decode.
+`NINFER_QWEN4_EXP_EXPERTS` picks `device`, `host` or `disk`, `NINFER_QWEN4_EXP_DEVICES` the pipeline
+devices, and `NINFER_QWEN4_EXP_EXPERT_CACHE_MIB` the device expert cache of host or disk experts
+(a 24 GB card's on a larger one); a model stored without its n-gram table takes the table artifact
+from `NINFER_QWEN4_EXP_NGRAM_TABLE`:
+
+```bash
+NINFER_QWEN4_EXP_ARTIFACT=$PWD/models/flash-next-q2_0.ninfer \
+NINFER_QWEN4_EXP_NGRAM_TABLE=$PWD/models/flash-next-ngram-table.ninfer \
+NINFER_QWEN4_EXP_EXPERTS=host \
+  ctest --test-dir build -R ninfer_qwen4_exp_generate_real --output-on-failure
+```
+
+Its Ops are also composed over a slice of the BF16 checkpoint against an FP64 golden.
+`tools/reference/fetch_slice.py` range-fetches the first blocks, embedding, final mixer, head and
+the needed n-gram rows (`--exclude ngram_embedding` keeps the 102 GB table out), and
+`tools/reference/qwen4_exp.py --layers 4 --head --out DIR/golden` writes the golden:
 
 ```bash
 NINFER_QWEN4_EXP_SLICE=$PWD/fn_slice \

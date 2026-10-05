@@ -284,6 +284,10 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
 
 } // namespace
 
+VisionConfig parse_vision_config(const artifact::Directory& directory) {
+    return vision(directory.component("vision").config);
+}
+
 std::uint64_t GdnConfig::conv_channels() const {
     return artifact::checked_add(artifact::checked_mul(2, key_width(), "GDN key width"),
                                  value_width(), "GDN convolution channels");

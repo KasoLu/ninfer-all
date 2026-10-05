@@ -79,7 +79,7 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
         out->cpu_vision = loading::load_cpu_vision(binder, *out->config.vision, text);
     } else if (out->config.vision) {
         out->weights.vision = loading::bind_vision(
-            bindings, *out->config.vision, text,
+            bindings, *out->config.vision, text.hidden_size,
             options.overlay_vision() ? artifact::Residency::Pinned : artifact::Residency::Device);
     }
     std::pair<std::size_t, std::size_t> mtp_parameters{bindings.weights.size(),

@@ -82,8 +82,10 @@ private:
 [[nodiscard]] std::vector<WeightId> layer_weights(const BlockWeights& block);
 // Pinned residency keeps the tower in the page-locked Host block, one contiguous group per stage
 // (patch/position embedding, each layer, merger) in binding order.
+// `output_hidden` is the text model's hidden width, which the merger projects to.
 [[nodiscard]] VisionWeights bind_vision(Bindings& bindings, const VisionConfig& config,
-                                        const TextConfig& target, artifact::Residency residency);
+                                        std::uint64_t output_hidden,
+                                        artifact::Residency residency);
 [[nodiscard]] MtpWeights bind_mtp(Bindings& bindings, const TextConfig& config,
                                   const TextWeights& target);
 [[nodiscard]] DraftWeights bind_draft(Bindings& bindings, const DraftConfig& config,

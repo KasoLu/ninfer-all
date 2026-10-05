@@ -562,6 +562,16 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   product::format_pretty_count(memory.kv_capacity_max_page_groups),
                   product::format_pretty_bytes(memory.runtime_reservation_bytes),
                   product::format_pretty_bytes(memory.available_after_startup_bytes));
+    for (const ninfer::DeviceMemorySummary& stage : memory.devices) {
+        logger_->info("device {} | weights {} | state {} | workspace {}{}", stage.device,
+                      product::format_pretty_bytes(stage.weights.capacity_bytes),
+                      product::format_pretty_bytes(stage.sequence.capacity_bytes),
+                      product::format_pretty_bytes(stage.workspace.capacity_bytes),
+                      stage.expert_cache_bytes == 0
+                          ? std::string()
+                          : " | expert cache " +
+                                product::format_pretty_bytes(stage.expert_cache_bytes));
+    }
 
     if (cache.enabled) {
         // Report what was actually pinned, not what was requested: on Windows the host KV cache

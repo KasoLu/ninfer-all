@@ -52,11 +52,11 @@ struct Options {
     bool disjoint             = false;
     int device                = 0;
     // Qwen3.8-Flash-Next: a pipeline over several devices, host-resident experts and their
-    // device cache, and the n-gram table in RAM.
+    // device cache, and where the n-gram table comes from.
     std::vector<int> devices;
     ninfer::ExpertResidency expert_residency = ninfer::ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
-    bool ngram_ram = false;
+    ninfer::NgramTableOptions ngram_table;
 #if defined(NINFER_SM8X_COMPAT)
     // FP8 E4M3 KV attention has no SM86 implementation, so the upstream default would fail at
     // engine construction on this fork. INT8 group-64 is the qualified quantized profile here.
@@ -88,7 +88,7 @@ std::string usage_text() {
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N | --disjoint] [--device N | --devices A,B,...]\n"
            "       [--expert-residency device|host|disk] [--expert-cache-mib N|auto]\n"
-           "       [--ngram-ram]   (Qwen3.8-Flash-Next)\n"
+           "       [--ngram-table PATH] [--ngram-ram] [--no-ngram-table]   (Qwen3.8-Flash-Next)\n"
            "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4] [--output "
            "<directory>]\n"
            "       [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -217,8 +217,12 @@ Options parse_options(int argc, char** argv) {
                 out.expert_cache_bytes =
                     std::uint64_t(parse_integer<std::uint32_t>(mib, "expert-cache-mib")) << 20;
             }
+        } else if (option == "--ngram-table") {
+            out.ngram_table.path = value("--ngram-table");
         } else if (option == "--ngram-ram") {
-            out.ngram_ram = true;
+            out.ngram_table.ram = true;
+        } else if (option == "--no-ngram-table") {
+            out.ngram_table.disabled = true;
         } else if (option == "--rope-yarn") {
             out.rope_yarn = true;
         } else if (option == "--rope-yarn-factor") {
@@ -357,7 +361,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.devices                       = options.devices;
     engine_options.expert_residency              = options.expert_residency;
     engine_options.expert_cache_bytes            = options.expert_cache_bytes;
-    engine_options.ngram_ram                     = options.ngram_ram;
+    engine_options.ngram_table                   = options.ngram_table;
     engine_options.max_context      = options.context;
     engine_options.kv_cache         = options.kv;
     engine_options.lm_head_q4       = options.lm_head_q4;

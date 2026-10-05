@@ -34,8 +34,11 @@ HF repository, and Strata is github.com/Niko1221/Strata (MIT).
 | M4 | the GSQ-RCO GGUF releases (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S and the Coder build's 256-expert IQ1_M) imported without requantization, with their n-gram table in the same artifact; perplexity within 0.2% of llama.cpp's on the same windows | `tools/convert/qwen4_exp_gguf.py`, `src/models/qwen4_exp/ngram_component.*`, `docs/qwen3-8-flash-next.md` |
 | M4 | expert residency: device banks, pinned host banks with a device expert cache (wide calls copy the uncached routed experts into a device slot pool), or the artifact's files streamed into device slots (parallel reads); `moe_experts_gguf` over expert tables, vector products up to eight tokens and ggml's matrix kernel above that from device memory | `src/models/qwen4_exp/{expert_cache,expert_stream,read_pool}.*`, `src/ops/moe_experts/moe_experts_gguf.cu` |
 
-Not started: NInfer's own quantized expert formats and KV codecs for the new Ops, the RadixArk NVFP4 checkpoint,
-MTP, Vision, the context cache, structured output.
+| M5 | the n-gram table described by every model and stored inside it or in a table artifact of its own, refused when missing or different; up to eight concurrent requests with batched decode (the experts read once per batch), FIFO admission between prefill chunks; the context cache's live and turn-closure reuse of a sequence's recurrent state; structured output through the grammar's token masks; the Qwen3.5 Vision tower from the release's mmproj with three-axis RoPE for media prompts | `src/models/qwen4_exp/ngram_component.*`, `executor.*`, `src/runtime/engine/qwen4_exp_core.*`, `tools/convert/qwen4_exp_gguf.py` |
+
+Not started: NInfer's own quantized expert formats and KV codecs for the new Ops, the RadixArk NVFP4 checkpoint, the
+context cache's disk KV tier, and MTP, which needs the BF16 checkpoint's MTP layer: no GSQ-RCO GGUF release carries
+one.
 
 ---
 
@@ -507,13 +510,17 @@ lookahead prefetch); an option loads it, or a profile-selected hot part of it, i
   53.7 GB; `Qwen/Qwen3.8-Flash-Next-FP8`) imported encoded when its scale granularity matches.
 - metadata: format, `row_bytes`, `n_rows`, `head_dim_ng` 160, `n_heads` 16, multipliers[3], head_vocab[16],
   head_offset[16], eos id, image/video placeholder ids, a content digest.
-- **Placement:** the table is the model artifact's **`ngram` component**, in the same file as the weights. A
-  `.ninfer` file holds everything the model reads and the runtime reads only what a placement needs: nothing of the
-  table at load, the rows each token addresses afterwards (or all of it with `--ngram-ram`). Each quantization then
-  carries its own copy of the 28.8 GB IQ4_NL table (GSQ ships it as a second shard per release, also identical);
-  Hugging Face's chunk deduplication stores it once. A separate companion file, shared by the quantizations and
-  placeable on another disk, was built first and replaced by this single-file layout. The loader refuses a table whose
-  constants disagree with the model's.
+- **Placement (hybrid):** the table is described by the model artifact's **`ngram` component** (constants, row
+  format, SHA-256 of the rows), and its rows are stored either in the same file, as a self-contained model, or in a
+  **table artifact** of their own, a `.ninfer` with the `ngram` component alone, which every quantization shares
+  (GSQ ships the same 28.8 GB IQ4_NL table as the second shard of every release, the Coder build's included). The
+  runtime reads only what a placement needs: nothing of the table at load, the rows each token addresses afterwards
+  (or all of it with `--ngram-ram`). A model stored without its rows takes them from `--ngram-table PATH`; the
+  loader refuses a table whose constants, format or digest disagree with the model's, and refuses to start a model
+  with no table at all unless `--no-ngram-table` asks for the experimental table-less mode (the PLE injection is
+  skipped, equal to an all-zero table; Q2_0 WikiText-2 perplexity 2.66 -> 5.01). The published conversions are
+  table-less models plus one table repository. A side companion file without a container came first; a single file
+  per model replaced it, and the hybrid replaced that so that several published checkpoints share one table.
 
 **Runtime option surface** (CLI and serve config; names follow our `--kebab` convention):
 

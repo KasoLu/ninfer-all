@@ -462,6 +462,19 @@ enum class ExpertResidency : std::uint8_t {
     Disk,
 };
 
+// The n-gram table of Qwen3.8-Flash-Next's per-layer embedding: the model artifact's own rows, or
+// a separate table artifact holding the table the model names by digest. The rows stay in their
+// file and are read a row at a time.
+struct NgramTableOptions {
+    // A table artifact to read the rows from; empty takes the model artifact's own.
+    std::filesystem::path path;
+    // Loads the whole table into RAM at startup.
+    bool ram = false;
+    // Runs the model without its table: a non-standard, experimental mode that badly degrades the
+    // output, since the model was trained with the table.
+    bool disabled = false;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -486,9 +499,8 @@ struct EngineOptions {
     // evenly over the devices. Empty takes what each device has free after startup less a margin;
     // zero disables the cache.
     std::optional<std::uint64_t> expert_cache_bytes;
-    // The n-gram table of the per-layer embedding, which stays in the artifact's file and is read a
-    // row at a time; true loads the whole table into RAM at startup.
-    bool ngram_ram                     = false;
+    // Qwen3.8-Flash-Next only.
+    NgramTableOptions ngram_table;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     // Past the model's native window (max_position_embeddings), up to four times it: positions run
     // unscaled RoPE, or with rope_yarn the whole window takes Qwen's YaRN at factor
