@@ -29,7 +29,7 @@ Fp8LinearAddRoute resolve_route(std::int32_t output_rows, std::int32_t input_row
         return Fp8LinearAddRoute::A16;
     }
     if (!allows_a8(policy)) { throw std::invalid_argument("fp8 linear_add: unsupported policy"); }
-    const std::int32_t first_a8 = input_rows == Fp8N5120K6144::kInputRows ? 22 : 25;
+    const std::int32_t first_a8 = input_rows == Fp8N5120K6144::kInputRows ? 17 : 20;
     return tokens >= first_a8 ? Fp8LinearAddRoute::A8 : Fp8LinearAddRoute::A16;
 }
 

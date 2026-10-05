@@ -340,11 +340,11 @@ int main(int argc, char** argv) {
         return 77;
     }
     int failures = 0;
-    failures += run_shape(5120, 6144, 22, 861U, wide_only);
-    failures += run_shape(5120, 17408, 25, 863U, wide_only);
+    failures += run_shape(5120, 6144, 17, 861U, wide_only);
+    failures += run_shape(5120, 17408, 20, 863U, wide_only);
     if (!wide_only) {
-        failures += run_shape(5120, 6144, 22, 877U, false, true);
-        failures += run_shape(5120, 17408, 25, 881U, false, true);
+        failures += run_shape(5120, 6144, 17, 877U, false, true);
+        failures += run_shape(5120, 17408, 20, 881U, false, true);
     }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " FP8 linear_add\n";
     return failures == 0 ? 0 : 1;

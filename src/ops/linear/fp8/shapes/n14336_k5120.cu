@@ -27,7 +27,7 @@ Fp8Launch select_a16(std::int32_t tokens) {
     throw std::logic_error("fp8 A16 chunk exceeds shape capacity");
 }
 
-bool uses_a8(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 12; }
+bool uses_a8(std::int32_t, std::int32_t max_tokens) { return max_tokens >= 17; }
 } // namespace
 
 const Fp8LinearShape kFp8N14336K5120{14336, 5120, launch_fp8_a16_chunks<11, select_a16>,

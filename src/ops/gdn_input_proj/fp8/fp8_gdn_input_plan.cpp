@@ -22,7 +22,7 @@ Fp8GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (!allows_a8(policy)) {
         throw std::invalid_argument("fp8 gdn_input_proj: unsupported policy");
     }
-    return tokens >= 8 ? Fp8GdnInputRoute::A8 : Fp8GdnInputRoute::A16;
+    return tokens >= 17 ? Fp8GdnInputRoute::A8 : Fp8GdnInputRoute::A16;
 }
 
 } // namespace
