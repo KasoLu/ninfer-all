@@ -111,7 +111,7 @@ int run(const char* artifact_path) {
 
     const auto& tokenizer             = *model->resources().tokenizer;
     const std::size_t domain          = model->resources().public_token_count;
-    const std::vector<Prompt> prompts = {
+    std::vector<Prompt> prompts       = {
         {"<|im_start|>user\nWhat is the capital of France? Answer in one word.<|im_end|>\n"
          "<|im_start|>assistant\n<think>\n\n</think>\n\n",
          "Paris"},
@@ -122,6 +122,24 @@ int run(const char* artifact_path) {
          "<|im_start|>assistant\n<think>\n\n</think>\n\n",
          "", 96},
     };
+    // A fact deep inside a long context: several prefill chunks and the indexer's sparse
+    // selection (past 2,051 positions) must still find it.
+    std::string haystack;
+    const char* filler[] = {
+        "The river bends twice before it reaches the old mill, where the water slows. ",
+        "Farmers in the valley rotate barley and clover to keep the soil rich. ",
+        "A lighthouse keeper logs the passing ships and the weather every hour. ",
+        "The library catalog lists maps, letters and ledgers from three centuries. ",
+    };
+    for (int i = 0; i < 300; ++i) {
+        haystack += filler[i % 4];
+        if (i == 97) { haystack += "Remember this: the vault combination is 4771. "; }
+    }
+    prompts.push_back(
+        {"<|im_start|>user\n" + haystack +
+             "\nWhat is the vault combination? Reply with the number only.<|im_end|>\n"
+             "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+         "4771"});
     int failures = 0;
     std::vector<__nv_bfloat16> logits(model->config().vocab_size);
     for (const auto& prompt : prompts) {
@@ -153,6 +171,13 @@ int run(const char* artifact_path) {
                   << " tokens at " << double(generated.size()) / seconds(prefill_end, decode_end)
                   << " tok/s: \"" << text << "\"\n";
         failures += ok ? 0 : 1;
+        const auto cache = executor.expert_cache_stats();
+        if (cache.slots != 0) {
+            std::cout << "     expert cache: " << cache.slots << " slots, hit rate "
+                      << double(cache.hits) / double(std::max<std::uint64_t>(cache.routes, 1))
+                      << " over " << cache.routes << " routes, " << cache.admitted << " admitted ("
+                      << cache.copied_bytes / 1e9 << " GB)\n";
+        }
     }
     return failures;
 }

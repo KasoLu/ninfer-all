@@ -52,7 +52,13 @@ int run() {
     require(constants.rows == 320001536ULL, "n-gram table rows");
 
     expect_refusal([](Json& c) { c["hidden_size"] = 2048; }, "another hidden width");
-    expect_refusal([](Json& c) { c["num_experts"] = 256; }, "another expert count");
+    // An expert-pruned release keeps 256 of the 512 experts; fewer than the ten a token selects,
+    // or more than 512, are refused.
+    Json pruned           = fixture();
+    pruned["num_experts"] = 256;
+    require(parse_text_config(pruned).num_experts == 256, "an expert-pruned release parses");
+    expect_refusal([](Json& c) { c["num_experts"] = 9; }, "fewer experts than a token selects");
+    expect_refusal([](Json& c) { c["num_experts"] = 1024; }, "more experts than implemented");
     expect_refusal([](Json& c) { c["ple_layers"] = Json::array({3}); }, "PLE on a QSA block");
     expect_refusal([](Json& c) { c.erase("hc_lowrank"); }, "a missing field");
     expect_refusal([](Json& c) { c["architectures"] = Json::array({"Qwen3_5ForCausalLM"}); },

@@ -163,6 +163,8 @@ struct PlePlan {
 struct ExpertTable {
     QType format           = QType::GGUF_Q8_0;
     std::int64_t row_bytes = 0;
+    std::int32_t rows      = 0;
+    std::vector<const void*> pointers; // each expert's rows where the artifact put them
     DeviceBuffer table;
 
     [[nodiscard]] ops::GgufExpertTable view() const {
@@ -189,9 +191,11 @@ ExpertTable make_table(const Model& model, std::span<const WeightId> ids) {
                                         ": every expert of a bank must share its block type");
         }
         pointers.push_back(w.qdata);
+        out.rows = w.n;
     }
     out.table = DeviceBuffer(pointers.size() * sizeof(void*));
     out.table.copy_from_host(pointers.data(), pointers.size() * sizeof(void*));
+    out.pointers = std::move(pointers);
     return out;
 }
 
@@ -205,7 +209,8 @@ struct MoePlan {
                 down.view(),
                 shared_gate_table.view(),
                 shared_up_table.view(),
-                shared_down_table.view()};
+                shared_down_table.view(),
+                static_cast<std::int32_t>(gate.pointers.size())};
     }
 };
 
@@ -242,6 +247,7 @@ struct RankState {
     std::unique_ptr<PinnedHostBuffer> staging;
     cudaEvent_t staged = nullptr;
     cudaEvent_t done   = nullptr;
+    cudaEvent_t routes = nullptr; // the last pass's routes reached the host
     // Activation planes (capacity: prefill_chunk tokens).
     float* stack            = nullptr;
     std::int32_t* ids       = nullptr;
@@ -256,7 +262,6 @@ struct RankState {
     void* e                 = nullptr;
     void* f                 = nullptr;
     void* g                 = nullptr;
-    std::int32_t* route_ids = nullptr;
     float* route_weights    = nullptr;
     float* route_shared     = nullptr;
     std::int32_t* selected  = nullptr;
@@ -286,6 +291,12 @@ struct Executor::Impl {
     ExecutorMemory memory;
     std::vector<std::uint64_t> row_ids;
     std::vector<std::uint8_t> row_bytes_host;
+    // Expert cache (host-resident experts): every layer's routes of the last pass, on its device
+    // and in pinned host memory, and how many tokens they cover.
+    std::unique_ptr<ExpertCache> cache;
+    std::vector<DeviceBuffer> route_records;
+    std::unique_ptr<PinnedHostBuffer> route_host;
+    std::uint32_t pending_routes = 0;
 
     Impl(const Model& m, DeviceContext& d, ExecutorOptions o)
         : model(m), device(d), options(std::move(o)), config(m.config()),
@@ -301,6 +312,7 @@ struct Executor::Impl {
         plan_weights();
         allocate_ranks();
         allocate_sequences();
+        allocate_cache();
     }
 
     ~Impl() {
@@ -308,6 +320,7 @@ struct Executor::Impl {
             RankBinding bind(device, rank.rank);
             if (rank.staged != nullptr) { cudaEventDestroy(rank.staged); }
             if (rank.done != nullptr) { cudaEventDestroy(rank.done); }
+            if (rank.routes != nullptr) { cudaEventDestroy(rank.routes); }
         }
     }
 
@@ -454,8 +467,6 @@ struct Executor::Impl {
                 {&rank.e, plane * t * 2},
                 {&rank.f, plane * t * 2},
                 {&rank.g, plane * t * 4},
-                {reinterpret_cast<void**>(&rank.route_ids),
-                 std::uint64_t(config.num_experts_per_tok) * t * 4},
                 {reinterpret_cast<void**>(&rank.route_weights),
                  std::uint64_t(config.num_experts_per_tok) * t * 4},
                 {reinterpret_cast<void**>(&rank.route_shared), t * 4},
@@ -485,6 +496,7 @@ struct Executor::Impl {
                 round_up(t * 8) + round_up(std::uint64_t(config.ngram_heads()) * t * row_b));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.staged, cudaEventDisableTiming));
             CUDA_CHECK(cudaEventCreateWithFlags(&rank.done, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&rank.routes, cudaEventDisableTiming));
             memory.workspace_bytes += total + rank.workspace->capacity();
             ranks.push_back(std::move(rank));
         }
@@ -527,6 +539,88 @@ struct Executor::Impl {
             sequences.push_back(std::move(sequence));
             reset(s);
         }
+    }
+
+    void allocate_cache() {
+        const std::uint64_t pairs =
+            std::uint64_t(config.num_experts_per_tok) * options.prefill_chunk;
+        for (const auto& plan : layers) {
+            RankBinding bind(device, plan.rank);
+            route_records.emplace_back(pairs * sizeof(std::int32_t));
+        }
+        route_host =
+            std::make_unique<PinnedHostBuffer>(layers.size() * pairs * sizeof(std::int32_t));
+        if (model.options().experts != ExpertResidency::Host || options.expert_cache_bytes == 0) {
+            return;
+        }
+        // What each rank lends: the request split evenly, or what is free less a margin for the
+        // allocations later startup makes (sampling, CUDA context growth).
+        constexpr std::uint64_t kMargin = 1536ULL << 20;
+        std::vector<std::uint64_t> bytes(device.size(), 0);
+        for (std::size_t r = 0; r < device.size(); ++r) {
+            RankBinding bind(device, r);
+            std::size_t free_bytes = 0, total = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total));
+            const std::uint64_t available = free_bytes > kMargin ? free_bytes - kMargin : 0;
+            bytes[r] = options.expert_cache_bytes == ExecutorOptions::kAutoExpertCache
+                           ? available
+                           : std::min<std::uint64_t>(available,
+                                                     options.expert_cache_bytes / device.size());
+        }
+        std::vector<ExpertCacheLayer> cache_layers;
+        for (const auto& plan : layers) {
+            const auto bank = [](const ExpertTable& table) {
+                return ExpertBank{.expert_bytes = std::int64_t(table.rows) * table.row_bytes,
+                                  .host         = table.pointers,
+                                  .table        = table.table.p};
+            };
+            cache_layers.push_back(ExpertCacheLayer{.rank   = plan.rank,
+                                                    .stream = ranks[plan.rank].stream,
+                                                    .gate   = bank(plan.moe.gate),
+                                                    .up     = bank(plan.moe.up),
+                                                    .down   = bank(plan.moe.down)});
+        }
+        cache = std::make_unique<ExpertCache>(device, std::move(cache_layers), bytes);
+        for (const auto value : bytes) { memory.expert_cache_bytes += value; }
+    }
+
+    // Feeds the last pass's routes to the expert cache and lets it swap experts, before the next
+    // pass reads the tables.
+    void settle_routes() {
+        if (pending_routes == 0) { return; }
+        for (auto& rank : ranks) {
+            RankBinding bind(device, rank.rank);
+            CUDA_CHECK(cudaEventSynchronize(rank.routes));
+        }
+        const std::uint64_t pairs =
+            std::uint64_t(config.num_experts_per_tok) * options.prefill_chunk;
+        const auto* host = static_cast<const std::int32_t*>(route_host->data());
+        if (cache) {
+            const std::size_t used = std::size_t(config.num_experts_per_tok) * pending_routes;
+            for (std::size_t i = 0; i < layers.size(); ++i) {
+                cache->observe(i, std::span(host + i * pairs, used), pending_routes);
+            }
+            // A prompt chunk moves the working set; a decode step only nudges it.
+            cache->rebalance(pending_routes > 1 ? (2048ULL << 20) : (48ULL << 20));
+        }
+        pending_routes = 0;
+    }
+
+    void record_routes(std::uint32_t tokens) {
+        const std::uint64_t pairs =
+            std::uint64_t(config.num_experts_per_tok) * options.prefill_chunk;
+        auto* host = static_cast<std::int32_t*>(route_host->data());
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            RankBinding bind(device, layers[i].rank);
+            CUDA_CHECK(cudaMemcpyAsync(host + i * pairs, route_records[i].p,
+                                       std::size_t(config.num_experts_per_tok) * tokens * 4,
+                                       cudaMemcpyDeviceToHost, ranks[layers[i].rank].stream));
+        }
+        for (auto& rank : ranks) {
+            RankBinding bind(device, rank.rank);
+            CUDA_CHECK(cudaEventRecord(rank.routes, rank.stream));
+        }
+        pending_routes = tokens;
     }
 
     void reset(std::uint32_t s) {
@@ -742,14 +836,14 @@ struct Executor::Impl {
                         config.rms_norm_eps, history, ws, s);
     }
 
-    void run_moe(const LayerPlan& plan, RankState& rank, std::int32_t t) {
+    void run_moe(const LayerPlan& plan, RankState& rank, std::int32_t t, std::size_t index) {
         const MoePlan& m     = plan.moe;
         WorkspaceArena& ws   = *rank.workspace;
         const cudaStream_t s = rank.stream;
         const auto h         = static_cast<std::int32_t>(config.hidden_size);
         const auto top       = static_cast<std::int32_t>(config.num_experts_per_tok);
         const Tensor mixed(rank.mixed, DType::BF16, {h, t});
-        Tensor ids(rank.route_ids, DType::I32, {top, t});
+        Tensor ids(route_records[index].p, DType::I32, {top, t});
         Tensor weights(rank.route_weights, DType::FP32, {top, t});
         Tensor shared(rank.route_shared, DType::FP32, {t});
         ops::moe_route(mixed, m.router, m.shared_gate, ids, weights, shared, s);
@@ -776,6 +870,7 @@ struct Executor::Impl {
             }
         }
         const auto first = static_cast<std::int32_t>(sequence.position);
+        settle_routes();
         stage_inputs(sequence, tokens);
         const auto h        = static_cast<std::int32_t>(config.hidden_size);
         const auto hc       = static_cast<std::int32_t>(config.hc_count);
@@ -819,7 +914,7 @@ struct Executor::Impl {
                 ops::hyper_connection_read(stack, plan.mlp_hc.weights(), config.rms_norm_eps,
                                            *rank.workspace, mixed, &inject, rank.stream);
             }
-            run_moe(plan, rank, t);
+            run_moe(plan, rank, t, i);
             ops::hyper_connection_write(stack, Tensor(rank.y, DType::FP32, {h, t}), inject,
                                         rank.stream);
         }
@@ -838,6 +933,7 @@ struct Executor::Impl {
         Tensor logits(rank.logits, DType::BF16, {static_cast<std::int32_t>(config.vocab_size), n});
         project(head, mixed, logits, *rank.workspace, rank.stream);
         sequence.position += static_cast<std::uint32_t>(t);
+        record_routes(static_cast<std::uint32_t>(t));
     }
 };
 
@@ -868,6 +964,10 @@ Tensor Executor::logits(std::uint32_t rows) const {
 }
 
 std::size_t Executor::head_rank() const noexcept { return impl_->model.head_rank(); }
+
+ExpertCacheStats Executor::expert_cache_stats() const noexcept {
+    return impl_->cache ? impl_->cache->stats() : ExpertCacheStats{};
+}
 
 cudaStream_t Executor::head_stream() const noexcept {
     return impl_->ranks[impl_->model.head_rank()].stream;

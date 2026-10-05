@@ -1,5 +1,6 @@
-// moe_route against an FP64 oracle: the 512-expert softmax top-10 with renormalised weights and
-// the shared-expert sigmoid gate, from FP32 and BF16 block inputs, including tied logits.
+// moe_route against an FP64 oracle: the 512- and 256-expert softmax top-10 with renormalised
+// weights and the shared-expert sigmoid gate, from FP32 and BF16 block inputs, including tied
+// logits.
 #include "core/device.h"
 #include "ninfer/ops/moe_route.h"
 #include "ops/op_tester.h"
@@ -17,9 +18,10 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr int kHidden = 2560, kExperts = 512, kTop = 10;
+constexpr int kHidden = 2560, kTop = 10;
 
-int run(int tokens, bool fp32_input, bool ties, std::uint32_t seed) {
+// `kExperts` experts: 512, or the 256 an expert-pruned release keeps.
+int run(int tokens, bool fp32_input, bool ties, std::uint32_t seed, int kExperts = 512) {
     std::vector<float> m(static_cast<std::size_t>(kHidden) * tokens), router(static_cast<std::size_t>(kExperts) * kHidden),
         gate(kHidden);
     fill_uniform(m, seed, -3.0f, 3.0f);
@@ -29,11 +31,12 @@ int run(int tokens, bool fp32_input, bool ties, std::uint32_t seed) {
     round_to_bf16(router);
     round_to_bf16(gate);
     if (ties) {
-        // Experts 3, 7, 300 and 511 share one router row aligned with token 0's input, so their
-        // logits tie exactly among the ten largest.
+        // Experts 3, 7, 200 and the last share one router row aligned with token 0's input, so
+        // their logits tie exactly among the ten largest.
         for (int d = 0; d < kHidden; ++d) {
             const float v = router[3 * kHidden + d] + (m[d] > 0 ? 0.05f : -0.05f);
-            for (int e : {3, 7, 300, 511}) router[static_cast<std::size_t>(e) * kHidden + d] = v;
+            for (int e : {3, 7, 200, kExperts - 1})
+                router[static_cast<std::size_t>(e) * kHidden + d] = v;
         }
         round_to_bf16(router);
     }
@@ -65,7 +68,9 @@ int run(int tokens, bool fp32_input, bool ties, std::uint32_t seed) {
     const auto ids     = from_device<int>(d_ids.data(), static_cast<std::size_t>(kTop) * tokens);
     const auto weights = from_device<float>(d_weights.data(), static_cast<std::size_t>(kTop) * tokens);
     const auto shared  = from_device<float>(d_shared.data(), tokens);
-    const std::string label = "moe_route T=" + std::to_string(tokens) + (fp32_input ? " fp32" : " bf16") + (ties ? " ties" : "");
+    const std::string label = "moe_route T=" + std::to_string(tokens) +
+                              (fp32_input ? " fp32" : " bf16") + (ties ? " ties" : "") +
+                              " E=" + std::to_string(kExperts);
     int failures = 0;
     std::vector<double> expected_weights, got_weights, expected_shared, got_shared;
     for (int t = 0; t < tokens; ++t) {
@@ -116,6 +121,8 @@ int main() {
     failures += run(7, false, false, 9201u);
     failures += run(33, true, false, 9202u);
     failures += run(3, true, true, 9203u);
+    failures += run(5, true, false, 9204u, 256);
+    failures += run(2, false, true, 9205u, 256);
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " moe_route\n";
     return failures == 0 ? 0 : 1;
 }

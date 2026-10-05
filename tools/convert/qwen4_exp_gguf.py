@@ -70,7 +70,6 @@ EXPECTED_HEADER = {
     "qwen4exp.attention.head_count_kv": 2,
     "qwen4exp.attention.key_length": HEAD_DIM,
     "qwen4exp.attention.value_length": HEAD_DIM,
-    "qwen4exp.expert_count": EXPERTS,
     "qwen4exp.expert_used_count": 10,
     "qwen4exp.expert_feed_forward_length": EXPERT_WIDTH,
     "qwen4exp.expert_shared_feed_forward_length": SHARED_WIDTH,
@@ -120,8 +119,11 @@ def _hc(prefix: str) -> dict[str, tuple[tuple[int, ...], str]]:
     }
 
 
-def expected_tensors(ple_layers: tuple[int, ...] = (1,)) -> dict[str, tuple[tuple[int, ...], str]]:
-    """Row-major shape and kind of every tensor of the model shard."""
+def expected_tensors(
+    ple_layers: tuple[int, ...] = (1,), experts: int = EXPERTS
+) -> dict[str, tuple[tuple[int, ...], str]]:
+    """Row-major shape and kind of every tensor of the model shard; an expert-pruned release keeps
+    `experts` of the 512 (and one router row for each)."""
 
     out = {
         "token_embd.weight": ((VOCABULARY, HIDDEN), MATRIX),
@@ -140,11 +142,11 @@ def expected_tensors(ple_layers: tuple[int, ...] = (1,)) -> dict[str, tuple[tupl
                 p + f"hc_{half}_inject.weight": ((STREAMS, WIDTH), MATRIX),
             }
         out |= {
-            p + "ffn_gate_inp.weight": ((EXPERTS, HIDDEN), MATRIX),
+            p + "ffn_gate_inp.weight": ((experts, HIDDEN), MATRIX),
             p + "ffn_gate_inp_shexp.weight": ((HIDDEN,), "direct"),
-            p + "ffn_gate_exps.weight": ((EXPERTS, EXPERT_WIDTH, HIDDEN), MATRIX),
-            p + "ffn_up_exps.weight": ((EXPERTS, EXPERT_WIDTH, HIDDEN), MATRIX),
-            p + "ffn_down_exps.weight": ((EXPERTS, HIDDEN, EXPERT_WIDTH), MATRIX),
+            p + "ffn_gate_exps.weight": ((experts, EXPERT_WIDTH, HIDDEN), MATRIX),
+            p + "ffn_up_exps.weight": ((experts, EXPERT_WIDTH, HIDDEN), MATRIX),
+            p + "ffn_down_exps.weight": ((experts, HIDDEN, EXPERT_WIDTH), MATRIX),
             p + "ffn_gate_shexp.weight": ((SHARED_WIDTH, HIDDEN), MATRIX),
             p + "ffn_up_shexp.weight": ((SHARED_WIDTH, HIDDEN), MATRIX),
             p + "ffn_down_shexp.weight": ((HIDDEN, SHARED_WIDTH), MATRIX),
@@ -198,6 +200,11 @@ def validate(gguf: GGUFFile, config: dict) -> None:
     for key, expected in EXPECTED_HEADER.items():
         if gguf.kv.get(key) != expected:
             raise ValueError(f"{gguf.path}: {key} = {gguf.kv.get(key)!r}, expected {expected!r}")
+    if gguf.kv.get("qwen4exp.expert_count") != config["num_experts"]:
+        raise ValueError(
+            f"{gguf.path}: {gguf.kv.get('qwen4exp.expert_count')} experts per layer, the model config "
+            f"{config['num_experts']} (convert an expert-pruned release with its GGUF as --source gguf)"
+        )
     if gguf.kv.get("qwen4exp.ple.eos_token_id") != config["eos_token_id"]:
         raise ValueError(f"{gguf.path}: the PLE EOS differs from the model's")
     if config["ple_layers"] != [1] or config["num_hidden_layers"] != LAYERS:
@@ -205,7 +212,7 @@ def validate(gguf: GGUFFile, config: dict) -> None:
     for layer, kind in enumerate(config["layer_types"]):
         if (kind == "full_attention") != full_attention(layer):
             raise ValueError("the qwen4exp GGUF recipe needs QSA on every fourth block")
-    expected = expected_tensors(tuple(config["ple_layers"]))
+    expected = expected_tensors(tuple(config["ple_layers"]), config["num_experts"])
     model = {name for name in gguf.tensors if name != "per_layer_token_embd.weight"}
     if model != set(expected):
         missing = sorted(set(expected) - model)[:5]
@@ -329,11 +336,12 @@ def text_sources(gguf: GGUFFile, config: dict) -> dict[str, tuple[LogicalSource,
             direct(n + "convolution", _direct(channels.T, torch.bfloat16, g + "ssm_conv1d.weight"))
             direct(n + "norm", _norm(gguf, g + "ssm_norm.weight", False))
         m = p + "moe/"
-        matrix(m + "router", g + "ffn_gate_inp.weight", (EXPERTS, HIDDEN))
+        experts = config["num_experts"]
+        matrix(m + "router", g + "ffn_gate_inp.weight", (experts, HIDDEN))
         direct(m + "shared_score", _direct(_words(gguf, g + "ffn_gate_inp_shexp.weight")
                                            .reshape(1, HIDDEN), torch.bfloat16,
                                            g + "ffn_gate_inp_shexp.weight"))
-        for expert in range(EXPERTS):
+        for expert in range(experts):
             e = m + f"experts/{expert}/"
             matrix(e + "gate", g + "ffn_gate_exps.weight", (EXPERT_WIDTH, HIDDEN),
                    rows(expert * EXPERT_WIDTH))
@@ -401,8 +409,9 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
             recipe.group(qkv + [n + "z"] if formats[n + "z"] == formats[n + "query"] else qkv)
             recipe.group([n + "a_projection", n + "b_projection"])
         m = p + "moe/"
-        gates = [m + f"experts/{e}/gate" for e in range(EXPERTS)]
-        ups = [m + f"experts/{e}/up" for e in range(EXPERTS)]
+        experts = config["num_experts"]
+        gates = [m + f"experts/{e}/gate" for e in range(experts)]
+        ups = [m + f"experts/{e}/up" for e in range(experts)]
         if formats[gates[0]] == formats[ups[0]]:
             # Each expert's gate rows then its up rows, expert-major: one [gate; up] parent per
             # expert, one bank per layer.
@@ -410,7 +419,7 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
         else:
             recipe.group(gates)
             recipe.group(ups)
-        recipe.group([m + f"experts/{e}/down" for e in range(EXPERTS)])
+        recipe.group([m + f"experts/{e}/down" for e in range(experts)])
         recipe.group([m + "router", m + "shared_score"])
         _group_same_format(recipe, [m + "shared/gate", m + "shared/up"], formats)
         if layer in config["ple_layers"]:
@@ -424,6 +433,24 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
         name = f"text/layers/{layer}/gdn/output"
         for input_name in model.parameters[name].inputs:
             recipe.use(name, input_name, auxiliaries={"input_columns": columns})
+
+
+def with_gguf_expert_count(config: dict, path) -> dict:
+    """The HF config with the expert count of the GGUF at `path`: an expert-pruned release (the
+    Coder build keeps 256 of 512 per layer) is that model's config with fewer experts."""
+
+    from copy import deepcopy
+
+    with GGUFFile(path) as gguf:
+        count = gguf.kv.get("qwen4exp.expert_count")
+    text = config.get("text_config", config)
+    if type(count) is not int or count == text.get("num_experts"):
+        return config
+    if not 10 <= count <= text.get("num_experts", 0):
+        raise ValueError(f"{path}: {count} experts per layer cannot be a pruning of this model")
+    out = deepcopy(config)
+    out.get("text_config", out)["num_experts"] = count
+    return out
 
 
 def ngram_source(gguf: GGUFFile, rows_count: int) -> LogicalSource:
@@ -457,6 +484,7 @@ __all__ = [
     "EXPECTED_HEADER",
     "RECIPES",
     "expected_tensors",
+    "with_gguf_expert_count",
     "ngram_source",
     "qwen3_8_flash_next_gguf",
     "qwen3_8_flash_next_ngram",

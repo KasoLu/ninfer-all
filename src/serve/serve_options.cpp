@@ -102,6 +102,15 @@ std::string serve_usage_text(const char* argv0) {
            "                                (Linux); excludes --device\n"
            "  --stage-layers A,B,...        layers per stage in --devices order (default:\n"
            "                                split by free memory)\n"
+           "  --expert-residency device|host  Qwen3.8-Flash-Next: expert banks in GPU memory\n"
+           "                                (default) or in pinned host memory, read across\n"
+           "                                the bus\n"
+           "  --expert-cache-mib N|auto     with host experts: device memory for the most\n"
+           "                                used experts (default auto: what is free; 0 off)\n"
+           "  --ngram-table PATH            Qwen3.8-Flash-Next n-gram companion artifact\n"
+           "                                (default: found next to the model)\n"
+           "  --ngram-ram                   load the n-gram table into RAM instead of\n"
+           "                                reading rows from its file\n"
            "  --no-cuda-graph               decode without CUDA Graphs (on by default)\n"
            "  --cuda-graph-allowance-mib N  CUDA Graph driver-state allowance taken from the\n"
            "                                KV sizing budget (default 0: computed per\n"
@@ -952,6 +961,35 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--devices") {
             options.devices = parse_device_list(require_value("--devices"));
+            continue;
+        }
+        if (arg == "--expert-residency") {
+            const std::string residency = require_value("--expert-residency");
+            if (residency == "device") {
+                options.expert_residency = ExpertResidency::Device;
+            } else if (residency == "host") {
+                options.expert_residency = ExpertResidency::Host;
+            } else {
+                throw std::invalid_argument("--expert-residency must be device or host");
+            }
+            continue;
+        }
+        if (arg == "--expert-cache-mib") {
+            const std::string mib = require_value("--expert-cache-mib");
+            if (mib == "auto") {
+                options.expert_cache_bytes.reset();
+            } else {
+                options.expert_cache_bytes =
+                    std::uint64_t(parse_nonnegative_int(mib.c_str(), "expert-cache-mib")) << 20;
+            }
+            continue;
+        }
+        if (arg == "--ngram-table") {
+            options.ngram_table.path = require_value("--ngram-table");
+            continue;
+        }
+        if (arg == "--ngram-ram") {
+            options.ngram_table.ram = true;
             continue;
         }
         if (arg == "--stage-layers") {

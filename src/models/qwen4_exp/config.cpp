@@ -161,7 +161,11 @@ TextConfig parse_text_config(const Json& value) {
     require_value(out.linear_num_value_heads, 48, "linear_num_value_heads");
     require_value(out.linear_value_head_dim, 128, "linear_value_head_dim");
     require_value(out.linear_conv_kernel_dim, 4, "linear_conv_kernel_dim");
-    require_value(out.num_experts, 512, "num_experts");
+    // 512 experts, or fewer in an expert-pruned release (the router keeps one row per expert).
+    if (out.num_experts < out.num_experts_per_tok || out.num_experts > 512) {
+        throw ArtifactError("num_experts is " + std::to_string(out.num_experts) +
+                            "; this engine implements 10 to 512");
+    }
     require_value(out.num_experts_per_tok, 10, "num_experts_per_tok");
     require_value(out.moe_intermediate_size, 640, "moe_intermediate_size");
     require_value(out.shared_expert_intermediate_size, 640, "shared_expert_intermediate_size");

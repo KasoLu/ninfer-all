@@ -15,6 +15,7 @@
 #include "models/qwen3_5/weights.h"
 #include "models/qwen4_exp/config.h"
 #include "ninfer/ops/weight_input.h"
+#include "ninfer/types.h"
 
 #include <cstdint>
 #include <memory>
@@ -73,12 +74,6 @@ struct TextWeights {
     std::vector<LayerWeights> layers;
 };
 
-enum class ExpertResidency : std::uint8_t {
-    // In the weight arena of the layer's stage device.
-    Device,
-    // In the page-locked Host block; the expert kernels read it over the bus.
-    Host,
-};
 
 struct LoadOptions {
     // Pipeline stages, one per device rank; `stage_layers` lists each one's layer count (empty:

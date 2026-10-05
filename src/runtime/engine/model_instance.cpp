@@ -495,6 +495,8 @@ void install_device_route_profile_on(const EngineOptions& options, int device) {
         device, std::make_shared<const ops::DeviceRouteProfile>(std::move(*profile)));
 }
 
+} // namespace
+
 void install_device_route_profile_for(const EngineOptions& options, const DeviceContext& device) {
     std::vector<int> installed;
     for (const int id : device.device_ids()) {
@@ -503,8 +505,6 @@ void install_device_route_profile_for(const EngineOptions& options, const Device
         installed.push_back(id);
     }
 }
-
-} // namespace
 
 bool ModelInstance::suspendable() const noexcept {
     return model->weights_suspendable() && program->device_state_suspendable();

@@ -99,3 +99,19 @@ def test_the_ngram_companion_model_holds_only_the_table(tmp_path):
     assert model.parameters["text/ngram_table"].shape == (320001536, 160)
     with pytest.raises(ValueError):
         qwen4_exp.build_model(Base(), components=("text", "mtp"))
+
+
+def test_an_expert_pruned_release_takes_its_own_expert_count(tmp_path):
+    # The Coder release keeps 256 of the 512 experts per layer, and one router row for each.
+    path = tmp_path / "pruned.gguf"
+    write_gguf(path, {"general.architecture": "qwen4exp", "qwen4exp.expert_count": 256}, [])
+    checkpoint = _checkpoint()
+    pruned = qwen4_exp_gguf.with_gguf_expert_count(checkpoint, path)
+    assert qwen4_exp.text_config(pruned)["num_experts"] == 256
+    assert qwen4_exp.text_config(checkpoint)["num_experts"] == 512
+    tensors = qwen4_exp_gguf.expected_tensors((1,), 256)
+    assert tensors["blk.0.ffn_gate_inp.weight"] == ((256, 2560), "matrix")
+    assert tensors["blk.0.ffn_gate_exps.weight"] == ((256, 640, 2560), "matrix")
+    write_gguf(path, {"general.architecture": "qwen4exp", "qwen4exp.expert_count": 600}, [])
+    with pytest.raises(ValueError):
+        qwen4_exp_gguf.with_gguf_expert_count(checkpoint, path)

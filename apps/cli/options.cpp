@@ -170,6 +170,15 @@ std::string usage_text(const char* argv0) {
            "                                exercises the path on one GPU\n"
            "  --stage-layers A,B,...        layers per stage (default: split by each GPU's\n"
            "                                free memory)\n"
+           "  --expert-residency device|host  Qwen3.8-Flash-Next: expert banks in GPU memory\n"
+           "                                (default) or in pinned host memory, read across\n"
+           "                                the bus\n"
+           "  --expert-cache-mib N|auto     with host experts: device memory for the most\n"
+           "                                used experts (default auto: what is free; 0 off)\n"
+           "  --ngram-table PATH            Qwen3.8-Flash-Next n-gram companion artifact\n"
+           "                                (default: found next to the model)\n"
+           "  --ngram-ram                   load the n-gram table into RAM instead of\n"
+           "                                reading rows from its file\n"
            "  --no-cuda-graph               decode without CUDA Graphs\n"
            "\n"
            "KV CACHE\n"
@@ -344,6 +353,27 @@ Options parse_options(int argc, char** argv) {
             options.devices = parse_device_list(value(arg));
         } else if (arg == "--stage-layers") {
             options.stage_layers = parse_stage_layers(value(arg));
+        } else if (arg == "--expert-residency") {
+            const std::string residency = value(arg);
+            if (residency == "device") {
+                options.expert_residency = ninfer::ExpertResidency::Device;
+            } else if (residency == "host") {
+                options.expert_residency = ninfer::ExpertResidency::Host;
+            } else {
+                throw std::invalid_argument("--expert-residency must be device or host");
+            }
+        } else if (arg == "--expert-cache-mib") {
+            const std::string mib = value(arg);
+            if (mib == "auto") {
+                options.expert_cache_bytes.reset();
+            } else {
+                options.expert_cache_bytes =
+                    std::uint64_t(parse_u32(mib.c_str(), "expert-cache-mib", true)) << 20;
+            }
+        } else if (arg == "--ngram-table") {
+            options.ngram_table.path = value(arg);
+        } else if (arg == "--ngram-ram") {
+            options.ngram_table.ram = true;
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {

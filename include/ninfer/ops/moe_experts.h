@@ -34,9 +34,9 @@ void moe_experts_bf16(const Tensor& m, const Tensor& ids, const Tensor& weights,
 /**
  * The same experts over GGUF block banks (an imported GSQ-RCO release), reached through tables of
  * expert base pointers, so an expert may sit in a device bank, a cache slot or mapped host memory.
- * `gate` and `up` hold each expert's 640 rows of 2560 values, `down` its 2560 rows of 640; each
- * table has 512 entries, the shared expert's tables one. Every entry points at device-readable
- * memory in the table's block type, rows `row_bytes` apart.
+ * `gate` and `up` hold each expert's 640 rows of 2560 values, `down` its 2560 rows of 640; the
+ * routed tables have `experts` entries (up to 512), the shared expert's tables one. Every entry
+ * points at device-readable memory in the table's block type, rows `row_bytes` apart.
  *
  * The products quantize their activation to ggml's q8_1 as llama.cpp does (the format's
  * arithmetic): m once per token, the middle silu(gate . m) * (up . m) after its BF16 store. Each
@@ -54,6 +54,8 @@ struct GgufExpertTable {
 struct GgufMoeWeights {
     GgufExpertTable gate, up, down;
     GgufExpertTable shared_gate, shared_up, shared_down;
+    // Entries of the routed tables: 512, or the 256 an expert-pruned release keeps.
+    std::int32_t experts = 512;
 };
 
 [[nodiscard]] std::size_t moe_experts_gguf_workspace_bytes(std::int32_t tokens);

@@ -7,12 +7,12 @@
 namespace ninfer::ops {
 
 /**
- * The router of Qwen3.8-Flash-Next's 512-expert MoE with its shared-expert gate, for `tokens`
- * columns of the block input m (BF16 or FP32 [2560, tokens]; FP32 keeps the activation unrounded,
- * which the selection is sensitive to):
+ * The router of Qwen3.8-Flash-Next's MoE (512 experts, or the 256 an expert-pruned release keeps)
+ * with its shared-expert gate, for `tokens` columns of the block input m (BF16 or FP32
+ * [2560, tokens]; FP32 keeps the activation unrounded, which the selection is sensitive to):
  *
- *   logits = router . m                       router BF16 [2560, 512]
- *   p      = softmax(logits)                  over the 512 experts
+ *   logits = router . m                       router BF16 [2560, E], 10 <= E <= 512
+ *   p      = softmax(logits)                  over the E experts
  *   ids    = the 10 largest p (ties to the lower expert index), in decreasing p
  *   weights[j] = p[ids[j]] / sum_k p[ids[k]]
  *   shared = sigmoid(shared_gate . m)         shared_gate BF16 [2560]

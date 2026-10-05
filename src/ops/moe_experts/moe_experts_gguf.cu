@@ -142,7 +142,8 @@ void moe_experts_gguf(const Tensor& m, const Tensor& ids, const Tensor& weights,
     // Every token selects the shared expert (index 0 of its one-entry bank).
     Tensor shared_ids = workspace.alloc(DType::I32, {tokens});
     CUDA_CHECK(cudaMemsetAsync(shared_ids.data, 0, shared_ids.bytes(), stream));
-    run_bank(ids, tokens * kTopK, kExperts, kTopK, static_cast<const float*>(weights.data),
+    require(banks.experts >= kTopK && banks.experts <= kExperts, "experts must be in [10, 512]");
+    run_bank(ids, tokens * kTopK, banks.experts, kTopK, static_cast<const float*>(weights.data),
              activation.data, tokens, banks.gate, banks.up, banks.down, workspace, fixed_p, stream);
     run_bank(shared_ids, tokens, 1, 1, static_cast<const float*>(shared.data), activation.data,
              tokens, banks.shared_gate, banks.shared_up, banks.shared_down, workspace, fixed_p,

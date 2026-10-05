@@ -62,6 +62,8 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 | `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses, Q8 primal embedding | `ternary` (GGUF) |
 | `qwen3_8_27b_gguf` | Every text, embedding, head and MTP tensor in its GGUF block format, byte for byte | `gguf` (GGUF), `vision` (mmproj GGUF) |
+| `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major | `gguf` (the release's first shard) |
+| `qwen3_8_flash_next_ngram` | Qwen3.8-Flash-Next's n-gram table companion (`--components ngram`), IQ4_NL rows byte for byte | `ngram` (the release's second shard) |
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
@@ -218,6 +220,16 @@ python3 -m tools.convert \
 
 `--model` needs only the base checkpoint's configuration and tokenizer files. The products that
 serve these formats are described in [GGUF block formats](gguf.md).
+
+### Qwen3.8-Flash-Next GGUF releases
+
+`qwen3_8_flash_next_gguf` ([`qwen4_exp_gguf.py`](../tools/convert/qwen4_exp_gguf.py)) imports the
+model shard of a Qwen3.8-Flash-Next GSQ-RCO release the same way: every matrix keeps its block type,
+the 512-expert banks stay expert-major (one expert is one contiguous byte range), and the exporter's
+conventions are undone by row gathers and exact small-tensor transforms. `--components ngram` with
+`qwen3_8_flash_next_ngram` writes the release's n-gram table into a companion artifact that every
+quantization of the model shares. Commands, runtime options and measurements:
+[Qwen3.8-Flash-Next](qwen3-8-flash-next.md).
 
 ## Change part of a recipe
 

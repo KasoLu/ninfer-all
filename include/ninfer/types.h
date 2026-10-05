@@ -449,6 +449,24 @@ struct ModelSuspendOptions {
     bool auto_resume = true;
 };
 
+// Qwen3.8-Flash-Next (Qwen4ExpForCausalLM): where the routed experts' banks live.
+enum class ExpertResidency : std::uint8_t {
+    // In the weight arena of each layer's stage device.
+    Device,
+    // In page-locked host memory, read by the expert kernels across the bus: the model then needs
+    // only its dense weights in device memory.
+    Host,
+};
+
+// Qwen3.8-Flash-Next: the n-gram table of its per-layer embedding, a companion artifact
+// (`tools/convert --components ngram`) shared by every quantization of the model.
+struct NgramTableOptions {
+    // Empty: the first matching companion in the artifact's directory.
+    std::filesystem::path path;
+    // Load the whole table into memory instead of reading each row from the file.
+    bool ram = false;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -467,6 +485,13 @@ struct EngineOptions {
     // Layers per stage, one count per entry of `devices`. Empty lets the engine choose from each
     // device's free memory.
     std::vector<std::uint32_t> stage_layers;
+    // Qwen3.8-Flash-Next only.
+    ExpertResidency expert_residency = ExpertResidency::Device;
+    // Host-resident experts: device memory lent to the cache of the most used experts, split
+    // evenly over the devices. Empty takes what each device has free after startup less a margin;
+    // zero disables the cache.
+    std::optional<std::uint64_t> expert_cache_bytes;
+    NgramTableOptions ngram_table;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     // Past the model's native window (max_position_embeddings), up to four times it: positions run
     // unscaled RoPE, or with rope_yarn the whole window takes Qwen's YaRN at factor

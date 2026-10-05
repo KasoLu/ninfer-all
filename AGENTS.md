@@ -30,7 +30,11 @@ approval requirements beyond the user's instructions and the actual execution en
 NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU performance, with an
 optional layer pipeline across several GPUs on Linux. It implements
 `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`; official Qwen3.6/3.8 artifacts and user recipes
-use the same architecture, binding and execution path.
+use the same architecture, binding and execution path. Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`,
+`src/models/qwen4_exp`) is a second, explicit family with its own load, executor and Engine core
+(`runtime/engine/qwen4_exp_core`); it shares the Qwen3.5 frontend, runs requests one at a time, and
+may keep its routed experts in pinned host memory with a device cache of the most used ones
+(`--expert-residency host`), the one product mode in which model weights live off the GPU.
 This fork targets **`sm_86`** and is tuned on **NVIDIA GeForce RTX 3090** (24 GB), built with
 CUDA 12.8. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX 5090; that is where its schedules,
 route tables and published measurements come from, and none of it is authoritative here -- every

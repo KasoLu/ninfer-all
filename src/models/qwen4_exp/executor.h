@@ -9,6 +9,7 @@
 
 #include "core/device.h"
 #include "core/tensor.h"
+#include "models/qwen4_exp/expert_cache.h"
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/ngram_companion.h"
 
@@ -25,11 +26,16 @@ struct ExecutorOptions {
     std::uint32_t sequences     = 1;
     NgramCompanion ngram;
     NgramResidency ngram_residency = NgramResidency::Disk;
+    // Host-resident experts only: device memory lent to the expert cache, split evenly over the
+    // ranks; kAutoExpertCache takes what each device has free less a margin, 0 none.
+    static constexpr std::uint64_t kAutoExpertCache = ~std::uint64_t{0};
+    std::uint64_t expert_cache_bytes                = kAutoExpertCache;
 };
 
 struct ExecutorMemory {
-    std::uint64_t state_bytes     = 0; // per-sequence state on every device
-    std::uint64_t workspace_bytes = 0;
+    std::uint64_t state_bytes        = 0; // per-sequence state on every device
+    std::uint64_t workspace_bytes    = 0;
+    std::uint64_t expert_cache_bytes = 0;
 };
 
 class Executor {
@@ -53,6 +59,7 @@ public:
                  std::uint32_t logit_rows);
     [[nodiscard]] Tensor logits(std::uint32_t rows) const;
     [[nodiscard]] std::size_t head_rank() const noexcept;
+    [[nodiscard]] ExpertCacheStats expert_cache_stats() const noexcept;
     [[nodiscard]] cudaStream_t head_stream() const noexcept;
 
 private:

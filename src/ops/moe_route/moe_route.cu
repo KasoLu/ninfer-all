@@ -1,6 +1,6 @@
 // ninfer::ops - Qwen3.8-Flash-Next MoE router (contract in include/ninfer/ops/moe_route.h).
-// One CTA per token: 513 dot products over the block input (one warp per row), a softmax over
-// the 512 logits, then ten rounds of an arg-max that takes the lower index on ties.
+// One CTA per token: E + 1 dot products over the block input (one warp per row), then ten rounds of
+// an arg-max over the E logits that takes the lower index on ties (softmax is monotonic).
 #include "ninfer/ops/moe_route.h"
 
 #include "core/device.h"
@@ -16,10 +16,10 @@ namespace ninfer::ops {
 namespace {
 
 constexpr int kHidden  = 2560;
-constexpr int kExperts = 512;
-constexpr int kTopK    = 10;
-constexpr int kThreads = 512;
-static_assert(kThreads == kExperts, "one thread per expert in the top-10 rounds");
+constexpr int kMaxExperts = 512;
+constexpr int kTopK       = 10;
+constexpr int kThreads    = 512;
+static_assert(kThreads == kMaxExperts, "one thread per expert in the top-10 rounds");
 
 template <typename Input>
 __device__ __forceinline__ float load(const Input* m, std::int64_t i) {
@@ -33,10 +33,11 @@ __device__ __forceinline__ float load(const Input* m, std::int64_t i) {
 template <typename Input>
 __global__ void __launch_bounds__(kThreads)
     moe_route_kernel(const Input* __restrict__ m, const __nv_bfloat16* __restrict__ router,
-                     const __nv_bfloat16* __restrict__ shared_gate, int* __restrict__ ids,
-                     float* __restrict__ weights, float* __restrict__ shared) {
+                     const __nv_bfloat16* __restrict__ shared_gate, int experts,
+                     int* __restrict__ ids, float* __restrict__ weights,
+                     float* __restrict__ shared) {
     __shared__ float input[kHidden];
-    __shared__ float logits[kExperts + 1];
+    __shared__ float logits[kMaxExperts + 1];
     __shared__ float best_value[kThreads / 32];
     __shared__ int best_index[kThreads / 32];
     __shared__ float chosen[kTopK];
@@ -46,8 +47,9 @@ __global__ void __launch_bounds__(kThreads)
     const int warp = tid >> 5, lane = tid & 31;
     for (int d = tid; d < kHidden; d += kThreads) input[d] = load(m, static_cast<std::int64_t>(t) * kHidden + d);
     __syncthreads();
-    for (int row = warp; row <= kExperts; row += kThreads / 32) {
-        const __nv_bfloat16* w = row < kExperts ? router + static_cast<std::int64_t>(row) * kHidden : shared_gate;
+    for (int row = warp; row <= experts; row += kThreads / 32) {
+        const __nv_bfloat16* w =
+            row < experts ? router + static_cast<std::int64_t>(row) * kHidden : shared_gate;
         float dot = 0.0f;
         for (int d = lane; d < kHidden; d += 32) dot = fmaf(__bfloat162float(w[d]), input[d], dot);
 #pragma unroll
@@ -55,13 +57,14 @@ __global__ void __launch_bounds__(kThreads)
         if (lane == 0) logits[row] = dot;
     }
     __syncthreads();
-    if (tid == 0) shared[t] = 1.0f / (1.0f + __expf(-logits[kExperts]));
+    if (tid == 0) shared[t] = 1.0f / (1.0f + __expf(-logits[experts]));
     // Top-10 of the logits (softmax is monotonic), lower index on ties.
     for (int k = 0; k < kTopK; ++k) {
-        float value = logits[tid]; // kThreads == kExperts
-        int index   = tid;
+        // A thread past the experts, or one already chosen, offers nothing.
+        float value = tid < experts ? logits[tid] : -INFINITY;
+        int index   = tid < experts ? tid : kMaxExperts;
         for (int j = 0; j < k; ++j) {
-            if (chosen_index[j] == tid) value = -INFINITY, index = kExperts;
+            if (chosen_index[j] == tid) value = -INFINITY, index = kMaxExperts;
         }
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -116,9 +119,11 @@ void moe_route(const Tensor& m, const Tensor& router, const Tensor& shared_gate,
                 m.data != nullptr && m.ne[0] == kHidden && m.ne[1] > 0 && m.ne[2] == 1,
             "m must be contiguous BF16 or FP32 [2560, tokens]");
     const std::int32_t tokens = m.ne[1];
+    const std::int32_t experts = router.ne[1];
     require(router.dtype == DType::BF16 && router.is_contiguous() && router.data != nullptr &&
-                router.ne[0] == kHidden && router.ne[1] == kExperts,
-            "router must be BF16 [2560, 512]");
+                router.ne[0] == kHidden && experts >= kTopK && experts <= kMaxExperts &&
+                router.ne[2] == 1,
+            "router must be BF16 [2560, experts] with 10 to 512 experts");
     require(shared_gate.dtype == DType::BF16 && shared_gate.is_contiguous() &&
                 shared_gate.data != nullptr && shared_gate.ne[0] == kHidden && shared_gate.ne[1] == 1,
             "shared_gate must be BF16 [2560]");
@@ -135,11 +140,11 @@ void moe_route(const Tensor& m, const Tensor& router, const Tensor& shared_gate,
     const auto* g = static_cast<const __nv_bfloat16*>(shared_gate.data);
     if (m.dtype == DType::FP32) {
         moe_route_kernel<float><<<tokens, kThreads, 0, stream>>>(
-            static_cast<const float*>(m.data), r, g, static_cast<int*>(ids.data),
+            static_cast<const float*>(m.data), r, g, experts, static_cast<int*>(ids.data),
             static_cast<float*>(weights.data), static_cast<float*>(shared.data));
     } else {
         moe_route_kernel<__nv_bfloat16><<<tokens, kThreads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(m.data), r, g, static_cast<int*>(ids.data),
+            static_cast<const __nv_bfloat16*>(m.data), r, g, experts, static_cast<int*>(ids.data),
             static_cast<float*>(weights.data), static_cast<float*>(shared.data));
     }
     CUDA_CHECK(cudaGetLastError());

@@ -16,6 +16,7 @@ from .qwen3_5 import build_model as build_qwen3_5
 from .qwen4_exp import _ARCHITECTURES as QWEN4_EXP_ARCHITECTURES
 from .qwen4_exp import build_model as build_qwen4_exp
 from .qwen4_exp_gguf import RECIPES as QWEN4_EXP_GGUF_RECIPES
+from .qwen4_exp_gguf import with_gguf_expert_count
 from .recipe import Recipe
 from .sources.gguf import GGUFFile
 from .sources.safetensors import SafetensorsSource
@@ -180,6 +181,9 @@ def main(argv=None):
             if architectures[0] in QWEN4_EXP_ARCHITECTURES
             else build_qwen3_5
         )
+        if build_model is build_qwen4_exp and "gguf" in paths:
+            # An expert-pruned release takes the model's config with its own expert count.
+            base.config = with_gguf_expert_count(base.config, paths["gguf"])
         model = build_model(
             base,
             components=components,

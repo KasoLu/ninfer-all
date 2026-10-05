@@ -13,6 +13,10 @@ namespace ninfer::runtime {
 
 [[nodiscard]] EngineOptions normalize_engine_options(EngineOptions options);
 
+// Installs each rank's GPU route profile (EngineOptions::device_profile) before any Op runs,
+// calibrating a device that has no measured profile.
+void install_device_route_profile_for(const EngineOptions& options, const DeviceContext& device);
+
 struct ModelInstance {
     using ModelContract = models::qwen3_5::RuntimeTypes;
 

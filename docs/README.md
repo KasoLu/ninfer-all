@@ -14,6 +14,7 @@ run the CLI or HTTP server.
 | [Performance](performance.md) | RTX 5090 measurement coverage, per-model serving results, methodology, and publication rules |
 | [Weight conversion](weight-conversion.md) | official recipes, custom formats and sources, conversion methods, optional components and artifact output |
 | [GGUF block formats](gguf.md) | GGUF releases with a ggml type per tensor: the fifteen block formats, their products, serving and measurements |
+| [Qwen3.8-Flash-Next](qwen3-8-flash-next.md) | converting the GSQ-RCO GGUF releases and their n-gram table, running on several GPUs or with host-resident experts |
 | [Perplexity](perplexity.md) | fixed-corpus and custom-text causal perplexity, comparison rules, progress, and reports |
 | [Device profiles](device-profiles.md) | per-GPU route profiles: the built-in RTX 3090/4090/5090 table, calibration at first start, `ninfer-calibrate` |
 | [CLI examples](../examples/cli/) | committed text, multimodal, thinking, long-decode, and long-context inputs |

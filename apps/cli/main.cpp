@@ -320,6 +320,9 @@ int main(int argc, char** argv) {
         engine_options.device                   = cli.device;
         engine_options.devices                  = cli.devices;
         engine_options.stage_layers             = cli.stage_layers;
+        engine_options.expert_residency              = cli.expert_residency;
+        engine_options.ngram_table                   = cli.ngram_table;
+        engine_options.expert_cache_bytes            = cli.expert_cache_bytes;
         engine_options.max_context              = cli.max_context;
         engine_options.kv_capacity              = cli.kv_capacity;
         engine_options.prefill_chunk            = cli.prefill_chunk;
