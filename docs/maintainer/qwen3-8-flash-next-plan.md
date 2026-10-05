@@ -30,8 +30,13 @@ HF repository, and Strata is github.com/Niko1221/Strata (MIT).
 | M3 | `hyper_connection` read/write, `ple_inject`, `ngram_embed_rows` (FP8 row-scale, BF16), the sigmoid gate of `gated_rmsnorm`, `qsa_indexer` (pooled keys, top-512 block selection), `sparse_softmax_attention` (BF16 KV), `moe_route` (512-expert top-10 and shared gate), `moe_experts_bf16`, each against its FP64 oracle | `src/ops/{hyper_connection,ple_inject,qsa_indexer,sparse_attention,moe_route,moe_experts}/` |
 | M3 | the Ops composed over the checkpoint's first four layers (three GDN, one QSA) and the head on BF16 weights, against the FP64 reference on 16 tokens: stack relative L2 ≈ 1.1e-2 per layer, top-1 agreement 16/16 (RTX 3090) | `tests/models/qwen4_exp/test_slice_real.cpp`, `tools/reference/fetch_slice.py` |
 
-Not started: the family's load/execution/program (the M0 runtime split, M4), quantized expert formats and KV codecs
-for the new Ops (the 24 GB fit needs them), the n-gram companion artifact, MTP, hybrid CPU/GPU experts.
+| M4 | the family's own load and execution behind the public Engine (CLI, serving, perplexity): GGUF block banks bound as stored, the stage split over `--devices` (balanced by stored bytes, shared auxiliaries copied to every rank that reads them), one FIFO sequence, decode replaying one CUDA graph per stage | `src/models/qwen4_exp/{model,executor}.*`, `src/runtime/engine/qwen4_exp_core.*` |
+| M4 | the GSQ-RCO GGUF releases (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S and the Coder build's 256-expert IQ1_M) imported without requantization, and their shared n-gram table as a companion artifact; perplexity within 0.2% of llama.cpp's on the same windows | `tools/convert/qwen4_exp_gguf.py`, `src/models/qwen4_exp/ngram_companion.*`, `docs/qwen3-8-flash-next.md` |
+| M4 | expert residency: device banks, pinned host banks with a device expert cache, or the artifact's files streamed into device slots (parallel reads); `moe_experts_gguf` over expert tables, vector products up to eight tokens and ggml's matrix kernel above that for device-resident banks | `src/models/qwen4_exp/{expert_cache,expert_stream,read_pool}.*`, `src/ops/moe_experts/moe_experts_gguf.cu` |
+
+Not started: NInfer's own quantized expert formats and KV codecs for the new Ops, the RadixArk NVFP4 checkpoint,
+MTP, Vision, the context cache, structured output. Host experts prefill through the vector products across the
+bus; copying each layer's experts into device slots as disk residency does would let them use the matrix kernel.
 
 ---
 

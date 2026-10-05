@@ -51,19 +51,28 @@ The companion is found next to the model artifact, or named with `--ngram-table`
 
 # One GPU: the experts in pinned host memory, the most used of them cached on the GPU.
 ./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --expert-residency host --max-context 32768
+
+# One GPU and little RAM: the experts stay in the artifact's files and stream into a GPU cache.
+./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --expert-residency disk --max-context 32768
 ```
 
 | Option | Meaning |
 |---|---|
-| `--expert-residency device\|host` | expert banks in the stage devices' memory (default), or in page-locked host memory that the expert kernels read across the bus |
-| `--expert-cache-mib N\|auto` | with host experts, device memory for the most used experts: `auto` (default) takes what each device has free after startup less a margin, `0` disables the cache |
+| `--expert-residency device\|host\|disk` | expert banks in the stage devices' memory (default); in page-locked host memory that the expert kernels read across the bus; or left in the artifact's files, each layer's routed experts read into a device cache before they run |
+| `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts: `auto` (default) takes what each device has free after startup less a margin; `0` disables the host-mode cache (disk mode needs one) |
 | `--ngram-table PATH` | the n-gram companion artifact |
 | `--ngram-ram` | load the 28.8 GB table into RAM instead of reading the 16 rows each token needs from its file |
 | `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides) |
 
 With host experts the GPU holds only the dense weights (3.7 GB for the Q2_0 release), the
 per-request state and the expert cache; the host needs the expert banks in page-locked memory
-(34 GB for Q2_0). The n-gram table is read from the file's page cache unless `--ngram-ram` is given.
+(34 GB for Q2_0). With disk experts the host needs no copy of the banks at all: the expert cache
+reads the missing experts from the artifact's files through the OS page cache, eight reads in
+flight, into a 256 MB page-locked staging ring, so the page cache keeps whatever the system can
+spare and the rest comes from the disk. The n-gram table is read from the file's page cache unless `--ngram-ram` is given.
+
+The KV cache of the 12 sparse-attention layers is BF16 whatever `--kv-dtype` asks (the engine says
+so at startup, and reports BF16).
 
 Requests run one at a time in arrival order; `--max-concurrency` above one queues.
 
@@ -78,15 +87,54 @@ Requests run one at a time in arrival order; `--max-concurrency` above one queue
 - The 512-expert MoE groups each layer's (token, expert) pairs by expert on the GPU and runs one
   pass over each selected expert's rows for all of its tokens, through device tables of expert
   base pointers: an expert is read wherever the table points, in device memory, a cache slot or the
-  pinned host block. Weighted expert outputs are summed in fixed point, so the result does not
-  depend on the order experts finish in.
+  pinned host block. Up to eight tokens run vector products; wider calls with the experts on the
+  GPUs or on disk run ggml's integer tensor-core matrix kernel over the routed pairs (zeros follow
+  each down bank, since the kernel reads a 640-value row in 256-value steps), while host experts
+  stay on the vector products, which read the pinned block across the bus better. Weighted expert
+  outputs are summed in fixed point, so the result does not depend on the order experts finish in.
 - The expert cache counts the routes each forward pass took (decayed per token) and, between
-  passes, copies the experts it needed most into its slots and points the tables at them.
+  passes, copies the experts it needed most into its slots and points the tables at them. With
+  disk experts the cache works per layer instead: once a layer has routed its tokens, the experts
+  it lacks are read into the slots least recently used (never one the same call needs), and only
+  then do the layer's experts run.
+- A decode step (one token) replays a CUDA graph per pipeline stage, captured at a sequence's
+  second decode step; the token's position reaches the sparse-attention kernels in device memory.
+  Disk experts need the host between a layer's routing and its experts, so their steps stay eager.
+  `--no-cuda-graph` decodes eagerly everywhere.
 
 ## Measurements
 
-RTX 3090 (24 GB, PCIe 4.0), Q2_0 release, greedy decoding, prompts of 20 to 29 tokens:
+Q2_0 release, greedy decoding, CUDA 12.8, 2026-10-05. Decode is measured over the 78 tokens of a
+short answer (prompt of 20 tokens) and over the first tokens after a 4,463-token prompt; prefill is
+that prompt in 512-token chunks.
 
-| Placement | Device memory | Decode |
-|---|---:|---:|
-| Experts in pinned host memory, no cache | 3.7 GB | 16.8 tok/s |
+| Hardware and placement | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
+|---|---:|---:|---:|---:|---:|
+| 2× RTX 3090 Ti (PCIe, no P2P), experts on the GPUs (`--devices 0,1`) | 18.4 + 19.4 GB | 0.7 GB | 90.4 tok/s | 107 tok/s | 1,127 tok/s |
+| RTX 3090, experts in pinned host memory, 18.4 GB expert cache | 22.6 GB | 34 GB pinned | 48.4 tok/s | 42.4 tok/s | 378 tok/s |
+| RTX 3090, experts on disk, artifact in the page cache | 22.6 GB | 0.9 GB + page cache | 47.0 tok/s | 40.4 tok/s | 526 tok/s |
+| RTX 3090, experts on disk, page cache dropped every second (NVMe, 4.3 GB/s) | 22.6 GB | 0.9 GB | 16.0 tok/s | 11.0 tok/s | 174 tok/s |
+
+Host memory is the process's peak resident set (the pinned bank for host experts). Decode after
+the long prompt covers its first five tokens only. CUDA graphs add 11% to the short-answer decode on
+the two GPUs (81.2 tok/s eager) and 7% with host experts (44.3 tok/s); disk experts decode eagerly.
+Prefill touches nearly every expert of every layer in each chunk. Host experts stay on the vector
+products, which read each expert across the bus once per eight of its tokens, so larger chunks do
+not help them (11.9 s for the long prompt in 512-token chunks, 12.6 s in 2,048 and 13.5 s in
+4,096); disk experts are copied into device slots once per layer and chunk and run the matrix
+kernel, which is why a warm page cache prefills faster than pinned memory.
+
+Every GSQ-RCO release converts and answers the generate test's prompts (the facts and the
+4,463-token needle) with CUDA graphs and without, identically: Q2_0 in all three placements,
+IQ2_XS (39.2 GB) and the Coder build's IQ1_M (29.6 GB, 256 experts) on the two GPUs, IQ3_XXS
+(47.0 GB) and IQ3_S (54.8 GB) with host experts on one GPU (42.9 and 50.3 GB pinned).
+
+Against llama.cpp on the same RTX 3090 with the same GGUF (`--n-cpu-moe 48 -t 32`, the experts on
+the CPU): llama-bench gives 11.2 tok/s decode (tg128) and 267 tok/s prefill (pp512).
+
+Perplexity agrees with llama.cpp: over the first 72 KB of the WikiText sample in
+`eval/corpora/perplexity-1m`, 2,560-token windows advancing by 1,024 targets (llama.cpp's
+`--ppl-stride 1024 -c 2048`, which widens the window to 2,560), the fourteen windows both evaluate
+identically (14,336 targets) give 2.6558 in NInfer against 2.6443 in llama.cpp with its default F16
+KV cache, and 2.6502 with a BF16 KV cache like NInfer's; window by window the BF16 runs differ by
+-0.012 to +0.021 nats.
