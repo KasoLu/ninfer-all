@@ -503,6 +503,8 @@ private:
     const DeviceKVPagePool* pages_ = nullptr;
     std::vector<Tensor> replicas_;
     std::vector<std::size_t> replica_ranks_;
+    // The device that holds each copy.
+    std::vector<int> replica_devices_;
     PinnedHostBuffer host_shadow_;
     std::vector<bool> row_in_use_;
     std::vector<std::uint32_t> row_generations_;

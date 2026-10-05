@@ -1039,6 +1039,7 @@ KVExecutionTablePool::KVExecutionTablePool(std::span<const DeviceSpan> backings,
         for (std::size_t copy = 0; copy < replicas_.size(); ++copy) {
             cudaPointerAttributes attributes{};
             CUDA_CHECK(cudaPointerGetAttributes(&attributes, replicas_[copy].data));
+            replica_devices_.push_back(attributes.device);
             DeviceBinding bind(attributes.device);
             for (std::int32_t table_row = 0; table_row < spec_.table_rows; ++table_row) {
                 CUDA_CHECK(cudaEventCreateWithFlags(&fence(table_row, copy).event,
@@ -1213,8 +1214,11 @@ void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
                                            std::span<const cudaStream_t> streams) {
     if (indices.empty()) { return; }
     const std::uint32_t end = logical_begin + static_cast<std::uint32_t>(indices.size());
-    // Every copy is written from the one host shadow, each on its own rank's stream.
+    // Every copy is written from the one host shadow, each on its own rank's stream with that
+    // rank's device current: a suspendable region grants access only to the devices that may
+    // address it, which without peer access is its own device alone.
     for (std::size_t copy = 0; copy < replica_ranks_.size(); ++copy) {
+        DeviceBinding bind(replica_devices_[copy]);
         Tensor destination_row = row(row_handle, replica_ranks_[copy]);
         auto* destination      = static_cast<std::int32_t*>(destination_row.data) + logical_begin;
         CUDA_CHECK(cudaMemcpyAsync(destination, indices.data(), indices.size_bytes(),
