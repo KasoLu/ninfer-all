@@ -148,8 +148,8 @@ def mtp_config(source: dict) -> dict:
 
 # --- logical parameters ---------------------------------------------------------------------------
 # Names follow the Qwen3.5 adapter's where the mathematics is shared (attention, Gated DeltaNet,
-# MoE); hyper-connections, the indexer and PLE add their own. The n-gram table is not a parameter of
-# the main artifact: it ships as a companion (see the plan's section 2.5).
+# MoE); hyper-connections, the indexer and PLE add their own. The n-gram table is the `ngram`
+# component's one parameter, in the same artifact (see the plan's section 2.5).
 
 def _hyper_connection(builder, prefix, source_prefix, store, config, *, inject):
     width = config["hc_count"] * config["hidden_size"]
@@ -194,10 +194,10 @@ def _ple(builder, prefix, source_prefix, store, config):
 
 
 def ngram_config(source: dict) -> dict:
-    """The n-gram companion artifact's config: the table and the hash that addresses it.
+    """The `ngram` component's config: the table and the hash that addresses it.
 
-    The companion carries the constants its rows were written for; the runtime derives them again
-    from the model's text config and refuses a companion that disagrees.
+    The component carries the constants its rows were written for; the runtime derives them again
+    from the text config and refuses a table that disagrees.
     """
     text = text_config(source)
     heads = (text["ngram_size"] - 1) * text["heads_per_ngram"]
@@ -265,18 +265,18 @@ def ngram_hash_constants(text: dict, ple_layer_index: int = 0) -> tuple[list[int
 
 
 def build_model(base, *, components=("text",), companions=None, resource_overrides=None):
-    """The text component of a Qwen3.8-Flash-Next checkpoint (no Vision or MTP), or with
-    `components=("ngram",)` the n-gram companion that holds only the table."""
+    """The text component of a Qwen3.8-Flash-Next checkpoint (no Vision or MTP) and the `ngram`
+    component that holds its n-gram table: one artifact carries everything the model reads."""
     from .model import Model
     from .qwen3_5 import _Builder
     from .resources import load_resources
 
-    if tuple(components) == ("ngram",):
-        return _build_ngram(base)
     if tuple(components) != ("text",):
-        raise ValueError("Qwen3.8-Flash-Next converts --components text or --components ngram")
+        raise ValueError(
+            "Qwen3.8-Flash-Next converts --components text, which includes its n-gram table"
+        )
     config = text_config(base.config)
-    records = {"text": {"config": config}}
+    records = {"text": {"config": config}, "ngram": {"config": ngram_config(base.config)}}
     refs, resources, count, special = load_resources(
         base.root, vocab_size=config["vocab_size"], vision_config=None,
         overrides=resource_overrides)
@@ -305,19 +305,19 @@ def build_model(base, *, components=("text",), companions=None, resource_overrid
         builder.moe(p, sp, base, config)
         if i in config["ple_layers"]:
             _ple(builder, p, sp, base, config)
+    _ngram_table(model)
     return model
 
 
-def _build_ngram(base):
-    from .model import Model, Parameter
+def _ngram_table(model):
+    from .model import Parameter
     from .sources.logical import LogicalSource
 
-    config = ngram_config(base.config)
-    model = Model({"text": {"config": config}})
+    config = model.components["ngram"]["config"]
     shape = (config["rows"], config["row_width"])
 
     def unavailable(begin, end):
         raise ValueError("the n-gram table has no default source: provide --source ngram")
 
-    model.add(Parameter("text/ngram_table", shape, LogicalSource(shape, "ngram", unavailable)))
-    return model
+    model.add(Parameter("ngram/table", shape, LogicalSource(shape, "ngram", unavailable),
+                        residency="ngram"))

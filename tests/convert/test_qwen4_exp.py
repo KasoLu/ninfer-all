@@ -138,3 +138,11 @@ def test_build_model_maps_the_text_component(tmp_path):
         convolution = model.parameters["text/layers/0/ple/convolution"]
         assert convolution.shape == (16, 4)
         assert torch.equal(convolution.source.values().reshape(16, 4), conv[:, 0, :])
+        # The n-gram table is the artifact's `ngram` component: four heads (two per n-gram order
+        # above one) of 101, 103, 107 and 109 rows, padded to a multiple of eight, each row
+        # ple_embed_dim / 4 = 2 values wide.
+        assert set(model.components) == {"text", "ngram"}
+        assert model.components["ngram"]["config"]["head_vocab"] == [101, 103, 107, 109]
+        assert model.parameters["ngram/table"].shape == (424, 2)
+        with pytest.raises(ValueError, match="--source ngram"):
+            model.parameters["ngram/table"].source.rows(0, 1)

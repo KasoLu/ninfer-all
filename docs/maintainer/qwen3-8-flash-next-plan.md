@@ -31,7 +31,7 @@ HF repository, and Strata is github.com/Niko1221/Strata (MIT).
 | M3 | the Ops composed over the checkpoint's first four layers (three GDN, one QSA) and the head on BF16 weights, against the FP64 reference on 16 tokens: stack relative L2 ≈ 1.1e-2 per layer, top-1 agreement 16/16 (RTX 3090) | `tests/models/qwen4_exp/test_slice_real.cpp`, `tools/reference/fetch_slice.py` |
 
 | M4 | the family's own load and execution behind the public Engine (CLI, serving, perplexity): GGUF block banks bound as stored, the stage split over `--devices` (balanced by stored bytes, shared auxiliaries copied to every rank that reads them), one FIFO sequence, decode replaying one CUDA graph per stage | `src/models/qwen4_exp/{model,executor}.*`, `src/runtime/engine/qwen4_exp_core.*` |
-| M4 | the GSQ-RCO GGUF releases (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S and the Coder build's 256-expert IQ1_M) imported without requantization, and their shared n-gram table as a companion artifact; perplexity within 0.2% of llama.cpp's on the same windows | `tools/convert/qwen4_exp_gguf.py`, `src/models/qwen4_exp/ngram_companion.*`, `docs/qwen3-8-flash-next.md` |
+| M4 | the GSQ-RCO GGUF releases (Q2_0, IQ2_XS, IQ3_XXS, IQ3_S and the Coder build's 256-expert IQ1_M) imported without requantization, with their n-gram table in the same artifact; perplexity within 0.2% of llama.cpp's on the same windows | `tools/convert/qwen4_exp_gguf.py`, `src/models/qwen4_exp/ngram_component.*`, `docs/qwen3-8-flash-next.md` |
 | M4 | expert residency: device banks, pinned host banks with a device expert cache (wide calls copy the uncached routed experts into a device slot pool), or the artifact's files streamed into device slots (parallel reads); `moe_experts_gguf` over expert tables, vector products up to eight tokens and ggml's matrix kernel above that from device memory | `src/models/qwen4_exp/{expert_cache,expert_stream,read_pool}.*`, `src/ops/moe_experts/moe_experts_gguf.cu` |
 
 Not started: NInfer's own quantized expert formats and KV codecs for the new Ops, the RadixArk NVFP4 checkpoint,
@@ -507,21 +507,22 @@ lookahead prefetch); an option loads it, or a profile-selected hot part of it, i
   53.7 GB; `Qwen/Qwen3.8-Flash-Next-FP8`) imported encoded when its scale granularity matches.
 - metadata: format, `row_bytes`, `n_rows`, `head_dim_ng` 160, `n_heads` 16, multipliers[3], head_vocab[16],
   head_offset[16], eos id, image/video placeholder ids, a content digest.
-- **Placement:** the table goes in a **separate companion artifact file** (`<model>.ngram.ninfer`, same v3 framing,
-  referenced from the main artifact by digest), because (a) it is 29-52 GB and identical across every quantization
-  of the main weights (GSQ ships it the same way), (b) users will want it on a different SSD than the weights, and
-  (c) the main artifact then stays uploadable/loadable as today. The loader refuses a companion whose digest or
-  constants disagree.
+- **Placement:** the table is the model artifact's **`ngram` component**, in the same file as the weights. A
+  `.ninfer` file holds everything the model reads and the runtime reads only what a placement needs: nothing of the
+  table at load, the rows each token addresses afterwards (or all of it with `--ngram-ram`). Each quantization then
+  carries its own copy of the 28.8 GB IQ4_NL table (GSQ ships it as a second shard per release, also identical);
+  Hugging Face's chunk deduplication stores it once. A separate companion file, shared by the quantizations and
+  placeable on another disk, was built first and replaced by this single-file layout. The loader refuses a table whose
+  constants disagree with the model's.
 
 **Runtime option surface** (CLI and serve config; names follow our `--kebab` convention):
 
 | option | values | default | meaning |
 |---|---|---|---|
-| `--ngram-table PATH` | path | next to the artifact | companion file |
 | `--ngram-residency` | `disk`, `ram`, `ram-hot` | `disk` | where rows come from |
 | `--ngram-io` | `buffered`, `direct`, `mmap` | `buffered` | disk mode: `pread` into a bounded row cache through the OS page cache (`posix_fadvise(RANDOM)`; Windows `FILE_FLAG_RANDOM_ACCESS`); `direct` = O_DIRECT / `FILE_FLAG_NO_BUFFERING` 4 KiB-aligned reads that bypass the page cache (Strata's default on Windows: keeps RAM for the expert arena); `mmap` = map + `madvise(MADV_RANDOM)`, prefetch via `madvise(WILLNEED)` / `PrefetchVirtualMemory` |
 | `--ngram-ram-budget GiB` | number | 4 (ram-hot) | resident budget for `ram-hot`; also caps the user-space row cache in `disk` mode |
-| `--ngram-hot-profile PATH` | file | built-in profile shipped in the companion | row-frequency profile for `ram-hot` |
+| `--ngram-hot-profile PATH` | file | built-in profile shipped in the artifact | row-frequency profile for `ram-hot` |
 | `--ngram-lock` | flag | off | `mlock`/`VirtualLock` the resident rows (`ram`, `ram-hot`) |
 | `--ngram-io-depth N` | int | 64 | outstanding reads (io_uring on Linux, overlapped I/O / IOCP on Windows) |
 
@@ -583,7 +584,7 @@ registry):
 | path | contents |
 |---|---|
 | `config.{h,cpp}` | strict parser for `qwen4_exp`/`qwen4_exp_text` keys (1.0); normalises `full_attention` -> QSA; validates the invariants transformers validates (indexer_kv_heads 1, budget % ratio, rotary ≤ indexer dim, PLE on a linear layer, eos set) and the shapes this engine implements (H 2560, 512x10, I 640, HC 4, LR 320, 16x160 n-gram) |
-| `load/` | bindings: `text/token_embedding` (Host residency allowed), `text/output_head`, `text/layers/i/{attn_hc,mlp_hc}/{norm,down,up,inject}`, `gdn/*` (as qwen3_5), `qsa/{query_gate,key,value,output,query_norm,key_norm,index_query,index_key,index_query_norm,index_key_norm}`, `moe/{router,shared_score,shared/*,experts bank}`, `ple/{key,value,norm_key,norm_query,norm_conv,conv}`, `text/final_mixer/*`, `mtp/*`; the n-gram companion binding; expert residency (Device / HostArena) |
+| `load/` | bindings: `text/token_embedding` (Host residency allowed), `text/output_head`, `text/layers/i/{attn_hc,mlp_hc}/{norm,down,up,inject}`, `gdn/*` (as qwen3_5), `qsa/{query_gate,key,value,output,query_norm,key_norm,index_query,index_key,index_query_norm,index_key_norm}`, `moe/{router,shared_score,shared/*,experts bank}`, `ple/{key,value,norm_key,norm_query,norm_conv,conv}`, `text/final_mixer/*`, `mtp/*`; the `ngram/table` binding; expert residency (Device / HostArena) |
 | `execution/` | `TextContext` equivalent with an FP32 stack `R [HC,H,T]`; `hc_read`/`hc_write` calls; `gdn_mix` reused from qwen3_5 semantics with the sigmoid gate; `qsa_mix`; `moe` (resident or hybrid); `ple_inject`; `mtp_*` |
 | `program/` | Program contract implementation; starts as a trimmed copy of qwen3_5's program (stores, transactions, graphs, prefix cache), with the deltas in 3.5-3.8; shared code moves down to `src/runtime`/`src/core` only where both families need it byte-for-byte |
 | `frontend/` | reuse qwen3_5's tokenizer/template/processor code by linking, plus `reasoning_effort`; sampling presets for the new architecture |
@@ -671,14 +672,15 @@ oracle tests in `tests/ops/`, and a `bench/ops` microbenchmark):
     on Strata's `tools/mtp_fetch.py`: 31 tensors from 28 shards, ~5 GB, SHA-256 pinned). GGUF conventions undone as
     the ternary path does: tiled GDN value heads -> grouped order, `1+w` norms -> `w`, `ssm_a` -> `A_log`, fused
     `nextn_eh_proj [fc_embedding | fc_hidden]` split back.
-  - companion `qwen3_8_flash_next_ngram_{fp8,iq4nl}`: writes the n-gram companion artifact from either the 128
-    HF BF16 row shards (streamed shard by shard, never materialised; FP8 E4M3 per-row scale = max|row|/448) or the
-    GGUF shard 2 (`per_layer_token_embd`, IQ4_NL, imported byte-exactly - note GGUF's split-half nibble order).
+  - the n-gram table, the same artifact's `ngram` component: from the GGUF shard 2 (`--source ngram=`,
+    `per_layer_token_embd`, IQ4_NL, imported byte-exactly - note GGUF's split-half nibble order); the 128 HF BF16 row
+    shards (streamed shard by shard, never materialised; FP8 E4M3 per-row scale = max|row|/448) are not a source
+    yet.
 - Expert banks: one parent object per (layer, projection) holding 512 experts contiguously, expert-major, each
   expert's rows contiguous, so an expert is one contiguous byte range (cache slot copy = one DMA, CPU kernel = one
   stream). 73,728 logical expert parameters are grouped by `recipe.group`.
-- Size: Plan A artifact ≈ 68 GB experts + ~5 GB rest; GSQ Q2 artifact ≈ 34 GB + ~4 GB; both cross the 32 GB part
-  limit, which the container already handles. Tensor axes must stay < 2^31 elements: the expert bank
+- Size: Plan A artifact ≈ 68 GB experts + ~5 GB rest; GSQ Q2 artifact ≈ 34 GB + ~4 GB, each with the 28.8 GB
+  n-gram table, in one file (the writer splits into parts only when `--max-file-bytes` asks). Tensor axes must stay < 2^31 elements: the expert bank
   [512*1280, 2560] = 1.68e9 elements is fine; the n-gram table [320,001,446, 160] is fine per axis.
 
 ### 3.4 Hybrid execution (host experts + VRAM expert cache + CPU expert compute)
@@ -761,7 +763,7 @@ against the oracle), not bitwise across splits.
 | reuse (adapt under MIT) | write fresh |
 |---|---|
 | n-gram hash and row constants, EOS-cut semantics, and **its parity vectors** (`src/kernels/ple_parity.cpp`, `ple_reader_test.cpp`) as oracle fixtures | every Op wrapper/contract/workspace/qualification (our Op contract) |
-| `src/ngram/ple_reader.cpp` design: I/O thread, bounded row cache, Windows unbuffered reads, keepalive | the companion artifact format and loader |
+| `src/ngram/ple_reader.cpp` design: I/O thread, bounded row cache, Windows unbuffered reads, keepalive | the n-gram component and its loader |
 | doorbell protocol + `wait_flag_ge` + mapped staging (`elementwise.cu`, `verify_kernels.cu:426`) | sparse attention over our paged KV codecs and 64-token pages |
 | expert cache policy (byte-sized slots, profile fill, adaptive swaps, evict-now/admit-later), `expert_source.cpp` low-RAM lookahead | MoE 512 GPU routes at our formats (A8 MMA prefill, decode/small-T) |
 | CPU Q2_0 AVX-512 VNNI / AVX2 expert kernels (`src/kernels/cpu/expert.cpp`, `kq_avx2.cpp`) as the starting point for `q2_g64` CPU kernels | HC kernels (Strata's `fused_gr.cu` is a reference for the fusion, not for our contracts) |
@@ -784,7 +786,7 @@ CPU box with ≥ 400 GB RAM or a rented multi-GPU vLLM node for one-off logit du
 |---|---|---|---|---|
 | M0 | Product decision + family scaffold | AGENTS/README name the architecture and (later) the hybrid mode; `src/models/qwen4_exp/config`; `registry` entry; `ModelInstance` two-member variant; ResourceManager/RequestRecord instantiated for both contracts; refusal paths for unsupported shapes | config round-trip on the real `config.json`; refusal tests for each validated invariant; qwen3_5 test suite unchanged (`ctest`) | 1-2 |
 | M1 | Reference harness (CPU, Python 3.11) | `tools/reference/qwen4_exp/`: an FP32/FP64 transcription of the modular code that loads tensors **lazily by range** from the HF safetensors (one expert at a time), runs any layer slice, and dumps golden tensors: hash rows (incl. EOS cuts, BOS context, image ids), PLE block, HC read/write, GDN layer (prefill + step), QSA layer at n ≤ 2051 and n > 2051 (selection sets included), MoE, final mixer + head, MTP step | cross-check the hash against the checkpoint's I64 buffers and Strata's `ple_parity` vectors (exact); cross-check one full forward of layers 0-3 against transformers itself on the same slice (FP32, ≤ 1e-5 rel) | 1-2 |
-| M2 | Converter, artifact, loader | `tools/convert/qwen4_exp.py`, recipes (BF16-debug, Q8, Q4/Q5 experts, GSQ-Q2 import), n-gram companion writer (FP8-rowscale, IQ4_NL import), `--layers a..b` slice artifacts for tests, MTP range-fetch helper; C++ bindings/load for all roles, `q2_g64_fp16` format registration (artifact + python) | byte-exact import of encoded GGUF rows (Q2_0 experts, IQ4_NL table rows) vs the GGUF file; independent decode of every stored format vs source within the format's error bound; loader binding/shape tests; companion digest/constant refusal tests | 2-3 |
+| M2 | Converter, artifact, loader | `tools/convert/qwen4_exp.py`, recipes (BF16-debug, Q8, Q4/Q5 experts, GSQ-Q2 import), n-gram table writer (FP8-rowscale, IQ4_NL import), `--layers a..b` slice artifacts for tests, MTP range-fetch helper; C++ bindings/load for all roles, `q2_g64_fp16` format registration (artifact + python) | byte-exact import of encoded GGUF rows (Q2_0 experts, IQ4_NL table rows) vs the GGUF file; independent decode of every stored format vs source within the format's error bound; loader binding/shape tests; companion digest/constant refusal tests | 2-3 |
 | M3 | New Ops at H 2560 (parallelisable) | `hyper_connection`, `ple_inject` + `ngram_dequant_rows`, GDN shape registrations + sigmoid gated norm, attention [256,24,2] dense, rope D128/R64 MRoPE, `qsa_indexer`, `sparse_softmax_attention` (BF16, int8, rk8v4 KV), `sparse_moe_512` (resident; Q4/Q5, Q8, q2_g64), head/embedding shapes | per op-development.md: naive FP32/FP64 oracle at T = 1, route boundaries and interior, real shapes; selection = exact set equality modulo documented near-ties; sparse attention with an identity selection must equal dense causal attention; microbenchmarks in `bench/ops` | 6-10 |
 | M4 | Full forward, GPU-resident, single device | `execution/` + minimal `program/` (prefill eager, decode ungraphed), n-gram rows via a simple `ram`/`pread` path; first on slice artifacts (layers 0-3 + head), then the full GSQ-Q2 artifact on one 48 GB card | slice: per-layer `R` and logits vs M1 dumps (FP32 criteria); full model: next-token KL and top-1 agreement vs a reference engine's logits (vLLM BF16 or llama.cpp on the same GSQ file) over a fixed 32K-token corpus incl. one > 8K prompt (sparse path engaged); perplexity within the GSQ README's reported recovery | 2-3 |
 | M5 | Decode product path | CUDA graphs (dense/sparse topology classes), MTP with step-0 selection reuse, verify + ReplaySSM + indexer-tail/PLE snapshots, commit/abort, StateImage extensions, pooled-key KV plane in host/disk tiers, prefix cache, serving `reasoning_effort` | greedy MTP output byte-identical to greedy non-speculative output, incl. forced-wrong drafts; checkpoint save/restore/fork equivalence (byte-identical continuation); needle-in-haystack at 32K/128K; serving schema tests | 3-4 |

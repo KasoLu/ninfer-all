@@ -13,8 +13,8 @@ interleaved ``attn_q`` splits into query and gate rows, and the indexer's split 
 squeezed PLE convolution keep the layout the HF adapter (qwen4_exp.py) declares.
 
 The first shard of a release holds the model; the second holds only ``per_layer_token_embd``, the
-n-gram table, which `qwen3_8_flash_next_ngram` writes into its own companion artifact
-(``--components ngram``) so that every quantisation of the model shares one copy of it.
+n-gram table, which the recipe imports row for row into the same artifact as its ``ngram``
+component, so that one file carries everything the model reads.
 """
 
 from __future__ import annotations
@@ -381,7 +381,9 @@ def _group_same_format(recipe, names: list[str], formats: dict[str, str]) -> Non
 
 
 def qwen3_8_flash_next_gguf(model, recipe, sources):
-    """A Qwen3.8-Flash-Next GSQ-RCO GGUF in its own block formats, `--source gguf=SHARD1.gguf`."""
+    """A Qwen3.8-Flash-Next GSQ-RCO GGUF release in its own block formats, in one artifact: the
+    model shard as `--source gguf=SHARD1.gguf` and the n-gram table shard as
+    `--source ngram=SHARD2.gguf`."""
 
     config = model.config
     if config.get("architectures") != ["Qwen4ExpForCausalLM"]:
@@ -389,10 +391,17 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
     gguf = sources["gguf"]
     if not isinstance(gguf, GGUFFile):
         raise ValueError("--source gguf must name the model's first .gguf shard")
+    table = sources["ngram"]
+    if not isinstance(table, GGUFFile):
+        raise ValueError("--source ngram must name the release's n-gram table shard (.gguf)")
     validate(gguf, config)
     formats: dict[str, str] = {}
     for name, (source, encoded) in text_sources(gguf, config).items():
         formats[name] = _assign(recipe, name, source, encoded, model)
+    source = ngram_source(table, model.components["ngram"]["config"]["rows"])
+    formats["ngram/table"] = source.read_encoded(0, 1).format
+    recipe.assign("ngram/table", format=formats["ngram/table"], method=import_encoded,
+                  source=source)
     if set(formats) != set(model.parameters):
         missing = sorted(set(model.parameters) - set(formats))[:5]
         raise ValueError(f"the GGUF leaves logical parameters without a source: {missing}")
@@ -461,23 +470,8 @@ def ngram_source(gguf: GGUFFile, rows_count: int) -> LogicalSource:
     return block_source(gguf, tensor, (rows_count, NGRAM_WIDTH), rows())
 
 
-def qwen3_8_flash_next_ngram(model, recipe, sources):
-    """The n-gram companion from a GSQ-RCO release's table shard, `--source ngram=SHARD2.gguf`."""
-
-    config = model.config
-    if config.get("architectures") != ["Qwen4ExpNgramTable"]:
-        raise ValueError("the n-gram recipe writes the companion: select --components ngram")
-    gguf = sources["ngram"]
-    if not isinstance(gguf, GGUFFile):
-        raise ValueError("--source ngram must name the release's table shard (.gguf)")
-    source = ngram_source(gguf, config["rows"])
-    recipe.assign("text/ngram_table", format=source.read_encoded(0, 1).format,
-                  method=import_encoded, source=source)
-
-
 RECIPES = {
     "qwen3_8_flash_next_gguf": qwen3_8_flash_next_gguf,
-    "qwen3_8_flash_next_ngram": qwen3_8_flash_next_ngram,
 }
 
 __all__ = [
@@ -487,7 +481,6 @@ __all__ = [
     "with_gguf_expert_count",
     "ngram_source",
     "qwen3_8_flash_next_gguf",
-    "qwen3_8_flash_next_ngram",
     "text_sources",
     "validate",
 ]

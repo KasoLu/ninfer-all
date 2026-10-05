@@ -137,8 +137,7 @@ def main(argv=None):
     parser.add_argument(
         "--components",
         default="text",
-        help="comma-separated text,vision,mtp,dflash,dflash2; ngram alone writes the "
-        "n-gram companion of a Qwen3.8-Flash-Next model",
+        help="comma-separated text,vision,mtp,dflash,dflash2",
     )
     parser.add_argument(
         "--resource",

@@ -148,9 +148,8 @@ filled to it, both models find two of the three needles.
   programmatic dependents in captured graphs; with CUDA 13.2 the FP8 and NVFP4 A16 operands widen
   natively. All of it compiles only into `120a` builds.
 - **Qwen3.8-Flash-Next.** ISTA-DASLab's GSQ-RCO GGUF releases of the 125B-parameter MoE (512
-  experts, about 6B active) convert without requantization (`qwen3_8_flash_next_gguf`, and its
-  n-gram table into a shared companion with `qwen3_8_flash_next_ngram`) and run as their own model
-  family: experts on the GPUs of a `--devices` pipeline (the 37.6 GB Q2_0 release decodes at 90 tok/s
+  experts, about 6B active) convert without requantization into one file with their n-gram table
+  (`qwen3_8_flash_next_gguf`) and run as their own model family: experts on the GPUs of a `--devices` pipeline (the 37.6 GB Q2_0 release decodes at 90 tok/s
   on two RTX 3090 Ti), in pinned host memory with the most used of them cached on one GPU
   (`--expert-residency host`, 48 tok/s on one RTX 3090), or left in the artifact's files and
   streamed into a GPU cache (`--expert-residency disk`, under 1 GB of RAM). Vision, MTP, the context
@@ -515,6 +514,8 @@ driver or clock change. See [device profiles](docs/device-profiles.md).
 |---|---|---|
 | Ternary Bonsai 2 27B | [WaveCut/Ternary-Bonsai-2-27B-NInfer-v3](https://huggingface.co/WaveCut/Ternary-Bonsai-2-27B-NInfer-v3) | 8.87 GiB. Ternary text tower, token table and head, Vision, Bonsai-trained MTP head and DFlash2 adapter, and an exact proposal head. Runs only on this line. |
 | Qwen3.8-27B GSQ-RCO IQ3_S | [WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3) | 13.99 GiB. ISTA-DASLab's 3.5-bit GGUF blocks kept byte for byte, their Q6_K MTP head, Vision, the DFlash2 adapter and a proposal head. Runs only on this line. |
+| Qwen3.8-Flash-Next GSQ-RCO Q2_0 | [WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3) | 61.87 GiB, one file: ISTA-DASLab's 2.4-bit GGUF blocks kept byte for byte and the 26.82 GiB n-gram table; text only. Experts on two 24 GB GPUs, in host memory or on disk. Runs only on this line. |
+| Qwen3.8-Flash-Next GSQ-RCO IQ3_S | [WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-NInfer-v3) | 77.89 GiB, one file: ISTA-DASLab's 3.5-bit GGUF blocks kept byte for byte and the same n-gram table; text only. Experts in host memory or on disk with one 24 GB GPU. Runs only on this line. |
 | Qwen3.8-27B | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19 GiB, `groupwise-int` (Q4/Q5), the upstream artifact the reference tables use |
 | Qwen3.8-27B, abliterated | [WaveCut/Huihui-Qwen3.8-27B-abliterated-NInfer-v3](https://huggingface.co/WaveCut/Huihui-Qwen3.8-27B-abliterated-NInfer-v3) | 19.03 GiB, official `qwen3_8_27b` recipe with MTP, DFlash2 and a proposal head |
 | Qwen3.6-35B-A3B NVFP4 | [WaveCut/Qwen3.6-35B-A3B-NVFP4-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.6-35B-A3B-NVFP4-NInfer-v3) | 20.39 GiB. RedHatAI's NVFP4 experts kept code for code, Q8 projections, Vision, MTP and a proposal head. Needs an `sm_120a` GPU. |

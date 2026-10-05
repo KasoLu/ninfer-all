@@ -75,7 +75,7 @@ def test_expected_tensors_cover_the_release_layout():
     assert "blk.1.ple_key.weight" in tensors and "blk.5.ple_key.weight" not in tensors
 
 
-def test_ngram_companion_config_has_the_reference_constants():
+def test_ngram_config_has_the_reference_constants():
     config = qwen4_exp.ngram_config(_checkpoint())
     # The constants the checkpoint stores (plan section 1.4.1), derived here from the config.
     assert config["multipliers"] == [23703573157769, 20109073645365, 8052911324071]
@@ -86,19 +86,15 @@ def test_ngram_companion_config_has_the_reference_constants():
     assert config["architectures"] == ["Qwen4ExpNgramTable"]
 
 
-def test_the_ngram_companion_model_holds_only_the_table(tmp_path):
-    for name in ("config.json",):
-        (tmp_path / name).write_text((_FIXTURES / name).read_text())
-
+def test_flash_next_converts_the_text_component_alone(tmp_path):
+    # The text component carries the n-gram table; nothing converts without it or beside it.
     class Base:
         config = _checkpoint()
         root = tmp_path
 
-    model = qwen4_exp.build_model(Base(), components=("ngram",))
-    assert list(model.parameters) == ["text/ngram_table"]
-    assert model.parameters["text/ngram_table"].shape == (320001536, 160)
-    with pytest.raises(ValueError):
-        qwen4_exp.build_model(Base(), components=("text", "mtp"))
+    for components in (("ngram",), ("text", "ngram"), ("text", "mtp")):
+        with pytest.raises(ValueError, match="--components text"):
+            qwen4_exp.build_model(Base(), components=components)
 
 
 def test_an_expert_pruned_release_takes_its_own_expert_count(tmp_path):

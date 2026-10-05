@@ -5,7 +5,6 @@
 // generated token must be the same.
 //
 //   NINFER_QWEN4_EXP_ARTIFACT  the model's .ninfer (required; skips without it)
-//   NINFER_QWEN4_EXP_NGRAM     its n-gram companion (default: found next to the artifact)
 //   NINFER_QWEN4_EXP_DEVICES   comma-separated device ids, one pipeline stage each (default 0)
 //   NINFER_QWEN4_EXP_EXPERTS   device | host | disk (default device)
 //   NINFER_QWEN4_EXP_NGRAM_RAM 1 loads the n-gram table into RAM
@@ -15,7 +14,7 @@
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen4_exp/executor.h"
 #include "models/qwen4_exp/model.h"
-#include "models/qwen4_exp/ngram_companion.h"
+#include "models/qwen4_exp/ngram_component.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -157,24 +156,17 @@ int run(const char* artifact_path) {
     std::cout << ", read " << model->storage_stats().read_bytes / 1e9 << " GB, pinned "
               << model->storage_stats().pinned_bytes / 1e9 << " GB\n";
 
-    std::filesystem::path companion;
-    if (const char* path = std::getenv("NINFER_QWEN4_EXP_NGRAM")) {
-        companion = path;
-    } else {
-        const auto found = find_ngram_companion(std::filesystem::path(artifact_path).parent_path(),
-                                                artifact_path, model->config());
-        if (!found) { throw std::runtime_error("no n-gram companion next to the artifact"); }
-        companion = *found;
-    }
     ExecutorOptions options;
     options.max_context   = 8192;
     const char* chunk     = std::getenv("NINFER_QWEN4_EXP_PREFILL_CHUNK");
     options.prefill_chunk = chunk != nullptr ? static_cast<std::uint32_t>(std::stoul(chunk)) : 512;
-    options.ngram         = open_ngram_companion(companion, model->config());
+    options.ngram         = ngram_table_source(reader, artifact_path, model->config());
     const char* ram       = std::getenv("NINFER_QWEN4_EXP_NGRAM_RAM");
     options.ngram_residency =
         ram != nullptr && std::string(ram) == "1" ? NgramResidency::Ram : NgramResidency::Disk;
-    std::cout << "n-gram table " << companion.filename().string() << '\n';
+    std::cout << "n-gram table: " << options.ngram.layout.rows << " rows of "
+              << options.ngram.layout.row_bytes << " bytes in "
+              << options.ngram.layout.segments.size() << " file segment(s)\n";
     std::vector<Prompt> prompts = {
         {"<|im_start|>user\nWhat is the capital of France? Answer in one word.<|im_end|>\n"
          "<|im_start|>assistant\n<think>\n\n</think>\n\n",

@@ -8,8 +8,13 @@ active per token) from ISTA-DASLab's GSQ-RCO GGUF releases, converted without re
 - [Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF).
 
 Each release is two GGUF shards: the model, and the 28.8 GB n-gram table of the model's per-layer
-embedding (PLE), identical across releases. NInfer keeps them apart too: the model artifact, and an
-n-gram companion artifact that every quantization of the model shares.
+embedding (PLE), identical across releases. A NInfer artifact is one file that holds both: the
+table is its `ngram` component, which nothing reads at load; each token reads the 16 rows it
+addresses from the file, or `--ngram-ram` loads the table into RAM.
+
+Two conversions are published, with their measurements:
+[Q2_0](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3) and
+[IQ3_S](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-NInfer-v3).
 
 The text model runs; Vision, MTP drafting, the context cache and structured output are not
 available for this family yet (the [plan](maintainer/qwen3-8-flash-next-plan.md) tracks them).
@@ -24,26 +29,19 @@ available for this family yet (the [plan](maintainer/qwen3-8-flash-next-plan.md)
 python3 -m tools.convert --model /path/to/Qwen3.8-Flash-Next \
   --recipe qwen3_8_flash_next_gguf \
   --source gguf=/path/to/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
-  --device cpu --rows-per-chunk 4096 \
-  --name Qwen3.8-Flash-Next-GSQ-RCO-Q2_0 --out models/flash-next-q2_0.ninfer
-
-python3 -m tools.convert --model /path/to/Qwen3.8-Flash-Next --components ngram \
-  --recipe qwen3_8_flash_next_ngram \
   --source ngram=/path/to/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf \
-  --device cpu --rows-per-chunk 1048576 \
-  --name Qwen3.8-Flash-Next-ngram-IQ4_NL --out models/flash-next-ngram-iq4nl.ninfer
+  --device cpu --rows-per-chunk 65536 \
+  --name qwen3.8-flash-next --out models/flash-next-q2_0.ninfer
 ```
 
 Every matrix keeps the block type the release chose (see [GGUF block formats](gguf.md)); the expert
 banks keep the exporter's expert-major layout, so one expert is one contiguous range of bytes. The
 recipe undoes llama.cpp's exporter conventions as the Qwen3.8-27B GGUF recipe does (grouped GDN
-value heads, `1 + w` norms, `A_log`, the head-interleaved query and gate). The companion carries the
-hash constants its rows were written for; the runtime derives them again from the model's
-configuration and refuses a companion that disagrees.
+value heads, `1 + w` norms, `A_log`, the head-interleaved query and gate). The n-gram table keeps
+the release's IQ4_NL rows, and its component carries the hash constants they were written for; the
+runtime derives them again from the model's configuration and refuses a table that disagrees.
 
 ## Run
-
-The companion is found next to the model artifact, or named with `--ngram-table`:
 
 ```bash
 # Two 24 GB GPUs: every expert in device memory, one pipeline stage per GPU (Linux).
@@ -60,8 +58,7 @@ The companion is found next to the model artifact, or named with `--ngram-table`
 |---|---|
 | `--expert-residency device\|host\|disk` | expert banks in the stage devices' memory (default); in page-locked host memory that the expert kernels read across the bus; or left in the artifact's files, each layer's routed experts read into a device cache before they run |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts: `auto` (default) takes what each device has free after startup less a margin; `0` disables the host-mode cache (disk mode needs one) |
-| `--ngram-table PATH` | the n-gram companion artifact |
-| `--ngram-ram` | load the 28.8 GB table into RAM instead of reading the 16 rows each token needs from its file |
+| `--ngram-ram` | load the 28.8 GB n-gram table into RAM instead of reading the 16 rows each token needs from the artifact |
 | `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides) |
 
 With host experts the GPU holds only the dense weights (3.7 GB for the Q2_0 release), the
@@ -69,7 +66,8 @@ per-request state and the expert cache; the host needs the expert banks in page-
 (34 GB for Q2_0). With disk experts the host needs no copy of the banks at all: the expert cache
 reads the missing experts from the artifact's files through the OS page cache, eight reads in
 flight, into a 256 MB page-locked staging ring, so the page cache keeps whatever the system can
-spare and the rest comes from the disk. The n-gram table is read from the file's page cache unless `--ngram-ram` is given.
+spare and the rest comes from the disk. The n-gram rows are read the same way unless `--ngram-ram`
+is given.
 
 The KV cache of the 12 sparse-attention layers is BF16 whatever `--kv-dtype` asks (the engine says
 so at startup, and reports BF16).
@@ -82,7 +80,7 @@ Requests run one at a time in arrival order; `--max-concurrency` above one queue
 - The 36 Gated DeltaNet layers run the Qwen3.5 GDN kernels with a sigmoid output gate; the 12 sparse
   attention layers run the block indexer and attend only to the blocks it selects (plain dense
   attention below 2,051 positions).
-- The PLE layer reads its 16 n-gram rows per token from the companion (IQ4_NL rows decoded on the
+- The PLE layer reads its 16 n-gram rows per token from the artifact (IQ4_NL rows decoded on the
   GPU).
 - The 512-expert MoE groups each layer's (token, expert) pairs by expert on the GPU and runs one
   pass over each selected expert's rows for all of its tokens, through device tables of expert
@@ -127,17 +125,35 @@ each of them crosses the bus or comes off the disk once per chunk, so larger `--
 values serve more tokens per copy: with host experts on an RTX 3090 Ti the long prompt takes 6.05 s
 in 512-token chunks and 4.58 s in 2,048 (10.97 s before the experts went through device slots).
 
-Every GSQ-RCO release converts and answers the generate test's prompts (the facts and the
-4,463-token needle) with CUDA graphs and without, identically: Q2_0 in all three placements,
-IQ2_XS (39.2 GB) and the Coder build's IQ1_M (29.6 GB, 256 experts) on the two GPUs, IQ3_XXS
-(47.0 GB) and IQ3_S (54.8 GB) with host experts on one GPU (42.9 and 50.3 GB pinned).
+The IQ3_S release on one RTX 3090 (310 W power limit, PCIe 4.0 x16) in a host with 62 GB of RAM,
+23 cores of an AMD EPYC 7663 and an NVMe drive, 2026-10-05, with the Q2_0 release in the same
+sitting; the artifacts are single files with their n-gram tables, and decode counts the 86 tokens of
+the short answer:
 
-Against llama.cpp on the same RTX 3090 with the same GGUF (`--n-cpu-moe 48 -t 32`, the experts on
-the CPU): llama-bench gives 11.2 tok/s decode (tg128) and 267 tok/s prefill (pp512).
+| Release and placement | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
+|---|---:|---:|---:|---:|---:|
+| IQ3_S, experts in pinned host memory, 16.2 GB expert cache | 22.6 GiB | 50.3 GB pinned | 34.4 tok/s | 30.2 tok/s | 533 tok/s |
+| IQ3_S, experts on disk, the page cache holding what of the 83.6 GB file fits | 22.6 GiB | page cache | 19.0 tok/s | 21.6 tok/s | 209 tok/s |
+| IQ3_S, experts on disk, the file's pages evicted every second | 22.6 GiB | — | 10.7 tok/s | 5.4 tok/s | 47 tok/s |
+| Q2_0, experts in pinned host memory | 22.6 GiB | 34.0 GB pinned | 50.2 tok/s | 43.7 tok/s | 847 tok/s |
+
+On the current code the generate test's prompts (the facts and the 4,463-token needle) come out
+right with CUDA graphs and without for Q2_0 (disk and host experts here, and all three placements
+before the n-gram table moved into the artifact) and IQ3_S (disk and host experts). IQ2_XS (39.2
+GB) and the Coder build's IQ1_M (29.6 GB, 256 experts) on two GPUs and IQ3_XXS (47.0 GB) with host
+experts passed before wide expert calls moved to the matrix kernel and have not been rerun since.
+
+llama.cpp runs the same GGUFs with the experts on the CPU (`--n-cpu-moe 48`). On the second
+machine above (23 threads) llama-bench gives 29.6 tok/s decode (tg128) and 312 tok/s prefill
+(pp512) for IQ3_S, and 12.7 and 368 tok/s for Q2_0; the first RTX 3090's machine (32 threads) gave
+11.2 and 267 tok/s for Q2_0. Its speed follows the host CPU, and its Q2_0 CPU path is the slower one.
 
 Perplexity agrees with llama.cpp: over the first 72 KB of the WikiText sample in
 `eval/corpora/perplexity-1m`, 2,560-token windows advancing by 1,024 targets (llama.cpp's
 `--ppl-stride 1024 -c 2048`, which widens the window to 2,560), the fourteen windows both evaluate
-identically (14,336 targets) give 2.6558 in NInfer against 2.6443 in llama.cpp with its default F16
-KV cache, and 2.6502 with a BF16 KV cache like NInfer's; window by window the BF16 runs differ by
--0.012 to +0.021 nats.
+identically (14,336 targets) give, with a BF16 KV cache in both:
+
+| Release | NInfer | llama.cpp | Window by window |
+|---|---:|---:|---|
+| Q2_0 | 2.6579 | 2.6502 | -0.014 to +0.016 nats |
+| IQ3_S | 2.1317 | 2.1278 | -0.022 to +0.016 nats |

@@ -303,7 +303,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.devices                  = options.devices;
     engine_options.stage_layers             = options.stage_layers;
     engine_options.expert_residency           = options.expert_residency;
-    engine_options.ngram_table                = options.ngram_table;
+    engine_options.ngram_ram                  = options.ngram_ram;
     engine_options.expert_cache_bytes         = options.expert_cache_bytes;
     engine_options.context_cost.preset_path = options.context_cost_presets;
     engine_options.device_profile           = options.device_profile;

@@ -11,7 +11,7 @@
 #include "core/tensor.h"
 #include "models/qwen4_exp/expert_cache.h"
 #include "models/qwen4_exp/model.h"
-#include "models/qwen4_exp/ngram_companion.h"
+#include "models/qwen4_exp/ngram_component.h"
 
 #include <cstdint>
 #include <memory>
@@ -24,7 +24,7 @@ struct ExecutorOptions {
     // Tokens per forward call: a prompt is fed in calls of at most this many.
     std::uint32_t prefill_chunk = 2048;
     std::uint32_t sequences     = 1;
-    NgramCompanion ngram;
+    NgramTableSource ngram;
     NgramResidency ngram_residency = NgramResidency::Disk;
     // Host-resident experts only: device memory lent to the expert cache, split evenly over the
     // ranks; kAutoExpertCache takes what each device has free less a margin, 0 none.

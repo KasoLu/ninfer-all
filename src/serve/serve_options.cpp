@@ -109,10 +109,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --expert-cache-mib N|auto     with host or disk experts: device memory for the\n"
            "                                most used experts (default auto: what is free;\n"
            "                                0 turns the host cache off; disk needs one)\n"
-           "  --ngram-table PATH            Qwen3.8-Flash-Next n-gram companion artifact\n"
-           "                                (default: found next to the model)\n"
-           "  --ngram-ram                   load the n-gram table into RAM instead of\n"
-           "                                reading rows from its file\n"
+           "  --ngram-ram                   Qwen3.8-Flash-Next: load the n-gram table into\n"
+           "                                RAM instead of reading its rows from the artifact\n"
            "  --no-cuda-graph               decode without CUDA Graphs (on by default)\n"
            "  --cuda-graph-allowance-mib N  CUDA Graph driver-state allowance taken from the\n"
            "                                KV sizing budget (default 0: computed per\n"
@@ -988,12 +986,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             continue;
         }
-        if (arg == "--ngram-table") {
-            options.ngram_table.path = require_value("--ngram-table");
-            continue;
-        }
         if (arg == "--ngram-ram") {
-            options.ngram_table.ram = true;
+            options.ngram_ram = true;
             continue;
         }
         if (arg == "--stage-layers") {

@@ -35,8 +35,9 @@ use the same architecture, binding and execution path. Qwen3.8-Flash-Next (`Qwen
 (`runtime/engine/qwen4_exp_core`); it shares the Qwen3.5 frontend, runs requests one at a time, and
 may keep its routed experts off the GPU, in pinned host memory with a device cache of the most used
 ones (`--expert-residency host`) or in the artifact's files, read into a device cache as each layer
-routes to them (`--expert-residency disk`). Its n-gram companion table is read from its file unless
-`--ngram-ram` loads it. These are the only product modes in which model weights live off the GPU.
+routes to them (`--expert-residency disk`). Its n-gram table stays in the artifact's file, read a
+row at a time, unless `--ngram-ram` loads it. These are the only product modes in which model
+weights live off the GPU.
 This fork targets **`sm_86`** and is tuned on **NVIDIA GeForce RTX 3090** (24 GB), built with
 CUDA 12.8. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX 5090; that is where its schedules,
 route tables and published measurements come from, and none of it is authoritative here -- every

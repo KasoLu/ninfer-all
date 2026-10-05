@@ -4,7 +4,7 @@
 #include "artifact/reader.h"
 #include "core/arena.h"
 #include "core/startup.h"
-#include "models/qwen4_exp/ngram_companion.h"
+#include "models/qwen4_exp/ngram_component.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/target_logprobs.h"
 #include "runtime/engine/diagnostics.h"
@@ -80,6 +80,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     install_device_route_profile_for(options, device);
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     const artifact::Reader reader(options.artifact_path);
+    // The n-gram table is checked before the weights load, so a model without one fails at once.
+    auto ngram = models::qwen4_exp::ngram_table_source(
+        reader, options.artifact_path,
+        models::qwen4_exp::parse_text_config(reader.directory().component("text").config));
     inspect.complete();
     models::qwen4_exp::LoadOptions load;
     load.artifact     = options.artifact_path;
@@ -91,17 +95,6 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     device.synchronize();
     materialize.complete();
 
-    std::filesystem::path companion = options.ngram_table.path;
-    if (companion.empty()) {
-        const auto found = models::qwen4_exp::find_ngram_companion(
-            options.artifact_path.parent_path(), options.artifact_path, model->config());
-        if (!found) {
-            throw std::invalid_argument(
-                "Qwen3.8-Flash-Next needs its n-gram table: pass --ngram-table or place the "
-                "companion artifact next to the model");
-        }
-        companion = *found;
-    }
     StartupPhaseScope frontend_phase(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<Qwen4ExpInstance>(Qwen4ExpInstance{
         .model    = nullptr,
@@ -121,9 +114,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     executor.max_context     = options.max_context;
     executor.prefill_chunk   = std::clamp<std::uint32_t>(options.prefill_chunk, 64, 4096);
     executor.sequences       = 1;
-    executor.ngram           = models::qwen4_exp::open_ngram_companion(companion, model->config());
-    executor.ngram_residency = options.ngram_table.ram ? models::qwen4_exp::NgramResidency::Ram
-                                                       : models::qwen4_exp::NgramResidency::Disk;
+    executor.ngram           = std::move(ngram);
+    executor.ngram_residency = options.ngram_ram ? models::qwen4_exp::NgramResidency::Ram
+                                                 : models::qwen4_exp::NgramResidency::Disk;
     executor.expert_cache_bytes =
         options.expert_cache_bytes.value_or(models::qwen4_exp::ExecutorOptions::kAutoExpertCache);
     executor.cuda_graphs = options.use_cuda_graph;
@@ -131,13 +124,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     device.synchronize();
     program.complete();
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                       "Qwen3.8-Flash-Next: %zu stage(s), experts in %s memory, n-gram table %s "
-                       "(%s), state %.0f MiB, workspace %.0f MiB, expert cache %.0f MiB",
+                       "Qwen3.8-Flash-Next: %zu stage(s), experts in %s memory, n-gram table "
+                       "%s, state %.0f MiB, workspace %.0f MiB, expert cache %.0f MiB",
                        model->stages().stages(),
                        options.expert_residency == ExpertResidency::Host   ? "pinned host"
                        : options.expert_residency == ExpertResidency::Disk ? "the artifact's files"
                                                                            : "device",
-                       companion.string().c_str(), options.ngram_table.ram ? "RAM" : "disk",
+                       options.ngram_ram ? "in RAM" : "read from the artifact",
                        double(instance->executor->memory().state_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0,
                        double(instance->executor->memory().expert_cache_bytes) / 1048576.0);

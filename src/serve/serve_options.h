@@ -63,10 +63,11 @@ struct ServeOptions {
     std::vector<int> devices;
     // Layers per stage, one count per entry of `devices`. Empty lets the engine choose.
     std::vector<std::uint32_t> stage_layers;
-    // Qwen3.8-Flash-Next: where the expert banks live, and its n-gram table companion.
+    // Qwen3.8-Flash-Next: where the expert banks live, and whether its n-gram table is loaded
+    // into RAM.
     ExpertResidency expert_residency = ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
-    NgramTableOptions ngram_table;
+    bool ngram_ram                         = false;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool ngram_native_sessions = false;
