@@ -540,7 +540,8 @@ cmake --build build --target ninfer-serve ninfer-calibrate
 
 `CMAKE_CUDA_ARCHITECTURES` is `86` for the RTX 30 series, `89` for the RTX 40 series and `120a`
 for the RTX 50 series and the RTX PRO 6000 Blackwell (on the `mma.sync` compatibility path, which the
-ternary route needs). The
+ternary route needs; a `120a` build needs CUDA 12.9 or newer, since CUDA 12.8 miscompiles sm_120a
+kernels and configure refuses it). The
 opt-in build options are listed in the [Linux build guide](docs/rtx-3090-linux.md#build-options).
 Windows builds, release packages, tests and benchmarks work as in the
 [NInfer-3090 README](https://github.com/ashalliants/ninfer-3090#readme).
