@@ -7,6 +7,7 @@
 > |---|---|---|
 > | [Reference measurements, September 2026](performance/reference-2026-09.md): Ternary Bonsai 2 27B and Qwen3.8-27B at full context, the largest context per card, draft lengths 1 to 15 | RTX 3090, RTX 4090, RTX 5090, CUDA 13.1 | this line |
 > | [RTX 3090 (`sm_86`) findings](#rtx-3090-sm_86-findings-this-fork) below | RTX 3090, `sm_86`, CUDA 12.8 | this fork |
+> | [RTX 5090 (`sm_120a`) against upstream](#rtx-5090-sm_120a-against-upstream-this-fork) below | RTX 5090, `sm_120a`, CUDA 12.9 | this fork |
 > | [Vision residency on RTX 3090](performance/qwen3.8-27b.md#vision-residency-on-rtx-3090-groupwise-int-sm_86) | RTX 3090, `sm_86` | this fork |
 > | Every per-model page under `performance/` | **RTX 5090, `sm_120a`, CUDA 13.1** | upstream |
 >
@@ -583,6 +584,30 @@ keys as INT8, with values left at INT8, the same quick protocol measured **4.476
 alone, about fourteen times `rk4v4`'s whole +0.214%, and it agrees with the rule `rk4v4` found that
 any 3-bit key coding costs +0.7% or more. `rk4v4` already reaches the model's native 262,144-token
 context on the 27B, so the extra headroom does not pay for the quality.
+
+## RTX 5090 (`sm_120a`) against upstream — this fork
+
+**Context-cache TTFT, 2026-10-05.** One RTX 5090 (575 W, driver 570.195.03), Release `120a` builds
+with CUDA 12.9 of this fork at `3e842a91` and of upstream master at `68c54356f`, the official
+Qwen3.8-27B artifact (15.9 GiB of weights), BF16 KV, `--max-context 32768`, each server otherwise at
+its own defaults. Three conversations open with a system message and a 24,076-token user turn of
+synthetic records; each then sends a second user turn on the first answer, the same second turn
+again, and a sibling branch: a different second user turn on the same first answer. Streaming Chat
+Completions, thinking off, 8 output tokens, medians over the three conversations:
+
+| Case | This fork | Upstream master |
+|---|---:|---:|
+| Cold prompt | 5.43 s | 7.81 s |
+| Continued turn | 80 ms, 24,081 tokens reused | 76 ms, 24,081 reused |
+| The same turn again | 55 ms, 24,099 reused | 56 ms, 24,097-24,099 reused |
+| Sibling branch | 5.52 s, nothing reused | 7.89 s; 0.12 s in one conversation, 24,067 reused |
+
+The cold prompt prefills at 4.47k tok/s here and at 3.16k upstream, and both serve a continued
+conversation from its cached state. A sibling branch reuses nothing here: once the conversation has
+moved on, the cache holds its recurrent state at the newest frontier and at the close of the newest
+user turn, and the branch leaves the conversation before both, so its 24K-token prefix is prefilled
+again. Upstream's context cache, which `b9114396f` replaced on 2026-10-04, reused that prefix from a
+checkpoint in one conversation of the three and in neither of the others.
 
 ## Published coverage
 
