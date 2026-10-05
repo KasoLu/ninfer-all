@@ -1,15 +1,19 @@
 // ninfer::ops - hyper-connection read/write of Qwen3.8-Flash-Next (contract in
 // include/ninfer/ops/hyper_connection.h). Four launches: per-stream RMSNorm into FP32 workspace,
 // the down and inject GEMVs with their activations, the up GEMV with the gated stream mix, and the
-// weighted write. Every product accumulates in FP32. The two GEMVs stream their 6.5 MB of weights
-// in 16-byte vectors with every CTA busy at one token: the down rows split K over a CTA's warps,
-// the up rows of eight hidden indices are one contiguous run per stream.
+// weighted write. Every product accumulates in FP32. Up to eight tokens, the two GEMVs stream their
+// 6.5 MB of weights in 16-byte vectors with every CTA busy at one token: the down rows split K over
+// a CTA's warps, the up rows of eight hidden indices are one contiguous run per stream. Wider calls
+// run the down and up products as cuBLAS tensor-core GEMMs over BF16 operands (the normalized stack
+// and the low-rank activation rounded to BF16, as the checkpoint's own arithmetic keeps them) and
+// keep the four inject rows on the FP32 GEMV.
 #include "ninfer/ops/hyper_connection.h"
 
 #include "core/device.h"
 #include "core/layout.h"
 #include "ops/common/math.h"
 
+#include <cublas_v2.h>
 #include <cuda_bf16.h>
 
 #include <cstdint>
@@ -66,10 +70,12 @@ __device__ __forceinline__ void load_f32x8(const float* p, float (&out)[8]) {
     out[4] = b.x, out[5] = b.y, out[6] = b.z, out[7] = b.w;
 }
 
-// One block per (stream, token), four values per thread: xn = x * rsqrt(mean x^2 + eps) * (1 + g).
+// One block per (stream, token), four values per thread: xn = x * rsqrt(mean x^2 + eps) * (1 + g),
+// and its BF16 rounding when asked for.
 __global__ void __launch_bounds__(kNormThreads)
     hc_norm_kernel(const float* __restrict__ stack, const __nv_bfloat16* __restrict__ norm,
-                   float eps, float* __restrict__ normalized) {
+                   float eps, float* __restrict__ normalized,
+                   __nv_bfloat16* __restrict__ normalized_bf16) {
     const int c             = blockIdx.x;
     const int t             = blockIdx.y;
     const std::int64_t base = (static_cast<std::int64_t>(t) * kStreams + c) * kHidden;
@@ -84,20 +90,25 @@ __global__ void __launch_bounds__(kNormThreads)
     const float scale = rsqrtf(sum / kHidden + eps);
     const auto* g   = reinterpret_cast<const __nv_bfloat162*>(norm + c * kHidden) + 2 * threadIdx.x;
     const float2 g0 = __bfloat1622float2(g[0]), g1 = __bfloat1622float2(g[1]);
-    reinterpret_cast<float4*>(normalized + base)[threadIdx.x] =
-        make_float4(x.x * scale * (1.0f + g0.x), x.y * scale * (1.0f + g0.y),
-                    x.z * scale * (1.0f + g1.x), x.w * scale * (1.0f + g1.y));
+    const float4 xn = make_float4(x.x * scale * (1.0f + g0.x), x.y * scale * (1.0f + g0.y),
+                                  x.z * scale * (1.0f + g1.x), x.w * scale * (1.0f + g1.y));
+    reinterpret_cast<float4*>(normalized + base)[threadIdx.x] = xn;
+    if (normalized_bf16 != nullptr) {
+        auto* out = reinterpret_cast<__nv_bfloat162*>(normalized_bf16 + base) + 2 * threadIdx.x;
+        out[0]    = __floats2bfloat162_rn(xn.x, xn.y);
+        out[1]    = __floats2bfloat162_rn(xn.z, xn.w);
+    }
 }
 
-// One block per (row of [down; inject], column chunk): lowrank + streams rows over the 10240-wide
-// input, each warp a 1280-wide slice. Rows below lowrank write silu(v / n) to `low`; inject rows
-// write 2 sigmoid(v / n).
+// One block per (row of [down; inject] from first_row on, column chunk): lowrank + streams rows
+// over the 10240-wide input, each warp a 1280-wide slice. Rows below lowrank write silu(v / n) to
+// `low`; inject rows write 2 sigmoid(v / n).
 __global__ void __launch_bounds__(kDownWarps * 32)
     hc_down_kernel(const float* __restrict__ normalized, const __nv_bfloat16* __restrict__ down,
-                   const __nv_bfloat16* __restrict__ inject, int tokens, float* __restrict__ low,
-                   float* __restrict__ inject_weights) {
+                   const __nv_bfloat16* __restrict__ inject, int tokens, int first_row,
+                   float* __restrict__ low, float* __restrict__ inject_weights) {
     __shared__ float partial[kDownWarps][kColumnChunk];
-    const int row   = blockIdx.x;
+    const int row   = first_row + static_cast<int>(blockIdx.x);
     const int t0    = blockIdx.y * kColumnChunk;
     const int count = min(kColumnChunk, tokens - t0);
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -195,6 +206,67 @@ __global__ void __launch_bounds__(kStreams * 32)
     }
 }
 
+// The wide path's activation of the down product, v FP32 [tokens][lowrank]: silu(v / n) in BF16,
+// the up product's operand.
+__global__ void __launch_bounds__(256)
+    hc_low_kernel(const float* __restrict__ v, __nv_bfloat16* __restrict__ low,
+                  std::int64_t count) {
+    const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) { return; }
+    const float x = v[i] / kStreams;
+    low[i]        = __float2bfloat16_rn(x * sigmoid_f(x));
+}
+
+// The wide path's mix over the up product's gate logits FP32 [tokens][streams * hidden]:
+// mixed[d] = (1/n) sum_c sigmoid(gate_c) xn[c, d].
+__global__ void __launch_bounds__(256)
+    hc_mix_kernel(const float* __restrict__ normalized, const float* __restrict__ gates,
+                  __nv_bfloat16* __restrict__ mixed, std::int64_t count) {
+    const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count) { return; }
+    const std::int64_t t = i / kHidden, d = i % kHidden;
+    float sum = 0.0f;
+#pragma unroll
+    for (int c = 0; c < kStreams; ++c) {
+        const std::int64_t at = t * kWidth + c * kHidden + d;
+        sum += sigmoid_f(gates[at]) * normalized[at];
+    }
+    mixed[i] = __float2bfloat16_rn(sum / kStreams);
+}
+
+void check_blas(cublasStatus_t status, const char* what) {
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(std::string("hyper_connection: cuBLAS ") + what + " failed (" +
+                                 std::to_string(static_cast<int>(status)) + ")");
+    }
+}
+
+// One handle per device, created on first use and kept: the stream is set per call.
+cublasHandle_t blas_handle() {
+    static constexpr int kMaxDevices = 16;
+    static cublasHandle_t handles[kMaxDevices]{};
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    if (device < 0 || device >= kMaxDevices) {
+        throw std::runtime_error("hyper_connection: device index out of range");
+    }
+    if (handles[device] == nullptr) { check_blas(cublasCreate(&handles[device]), "create"); }
+    return handles[device];
+}
+
+// C FP32 (m x n, column-major, ldc = m) = A^T B for A BF16 stored k-contiguous per output row
+// (k x m column-major) and B BF16 k-contiguous per token (k x n column-major).
+void gemm_bf16(cudaStream_t stream, int m, int n, int k, const __nv_bfloat16* a,
+               const __nv_bfloat16* b, float* c) {
+    const cublasHandle_t handle = blas_handle();
+    check_blas(cublasSetStream(handle, stream), "set stream");
+    const float one = 1.0f, zero = 0.0f;
+    check_blas(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, m, n, k, &one, a, CUDA_R_16BF, k, b,
+                            CUDA_R_16BF, k, &zero, c, CUDA_R_32F, m, CUBLAS_COMPUTE_32F,
+                            CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+               "GEMM");
+}
+
 __device__ __forceinline__ float to_float(float value) { return value; }
 __device__ __forceinline__ float to_float(__nv_bfloat16 value) { return __bfloat162float(value); }
 
@@ -250,6 +322,11 @@ std::size_t hyper_connection_read_workspace_bytes(std::int32_t streams, std::int
     (void)layout.alloc(DType::FP32, {kWidth, tokens});
     (void)layout.alloc(DType::FP32, {kLowrank, tokens});
     (void)layout.alloc(DType::FP32, {kStreams, tokens});
+    if (tokens > kColumnChunk) {
+        (void)layout.alloc(DType::BF16, {kWidth, tokens});
+        (void)layout.alloc(DType::BF16, {kLowrank, tokens});
+        (void)layout.alloc(DType::FP32, {kWidth, tokens});
+    }
     return layout.peak_bytes(1);
 }
 
@@ -286,19 +363,51 @@ void hyper_connection_read(const Tensor& stack, const HyperConnectionWeights& we
     float* inject_out  = inject_weights != nullptr ? static_cast<float*>(inject_weights->data)
                                                    : static_cast<float*>(scratch.data);
 
+    const auto* down_w   = static_cast<const __nv_bfloat16*>(weights.down->data);
+    const auto* inject_w = weights.inject != nullptr
+                               ? static_cast<const __nv_bfloat16*>(weights.inject->data)
+                               : nullptr;
+    auto* normalized_p   = static_cast<float*>(normalized.data);
+    const int chunks     = div_up(tokens, kColumnChunk);
+    if (tokens > kColumnChunk) {
+        Tensor normalized_bf16 = workspace.alloc(DType::BF16, {kWidth, tokens});
+        Tensor low_bf16        = workspace.alloc(DType::BF16, {kLowrank, tokens});
+        Tensor products        = workspace.alloc(DType::FP32, {kWidth, tokens});
+        auto* xn16             = static_cast<__nv_bfloat16*>(normalized_bf16.data);
+        auto* low16            = static_cast<__nv_bfloat16*>(low_bf16.data);
+        auto* products_p       = static_cast<float*>(products.data);
+        hc_norm_kernel<<<dim3(kStreams, tokens), kNormThreads, 0, stream>>>(
+            static_cast<const float*>(stack.data),
+            static_cast<const __nv_bfloat16*>(weights.norm->data), eps, normalized_p, xn16);
+        CUDA_CHECK(cudaGetLastError());
+        if (inject_w != nullptr) {
+            hc_down_kernel<<<dim3(kStreams, chunks), kDownWarps * 32, 0, stream>>>(
+                normalized_p, down_w, inject_w, tokens, kLowrank, nullptr, inject_out);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        // v [tokens][lowrank] = down . xn, then low = silu(v / n); the gate logits
+        // [tokens][streams * hidden] = up . low reuse the same plane.
+        gemm_bf16(stream, kLowrank, tokens, kWidth, down_w, xn16, products_p);
+        const std::int64_t low_count = std::int64_t(kLowrank) * tokens;
+        hc_low_kernel<<<static_cast<unsigned>(div_up(low_count, std::int64_t{256})), 256, 0,
+                        stream>>>(products_p, low16, low_count);
+        CUDA_CHECK(cudaGetLastError());
+        gemm_bf16(stream, kWidth, tokens, kLowrank,
+                  static_cast<const __nv_bfloat16*>(weights.up->data), low16, products_p);
+        const std::int64_t mixed_count = std::int64_t(kHidden) * tokens;
+        hc_mix_kernel<<<static_cast<unsigned>(div_up(mixed_count, std::int64_t{256})), 256, 0,
+                        stream>>>(normalized_p, products_p, static_cast<__nv_bfloat16*>(mixed.data),
+                                  mixed_count);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     hc_norm_kernel<<<dim3(kStreams, tokens), kNormThreads, 0, stream>>>(
         static_cast<const float*>(stack.data),
-        static_cast<const __nv_bfloat16*>(weights.norm->data), eps,
-        static_cast<float*>(normalized.data));
+        static_cast<const __nv_bfloat16*>(weights.norm->data), eps, normalized_p, nullptr);
     CUDA_CHECK(cudaGetLastError());
-    const int rows   = kLowrank + (weights.inject != nullptr ? kStreams : 0);
-    const int chunks = div_up(tokens, kColumnChunk);
+    const int rows = kLowrank + (inject_w != nullptr ? kStreams : 0);
     hc_down_kernel<<<dim3(rows, chunks), kDownWarps * 32, 0, stream>>>(
-        static_cast<const float*>(normalized.data),
-        static_cast<const __nv_bfloat16*>(weights.down->data),
-        weights.inject != nullptr ? static_cast<const __nv_bfloat16*>(weights.inject->data)
-                                  : nullptr,
-        tokens, static_cast<float*>(low.data), inject_out);
+        normalized_p, down_w, inject_w, tokens, 0, static_cast<float*>(low.data), inject_out);
     CUDA_CHECK(cudaGetLastError());
     hc_up_mix_kernel<<<dim3(kHidden / kUpRows, chunks), kStreams * 32, 0, stream>>>(
         static_cast<const float*>(normalized.data), static_cast<const float*>(low.data),
