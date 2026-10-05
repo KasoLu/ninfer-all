@@ -4,13 +4,19 @@
 
 namespace ninfer::ops::detail::unified {
 namespace {
-// This Op admits dense, even-width BF16 residuals. Adjacent MMA rows share one load.
+// This Op admits dense, even-width BF16 residuals. Adjacent MMA rows share one load. The residual
+// add is rounded on its own (__fadd_rn never contracts into an FMA with the scaling before it), so
+// a column stores the same update whether its tile is full or predicated.
 struct Fp8ResidualAddEpilogue : LinearResidualAddEpilogue {
+    __device__ __forceinline__ float apply(int row, int token, float value) const {
+        return __fadd_rn(value, residual.load(row, token));
+    }
+
     __device__ __forceinline__ float2 apply_row_pair(int row, int token, float2 value) const {
         const auto* pointer =
             residual.data + static_cast<std::int64_t>(token) * residual.leading_dim + row;
         const float2 add = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(pointer));
-        return make_float2(value.x + add.x, value.y + add.y);
+        return make_float2(__fadd_rn(value.x, add.x), __fadd_rn(value.y, add.y));
     }
 };
 
@@ -41,8 +47,7 @@ void launch_problem(const Tensor& x, const Weight& weight, Tensor& residual,
         if constexpr (S::kTmaSwizzle)
             launch_fp8_a8_tma_mma<S>(operands, output, epilogue, stream, workspace.partials);
         else
-            launch_fp8_a8_mma<S>(operands, output, LinearResidualAddEpilogue{{data, weight.n}},
-                                   stream);
+            launch_fp8_a8_mma<S>(operands, output, epilogue, stream);
     };
     if constexpr (K == 6144) {
         if (x.ne[1] <= 64) return launch.template operator()<K6144Tma32x64>();
