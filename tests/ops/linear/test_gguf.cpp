@@ -169,10 +169,12 @@ Error compare(const std::vector<float>& got, const std::vector<double>& want) {
     return {std::sqrt(num / std::max(den, 1e-30)), worst / std::max(scale, 1e-30)};
 }
 
-int run_type(const TypeCase& c, std::uint32_t seed) {
+// K = 1536 and K = 2560, Qwen3.8-Flash-Next's hidden width, whose 80 slices leave the vector
+// products' last pass over a row with half of a warp's lanes idle.
+int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k) {
     constexpr std::int32_t kRows = 256;
-    constexpr std::int32_t kK    = 1536;
-    const std::int32_t widths[]  = {1, 2, 3, 5, 8, 9, 17, 40, 70, 130};
+    const std::int32_t kK        = k;
+    const std::int32_t widths[]  = {1, 2, 3, 4, 5, 8, 9, 17, 40, 70, 130};
     const std::int32_t max_t     = 130;
     std::mt19937 rng(seed);
     int failures = 0;
@@ -342,9 +344,12 @@ int main() {
         int failures      = 0;
         std::uint32_t seed = 9001;
         for (const auto& c : cases()) {
-            const int f = run_type(c, seed++);
-            std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << '\n';
-            failures += f;
+            for (const std::int32_t k : {1536, 2560}) {
+                const int f = run_type(c, seed++, k);
+                std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k
+                          << '\n';
+                failures += f;
+            }
         }
         std::cout << (failures == 0 ? "OK" : "FAIL") << " GGUF Linear\n";
         return failures == 0 ? 0 : 1;
