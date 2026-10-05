@@ -637,18 +637,43 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         }
     }
     if (prompt_nvfp4_fast(cache_storage, envelope, batch_size)) {
-        // The fast NVFP4 prompt kernel's split partials: its plan picks the split count from the
-        // visible keys of each launch, so reserve the most any split count within its 64 MiB
-        // budget can take at the widest width rather than the count the envelope's keys select.
-        constexpr std::size_t kSplitBudgetBytes = std::size_t{64} << 20;
-        std::size_t split_bytes                 = 0;
-        for (std::int32_t splits = 2; splits <= 16; ++splits) {
-            const std::size_t bytes =
-                detail::rotated_fast_prompt_split_bytes(q_heads, max_width, splits);
-            if (bytes > kSplitBudgetBytes) { break; }
-            split_bytes = bytes;
+        // The fast NVFP4 prompt kernel's split partials. A launch plans its split count from the
+        // visible keys it passes, and fewer keys never select more splits, so each width reserves
+        // its plan at the most keys within the envelope at which it still runs the kernel: a width
+        // takes the prompt route up to some key count (single-row prefill widths and narrow
+        // verification widths leave it for small-T past theirs), and the kernel needs more than
+        // 2048 keys.
+        const auto prompt_route = [&](std::int32_t width, std::uint32_t keys) {
+            CausalAttentionExecutionEnvelope at = envelope;
+            at.max_visible_keys                 = keys;
+            return detail::causal_attention_resolve_route(q_heads, width, batch_size,
+                                                          cache_storage, at) ==
+                   detail::CausalAttentionRoute::Prompt;
+        };
+        for (std::int32_t width = min_width; width <= max_width; ++width) {
+            std::uint32_t keys = envelope.max_visible_keys;
+            if (!prompt_route(width, keys)) {
+                // The prompt route holds for every key count up to its last one.
+                std::uint32_t low  = 0;
+                std::uint32_t high = keys;
+                while (high - low > 1) {
+                    const std::uint32_t middle = low + (high - low) / 2;
+                    if (prompt_route(width, middle)) {
+                        low = middle;
+                    } else {
+                        high = middle;
+                    }
+                }
+                keys = low;
+            }
+            if (keys < envelope.min_visible_keys || !detail::nvfp4_fast_prompt_applies(keys)) {
+                continue;
+            }
+            const detail::RotatedFastPromptPlan plan =
+                detail::rotated_fast_prompt_plan(q_heads, width, keys);
+            maximum = std::max(
+                maximum, detail::rotated_fast_prompt_split_bytes(q_heads, width, plan.splits));
         }
-        maximum = std::max(maximum, split_bytes);
     }
     return maximum;
 }

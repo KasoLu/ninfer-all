@@ -7,7 +7,6 @@
 #include "core/paged_kv_cache.h"
 #include "ops/common/math.h"
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -99,18 +98,6 @@ inline RotatedFastPromptPlan rotated_fast_prompt_plan(std::int32_t q_heads, std:
 // chunk, but slower for short launches over few keys (1024 columns over none: 185 against 127 us).
 inline bool nvfp4_fast_prompt_applies(std::uint32_t max_visible_keys) {
     return max_visible_keys > 2048;
-}
-
-// Transient bytes of the widest fast prompt launch among widths [first, last].
-inline std::size_t rotated_fast_prompt_workspace_bytes(std::int32_t q_heads, std::int32_t first,
-                                                       std::int32_t last,
-                                                       std::uint32_t max_visible_keys) {
-    std::size_t maximum = 0;
-    for (std::int32_t width = first; width <= last; ++width) {
-        const RotatedFastPromptPlan plan = rotated_fast_prompt_plan(q_heads, width, max_visible_keys);
-        maximum = std::max(maximum, rotated_fast_prompt_split_bytes(q_heads, width, plan.splits));
-    }
-    return maximum;
 }
 
 } // namespace ninfer::ops::detail
