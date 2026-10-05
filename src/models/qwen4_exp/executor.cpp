@@ -944,7 +944,9 @@ struct Executor::Impl {
         pending_routes = 0;
     }
 
+    // Brings the pass's routes to the host for the expert cache's counts; nothing else reads them.
     void record_routes(std::uint32_t tokens) {
+        if (!cache) { return; }
         const std::uint64_t pairs =
             std::uint64_t(config.num_experts_per_tok) * options.prefill_chunk;
         auto* host = static_cast<std::int32_t*>(route_host->data());
