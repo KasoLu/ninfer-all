@@ -153,12 +153,17 @@ UploadTotals upload_device_objects(const Reader& reader, std::span<const DeviceP
         if (placement.rank >= rank_count || bases[placement.rank] == nullptr) {
             throw ArtifactError("device placement names a rank the plan has no arena for");
         }
+        std::byte* const destination = bases[placement.rank] + placement.offset;
+        if (placement.tail != 0) {
+            const ScopedRank bound(device, placement.rank);
+            check_cuda(cudaMemset(destination + placement.bytes, 0, placement.tail),
+                       "zero a device tail");
+        }
         if (placement.transcode) {
             transcoded.push_back(&placement);
             continue;
         }
-        std::byte* const destination = bases[placement.rank] + placement.offset;
-        const auto& descriptor       = reader.directory().tensor(placement.object);
+        const auto& descriptor = reader.directory().tensor(placement.object);
         for (const auto& segment : reader.segments(descriptor.offset, descriptor.bytes)) {
             ranges_by_rank[placement.rank].push_back(
                 {segment.file_index, segment.file_offset,
@@ -472,10 +477,11 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         if (placement.offset < previous_device_end[placement.rank] || placement.alignment == 0 ||
             placement.offset % placement.alignment != 0 || placement.offset > rank_capacity ||
-            placement.bytes > rank_capacity - placement.offset) {
+            placement.bytes > rank_capacity - placement.offset ||
+            placement.tail > rank_capacity - placement.offset - placement.bytes) {
             throw ArtifactError("device offset differs from materialization plan");
         }
-        previous_device_end[placement.rank] = placement.offset + placement.bytes;
+        previous_device_end[placement.rank] = placement.offset + placement.bytes + placement.tail;
         const DeviceSpan storage{static_cast<std::byte*>(arena->base()) + placement.offset,
                                  static_cast<std::size_t>(placement.bytes)};
         const auto divisor = object.host

@@ -31,6 +31,8 @@ constexpr std::uint64_t kAlign = 256;
 constexpr std::size_t kStagingHalf = 128ULL << 20;
 // Reads in flight at once: an NVMe drive reaches its bandwidth only with several requests queued.
 constexpr std::size_t kReadThreads = 8;
+// Zero bytes after the last slot of a pool.
+constexpr std::uint64_t kTail = 256;
 
 std::uint64_t aligned(std::uint64_t value) { return (value + kAlign - 1) / kAlign * kAlign; }
 
@@ -179,8 +181,11 @@ struct ExpertStream::Impl {
             const std::uint64_t budget = rank < bytes_by_rank.size() ? bytes_by_rank[rank] : 0;
             pool.slots.resize(static_cast<std::size_t>(budget / pool.slot_bytes));
             if (!pool.slots.empty()) {
+                // Zeroed, with zeros past the last slot: the expert matrix kernel reads whole
+                // K steps past a down row's end, into the next slot or the tail.
                 RankBinding bind(device, rank);
-                pool.storage = DeviceBuffer(pool.slots.size() * pool.slot_bytes);
+                pool.storage = DeviceBuffer(pool.slots.size() * pool.slot_bytes + kTail);
+                CUDA_CHECK(cudaMemset(pool.storage.p, 0, pool.storage.bytes));
             }
             stats.slots += static_cast<std::uint32_t>(pool.slots.size());
             pools.emplace(rank, std::move(pool));

@@ -2,7 +2,11 @@
 // of the exactly dequantized weights. The tables point several experts at one buffer, so a few
 // distinct banks cover all 512 experts while the routing still groups by expert id. The products
 // quantize their activations to q8_1 as llama.cpp does, so they are held to that arithmetic's
-// error.
+// error. Up to eight tokens take the vector kernel; wider calls over device-resident banks (each
+// matrix followed by 256 zero bytes, which the matrix kernel's last K step of a 640-value down row
+// reads) take the matrix kernel wherever the block type has one (IQ1_M stays on the vector
+// kernel), with one or several column tiles per expert, and the same calls over banks that are not
+// declared device resident take the vector kernel.
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -91,6 +95,9 @@ std::vector<std::uint8_t> random_blocks(QType q, std::int32_t rows, std::int32_t
 
 // `distinct` random matrices of one projection, the device table that maps expert e to matrix
 // e % distinct, and their exact values.
+// Zero bytes after every matrix, as a device-resident bank keeps them.
+constexpr std::size_t kTail = 256;
+
 struct Bank {
     QType format;
     std::int64_t row_bytes = 0;
@@ -106,7 +113,8 @@ struct Bank {
         std::vector<const void*> pointers(experts);
         for (int i = 0; i < count; ++i) {
             const auto bytes = random_blocks(q, rows, k, rng);
-            matrices.emplace_back(bytes.size());
+            matrices.emplace_back(bytes.size() + kTail);
+            check(cudaMemset(matrices.back().p, 0, bytes.size() + kTail), "zero a bank");
             matrices.back().copy_from_host(bytes.data(), bytes.size());
             DeviceBuffer values(std::size_t(rows) * k * sizeof(float));
             ops::gguf::dequantize_rows(ops::detail::gguf_type(q), matrices.back().p, row_bytes, k,
@@ -168,10 +176,15 @@ int run_case(const Case& c, std::uint32_t seed) {
     const Bank sgate(c.shared_gate, kWidth, kHidden, 1, 1, rng);
     const Bank sup(c.shared_up, kWidth, kHidden, 1, 1, rng);
     const Bank sdown(c.shared_down, kHidden, kWidth, 1, 1, rng);
-    const ops::GgufMoeWeights banks{gate.view(),  up.view(),  down.view(),
-                                    sgate.view(), sup.view(), sdown.view()};
     int failures = 0;
+    std::vector<std::pair<int, bool>> calls; // tokens, device resident
     for (const int tokens : c.tokens) {
+        calls.emplace_back(tokens, true);
+        if (tokens > 8) { calls.emplace_back(tokens, false); }
+    }
+    for (const auto& [tokens, device_resident] : calls) {
+        const ops::GgufMoeWeights banks{gate.view(),  up.view(),  down.view(), sgate.view(),
+                                        sup.view(),   sdown.view(), kExperts,  device_resident};
         std::normal_distribution<float> normal(0.0f, 1.0f);
         std::uniform_real_distribution<float> unit(0.05f, 1.0f);
         std::vector<__nv_bfloat16> m(std::size_t(kHidden) * tokens);
@@ -211,7 +224,8 @@ int run_case(const Case& c, std::uint32_t seed) {
         std::vector<float> again(got.size());
         d_y.copy_to_host(again.data(), again.size() * 4);
         if (std::memcmp(got.data(), again.data(), got.size() * 4) != 0) {
-            std::cerr << "FAIL " << c.name << " T=" << tokens << ": a repeat differs\n";
+            std::cerr << "FAIL " << c.name << " T=" << tokens
+                      << (device_resident ? " matrix" : " vector") << ": a repeat differs\n";
             ++failures;
         }
         double num = 0, den = 0, worst = 0, scale = 0;
@@ -245,7 +259,8 @@ int run_case(const Case& c, std::uint32_t seed) {
                      max = worst / std::max(scale, 1e-30);
         // Two q8_1 activations (the token and the middle) per product chain.
         const bool ok = std::isfinite(rms) && rms < 4e-2 && max < 1.6e-1;
-        std::cout << (ok ? "OK   " : "FAIL ") << c.name << " T=" << tokens << " rms=" << rms
+        std::cout << (ok ? "OK   " : "FAIL ") << c.name << " T=" << tokens
+                  << (tokens > 8 ? (device_resident ? " matrix" : " vector") : "") << " rms=" << rms
                   << " max=" << max << '\n';
         failures += ok ? 0 : 1;
     }
@@ -294,7 +309,7 @@ int main() {
              Q::GGUF_IQ3_S,
              Q::GGUF_Q8_0,
              4,
-             {1, 5},
+             {1, 5, 24},
              kExperts},
             {"iq1_m/iq3_xxs",
              Q::GGUF_IQ1_M,
@@ -304,7 +319,7 @@ int main() {
              Q::GGUF_IQ3_XXS,
              Q::GGUF_IQ4_NL,
              4,
-             {1, 4},
+             {1, 4, 16},
              kExperts},
         };
         int failures       = 0;

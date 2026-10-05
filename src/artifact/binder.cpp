@@ -88,6 +88,15 @@ void Binder::require_device(ObjectHandle object, std::uint64_t alignment) {
     demand.alignment = std::max({demand.alignment, alignment, geometry.alignment});
 }
 
+void Binder::device_tail(ObjectHandle object, std::uint64_t bytes) {
+    auto& demand = demands_.at(object.index);
+    if (!demand.device) {
+        throw ArtifactError(reader_.directory().tensor(object).id +
+                            ": a device tail requires a device placement");
+    }
+    demand.tail = std::max(demand.tail, bytes);
+}
+
 void Binder::transcode_device(ObjectHandle object, QType target) {
     const auto& geometry = reader_.geometry(object);
     const auto& tensor   = reader_.directory().tensor(object);
@@ -235,9 +244,10 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
         const auto bytes    = device_bytes(index);
         auto& capacity      = plan.device_capacity_by_rank[rank];
         const auto offset   = align_up(capacity, demand.alignment, "device offset");
-        plan.device_objects.push_back(
-            {ObjectHandle{index}, offset, bytes, demand.alignment, demand.transcode, rank});
-        capacity = checked_add(offset, bytes, "device capacity");
+        plan.device_objects.push_back({ObjectHandle{index}, offset, bytes, demand.alignment,
+                                       demand.transcode, rank, demand.tail});
+        capacity = checked_add(checked_add(offset, bytes, "device capacity"), demand.tail,
+                               "device capacity");
     };
     std::vector<std::size_t> evictable;
     std::vector<std::size_t> pinned;

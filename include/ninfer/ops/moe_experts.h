@@ -44,6 +44,13 @@ void moe_experts_bf16(const Tensor& m, const Tensor& ids, const Tensor& weights,
  * 2^-32 fixed point, so y does not depend on the order the experts run in, and stored as FP32.
  * The oracle decodes every stored block exactly and evaluates in FP64 with the activation rounded
  * as the products round it; y is compared as FP32 by relative L2 and gross error.
+ *
+ * Up to eight tokens run ggml-style vector products. Wider calls over `device_resident` banks run
+ * all three projections through ggml's integer tensor-core matrix kernel (with the same q8_1
+ * arithmetic): the tables then point at device memory only, and at least 256 zero bytes follow the
+ * last expert of every down bank (and of a slot pool), since the kernel reads a 640-value row in
+ * three 256-value steps. Banks in mapped host memory stay on the vector products, which read them
+ * across the bus better.
  */
 struct GgufExpertTable {
     QType format               = QType::GGUF_Q8_0;
@@ -56,6 +63,8 @@ struct GgufMoeWeights {
     GgufExpertTable shared_gate, shared_up, shared_down;
     // Entries of the routed tables: 512, or the 256 an expert-pruned release keeps.
     std::int32_t experts = 512;
+    // Every entry in device memory, zeros past each down bank (see above).
+    bool device_resident = false;
 };
 
 [[nodiscard]] std::size_t moe_experts_gguf_workspace_bytes(std::int32_t tokens);

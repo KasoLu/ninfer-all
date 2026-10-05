@@ -131,6 +131,9 @@ ExpertLocation locate(const artifact::Reader& reader, const std::string& name, s
     return out;
 }
 
+// Zero bytes after each down bank; see bind_moe.
+constexpr std::uint64_t kExpertTail = 256;
+
 MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
                     ExpertResidency residency) {
     const std::uint64_t h = c.hidden_size, w = c.moe_intermediate_size;
@@ -158,6 +161,17 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
     out.shared_gate       = b.parameter(m + "shared/gate", {s, h}, {input});
     out.shared_up         = b.parameter(m + "shared/up", {s, h}, {input});
     out.shared_down       = b.parameter(m + "shared/down", {h, s}, {m + "shared/product"});
+    // The expert matrix kernel reads a down row's 640 values in three 256-value steps, past the end
+    // of each bank's last row: zeros follow every down bank in device memory.
+    std::vector<WeightId> downs{out.shared_down};
+    if (residency == ExpertResidency::Device) {
+        downs.insert(downs.end(), out.down.begin(), out.down.end());
+    }
+    for (const WeightId id : downs) {
+        for (const auto& part : b.at(id).reference.binding.parts) {
+            b.binder.device_tail(part.object, kExpertTail);
+        }
+    }
     return out;
 }
 

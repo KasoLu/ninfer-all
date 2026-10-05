@@ -9,6 +9,7 @@
 //   NINFER_QWEN4_EXP_DEVICES   comma-separated device ids, one pipeline stage each (default 0)
 //   NINFER_QWEN4_EXP_EXPERTS   device | host | disk (default device)
 //   NINFER_QWEN4_EXP_NGRAM_RAM 1 loads the n-gram table into RAM
+//   NINFER_QWEN4_EXP_PREFILL_CHUNK  tokens per prefill call (default 512)
 #include "artifact/reader.h"
 #include "core/device.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
@@ -167,7 +168,8 @@ int run(const char* artifact_path) {
     }
     ExecutorOptions options;
     options.max_context   = 8192;
-    options.prefill_chunk = 512;
+    const char* chunk     = std::getenv("NINFER_QWEN4_EXP_PREFILL_CHUNK");
+    options.prefill_chunk = chunk != nullptr ? static_cast<std::uint32_t>(std::stoul(chunk)) : 512;
     options.ngram         = open_ngram_companion(companion, model->config());
     const char* ram       = std::getenv("NINFER_QWEN4_EXP_NGRAM_RAM");
     options.ngram_residency =

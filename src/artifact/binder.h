@@ -48,6 +48,11 @@ public:
     [[nodiscard]] const Reader& reader() const noexcept { return reader_; }
 
     void require_device(ObjectHandle object, std::uint64_t alignment = 256);
+    // Reserves `bytes` of zeros right after a device object, which the load writes: a kernel that
+    // reads whole K steps may read past the end of a matrix whose rows are not a whole number of
+    // them (ggml's matrix kernel reads up to one 256-value step past such a row). The object must
+    // already have a device demand; a repeated request keeps the largest.
+    void device_tail(ObjectHandle object, std::uint64_t bytes);
     // Materialize a device object in a narrower row-split format than the artifact stores. The
     // object must already have a device demand and be a row-split Q8_G32_FP16 tensor, and every
     // consumer must accept the target format; a repeated request must name the same target.
@@ -80,6 +85,7 @@ private:
         std::uint64_t alignment = 256;
         std::optional<QType> transcode;
         std::uint32_t evict_rank = 0;
+        std::uint64_t tail       = 0;
         std::optional<std::size_t> device_rank;
         std::optional<std::uint64_t> pinned_order;
         std::vector<std::byte> host_data;

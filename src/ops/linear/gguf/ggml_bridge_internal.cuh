@@ -43,6 +43,14 @@ inline constexpr std::size_t kMatrixActivationSlack = 128 * sizeof(block_q8_1_mm
 template <ggml_type type>
 std::size_t matrix_fixup_bytes_impl(int rows, int columns);
 
+template <ggml_type type>
+bool moe_matrix_fits_impl(int rows, int k, bool tail);
+
+template <ggml_type type>
+void moe_matrix_product_impl(const void* const* experts, std::int64_t row_bytes, int rows, int k,
+                             const MoeRouting& routing, int max_active, int pairs, int max_columns,
+                             bool tail, const void* activation, float* out, cudaStream_t stream);
+
 // Where and how the vector kernel (ggml_bridge_vec.cuh) writes its rows.
 struct VecStore {
     __nv_bfloat16* bf16;

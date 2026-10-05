@@ -175,6 +175,25 @@ void moe_vector_swiglu(GgmlType type, const MoeTable& gate, const MoeTable& up,
                        const void* activation, int columns, __nv_bfloat16* out, int chunk,
                        cudaStream_t stream);
 
+// The matrix kernel over the experts a router selected, for products wide enough for its tiles:
+// pair p's FP32 row lands at out[p * table.rows]. The activation holds the pairs' columns in
+// routing order (quantize_moe_matrix_activation into moe_matrix_activation_bytes), and
+// `max_columns` bounds any one expert's pairs. The kernel reads k in whole 256-value steps: a
+// geometry whose k is not a whole number of them needs `tail`, the caller's promise that zeros
+// follow each bank's last expert (Binder::device_tail, a zeroed slot pool), since a row's last
+// step reads into the next row. A type without an integer kernel, or a geometry no tile fits
+// (rows a whole number of row tiles), is not supported and stays on moe_vector_product.
+[[nodiscard]] bool moe_matrix_supported(GgmlType type, int rows, int k, bool tail);
+void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& routing,
+                        int max_active, int pairs, int max_columns, bool tail,
+                        const void* activation, float* out, cudaStream_t stream);
+// Column c of the activation is x column routing.sorted[c] / column_group, in the layout of the
+// type's scale/sum schedule (matrix_activation_layout), zero past k up to a whole 256-value step.
+[[nodiscard]] std::size_t moe_matrix_activation_bytes(int k, int pairs);
+void quantize_moe_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k,
+                                    const MoeRouting& routing, int pairs, int column_group,
+                                    void* out, cudaStream_t stream);
+
 // out[i, :] = dequantize(W[row_ids ? row_ids[i] : i, :]) as BF16, rows `out_row_stride` apart.
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, __nv_bfloat16* out,

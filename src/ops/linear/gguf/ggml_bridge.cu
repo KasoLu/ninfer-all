@@ -205,19 +205,26 @@ VecArgs vector_args(const void* weight, std::int64_t row_bytes, int rows, int k,
 
 constexpr int kMatrixQuantizeThreads = 128;
 
+// Output column c reads x column column_map[c] / column_group (c without a map), its values
+// gathered through input_columns when given; values from k up to k_padded are zero.
 template <mmq_q8_1_ds_layout ds_layout>
 __global__ void quantize_matrix_kernel(const __nv_bfloat16* __restrict__ x,
                                        const std::int32_t* __restrict__ input_columns,
-                                       block_q8_1_mmq* __restrict__ y, int k, int columns) {
+                                       const std::int32_t* __restrict__ column_map,
+                                       int column_group, block_q8_1_mmq* __restrict__ y, int k,
+                                       int k_padded, int columns) {
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
 
     const std::int64_t i0 = (std::int64_t(blockDim.x) * blockIdx.y + threadIdx.x) * 4;
-    if (i0 >= k) { return; }
+    if (i0 >= k_padded) { return; }
     const int column             = blockIdx.x;
-    const __nv_bfloat16* source  = x + std::int64_t(column) * k;
+    const int source_column = column_map != nullptr ? column_map[column] / column_group : column;
+    const __nv_bfloat16* source = x + std::int64_t(source_column) * k;
     float4 xi;
-    if (input_columns != nullptr) {
+    if (i0 >= k) {
+        xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    } else if (input_columns != nullptr) {
         xi = make_float4(__bfloat162float(source[input_columns[i0 + 0]]),
                          __bfloat162float(source[input_columns[i0 + 1]]),
                          __bfloat162float(source[input_columns[i0 + 2]]),
@@ -606,31 +613,68 @@ std::size_t matrix_activation_bytes(int k, int columns) {
            detail::kMatrixActivationSlack;
 }
 
-void quantize_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k, int columns,
-                                const std::int32_t* input_columns, void* out,
-                                cudaStream_t stream) {
-    if (k <= 0 || k % (4 * detail::kMatrixQuantizeThreads) != 0 || columns <= 0) {
-        throw std::invalid_argument("gguf matrix activation: K must be whole 512-value groups");
-    }
-    const dim3 blocks(columns, (k + 4 * detail::kMatrixQuantizeThreads - 1) /
-                                   (4 * detail::kMatrixQuantizeThreads),
+namespace {
+
+// k_padded is a whole number of 128-value blocks, so every warp of the grid is wholly in or out.
+void quantize_matrix(GgmlType type, const __nv_bfloat16* x, int k, int k_padded, int columns,
+                     const std::int32_t* input_columns, const std::int32_t* column_map,
+                     int column_group, void* out, cudaStream_t stream) {
+    const dim3 blocks(columns,
+                      (k_padded + 4 * detail::kMatrixQuantizeThreads - 1) /
+                          (4 * detail::kMatrixQuantizeThreads),
                       1);
     auto* y = static_cast<block_q8_1_mmq*>(out);
     switch (mmq_get_q8_1_ds_layout(detail::to_ggml(type))) {
     case MMQ_Q8_1_DS_LAYOUT_D4:
         detail::quantize_matrix_kernel<MMQ_Q8_1_DS_LAYOUT_D4>
-            <<<blocks, detail::kMatrixQuantizeThreads, 0, stream>>>(x, input_columns, y, k, columns);
+            <<<blocks, detail::kMatrixQuantizeThreads, 0, stream>>>(
+                x, input_columns, column_map, column_group, y, k, k_padded, columns);
         break;
     case MMQ_Q8_1_DS_LAYOUT_DS4:
         detail::quantize_matrix_kernel<MMQ_Q8_1_DS_LAYOUT_DS4>
-            <<<blocks, detail::kMatrixQuantizeThreads, 0, stream>>>(x, input_columns, y, k, columns);
+            <<<blocks, detail::kMatrixQuantizeThreads, 0, stream>>>(
+                x, input_columns, column_map, column_group, y, k, k_padded, columns);
         break;
     case MMQ_Q8_1_DS_LAYOUT_D2S6:
         detail::quantize_matrix_kernel<MMQ_Q8_1_DS_LAYOUT_D2S6>
-            <<<blocks, detail::kMatrixQuantizeThreads, 0, stream>>>(x, input_columns, y, k, columns);
+            <<<blocks, detail::kMatrixQuantizeThreads, 0, stream>>>(
+                x, input_columns, column_map, column_group, y, k, k_padded, columns);
         break;
     }
     detail::check(cudaGetLastError(), "matrix activation launch");
+}
+
+} // namespace
+
+void quantize_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k, int columns,
+                                const std::int32_t* input_columns, void* out, cudaStream_t stream) {
+    if (k <= 0 || k % (4 * detail::kMatrixQuantizeThreads) != 0 || columns <= 0) {
+        throw std::invalid_argument("gguf matrix activation: K must be whole 512-value groups");
+    }
+    quantize_matrix(type, x, k, k, columns, input_columns, nullptr, 1, out, stream);
+}
+
+namespace {
+
+// The matrix kernel's K step: an activation covers whole steps.
+constexpr int kMatrixStep = 256;
+
+int moe_padded_k(int k) { return (k + kMatrixStep - 1) / kMatrixStep * kMatrixStep; }
+
+} // namespace
+
+std::size_t moe_matrix_activation_bytes(int k, int pairs) {
+    return matrix_activation_bytes(moe_padded_k(k), pairs);
+}
+
+void quantize_moe_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k,
+                                    const MoeRouting& routing, int pairs, int column_group,
+                                    void* out, cudaStream_t stream) {
+    if (routing.sorted == nullptr || column_group <= 0 || k <= 0 || k % 128 != 0 || pairs <= 0) {
+        throw std::invalid_argument("gguf moe matrix activation: invalid routing or K");
+    }
+    quantize_matrix(type, x, k, moe_padded_k(k), pairs, nullptr, routing.sorted, column_group, out,
+                    stream);
 }
 
 std::size_t matrix_fixup_bytes(GgmlType type, int rows, int columns) {
@@ -692,6 +736,73 @@ void matrix_product(GgmlType type, const void* weight, std::int64_t row_bytes, i
     }
 #undef NINFER_GGUF_MATRIX_CASE
     throw std::invalid_argument("gguf matrix product: no integer kernel for this block type");
+}
+
+bool moe_matrix_supported(GgmlType type, int rows, int k, bool tail) {
+#define NINFER_GGUF_MOE_FITS_CASE(NAME)                                                            \
+    case GgmlType::NAME:                                                                           \
+        return detail::moe_matrix_fits_impl<GGML_TYPE_##NAME>(rows, k, tail)
+    switch (type) {
+        NINFER_GGUF_MOE_FITS_CASE(Q8_0);
+        NINFER_GGUF_MOE_FITS_CASE(Q4_0);
+        NINFER_GGUF_MOE_FITS_CASE(Q5_0);
+        NINFER_GGUF_MOE_FITS_CASE(Q2_0);
+        NINFER_GGUF_MOE_FITS_CASE(Q2_K);
+        NINFER_GGUF_MOE_FITS_CASE(Q3_K);
+        NINFER_GGUF_MOE_FITS_CASE(Q4_K);
+        NINFER_GGUF_MOE_FITS_CASE(Q5_K);
+        NINFER_GGUF_MOE_FITS_CASE(Q6_K);
+        NINFER_GGUF_MOE_FITS_CASE(IQ2_XXS);
+        NINFER_GGUF_MOE_FITS_CASE(IQ2_XS);
+        NINFER_GGUF_MOE_FITS_CASE(IQ2_S);
+        NINFER_GGUF_MOE_FITS_CASE(IQ3_XXS);
+        NINFER_GGUF_MOE_FITS_CASE(IQ3_S);
+        NINFER_GGUF_MOE_FITS_CASE(IQ1_S);
+        NINFER_GGUF_MOE_FITS_CASE(IQ4_NL);
+        NINFER_GGUF_MOE_FITS_CASE(IQ4_XS);
+    case GgmlType::IQ1_M:
+        return false;
+    }
+#undef NINFER_GGUF_MOE_FITS_CASE
+    return false;
+}
+
+void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& routing,
+                        int max_active, int pairs, int max_columns, bool tail,
+                        const void* activation, float* out, cudaStream_t stream) {
+    if (table.experts == nullptr || routing.bounds == nullptr || activation == nullptr ||
+        out == nullptr) {
+        throw std::invalid_argument("gguf moe matrix product: invalid tables or routing");
+    }
+#define NINFER_GGUF_MOE_MATRIX_CASE(NAME)                                                          \
+    case GgmlType::NAME:                                                                           \
+        detail::moe_matrix_product_impl<GGML_TYPE_##NAME>(                                         \
+            table.experts, table.row_bytes, table.rows, table.k, routing, max_active, pairs,       \
+            max_columns, tail, activation, out, stream);                                           \
+        return
+    switch (type) {
+        NINFER_GGUF_MOE_MATRIX_CASE(Q8_0);
+        NINFER_GGUF_MOE_MATRIX_CASE(Q4_0);
+        NINFER_GGUF_MOE_MATRIX_CASE(Q5_0);
+        NINFER_GGUF_MOE_MATRIX_CASE(Q2_0);
+        NINFER_GGUF_MOE_MATRIX_CASE(Q2_K);
+        NINFER_GGUF_MOE_MATRIX_CASE(Q3_K);
+        NINFER_GGUF_MOE_MATRIX_CASE(Q4_K);
+        NINFER_GGUF_MOE_MATRIX_CASE(Q5_K);
+        NINFER_GGUF_MOE_MATRIX_CASE(Q6_K);
+        NINFER_GGUF_MOE_MATRIX_CASE(IQ2_XXS);
+        NINFER_GGUF_MOE_MATRIX_CASE(IQ2_XS);
+        NINFER_GGUF_MOE_MATRIX_CASE(IQ2_S);
+        NINFER_GGUF_MOE_MATRIX_CASE(IQ3_XXS);
+        NINFER_GGUF_MOE_MATRIX_CASE(IQ3_S);
+        NINFER_GGUF_MOE_MATRIX_CASE(IQ1_S);
+        NINFER_GGUF_MOE_MATRIX_CASE(IQ4_NL);
+        NINFER_GGUF_MOE_MATRIX_CASE(IQ4_XS);
+    case GgmlType::IQ1_M:
+        break;
+    }
+#undef NINFER_GGUF_MOE_MATRIX_CASE
+    throw std::invalid_argument("gguf moe matrix product: no integer kernel for this block type");
 }
 
 void store_plane(const float* in, std::int64_t in_column_stride, int rows, int columns,
