@@ -13,6 +13,8 @@ TYPE_Q8_0 = 8
 
 # ggml-common.h: block values and bytes of every type the importer keeps.
 GGML_BLOCKS = {
+    2: (32, 18),
+    6: (32, 22),
     8: (32, 34),
     10: (256, 84),
     11: (256, 110),
@@ -28,6 +30,7 @@ GGML_BLOCKS = {
     22: (256, 82),
     23: (256, 136),
     29: (256, 56),
+    42: (64, 18),
 }
 
 

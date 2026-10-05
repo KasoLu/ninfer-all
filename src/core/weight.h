@@ -36,10 +36,14 @@ enum class QType : std::uint16_t {
     GGUF_IQ1_M   = 22,
     GGUF_IQ4_NL  = 23,
     GGUF_IQ4_XS  = 24,
+    GGUF_Q4_0    = 25,
+    GGUF_Q5_0    = 26,
+    // Two-bit codes over {-1, 0, 1, 2} times one binary16 d per 64 columns (GSQ-RCO's Q2_0).
+    GGUF_Q2_0 = 27,
 };
 
 [[nodiscard]] constexpr bool is_gguf(QType format) {
-    return format >= QType::GGUF_Q8_0 && format <= QType::GGUF_IQ4_XS;
+    return format >= QType::GGUF_Q8_0 && format <= QType::GGUF_Q2_0;
 }
 
 struct GgufBlockShape {
@@ -65,6 +69,12 @@ struct GgufBlockShape {
     case QType::GGUF_IQ1_M: return {256, 56};
     case QType::GGUF_IQ4_NL: return {32, 18};
     case QType::GGUF_IQ4_XS: return {256, 136};
+    case QType::GGUF_Q4_0:
+        return {32, 18};
+    case QType::GGUF_Q5_0:
+        return {32, 22};
+    case QType::GGUF_Q2_0:
+        return {64, 18};
     default: return {};
     }
 }

@@ -14,6 +14,8 @@ namespace ninfer::ops::gguf {
 
 // The block type's id in a GGUF tensor directory (ggml_type).
 enum class GgmlType : int {
+    Q4_0    = 2,
+    Q5_0    = 6,
     Q8_0    = 8,
     Q2_K    = 10,
     Q3_K    = 11,
@@ -29,6 +31,7 @@ enum class GgmlType : int {
     IQ2_S   = 22,
     IQ4_XS  = 23,
     IQ1_M   = 29,
+    Q2_0    = 42,
 };
 
 struct BlockShape {

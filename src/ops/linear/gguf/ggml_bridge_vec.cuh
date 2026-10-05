@@ -104,6 +104,92 @@ struct Decoder<GGML_TYPE_Q8_0> {
     }
 };
 
+// Q4_0: codes c in 0..15, value d * (c - 8); value j < 16 is the low nibble of byte j, value
+// j + 16 its high nibble.
+template <>
+struct Decoder<GGML_TYPE_Q4_0> {
+    static constexpr int kBlockElems = 32, kBlockBytes = 18, kTableWords = 0;
+
+    __device__ static const std::uint32_t* table() { return nullptr; }
+
+    __device__ __forceinline__ static void decode(const std::uint8_t* b, int, const std::uint32_t*,
+                                                  Slice& s) {
+        s.f[0] = half_at(b);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const std::uint32_t q = u32_a2(b + 2 + 4 * j);
+            s.w[j]                = int(__vsubss4(q & 0x0F0F0F0Fu, 0x08080808u));
+            s.w[j + 4]            = int(__vsubss4((q >> 4) & 0x0F0F0F0Fu, 0x08080808u));
+        }
+    }
+
+    __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
+        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+    }
+};
+
+// Q5_0: Q4_0's nibbles with a fifth bit per value in qh (bit j for value j), value d * (c - 16).
+template <>
+struct Decoder<GGML_TYPE_Q5_0> {
+    static constexpr int kBlockElems = 32, kBlockBytes = 22, kTableWords = 0;
+
+    __device__ static const std::uint32_t* table() { return nullptr; }
+
+    // The four bits of `h` as bit 4 of four bytes.
+    __device__ __forceinline__ static std::uint32_t high_bits(std::uint32_t h) {
+        return ((h << 4) & 0x00000010u) | ((h << 11) & 0x00001000u) | ((h << 18) & 0x00100000u) |
+               ((h << 25) & 0x10000000u);
+    }
+
+    __device__ __forceinline__ static void decode(const std::uint8_t* b, int, const std::uint32_t*,
+                                                  Slice& s) {
+        s.f[0]                 = half_at(b);
+        const std::uint32_t qh = u32_a2(b + 2);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const std::uint32_t q  = u32_a2(b + 6 + 4 * j);
+            const std::uint32_t lo = (q & 0x0F0F0F0Fu) | high_bits(qh >> (4 * j));
+            const std::uint32_t hi = ((q >> 4) & 0x0F0F0F0Fu) | high_bits(qh >> (16 + 4 * j));
+            s.w[j]                 = int(__vsubss4(lo, 0x10101010u));
+            s.w[j + 4]             = int(__vsubss4(hi, 0x10101010u));
+        }
+    }
+
+    __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
+        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+    }
+};
+
+// Q2_0: 64 two-bit codes c, value d * (c - 1); value j is bits 2(j % 4) of byte j / 4. A block is
+// two 32-value slices.
+template <>
+struct Decoder<GGML_TYPE_Q2_0> {
+    static constexpr int kBlockElems = 64, kBlockBytes = 18, kTableWords = 0;
+
+    __device__ static const std::uint32_t* table() { return nullptr; }
+
+    // The four codes of byte `x` as four bytes, minus one each.
+    __device__ __forceinline__ static int spread(std::uint32_t x) {
+        x &= 0xFFu;
+        return int(__vsubss4((x | (x << 6) | (x << 12) | (x << 18)) & 0x03030303u, 0x01010101u));
+    }
+
+    __device__ __forceinline__ static void decode(const std::uint8_t* b, int u,
+                                                  const std::uint32_t*, Slice& s) {
+        s.f[0] = half_at(b);
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const std::uint32_t q = u32_a2(b + 2 + 8 * u + 4 * h);
+#pragma unroll
+            for (int byte = 0; byte < 4; ++byte) { s.w[4 * h + byte] = spread(q >> (8 * byte)); }
+        }
+    }
+
+    __device__ __forceinline__ static float dot(const Slice& s, const int* a, float d, float) {
+        return s.f[0] * d * float(dot4(s.w + 4, a + 4, dot4(s.w, a, 0)));
+    }
+};
+
 template <>
 struct Decoder<GGML_TYPE_IQ4_NL> {
     static constexpr int kBlockElems = 32, kBlockBytes = 18, kTableWords = 0;

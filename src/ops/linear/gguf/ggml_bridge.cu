@@ -71,6 +71,12 @@ using VectorLaunch = void (*)(const VecArgs&, int, bool, cudaStream_t);
 VectorLaunch vector_launch(GgmlType type) {
     switch (type) {
     case GgmlType::Q8_0: return vec_launch<GGML_TYPE_Q8_0>;
+    case GgmlType::Q4_0:
+        return vec_launch<GGML_TYPE_Q4_0>;
+    case GgmlType::Q5_0:
+        return vec_launch<GGML_TYPE_Q5_0>;
+    case GgmlType::Q2_0:
+        return vec_launch<GGML_TYPE_Q2_0>;
     case GgmlType::Q2_K: return vec_launch<GGML_TYPE_Q2_K>;
     case GgmlType::Q3_K: return vec_launch<GGML_TYPE_Q3_K>;
     case GgmlType::Q4_K: return vec_launch<GGML_TYPE_Q4_K>;
@@ -217,6 +223,33 @@ __global__ void dequantize_rows_kernel(const char* __restrict__ weight, std::int
             const block_q8_0& b = blocks[i / QK8_0];
             y[i] = ggml_cuda_cast<dst_t>(__half2float(b.d) * b.qs[i % QK8_0]);
         }
+    } else if constexpr (type == GGML_TYPE_Q4_0) {
+        const block_q4_0* blocks = static_cast<const block_q4_0*>(x) + blockIdx.x * (QK_K / QK4_0);
+        for (int i = threadIdx.x; i < QK_K; i += threads) {
+            const block_q4_0& b = blocks[i / QK4_0];
+            const int j         = i % QK4_0;
+            const int code      = j < QK4_0 / 2 ? (b.qs[j] & 0xF) : (b.qs[j - QK4_0 / 2] >> 4);
+            y[i]                = ggml_cuda_cast<dst_t>(__half2float(b.d) * float(code - 8));
+        }
+    } else if constexpr (type == GGML_TYPE_Q5_0) {
+        const block_q5_0* blocks = static_cast<const block_q5_0*>(x) + blockIdx.x * (QK_K / QK5_0);
+        for (int i = threadIdx.x; i < QK_K; i += threads) {
+            const block_q5_0& b = blocks[i / QK5_0];
+            const int j         = i % QK5_0;
+            std::uint32_t qh;
+            memcpy(&qh, b.qh, sizeof(qh));
+            const int low  = j < QK5_0 / 2 ? (b.qs[j] & 0xF) : (b.qs[j - QK5_0 / 2] >> 4);
+            const int code = low | int(((qh >> j) & 1u) << 4);
+            y[i]           = ggml_cuda_cast<dst_t>(__half2float(b.d) * float(code - 16));
+        }
+    } else if constexpr (type == GGML_TYPE_Q2_0) {
+        const block_q2_0* blocks = static_cast<const block_q2_0*>(x) + blockIdx.x * (QK_K / QK2_0);
+        for (int i = threadIdx.x; i < QK_K; i += threads) {
+            const block_q2_0& b = blocks[i / QK2_0];
+            const int j         = i % QK2_0;
+            const int code      = (b.qs[j / 4] >> (2 * (j % 4))) & 3;
+            y[i]                = ggml_cuda_cast<dst_t>(__half2float(b.d) * float(code - 1));
+        }
     } else if constexpr (type == GGML_TYPE_Q2_K) {
         dequantize_q2_K(x, blockIdx.x, y, threadIdx.x);
     } else if constexpr (type == GGML_TYPE_Q3_K) {
@@ -266,6 +299,15 @@ void dispatch_dequantize(GgmlType type, const void* weight, std::int64_t row_byt
                          std::int64_t out_row_stride, cudaStream_t stream) {
     switch (type) {
     case GgmlType::Q8_0: return launch_dequantize<GGML_TYPE_Q8_0, 64>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
+    case GgmlType::Q4_0:
+        return launch_dequantize<GGML_TYPE_Q4_0, 64>(weight, row_bytes, k, row_ids, rows, out,
+                                                     out_row_stride, stream);
+    case GgmlType::Q5_0:
+        return launch_dequantize<GGML_TYPE_Q5_0, 64>(weight, row_bytes, k, row_ids, rows, out,
+                                                     out_row_stride, stream);
+    case GgmlType::Q2_0:
+        return launch_dequantize<GGML_TYPE_Q2_0, 64>(weight, row_bytes, k, row_ids, rows, out,
+                                                     out_row_stride, stream);
     case GgmlType::Q2_K: return launch_dequantize<GGML_TYPE_Q2_K, 64>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
     case GgmlType::Q3_K: return launch_dequantize<GGML_TYPE_Q3_K, 64>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
     case GgmlType::Q4_K: return launch_dequantize<GGML_TYPE_Q4_K, 32>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
@@ -290,6 +332,12 @@ void dispatch_dequantize(GgmlType type, const void* weight, std::int64_t row_byt
 BlockShape block_shape(GgmlType type) {
     switch (type) {
     case GgmlType::Q8_0: return {32, 34};
+    case GgmlType::Q4_0:
+        return {32, 18};
+    case GgmlType::Q5_0:
+        return {32, 22};
+    case GgmlType::Q2_0:
+        return {64, 18};
     case GgmlType::Q2_K: return {256, 84};
     case GgmlType::Q3_K: return {256, 110};
     case GgmlType::Q4_K: return {256, 144};
@@ -392,6 +440,12 @@ void quantize_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k, in
 std::size_t matrix_fixup_bytes(GgmlType type, int rows, int columns) {
     switch (type) {
     case GgmlType::Q8_0: return detail::matrix_fixup_bytes_impl<GGML_TYPE_Q8_0>(rows, columns);
+    case GgmlType::Q4_0:
+        return detail::matrix_fixup_bytes_impl<GGML_TYPE_Q4_0>(rows, columns);
+    case GgmlType::Q5_0:
+        return detail::matrix_fixup_bytes_impl<GGML_TYPE_Q5_0>(rows, columns);
+    case GgmlType::Q2_0:
+        return detail::matrix_fixup_bytes_impl<GGML_TYPE_Q2_0>(rows, columns);
     case GgmlType::Q2_K: return detail::matrix_fixup_bytes_impl<GGML_TYPE_Q2_K>(rows, columns);
     case GgmlType::Q3_K: return detail::matrix_fixup_bytes_impl<GGML_TYPE_Q3_K>(rows, columns);
     case GgmlType::Q4_K: return detail::matrix_fixup_bytes_impl<GGML_TYPE_Q4_K>(rows, columns);
@@ -421,6 +475,9 @@ void matrix_product(GgmlType type, const void* weight, std::int64_t row_bytes, i
         return
     switch (type) {
         NINFER_GGUF_MATRIX_CASE(Q8_0);
+        NINFER_GGUF_MATRIX_CASE(Q4_0);
+        NINFER_GGUF_MATRIX_CASE(Q5_0);
+        NINFER_GGUF_MATRIX_CASE(Q2_0);
         NINFER_GGUF_MATRIX_CASE(Q2_K);
         NINFER_GGUF_MATRIX_CASE(Q3_K);
         NINFER_GGUF_MATRIX_CASE(Q4_K);
