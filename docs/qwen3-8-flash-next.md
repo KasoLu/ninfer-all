@@ -132,16 +132,17 @@ the short answer:
 
 | Release and placement | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
 |---|---:|---:|---:|---:|---:|
-| IQ3_S, experts in pinned host memory, 16.2 GB expert cache | 22.6 GiB | 50.3 GB pinned | 34.4 tok/s | 30.2 tok/s | 533 tok/s |
-| IQ3_S, experts on disk, the page cache holding what of the 83.6 GB file fits | 22.6 GiB | page cache | 19.0 tok/s | 21.6 tok/s | 209 tok/s |
-| IQ3_S, experts on disk, the file's pages evicted every second | 22.6 GiB | — | 10.7 tok/s | 5.4 tok/s | 47 tok/s |
-| Q2_0, experts in pinned host memory | 22.6 GiB | 34.0 GB pinned | 50.2 tok/s | 43.7 tok/s | 847 tok/s |
+| IQ3_S, experts in pinned host memory, 16.2 GB expert cache | 22.1 GiB | 50.3 GB pinned | 34.4 tok/s | 30.2 tok/s | 533 tok/s |
+| IQ3_S, experts on disk, the page cache holding what of the 83.6 GB file fits | 22.1 GiB | page cache | 19.0 tok/s | 21.6 tok/s | 209 tok/s |
+| IQ3_S, experts on disk, the file's pages evicted every second | 22.1 GiB | — | 10.7 tok/s | 5.4 tok/s | 47 tok/s |
+| Q2_0, experts in pinned host memory | 22.1 GiB | 34.0 GB pinned | 50.2 tok/s | 43.7 tok/s | 847 tok/s |
 
-On the current code the generate test's prompts (the facts and the 4,463-token needle) come out
-right with CUDA graphs and without for Q2_0 (disk and host experts here, and all three placements
-before the n-gram table moved into the artifact) and IQ3_S (disk and host experts). IQ2_XS (39.2
-GB) and the Coder build's IQ1_M (29.6 GB, 256 experts) on two GPUs and IQ3_XXS (47.0 GB) with host
-experts passed before wide expert calls moved to the matrix kernel and have not been rerun since.
+On the current code every GSQ-RCO release, converted into one file with its table, answers the
+generate test's prompts (the facts and the 4,463-token needle) on that card with disk experts and
+with host experts, with CUDA graphs and without: Q2_0, IQ2_XS (39.2 GB, 35.5 GB pinned), IQ3_XXS
+(47.0 GB, 42.9 GB pinned), IQ3_S, and the Coder build's IQ1_M (29.6 GB, 256 experts, 25.1 GB pinned).
+Q2_0 also ran with its experts on two GPUs before the table moved into the artifact. With disk
+experts the process peaked at 1.05 to 1.19 GB of RAM for IQ2_XS, IQ3_XXS and IQ1_M.
 
 llama.cpp runs the same GGUFs with the experts on the CPU (`--n-cpu-moe 48`). On the second
 machine above (23 threads) llama-bench gives 29.6 tok/s decode (tg128) and 312 tok/s prefill
