@@ -88,10 +88,10 @@ Fp8GdnConvPlan fp8_gdn_snapshot_resolve_plan(LinearPolicy policy, std::int32_t w
         throw std::invalid_argument("fp8 GDN snapshot: invalid B/W domain");
     }
     if (batch_size == 1) {
-        if (allows_a8(policy) && width >= 10) { return {Fp8GdnConvScheduleId::MaterializedA8}; }
+        if (allows_a8(policy) && width >= 17) { return {Fp8GdnConvScheduleId::MaterializedA8}; }
         return b1_a16_plan(width);
     }
-    if (allows_a8(policy) && width * batch_size >= 9) {
+    if (allows_a8(policy) && width * batch_size >= 17) {
         return {Fp8GdnConvScheduleId::MaterializedA8};
     }
     return {Fp8GdnConvScheduleId::MaterializedA16};
