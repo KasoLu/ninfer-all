@@ -21,8 +21,8 @@ project(ninfer LANGUAGES C CXX CUDA)
 
 # CUDA 12.8's ptxas miscompiles sm_120a code: it reads a register under one predicate that it only
 # wrote under another. On an RTX 5090 the PLE convolution then loads from an address it never
-# computed, and the FP8 A8, NVFP4, attention, convolution and GDN projection tests fail, upstream's
-# convolution test included; CUDA 12.9 builds the same sources correctly.
+# computed, and the PLE injection, convolution and attention tests fail, upstream's convolution test
+# included; CUDA 12.9 builds the same sources correctly.
 if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a" AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.9)
   message(FATAL_ERROR
     "A 120a build needs CUDA 12.9 or newer; CUDA ${CMAKE_CUDA_COMPILER_VERSION} miscompiles sm_120a "
