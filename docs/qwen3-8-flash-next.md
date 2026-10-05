@@ -22,9 +22,9 @@ The published conversions store the models without the table, which is published
 | Artifact | Size | |
 |---|---:|---|
 | [n-gram table](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-ngram-table-NInfer-v3) | 26.82 GiB | IQ4_NL rows, read by every model below |
-| [Q2_0](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3) | 35.05 GiB | |
-| [IQ3_S](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-NInfer-v3) | 51.07 GiB | |
-| [Coder IQ1_M](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-NInfer-v3) | 27.58 GiB | 256 experts per layer |
+| [Q2_0](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-NInfer-v3) | 35.89 GiB | with the Vision tower |
+| [IQ3_S](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-NInfer-v3) | 51.90 GiB | with the Vision tower |
+| [Coder IQ1_M](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-NInfer-v3) | 28.42 GiB | 256 experts per layer, with the Vision tower |
 
 The model runs with up to eight concurrent requests, a context cache of prompt prefixes, structured
 output, and images and video through its Vision tower (`--vision`, from an artifact converted with
@@ -220,7 +220,24 @@ generate test's prompts (the facts and the 4,463-token needle) on that card with
 with host experts, with CUDA graphs and without: Q2_0, IQ2_XS (39.2 GB, 35.5 GB pinned), IQ3_XXS
 (47.0 GB, 42.9 GB pinned), IQ3_S, and the Coder build's IQ1_M (29.6 GB, 256 experts, 25.1 GB pinned).
 Q2_0 also ran with its experts on two GPUs before the table moved into the artifact. With disk
-experts the process peaked at 1.05 to 1.19 GB of RAM for IQ2_XS, IQ3_XXS and IQ1_M.
+experts the process peaked at 1.05 to 1.19 GB of RAM for IQ2_XS, IQ3_XXS and IQ1_M, and at 1.10 GB
+for IQ3_S (an L40S host).
+
+The published layout, each model without its table and with its Vision tower plus the shared table
+artifact, was checked on one NVIDIA L40S (an sm_86 build): the generate test with device, host and
+disk experts for Q2_0, host and disk for IQ3_S and the Coder build, three sequences decoded as one
+batch against each decoded alone, a restored snapshot, an image question per release, and the
+server's concurrency, prefix reuse and JSON Schema checks.
+
+Where a decode step goes, from an Nsight Systems trace of the generate test's graph-replayed steps
+(Q2_0, every expert on that L40S): about 1,780 kernels and copies in 10.6 ms, 0.5 ms of it idle
+between them. A token reads about 4 GB of weights, and the BF16 hyper-connection projections are
+the largest share: 97 down/up pairs of 6.5 MB each, 1.27 GB, more than the ten routed experts of
+every layer (0.66 GB). Their GEMVs take 2.2 ms, the routed experts 1.75 ms, the GGUF projections
+of the Gated DeltaNet and attention layers with the head about 2.9 ms, and the router, shared
+experts, activation quantization, recurrent and sparse-attention kernels the rest. With host
+experts on a 24 GB card the expert kernels read what the cache lacks across the bus and take most
+of the step instead.
 
 llama.cpp runs the same GGUFs with the experts on the CPU (`--n-cpu-moe 48`). On the second
 machine above (23 threads) llama-bench gives 29.6 tok/s decode (tg128) and 312 tok/s prefill
