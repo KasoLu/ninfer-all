@@ -219,8 +219,10 @@ add_test(NAME ninfer_softmax_attention_wide_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --wide-only)
 add_test(NAME ninfer_softmax_attention_parallel_tiles_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --parallel-tiles-only)
+# Its FP64 oracle runs on the host and dominates: 24 minutes on an L40S host, past an hour on
+# smaller ones.
 set_tests_properties(ninfer_softmax_attention_wide_test
-  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600 RUN_SERIAL TRUE)
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 7200 RUN_SERIAL TRUE)
 set_tests_properties(ninfer_softmax_attention_parallel_tiles_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
