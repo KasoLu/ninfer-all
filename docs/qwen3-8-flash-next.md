@@ -87,11 +87,12 @@ Requests run one at a time in arrival order; `--max-concurrency` above one queue
 - The 512-expert MoE groups each layer's (token, expert) pairs by expert on the GPU and runs one
   pass over each selected expert's rows for all of its tokens, through device tables of expert
   base pointers: an expert is read wherever the table points, in device memory, a cache slot or the
-  pinned host block. Up to eight tokens run vector products; wider calls with the experts on the
-  GPUs or on disk run ggml's integer tensor-core matrix kernel over the routed pairs (zeros follow
-  each down bank, since the kernel reads a 640-value row in 256-value steps), while host experts
-  stay on the vector products, which read the pinned block across the bus better. Weighted expert
-  outputs are summed in fixed point, so the result does not depend on the order experts finish in.
+  pinned host block. Up to eight tokens run vector products; wider calls run ggml's integer
+  tensor-core matrix kernel over the routed pairs from device memory (zeros follow each down bank,
+  since the kernel reads a 640-value row in 256-value steps). With host experts, a wide call first
+  copies the routed experts the cache does not hold into a device pool (one slot per expert on each
+  GPU, 0.7 GB for Q2_0), so each expert crosses the bus once per chunk. Weighted expert outputs are
+  summed in fixed point, so the result does not depend on the order experts finish in.
 - The expert cache counts the routes each forward pass took (decayed per token) and, between
   passes, copies the experts it needed most into its slots and points the tables at them. With
   disk experts the cache works per layer instead: once a layer has routed its tokens, the experts
@@ -118,11 +119,10 @@ that prompt in 512-token chunks.
 Host memory is the process's peak resident set (the pinned bank for host experts). Decode after
 the long prompt covers its first five tokens only. CUDA graphs add 11% to the short-answer decode on
 the two GPUs (81.2 tok/s eager) and 7% with host experts (44.3 tok/s); disk experts decode eagerly.
-Prefill touches nearly every expert of every layer in each chunk. Host experts stay on the vector
-products, which read each expert across the bus once per eight of its tokens, so larger chunks do
-not help them (11.9 s for the long prompt in 512-token chunks, 12.6 s in 2,048 and 13.5 s in
-4,096); disk experts are copied into device slots once per layer and chunk and run the matrix
-kernel, which is why a warm page cache prefills faster than pinned memory.
+Prefill touches nearly every expert of every layer in each chunk, and with host or disk experts
+each of them crosses the bus or comes off the disk once per chunk, so larger `--prefill-chunk`
+values serve more tokens per copy: with host experts on an RTX 3090 Ti the long prompt takes 6.05 s
+in 512-token chunks and 4.58 s in 2,048 (10.97 s before the experts went through device slots).
 
 Every GSQ-RCO release converts and answers the generate test's prompts (the facts and the
 4,463-token needle) with CUDA graphs and without, identically: Q2_0 in all three placements,

@@ -53,6 +53,10 @@ public:
     // Copies up to `byte_budget` bytes of experts into slots and updates the tables, on each
     // layer's stream.
     void rebalance(std::uint64_t byte_budget);
+    // Projection k (0 gate, 1 up, 2 down) of `expert` in its device slot, or null when the expert
+    // is not cached. Slots are zeroed when allocated and 256 zero bytes follow the last, as the
+    // expert matrix kernel needs (see moe_experts_gguf).
+    [[nodiscard]] const void* cached(std::size_t layer, int k, std::int32_t expert) const;
     [[nodiscard]] ExpertCacheStats stats() const noexcept;
 
 private:

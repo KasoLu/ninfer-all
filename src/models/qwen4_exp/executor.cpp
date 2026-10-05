@@ -26,6 +26,7 @@
 #include "ninfer/ops/weight_input.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -38,6 +39,10 @@ namespace ninfer::models::qwen4_exp {
 namespace {
 
 constexpr std::int32_t kAlign = 256;
+// Calls wider than this run their experts through the matrix kernel, from device memory.
+constexpr std::int32_t kVectorTokens = 8;
+// Zero bytes after the last device slot of an expert pool (see moe_experts_gguf).
+constexpr std::uint64_t kSlotTail = 256;
 
 std::uint64_t round_up(std::uint64_t value) { return (value + kAlign - 1) / kAlign * kAlign; }
 
@@ -341,6 +346,20 @@ struct Executor::Impl {
     std::unique_ptr<PinnedHostBuffer> route_host;
     std::uint32_t pending_routes = 0;
 
+    // Host-resident experts, wide calls: a layer's routed experts that the cache does not hold are
+    // copied into device slots and the matrix kernel reads them there; one pool and one set of
+    // tables per rank, whose layers run one at a time.
+    struct SlotPool {
+        DeviceBuffer storage; // zeroed slots, then kSlotTail zero bytes
+        std::uint64_t slot_bytes = 0;
+        std::array<std::uint64_t, 3> offset{};
+        std::uint32_t slots = 0;
+        DeviceBuffer tables; // gate, up and down tables of every expert
+    };
+
+    std::vector<SlotPool> slot_pools; // by rank; empty unless the experts are host resident
+    std::unique_ptr<PinnedHostBuffer> slot_entries;
+
     Impl(const Model& m, DeviceContext& d, ExecutorOptions o)
         : model(m), device(d), options(std::move(o)), config(m.config()),
           ngram(derive_ngram_hash_constants(config.ngram)) {
@@ -630,6 +649,7 @@ struct Executor::Impl {
         route_host =
             std::make_unique<PinnedHostBuffer>(layers.size() * pairs * sizeof(std::int32_t));
         const ExpertResidency residency = model.options().experts;
+        if (residency == ExpertResidency::Host) { allocate_slot_pools(); }
         if (residency == ExpertResidency::Device ||
             (residency == ExpertResidency::Host && options.expert_cache_bytes == 0)) {
             return;
@@ -682,6 +702,39 @@ struct Executor::Impl {
         }
         cache = std::make_unique<ExpertCache>(device, std::move(cache_layers), bytes);
         for (const auto value : bytes) { memory.expert_cache_bytes += value; }
+    }
+
+    // One slot per expert on every rank, sized for its layers' widest projections, when half the
+    // free memory holds them; the expert cache takes what is left.
+    void allocate_slot_pools() {
+        const std::size_t experts = config.num_experts;
+        slot_pools.resize(device.size());
+        for (std::size_t r = 0; r < device.size(); ++r) {
+            std::array<std::uint64_t, 3> widest{};
+            for (const auto& plan : layers) {
+                if (plan.rank != r) { continue; }
+                const ExpertTable* tables[3] = {&plan.moe.gate, &plan.moe.up, &plan.moe.down};
+                for (int k = 0; k < 3; ++k) {
+                    widest[k] = std::max<std::uint64_t>(widest[k], std::uint64_t(tables[k]->rows) *
+                                                                       tables[k]->row_bytes);
+                }
+            }
+            if (widest[0] == 0) { continue; }
+            SlotPool& pool  = slot_pools[r];
+            pool.offset     = {0, round_up(widest[0]), round_up(widest[0]) + round_up(widest[1])};
+            pool.slot_bytes = pool.offset[2] + round_up(widest[2]);
+            RankBinding bind(device, r);
+            std::size_t free_bytes = 0, total = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total));
+            const std::uint64_t bytes = experts * pool.slot_bytes + kSlotTail;
+            if (bytes > free_bytes / 2) { continue; }
+            pool.slots   = static_cast<std::uint32_t>(experts);
+            pool.storage = DeviceBuffer(bytes);
+            CUDA_CHECK(cudaMemset(pool.storage.p, 0, pool.storage.bytes));
+            pool.tables = DeviceBuffer(3 * experts * sizeof(void*));
+            memory.workspace_bytes += pool.storage.bytes + pool.tables.bytes;
+        }
+        slot_entries = std::make_unique<PinnedHostBuffer>(3 * experts * sizeof(void*));
     }
 
     // Feeds the last pass's routes to the expert cache and lets it swap experts, before the next
@@ -940,6 +993,67 @@ struct Executor::Impl {
                         config.rms_norm_eps, history, ws, s);
     }
 
+    // A wide call over host-resident experts: once its routes reach the host, the routed experts
+    // the cache does not hold are copied into the rank's slots, and the experts run from device
+    // memory through tables that point at cache slots and pool slots. False, leaving the call to
+    // the vector products over the cache's tables, when the pool cannot hold them.
+    bool run_through_slots(const LayerPlan& plan, RankState& rank, std::int32_t t,
+                           std::size_t index, Tensor& ids, Tensor& weights, Tensor& shared) {
+        SlotPool& pool = slot_pools[rank.rank];
+        if (pool.slots == 0) { return false; }
+        const cudaStream_t s = rank.stream;
+        const auto top       = static_cast<std::int32_t>(config.num_experts_per_tok);
+        auto* routes         = static_cast<std::int32_t*>(route_host->data()) +
+                               index * std::size_t(top) * options.prefill_chunk;
+        CUDA_CHECK(
+            cudaMemcpyAsync(routes, ids.data, std::size_t(top) * t * 4, cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaStreamSynchronize(s));
+        const MoePlan& m          = plan.moe;
+        const std::size_t experts = m.gate.pointers.size();
+        std::vector<char> routed(experts, 0);
+        for (std::int32_t i = 0; i < top * t; ++i) {
+            const std::int32_t e = routes[i];
+            if (e >= 0 && std::size_t(e) < experts) { routed[e] = 1; }
+        }
+        auto* entries                = static_cast<const void**>(slot_entries->data());
+        const ExpertTable* tables[3] = {&m.gate, &m.up, &m.down};
+        std::uint32_t used           = 0;
+        for (std::size_t e = 0; e < experts; ++e) {
+            for (int k = 0; k < 3; ++k) { entries[k * experts + e] = nullptr; }
+            if (!routed[e]) { continue; }
+            if (cache && cache->cached(index, 0, std::int32_t(e)) != nullptr) {
+                for (int k = 0; k < 3; ++k) {
+                    entries[k * experts + e] = cache->cached(index, k, std::int32_t(e));
+                }
+                continue;
+            }
+            if (used == pool.slots) { return false; }
+            auto* base =
+                static_cast<std::byte*>(pool.storage.p) + std::size_t(used++) * pool.slot_bytes;
+            for (int k = 0; k < 3; ++k) {
+                std::byte* target = base + pool.offset[k];
+                CUDA_CHECK(cudaMemcpyAsync(target, tables[k]->pointers[e],
+                                           std::size_t(tables[k]->rows) * tables[k]->row_bytes,
+                                           cudaMemcpyHostToDevice, s));
+                entries[k * experts + e] = target;
+            }
+        }
+        CUDA_CHECK(cudaMemcpyAsync(pool.tables.p, entries, 3 * experts * sizeof(void*),
+                                   cudaMemcpyHostToDevice, s));
+        ops::GgufMoeWeights banks = m.banks();
+        const auto* table_p       = static_cast<const void* const*>(pool.tables.p);
+        banks.gate.experts        = table_p;
+        banks.up.experts          = table_p + experts;
+        banks.down.experts        = table_p + 2 * experts;
+        banks.device_resident     = true;
+        const auto h              = static_cast<std::int32_t>(config.hidden_size);
+        const Tensor mixed(rank.mixed, DType::BF16, {h, t});
+        Tensor y(rank.y, DType::FP32, {h, t});
+        auto scope = rank.workspace->scope();
+        ops::moe_experts_gguf(mixed, ids, weights, shared, banks, *rank.workspace, y, s);
+        return true;
+    }
+
     void run_moe(const LayerPlan& plan, RankState& rank, std::int32_t t, std::size_t index) {
         const MoePlan& m     = plan.moe;
         WorkspaceArena& ws   = *rank.workspace;
@@ -953,6 +1067,10 @@ struct Executor::Impl {
         {
             auto scope = ws.scope();
             ops::moe_route(mixed, m.router, m.shared_gate, ws, ids, weights, shared, s);
+        }
+        if (t > kVectorTokens && !slot_pools.empty() &&
+            run_through_slots(plan, rank, t, index, ids, weights, shared)) {
+            return;
         }
         if (stream) {
             // The routes reach the host before the layer's experts can be made resident.

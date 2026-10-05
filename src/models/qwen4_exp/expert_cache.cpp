@@ -16,6 +16,8 @@ constexpr double kDecay = 0.999;
 // A candidate displaces a cached expert only when it is clearly hotter, so near-ties do not thrash.
 constexpr double kHysteresis = 1.25;
 constexpr double kFloor      = 0.5;
+// Zero bytes after the last slot.
+constexpr std::uint64_t kTail = 256;
 
 std::uint64_t aligned(std::uint64_t value) { return (value + kAlign - 1) / kAlign * kAlign; }
 
@@ -71,7 +73,8 @@ ExpertCache::ExpertCache(DeviceContext& device, std::vector<ExpertCacheLayer> la
         for (int k = 0; k < 3; ++k) { layer.current[k] = layer.bank(k).host; }
         if (layer.slots != 0) {
             RankBinding bind(device_, layer.banks.rank);
-            layer.storage = DeviceBuffer(std::size_t(layer.slots) * layer.slot_bytes);
+            layer.storage = DeviceBuffer(std::size_t(layer.slots) * layer.slot_bytes + kTail);
+            CUDA_CHECK(cudaMemset(layer.storage.p, 0, layer.storage.bytes));
         }
         layer.staging = staging_bytes;
         staging_bytes += 3 * experts * sizeof(void*);
@@ -176,6 +179,12 @@ void ExpertCache::rebalance(std::uint64_t byte_budget) {
                                        layer.banks.stream));
         }
     }
+}
+
+const void* ExpertCache::cached(std::size_t index, int k, std::int32_t expert) const {
+    const Layer& layer = layers_.at(index);
+    return layer.slot_of.at(static_cast<std::size_t>(expert)) >= 0 ? layer.current[k][expert]
+                                                                   : nullptr;
 }
 
 ExpertCacheStats ExpertCache::stats() const noexcept { return stats_; }
