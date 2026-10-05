@@ -63,7 +63,8 @@ int run(int tokens, bool fp32_input, bool ties, std::uint32_t seed, int kExperts
     Tensor t_ids(d_ids.data(), DType::I32, {kTop, tokens});
     Tensor t_weights(d_weights.data(), DType::FP32, {kTop, tokens});
     Tensor t_shared(d_shared.data(), DType::FP32, {tokens});
-    ops::moe_route(t_m, t_router, t_gate, t_ids, t_weights, t_shared, nullptr);
+    WorkspaceArena workspace(ops::moe_route_workspace_bytes(tokens, kExperts));
+    ops::moe_route(t_m, t_router, t_gate, workspace, t_ids, t_weights, t_shared, nullptr);
     cuda_synchronize();
     const auto ids     = from_device<int>(d_ids.data(), static_cast<std::size_t>(kTop) * tokens);
     const auto weights = from_device<float>(d_weights.data(), static_cast<std::size_t>(kTop) * tokens);
@@ -119,6 +120,7 @@ int main() {
     int failures = 0;
     failures += run(1, true, false, 9200u);
     failures += run(7, false, false, 9201u);
+    failures += run(8, true, false, 9206u);
     failures += run(33, true, false, 9202u);
     failures += run(3, true, true, 9203u);
     failures += run(5, true, false, 9204u, 256);

@@ -5,6 +5,8 @@
 
 #include "ggml-cuda/dequantize.cuh"
 
+#include <cub/block/block_scan.cuh>
+
 #include <algorithm>
 #include <array>
 #include <cstdarg>
@@ -130,16 +132,30 @@ __launch_bounds__(kSortThreads) __global__
         if (e >= 0 && e < experts) { atomicAdd(count + e, 1); }
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-        int run = 0, listed = 0;
-        for (int e = 0; e < experts; ++e) {
-            bounds[e] = run;
-            cursor[e] = run;
-            run += count[e];
-            if (count[e] != 0) { active[listed++] = e; }
-        }
+    // Each thread owns a run of consecutive experts; two block scans give every run its first
+    // pair and its first active slot.
+    using Scan = cub::BlockScan<int, kSortThreads>;
+    __shared__ typename Scan::TempStorage scan;
+    const int per   = (experts + kSortThreads - 1) / kSortThreads;
+    const int first = threadIdx.x * per;
+    int owned = 0, used = 0;
+    for (int e = first; e < min(first + per, experts); ++e) {
+        owned += count[e];
+        used += count[e] != 0;
+    }
+    int run = 0, listed = 0, listed_total = 0;
+    Scan(scan).ExclusiveSum(owned, run);
+    __syncthreads();
+    Scan(scan).ExclusiveSum(used, listed, listed_total);
+    for (int e = first; e < min(first + per, experts); ++e) {
+        bounds[e] = run;
+        cursor[e] = run;
+        run += count[e];
+        if (count[e] != 0) { active[listed++] = e; }
+    }
+    if (threadIdx.x == kSortThreads - 1) {
         bounds[experts] = run;
-        *active_count   = listed;
+        *active_count   = listed_total;
     }
     __syncthreads();
     for (int p = threadIdx.x; p < pairs; p += blockDim.x) {

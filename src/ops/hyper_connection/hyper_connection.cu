@@ -1,7 +1,9 @@
 // ninfer::ops - hyper-connection read/write of Qwen3.8-Flash-Next (contract in
 // include/ninfer/ops/hyper_connection.h). Four launches: per-stream RMSNorm into FP32 workspace,
 // the down and inject GEMVs with their activations, the up GEMV with the gated stream mix, and the
-// weighted write. Every product accumulates in FP32; the weights stream once per column chunk.
+// weighted write. Every product accumulates in FP32. The two GEMVs stream their 6.5 MB of weights
+// in 16-byte vectors with every CTA busy at one token: the down rows split K over a CTA's warps,
+// the up rows of eight hidden indices are one contiguous run per stream.
 #include "ninfer/ops/hyper_connection.h"
 
 #include "core/device.h"
@@ -21,8 +23,20 @@ constexpr std::int32_t kStreams = 4;
 constexpr std::int32_t kHidden  = 2560;
 constexpr std::int32_t kLowrank = 320;
 constexpr std::int32_t kWidth   = kStreams * kHidden;
-// Columns one warp accumulates at once; wider calls loop over column chunks.
+// Tokens one CTA accumulates at once; wider calls cover column chunks with grid.y.
 constexpr int kColumnChunk = 8;
+// The down GEMV: one CTA per row, its warps splitting the 10240-wide input.
+constexpr int kDownWarps = 8;
+constexpr int kDownSlice = kWidth / kDownWarps; // 1280 inputs, five 8-wide vectors per lane
+static_assert(kDownSlice % 256 == 0);
+// The up GEMV: per CTA eight hidden indices, one warp per stream, four lanes per 320-wide row.
+constexpr int kUpRows    = 8;
+constexpr int kUpLanes   = 4;
+constexpr int kUpVectors = kLowrank / 8; // 40 per row
+static_assert(kUpRows * kUpLanes == 32 && kUpVectors % kUpLanes == 0);
+static_assert(kUpRows * kColumnChunk <= kStreams * 32);
+// The norm: one thread per four values of a stream.
+constexpr int kNormThreads = kHidden / 4;
 
 __device__ __forceinline__ float warp_sum(float value) {
 #pragma unroll
@@ -34,121 +48,150 @@ __device__ __forceinline__ float warp_sum(float value) {
 
 __device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + __expf(-x)); }
 
-// One block per (stream, token): xn = x * rsqrt(mean x^2 + eps) * (1 + g).
-__global__ void __launch_bounds__(256)
-    hc_norm_kernel(const float* __restrict__ stack, const __nv_bfloat16* __restrict__ norm,
-                   float eps, float* __restrict__ normalized) {
-    const int c                 = blockIdx.x;
-    const int t                 = blockIdx.y;
-    const std::int64_t base     = (static_cast<std::int64_t>(t) * kStreams + c) * kHidden;
-    __shared__ float partial[8];
-    float sum = 0.0f;
-    for (int d = threadIdx.x; d < kHidden; d += blockDim.x) {
-        const float x = stack[base + d];
-        sum += x * x;
-    }
-    sum = warp_sum(sum);
-    if ((threadIdx.x & 31) == 0) { partial[threadIdx.x >> 5] = sum; }
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float total = threadIdx.x < blockDim.x / 32 ? partial[threadIdx.x] : 0.0f;
-        total       = warp_sum(total);
-        if (threadIdx.x == 0) { partial[0] = total; }
-    }
-    __syncthreads();
-    const float scale = rsqrtf(partial[0] / kHidden + eps);
-    for (int d = threadIdx.x; d < kHidden; d += blockDim.x) {
-        normalized[base + d] =
-            stack[base + d] * scale * (1.0f + __bfloat162float(norm[c * kHidden + d]));
+__device__ __forceinline__ void unpack_bf16x8(const uint4& v, float (&out)[8]) {
+    const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(&v);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 f = __bfloat1622float2(pairs[i]);
+        out[2 * i]     = f.x;
+        out[2 * i + 1] = f.y;
     }
 }
 
-// One warp per output row of [down; inject] (lowrank + streams rows over the 10240-wide input).
-// Rows below lowrank write silu(v / n) to `low`; inject rows write 2 sigmoid(v / n).
-__global__ void __launch_bounds__(256)
+// Eight consecutive FP32 values, 32-byte aligned.
+__device__ __forceinline__ void load_f32x8(const float* p, float (&out)[8]) {
+    const float4 a = *reinterpret_cast<const float4*>(p);
+    const float4 b = *reinterpret_cast<const float4*>(p + 4);
+    out[0] = a.x, out[1] = a.y, out[2] = a.z, out[3] = a.w;
+    out[4] = b.x, out[5] = b.y, out[6] = b.z, out[7] = b.w;
+}
+
+// One block per (stream, token), four values per thread: xn = x * rsqrt(mean x^2 + eps) * (1 + g).
+__global__ void __launch_bounds__(kNormThreads)
+    hc_norm_kernel(const float* __restrict__ stack, const __nv_bfloat16* __restrict__ norm,
+                   float eps, float* __restrict__ normalized) {
+    const int c             = blockIdx.x;
+    const int t             = blockIdx.y;
+    const std::int64_t base = (static_cast<std::int64_t>(t) * kStreams + c) * kHidden;
+    __shared__ float partial[kNormThreads / 32];
+    const float4 x = reinterpret_cast<const float4*>(stack + base)[threadIdx.x];
+    float sum      = warp_sum(x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w);
+    if ((threadIdx.x & 31) == 0) { partial[threadIdx.x >> 5] = sum; }
+    __syncthreads();
+    sum = 0.0f;
+#pragma unroll
+    for (int w = 0; w < kNormThreads / 32; ++w) { sum += partial[w]; }
+    const float scale = rsqrtf(sum / kHidden + eps);
+    const auto* g   = reinterpret_cast<const __nv_bfloat162*>(norm + c * kHidden) + 2 * threadIdx.x;
+    const float2 g0 = __bfloat1622float2(g[0]), g1 = __bfloat1622float2(g[1]);
+    reinterpret_cast<float4*>(normalized + base)[threadIdx.x] =
+        make_float4(x.x * scale * (1.0f + g0.x), x.y * scale * (1.0f + g0.y),
+                    x.z * scale * (1.0f + g1.x), x.w * scale * (1.0f + g1.y));
+}
+
+// One block per (row of [down; inject], column chunk): lowrank + streams rows over the 10240-wide
+// input, each warp a 1280-wide slice. Rows below lowrank write silu(v / n) to `low`; inject rows
+// write 2 sigmoid(v / n).
+__global__ void __launch_bounds__(kDownWarps * 32)
     hc_down_kernel(const float* __restrict__ normalized, const __nv_bfloat16* __restrict__ down,
-                   const __nv_bfloat16* __restrict__ inject, int tokens, int rows,
-                   float* __restrict__ low, float* __restrict__ inject_weights) {
-    const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
-    const int lane = threadIdx.x & 31;
-    if (row >= rows) { return; }
+                   const __nv_bfloat16* __restrict__ inject, int tokens, float* __restrict__ low,
+                   float* __restrict__ inject_weights) {
+    __shared__ float partial[kDownWarps][kColumnChunk];
+    const int row   = blockIdx.x;
+    const int t0    = blockIdx.y * kColumnChunk;
+    const int count = min(kColumnChunk, tokens - t0);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const __nv_bfloat16* weights = row < kLowrank
                                        ? down + static_cast<std::int64_t>(row) * kWidth
                                        : inject + static_cast<std::int64_t>(row - kLowrank) * kWidth;
-    for (int t0 = 0; t0 < tokens; t0 += kColumnChunk) {
-        const int count = min(kColumnChunk, tokens - t0);
-        float acc[kColumnChunk] = {};
-        for (int k = lane * 2; k < kWidth; k += 64) {
-            const float2 w = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(weights + k));
+    const int first              = warp * kDownSlice;
+    float acc[kColumnChunk]      = {};
 #pragma unroll
-            for (int j = 0; j < kColumnChunk; ++j) {
-                if (j < count) {
-                    const float2 x = *reinterpret_cast<const float2*>(
-                        normalized + static_cast<std::int64_t>(t0 + j) * kWidth + k);
-                    acc[j] = fmaf(w.x, x.x, fmaf(w.y, x.y, acc[j]));
-                }
-            }
-        }
+    for (int i = 0; i < kDownSlice / 256; ++i) {
+        const int k = first + 8 * (lane + 32 * i);
+        float w[8];
+        unpack_bf16x8(__ldg(reinterpret_cast<const uint4*>(weights + k)), w);
 #pragma unroll
         for (int j = 0; j < kColumnChunk; ++j) {
-            const float v = warp_sum(acc[j]) / kStreams;
-            if (lane == 0 && j < count) {
-                const int t = t0 + j;
-                if (row < kLowrank) {
-                    low[static_cast<std::int64_t>(t) * kLowrank + row] = v * sigmoid_f(v);
-                } else {
-                    inject_weights[static_cast<std::int64_t>(t) * kStreams + row - kLowrank] =
-                        2.0f * sigmoid_f(v);
-                }
+            if (j < count) {
+                float x[8];
+                load_f32x8(normalized + static_cast<std::int64_t>(t0 + j) * kWidth + k, x);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) { acc[j] = fmaf(w[e], x[e], acc[j]); }
             }
         }
     }
+#pragma unroll
+    for (int j = 0; j < kColumnChunk; ++j) {
+        const float v = warp_sum(acc[j]);
+        if (lane == 0) { partial[warp][j] = v; }
+    }
+    __syncthreads();
+    if (warp != 0 || lane >= count) { return; }
+    float v = 0.0f;
+#pragma unroll
+    for (int w = 0; w < kDownWarps; ++w) { v += partial[w][lane]; }
+    v /= kStreams;
+    const int t = t0 + lane;
+    if (row < kLowrank) {
+        low[static_cast<std::int64_t>(t) * kLowrank + row] = v * sigmoid_f(v);
+    } else {
+        inject_weights[static_cast<std::int64_t>(t) * kStreams + row - kLowrank] =
+            2.0f * sigmoid_f(v);
+    }
 }
 
-// One warp per hidden index d: the four gate rows c * hidden + d of `up` (each lowrank wide)
-// against lo, then mixed[d] = (1/n) sum_c sigmoid(gate_c) xn[c, d].
-__global__ void __launch_bounds__(256)
+// One block per (eight consecutive hidden indices, column chunk), one warp per stream c: the
+// eight gate rows c * hidden + d of `up` are contiguous (each lowrank wide), four lanes on each.
+// Then mixed[d] = (1/n) sum_c sigmoid(gate_c) xn[c, d].
+__global__ void __launch_bounds__(kStreams * 32)
     hc_up_mix_kernel(const float* __restrict__ normalized, const float* __restrict__ low,
                      const __nv_bfloat16* __restrict__ up, int tokens,
                      __nv_bfloat16* __restrict__ mixed) {
-    const int d    = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
+    __shared__ float gated[kStreams][kUpRows][kColumnChunk];
+    const int c    = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    if (d >= kHidden) { return; }
-    for (int t0 = 0; t0 < tokens; t0 += kColumnChunk) {
-        const int count = min(kColumnChunk, tokens - t0);
-        float out[kColumnChunk] = {};
+    const int r = lane / kUpLanes, part = lane % kUpLanes;
+    const int d0                 = blockIdx.x * kUpRows;
+    const int d                  = d0 + r;
+    const int t0                 = blockIdx.y * kColumnChunk;
+    const int count              = min(kColumnChunk, tokens - t0);
+    const __nv_bfloat16* weights = up + static_cast<std::int64_t>(c * kHidden + d) * kLowrank;
+    float acc[kColumnChunk]      = {};
 #pragma unroll
-        for (int c = 0; c < kStreams; ++c) {
-            const __nv_bfloat16* weights =
-                up + static_cast<std::int64_t>(c * kHidden + d) * kLowrank;
-            float acc[kColumnChunk] = {};
-            for (int k = lane * 2; k < kLowrank; k += 64) {
-                const float2 w =
-                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(weights + k));
+    for (int i = 0; i < kUpVectors / kUpLanes; ++i) {
+        const int v = part + kUpLanes * i;
+        float w[8];
+        unpack_bf16x8(__ldg(reinterpret_cast<const uint4*>(weights + 8 * v)), w);
 #pragma unroll
-                for (int j = 0; j < kColumnChunk; ++j) {
-                    if (j < count) {
-                        const float2 x = *reinterpret_cast<const float2*>(
-                            low + static_cast<std::int64_t>(t0 + j) * kLowrank + k);
-                        acc[j] = fmaf(w.x, x.x, fmaf(w.y, x.y, acc[j]));
-                    }
-                }
-            }
+        for (int j = 0; j < kColumnChunk; ++j) {
+            if (j < count) {
+                float x[8];
+                load_f32x8(low + static_cast<std::int64_t>(t0 + j) * kLowrank + 8 * v, x);
 #pragma unroll
-            for (int j = 0; j < kColumnChunk; ++j) {
-                const float gate = sigmoid_f(warp_sum(acc[j]));
-                if (j < count) {
-                    out[j] += gate * normalized[static_cast<std::int64_t>(t0 + j) * kWidth +
-                                                c * kHidden + d];
-                }
+                for (int e = 0; e < 8; ++e) { acc[j] = fmaf(w[e], x[e], acc[j]); }
             }
         }
-        if (lane == 0) {
-            for (int j = 0; j < count; ++j) {
-                mixed[static_cast<std::int64_t>(t0 + j) * kHidden + d] =
-                    __float2bfloat16_rn(out[j] / kStreams);
-            }
+    }
+#pragma unroll
+    for (int j = 0; j < kColumnChunk; ++j) {
+        acc[j] += __shfl_xor_sync(0xffffffffu, acc[j], 1);
+        acc[j] += __shfl_xor_sync(0xffffffffu, acc[j], 2);
+        if (part == 0 && j < count) {
+            gated[c][r][j] =
+                sigmoid_f(acc[j]) *
+                normalized[static_cast<std::int64_t>(t0 + j) * kWidth + c * kHidden + d];
         }
+    }
+    __syncthreads();
+    if (threadIdx.x >= kUpRows * kColumnChunk) { return; }
+    const int row = threadIdx.x / kColumnChunk, j = threadIdx.x % kColumnChunk;
+    if (j < count) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int s = 0; s < kStreams; ++s) { sum += gated[s][row][j]; }
+        mixed[static_cast<std::int64_t>(t0 + j) * kHidden + d0 + row] =
+            __float2bfloat16_rn(sum / kStreams);
     }
 }
 
@@ -182,8 +225,11 @@ void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("hyper_connection: ") + message); }
 }
 
+bool aligned16(const void* pointer) { return reinterpret_cast<std::uintptr_t>(pointer) % 16 == 0; }
+
+// The kernels read the weights in 16-byte vectors.
 void require_bf16(const Tensor* tensor, std::int32_t n0, std::int32_t n1, const char* name) {
-    require(tensor != nullptr && tensor->data != nullptr, name);
+    require(tensor != nullptr && tensor->data != nullptr && aligned16(tensor->data), name);
     require(tensor->dtype == DType::BF16 && tensor->is_contiguous() && tensor->ne[0] == n0 &&
                 tensor->ne[1] == n1 && tensor->ne[2] == 1 && tensor->ne[3] == 1,
             name);
@@ -211,8 +257,9 @@ void hyper_connection_read(const Tensor& stack, const HyperConnectionWeights& we
                            WorkspaceArena& workspace, Tensor& mixed, Tensor* inject_weights,
                            cudaStream_t stream) {
     require(stack.dtype == DType::FP32 && stack.is_contiguous() && stack.data != nullptr &&
-                stack.ne[0] == kHidden && stack.ne[1] == kStreams && stack.ne[3] == 1,
-            "stack must be contiguous FP32 [2560, 4, tokens]");
+                aligned16(stack.data) && stack.ne[0] == kHidden && stack.ne[1] == kStreams &&
+                stack.ne[3] == 1,
+            "stack must be contiguous 16-byte aligned FP32 [2560, 4, tokens]");
     const std::int32_t tokens = stack.ne[2];
     require(tokens > 0, "tokens must be positive");
     require(eps > 0.0f, "eps must be positive");
@@ -239,20 +286,21 @@ void hyper_connection_read(const Tensor& stack, const HyperConnectionWeights& we
     float* inject_out  = inject_weights != nullptr ? static_cast<float*>(inject_weights->data)
                                                    : static_cast<float*>(scratch.data);
 
-    hc_norm_kernel<<<dim3(kStreams, tokens), 256, 0, stream>>>(
+    hc_norm_kernel<<<dim3(kStreams, tokens), kNormThreads, 0, stream>>>(
         static_cast<const float*>(stack.data),
         static_cast<const __nv_bfloat16*>(weights.norm->data), eps,
         static_cast<float*>(normalized.data));
     CUDA_CHECK(cudaGetLastError());
-    const int rows = kLowrank + (weights.inject != nullptr ? kStreams : 0);
-    hc_down_kernel<<<div_up(rows, 8), 256, 0, stream>>>(
+    const int rows   = kLowrank + (weights.inject != nullptr ? kStreams : 0);
+    const int chunks = div_up(tokens, kColumnChunk);
+    hc_down_kernel<<<dim3(rows, chunks), kDownWarps * 32, 0, stream>>>(
         static_cast<const float*>(normalized.data),
         static_cast<const __nv_bfloat16*>(weights.down->data),
         weights.inject != nullptr ? static_cast<const __nv_bfloat16*>(weights.inject->data)
                                   : nullptr,
-        tokens, rows, static_cast<float*>(low.data), inject_out);
+        tokens, static_cast<float*>(low.data), inject_out);
     CUDA_CHECK(cudaGetLastError());
-    hc_up_mix_kernel<<<div_up(kHidden, 8), 256, 0, stream>>>(
+    hc_up_mix_kernel<<<dim3(kHidden / kUpRows, chunks), kStreams * 32, 0, stream>>>(
         static_cast<const float*>(normalized.data), static_cast<const float*>(low.data),
         static_cast<const __nv_bfloat16*>(weights.up->data), tokens,
         static_cast<__nv_bfloat16*>(mixed.data));

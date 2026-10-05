@@ -4,7 +4,8 @@
 // tile (for example a full-precision vocab projection kept as BF16 by a QAT checkpoint). Computes
 // out[T, N] = x[T, K] * weight[N, K]^T with an fp32 accumulation and a BF16 store, matching the
 // contiguous token-major layout of the specialised kernels. Tiling is fixed and the extents are
-// runtime, so any (N, K, T) is handled without a per-shape instantiation.
+// runtime, so any (N, K, T) is handled without a per-shape instantiation. Up to eight tokens over
+// 16-byte rows take the GEMV form instead: one warp per output row streams the row once.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -87,6 +88,60 @@ __global__ void bf16_general_gemm_kernel(const __nv_bfloat16* __restrict__ x,
                         __float2bfloat16_rn(accum[rr][cc]);
                 }
             }
+        }
+    }
+}
+
+// One warp per output row: the row in 16-byte vectors (K a multiple of 8), every token's sum in a
+// register, FP32 accumulation and a BF16 store.
+constexpr std::int32_t kGemvMaxTokens = 8;
+constexpr std::int32_t kGemvWarps     = 8;
+
+__device__ __forceinline__ void unpack_bf16x8(const uint4& v, float (&out)[8]) {
+    const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(&v);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 f = __bfloat1622float2(pairs[i]);
+        out[2 * i]     = f.x;
+        out[2 * i + 1] = f.y;
+    }
+}
+
+template <int T>
+__global__ void __launch_bounds__(kGemvWarps * 32)
+    bf16_general_gemv_kernel(const __nv_bfloat16* __restrict__ x,
+                             const __nv_bfloat16* __restrict__ weight,
+                             __nv_bfloat16* __restrict__ out, std::int32_t N, std::int32_t K) {
+    const std::int32_t row  = static_cast<std::int32_t>(blockIdx.x) * kGemvWarps +
+                              static_cast<std::int32_t>(threadIdx.x >> 5);
+    const std::int32_t lane = static_cast<std::int32_t>(threadIdx.x & 31);
+    if (row >= N) { return; }
+    const auto* w = reinterpret_cast<const uint4*>(weight + static_cast<std::int64_t>(row) * K);
+    const std::int32_t vectors = K / 8;
+    float acc[T]               = {};
+    for (std::int32_t v = lane; v < vectors; v += 32) {
+        float wf[8];
+        unpack_bf16x8(__ldg(w + v), wf);
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            float xf[8];
+            unpack_bf16x8(
+                *reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(t) * K + 8 * v), xf);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) { acc[t] = fmaf(wf[i], xf[i], acc[t]); }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            acc[t] += __shfl_xor_sync(0xffffffffu, acc[t], offset);
+        }
+    }
+    if (lane == 0) {
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            out[static_cast<std::int64_t>(t) * N + row] = __float2bfloat16_rn(acc[t]);
         }
     }
 }

@@ -259,21 +259,25 @@ int run_selector_linear() {
 
 int run_general_bf16_linear() {
     // Shapes outside the specialised table (14336/5120, 5120/6144, 256/5120) route to the general
-    // runtime-shape GEMM fallback. Cover the minimal tile, non-tile-aligned extents (the row/column
-    // boundary guards), multi-tile grids, and the QAT full-precision vocab head's real shape.
+    // runtime-shape GEMM fallback, or its GEMV form up to eight tokens when K is a multiple of 8.
+    // Cover the minimal tile, non-tile-aligned extents (the row/column boundary guards), multi-tile
+    // grids, the QAT full-precision vocab head's real shape, and Qwen3.8-Flash-Next's BF16
+    // projections (the Gated DeltaNet a/b rows and the sparse-attention indexer).
     int failures = 0;
     const std::vector<std::pair<int, int>> shapes = {
         {32, 32},   // exactly one 32x32 tile
-        {50, 70},   // not a multiple of 32 in either extent
+        {50, 70},   // not a multiple of 32 in either extent; K not a multiple of 8 (no GEMV)
         {63, 33},   // odd extents
         {128, 256}, // multiple tiles
+        {32, 2560},     // Flash-Next GDN a / b
+        {640, 2560},    // Flash-Next indexer q/k
         {248320, 5120},  // QAT bf16 lm_head [vocab, hidden]
     };
     for (const auto& [n, k] : shapes) {
         DeviceWeight weight(make_patterned(n, k, 421U));
         // The vocab head's host reference is costly, so it covers decode widths only.
-        const std::vector<int> widths =
-            n > 4096 ? std::vector<int>{1, 2} : std::vector<int>{1, 2, 32, 33, 128};
+        const std::vector<int> widths = n > 4096 ? std::vector<int>{1, 2}
+                                                 : std::vector<int>{1, 2, 3, 7, 8, 9, 32, 33, 128};
         for (int tokens : widths) { failures += run_bf16_linear_case(weight, tokens); }
     }
     return failures;

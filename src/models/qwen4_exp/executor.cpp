@@ -476,7 +476,9 @@ struct Executor::Impl {
             static_cast<std::int32_t>(config.hc_count),
             static_cast<std::int32_t>(config.hidden_size),
             static_cast<std::int32_t>(config.hc_lowrank), t);
-        bytes = std::max(bytes, ops::moe_experts_gguf_workspace_bytes(t));
+        bytes = std::max(
+            {bytes, ops::moe_experts_gguf_workspace_bytes(t),
+             ops::moe_route_workspace_bytes(t, static_cast<std::int32_t>(config.num_experts))});
         for (const auto& plan : layers) {
             if (plan.rank != rank) { continue; }
             if (plan.gdn) {
@@ -938,7 +940,10 @@ struct Executor::Impl {
         Tensor ids(route_records[index].p, DType::I32, {top, t});
         Tensor weights(rank.route_weights, DType::FP32, {top, t});
         Tensor shared(rank.route_shared, DType::FP32, {t});
-        ops::moe_route(mixed, m.router, m.shared_gate, ids, weights, shared, s);
+        {
+            auto scope = ws.scope();
+            ops::moe_route(mixed, m.router, m.shared_gate, ws, ids, weights, shared, s);
+        }
         if (stream) {
             // The routes reach the host before the layer's experts can be made resident.
             auto* host = static_cast<std::int32_t*>(route_host->data()) +

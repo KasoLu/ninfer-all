@@ -1,8 +1,12 @@
 #pragma once
 
+#include "core/arena.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h> // cudaStream_t
+
+#include <cstddef>
+#include <cstdint>
 
 namespace ninfer::ops {
 
@@ -19,9 +23,13 @@ namespace ninfer::ops {
  *
  * Outputs: `ids` I32 [10, tokens], `weights` FP32 [10, tokens], `shared` FP32 [tokens]. The oracle
  * evaluates in FP64 from the represented inputs; ids must match it up to experts whose FP64
- * logits tie the tenth within 1e-5, weights and shared are compared as FP32.
+ * logits tie the tenth within 1e-5, weights and shared are compared as FP32. The logits pass
+ * through FP32 workspace.
  */
-void moe_route(const Tensor& m, const Tensor& router, const Tensor& shared_gate, Tensor& ids,
-               Tensor& weights, Tensor& shared, cudaStream_t stream);
+[[nodiscard]] std::size_t moe_route_workspace_bytes(std::int32_t tokens, std::int32_t experts);
+
+void moe_route(const Tensor& m, const Tensor& router, const Tensor& shared_gate,
+               WorkspaceArena& workspace, Tensor& ids, Tensor& weights, Tensor& shared,
+               cudaStream_t stream);
 
 } // namespace ninfer::ops

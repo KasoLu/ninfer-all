@@ -350,7 +350,8 @@ void moe(Context& c, int layer, const Tensor& m, Tensor& y) {
         ids(static_cast<std::size_t>(10) * T * 4), weights(static_cast<std::size_t>(10) * T * 4), shared(static_cast<std::size_t>(T) * 4);
     Tensor t_router(router.buffer.p, DType::BF16, {kH, 512}), t_sg(shared_gate.buffer.p, DType::BF16, {kH}),
         t_ids(ids.buffer.p, DType::I32, {10, T}), t_w(weights.buffer.p, DType::FP32, {10, T}), t_shared(shared.buffer.p, DType::FP32, {T});
-    ops::moe_route(m, t_router, t_sg, t_ids, t_w, t_shared, c.device.stream);
+    WorkspaceArena route_ws(ops::moe_route_workspace_bytes(T, 512));
+    ops::moe_route(m, t_router, t_sg, route_ws, t_ids, t_w, t_shared, c.device.stream);
     Device gate_up(c.ckpt.bytes(p + "experts.gate_up_proj")), down(c.ckpt.bytes(p + "experts.down_proj"));
     auto sgu = c.ckpt.bytes(p + "shared_expert.gate_proj.weight");
     const auto su = c.ckpt.bytes(p + "shared_expert.up_proj.weight");
