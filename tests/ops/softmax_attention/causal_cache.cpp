@@ -16,11 +16,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace ninfer;
@@ -3437,11 +3439,24 @@ int run_quantized_batch_cases(KvCacheStorage storage, std::uint32_t seed) {
     return failures;
 }
 
+// NINFER_WIDE_PROGRESS names each wide case on stdout before it runs, so a launch that faults the
+// device (the rest of the run then fails) is tied to its case.
+void wide_progress(const Geometry& geometry, KvCacheStorage storage, const char* kind,
+                   std::int32_t width, std::int64_t base, std::int64_t detail = -1) {
+    static const bool enabled = std::getenv("NINFER_WIDE_PROGRESS") != nullptr;
+    if (!enabled) { return; }
+    std::cout << "wide " << geometry.name << ' ' << cache_name(storage) << ' ' << kind
+              << " width=" << width << " base=" << base;
+    if (detail >= 0) { std::cout << " detail=" << detail; }
+    std::cout << std::endl;
+}
+
 // Copy verification: one request verifies 17..64 columns through the chunked single-row route.
 int run_wide_copy_cases(KvCacheStorage storage) {
     int failures = 0;
     for (const Geometry& geometry : kGeometries) {
         for (std::int32_t width = 17; width <= 64; ++width) {
+            wide_progress(geometry, storage, "batch", width, 127);
             failures += run_batch_case(geometry, storage,
                                        {width,
                                         {127},
@@ -3453,6 +3468,7 @@ int run_wide_copy_cases(KvCacheStorage storage) {
         }
         for (std::int32_t width : {17, 24, 32, 33, 48, 64}) {
             for (std::int32_t valid : {0, 1, width - 1, width}) {
+                wide_progress(geometry, storage, "batch", width, 2048, valid);
                 failures += run_batch_case(geometry, storage,
                                            {width,
                                             {2048},
@@ -3462,6 +3478,7 @@ int run_wide_copy_cases(KvCacheStorage storage) {
                                             static_cast<std::uint32_t>(2000 + width + valid),
                                             true});
             }
+            wide_progress(geometry, storage, "a1+a3 wide", width, 8192);
             failures += run_a1_case(geometry, storage,
                                     {.tokens            = width,
                                      .base              = 8192,
@@ -3483,6 +3500,7 @@ int run_wide_copy_cases(KvCacheStorage storage) {
         // still inside the prompt-route region. Width 65 remains a prompt operation.
         for (std::int32_t width : {17, 32, 33, 64, 65}) {
             for (std::uint32_t maximum : {256u, 257u, 320u, 321u, 640u, 641u, 1024u, 1025u}) {
+                wide_progress(geometry, storage, "a3 loose envelope", width, 31, maximum);
                 failures += run_a3_case(geometry, storage,
                                         {.tokens            = width,
                                          .base              = 31,
@@ -3493,6 +3511,7 @@ int run_wide_copy_cases(KvCacheStorage storage) {
             }
         }
         for (std::int32_t width : {17, 32, 33, 64}) {
+            wide_progress(geometry, storage, "a1 graph", width, 8192);
             failures += run_a1_case(geometry, storage,
                                     {.tokens       = width,
                                      .base         = 8192,
@@ -3513,6 +3532,7 @@ int run_wide_copy_cases(KvCacheStorage storage) {
                                  .small_prefill = true};
         };
         for (std::int32_t width : {16, 17, 24, 33, 48, 64, 65}) {
+            wide_progress(geometry, storage, "a1 small prefill", width, 8192);
             failures += run_a1_case(geometry, storage, prefill(width, 8192, 2201u),
                                     MappingPattern::Fragmented);
             failures +=
@@ -3521,6 +3541,8 @@ int run_wide_copy_cases(KvCacheStorage storage) {
         for (std::int32_t width : {17, 40, 64}) {
             const std::int32_t threshold = width * keys_per_row;
             for (std::int32_t visible : {threshold - 1, threshold}) {
+                wide_progress(geometry, storage, "a1 small prefill threshold", width,
+                              visible - width);
                 failures += run_a1_case(geometry, storage, prefill(width, visible - width, 2203u),
                                         MappingPattern::Fragmented);
             }
@@ -4085,12 +4107,18 @@ int run_softmax_attention_wide_tests() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
-    int failures = verify_workspace_capacity_contract();
+    // NINFER_WIDE_STORAGE=<cache name> runs one storage's wide cases alone.
+    const char* only     = std::getenv("NINFER_WIDE_STORAGE");
+    const auto selected  = [only](KvCacheStorage storage) {
+        return only == nullptr || std::string_view(only) == cache_name(storage);
+    };
+    int failures = only == nullptr ? verify_workspace_capacity_contract() : 0;
     for (const auto storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256}) {
-        failures += run_wide_copy_cases(storage);
+        if (selected(storage)) { failures += run_wide_copy_cases(storage); }
     }
     for (const auto storage : {KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value}) {
+        if (!selected(storage)) { continue; }
         failures += run_case_allowing_arch_skip("causal_softmax_attention wide copy (NVFP4 values)",
                                                 [storage] { return run_wide_copy_cases(storage); });
     }
