@@ -397,10 +397,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         if (out.arenas_[rank] && capacity) {
             (void)out.arenas_[rank]->alloc_bytes(static_cast<std::size_t>(capacity), 1);
         }
-        if (rank != 0) {
-            out.stats_.offloaded_device_capacity_bytes = checked_add(
-                out.stats_.offloaded_device_capacity_bytes, capacity, "offloaded device capacity");
-        }
+        out.stats_.device_capacity_by_rank.push_back(capacity);
     }
     if (plan.pinned_capacity_bytes > std::numeric_limits<std::size_t>::max()) {
         throw ArtifactError("pinned Host backing exceeds size_t");

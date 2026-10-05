@@ -240,6 +240,19 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("CUDA Graph allowance", format_bytes(memory.cuda_graph_allowance_bytes));
     print_metric("CUDA Graph used", format_bytes(memory.cuda_graph_measured_bytes));
     print_metric("planned device total", format_bytes(reserved));
+    if (memory.expert_cache_bytes != 0) {
+        print_metric("gpu expert cache", format_bytes(memory.expert_cache_bytes));
+    }
+    // A pipeline: each device's own share, the primary device's repeated from above.
+    for (const auto& stage : memory.devices) {
+        const std::string gpu = "gpu " + std::to_string(stage.device) + " ";
+        print_metric(gpu + "weights", format_arena_used(stage.weights));
+        print_metric(gpu + "sequence", format_arena_used(stage.sequence));
+        print_metric(gpu + "workspace peak", format_arena_peak(stage.workspace));
+        if (stage.expert_cache_bytes != 0) {
+            print_metric(gpu + "expert cache", format_bytes(stage.expert_cache_bytes));
+        }
+    }
 
     const ninfer::SpeculativeStats& speculative = result.speculative;
     if (speculative.enabled) {

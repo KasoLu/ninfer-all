@@ -78,8 +78,8 @@ struct MaterializationStats {
     std::uint64_t read_bytes = 0; // Actual payload reads, including direct-I/O alignment.
     std::uint64_t h2d_bytes  = 0;
     std::uint64_t device_capacity_bytes = 0; // primary device (rank 0)
-    // Expert-offload split only: the weight arenas held by the ranks past the primary device.
-    std::uint64_t offloaded_device_capacity_bytes = 0;
+    // The weight arena of every rank, the primary device's first; one entry on one device.
+    std::vector<std::uint64_t> device_capacity_by_rank;
     std::uint64_t retained_host_bytes   = 0;
     std::uint64_t owned_value_bytes     = 0;
     std::uint64_t pinned_bytes          = 0; // page-locked Host block (Residency::Pinned)

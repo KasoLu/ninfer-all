@@ -889,6 +889,28 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         out.host_kv_capacity_bytes = host_kv_arena->capacity_bytes();
         out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes();
     }
+    if (device.size() > 1) {
+        // The primary device's figures are the fields above. The work arena borrows a slice of
+        // each further device's scratch and keeps a peak per rank; between passes it holds none.
+        out.devices.push_back({.device    = out.device,
+                               .weights   = out.weights,
+                               .sequence  = out.sequence,
+                               .workspace = out.workspace});
+        for (std::size_t rank = 1; rank < device.size(); ++rank) {
+            const std::size_t weight_bytes =
+                rank < weights.device_capacity_by_rank.size()
+                    ? weights.device_capacity_by_rank[rank]
+                    : 0;
+            const DeviceArena& state = persistent_by_rank.at(rank - 1);
+            out.devices.push_back(
+                {.device    = device.rank(rank).device,
+                 .weights   = ArenaMemorySummary{weight_bytes, weight_bytes, weight_bytes},
+                 .sequence  = ArenaMemorySummary{state.capacity(), state.used(), state.peak_used()},
+                 .workspace = ArenaMemorySummary{
+                     workspace_storage_by_rank.at(rank - 1).capacity(), 0,
+                     rank < work.rank_count() ? work.peak_used_for_rank(rank) : 0}});
+        }
+    }
     return out;
 }
 

@@ -1447,6 +1447,16 @@ struct ResidencyStatus {
     std::string last_error;
 };
 
+// One device of a pipeline: what its weights, its layers' persistent state, its scratch and its
+// expert cache hold there.
+struct DeviceMemorySummary {
+    int device = 0;
+    ArenaMemorySummary weights;
+    ArenaMemorySummary sequence;
+    ArenaMemorySummary workspace;
+    std::size_t expert_cache_bytes = 0;
+};
+
 struct MemorySummary {
     int device                                = 0;
     std::uint32_t max_context                 = 0;
@@ -1483,6 +1493,12 @@ struct MemorySummary {
     std::size_t host_kv_page_group_bytes = 0;
     // Engaged only when the single host RAM budget mode is active.
     std::size_t host_cache_budget_bytes = 0;
+    // Qwen3.8-Flash-Next host or disk experts: device memory lent to the expert cache, over every
+    // device.
+    std::size_t expert_cache_bytes = 0;
+    // A pipeline over several devices: each device in stage order, the primary one (which the
+    // single-device fields above describe) first. Empty on one device.
+    std::vector<DeviceMemorySummary> devices;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;
