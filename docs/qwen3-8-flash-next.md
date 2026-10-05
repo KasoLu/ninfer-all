@@ -255,3 +255,9 @@ identically (14,336 targets) give, with a BF16 KV cache in both:
 |---|---:|---:|---|
 | Q2_0 | 2.6579 | 2.6502 | -0.014 to +0.016 nats |
 | IQ3_S | 2.1317 | 2.1278 | -0.022 to +0.016 nats |
+
+Q2_0 read 2.6558 on the RTX 3090 before wide MoE calls moved to ggml's matrix kernel and wide
+hyper-connection reads to BF16 GEMMs. On an L40S the four combinations of the two changes give
+2.6489 (both, today's kernels), 2.6494 (the matrix kernel alone), 2.6495 (neither) and 2.6555 (the
+GEMMs alone): rounding-order differences within 0.25% that move with the kernel mix and the GPU,
+not a loss from either change.
