@@ -1,15 +1,20 @@
 // ninfer::ops - Qwen3.8-Flash-Next sparse attention over selected blocks and the query's own
-// incomplete block (contract in include/ninfer/ops/sparse_attention.h). One CTA per (query,
-// KV head): its twelve query heads, one warp each, stream the positions in 32-key tiles staged
-// in shared memory, each lane scoring one key and accumulating eight output dims online.
+// incomplete block (contract in include/ninfer/ops/sparse_attention.h). A CTA takes one (query,
+// KV head): its twelve query heads, one warp each, stream positions in 32-key tiles staged in
+// shared memory, each lane scoring one key and accumulating eight output dims online. Up to eight
+// queries split their positions over CTAs of 64 positions each (a grid fixed for any position, so
+// a graph replays it), and a second launch merges the partial softmaxes; wider calls run the
+// whole list in one CTA per (query, KV head).
 #include "ninfer/ops/sparse_attention.h"
 
 #include "core/device.h"
+#include "core/layout.h"
 #include "ops/common/math.h"
 #include "ops/kernel/paged_kv_address.cuh"
 
 #include <cuda_bf16.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
@@ -26,18 +31,26 @@ constexpr int kTopBlocks   = 512;
 constexpr int kTile        = 32;
 constexpr int kThreads     = kGroup * 32;
 constexpr int kRowStride   = kHeadDim + 2; // BF16 elements; 129 words per row spreads the banks
+constexpr int kSplitTokens    = 8;
+constexpr int kSplitPositions = 2 * kTile;
+constexpr int kMaxPositions   = 4 * kTopBlocks + 3; // the selected blocks and the query's own
+constexpr int kSplits         = (kMaxPositions + kSplitPositions - 1) / kSplitPositions;
+constexpr int kPartialFloats  = kHeadDim + 2; // unnormalised output, running max, running sum
 
 __device__ __forceinline__ int position_at(const int* blocks, int count, int tail_begin, int i) {
     return i < 4 * count ? blocks[i >> 2] * 4 + (i & 3) : tail_begin + (i - 4 * count);
 }
 
+// Split: this CTA takes positions [64 z, 64 z + 64) of the list and leaves its partial softmax in
+// `partial`; otherwise the whole list, normalised into `out`.
+template <bool Split>
 __global__ void __launch_bounds__(kThreads)
     sparse_attention_kernel(const __nv_bfloat16* __restrict__ q, const int* __restrict__ first,
                             const int* __restrict__ selected, const int* __restrict__ counts,
                             const __nv_bfloat16* __restrict__ k_pages,
                             const __nv_bfloat16* __restrict__ v_pages,
                             const std::int32_t* __restrict__ block_table, float scale,
-                            __nv_bfloat16* __restrict__ out) {
+                            __nv_bfloat16* __restrict__ out, float* __restrict__ partial) {
     __shared__ float query[kGroup][kHeadDim];
     __shared__ __nv_bfloat16 keys[kTile * kRowStride];
     __shared__ __nv_bfloat16 values[kTile * kRowStride];
@@ -52,6 +65,8 @@ __global__ void __launch_bounds__(kThreads)
     const int tail_begin = (position + 1) / 4 * 4;
     const int total      = 4 * count + (position + 1 - tail_begin);
     const int* blocks    = selected + static_cast<std::int64_t>(t) * kTopBlocks;
+    const int begin      = Split ? static_cast<int>(blockIdx.z) * kSplitPositions : 0;
+    const int end        = Split ? min(total, begin + kSplitPositions) : total;
 
     for (int d = lane; d < kHeadDim; d += 32) {
         query[warp][d] = __bfloat162float(
@@ -60,14 +75,14 @@ __global__ void __launch_bounds__(kThreads)
 
     float running_max = -INFINITY, running_sum = 0.0f;
     float acc[8]      = {};
-    for (int base = 0; base < total; base += kTile) {
+    for (int base = begin; base < end; base += kTile) {
         __syncthreads();
         // Stage the tile: 32 rows of K and V, 4-byte words (the padded rows are not 16B aligned).
         for (int i = threadIdx.x; i < kTile * (kHeadDim / 2); i += kThreads) {
             const int row = i / (kHeadDim / 2), pair = i % (kHeadDim / 2);
             const int index = base + row;
             unsigned kw = 0, vw = 0;
-            if (index < total) {
+            if (index < end) {
                 const int p = position_at(blocks, count, tail_begin, index);
                 const std::int64_t offset =
                     paged_kv_element_offset<kHeadDim, kKvHeads>(block_table, kv_head, p, 2 * pair);
@@ -80,7 +95,7 @@ __global__ void __launch_bounds__(kThreads)
         __syncthreads();
         // Lane j scores key base + j for this warp's head.
         float score = -INFINITY;
-        if (base + lane < total) {
+        if (base + lane < end) {
             float dot = 0.0f;
             const __nv_bfloat162* row =
                 reinterpret_cast<const __nv_bfloat162*>(&keys[lane * kRowStride]);
@@ -98,7 +113,7 @@ __global__ void __launch_bounds__(kThreads)
         }
         const float new_max    = fmaxf(running_max, tile_max);
         const float correction = __expf(running_max - new_max);
-        const float weight     = base + lane < total ? __expf(score - new_max) : 0.0f;
+        const float weight     = base + lane < end ? __expf(score - new_max) : 0.0f;
         float weight_sum       = weight;
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -108,7 +123,7 @@ __global__ void __launch_bounds__(kThreads)
         running_max = new_max;
 #pragma unroll
         for (int i = 0; i < 8; ++i) acc[i] *= correction;
-        const int keys_in_tile = min(kTile, total - base);
+        const int keys_in_tile = min(kTile, end - base);
         for (int j = 0; j < keys_in_tile; ++j) {
             const float p = __shfl_sync(0xffffffffu, weight, j);
             const __nv_bfloat162* row =
@@ -121,11 +136,51 @@ __global__ void __launch_bounds__(kThreads)
             }
         }
     }
-    const float inverse = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
-    __nv_bfloat16* destination =
-        out + (static_cast<std::int64_t>(t) * kQueryHeads + q_head) * kHeadDim + lane * 8;
+    if constexpr (Split) {
+        float* slot =
+            partial +
+            ((static_cast<std::int64_t>(t) * kSplits + blockIdx.z) * kQueryHeads + q_head) *
+                kPartialFloats;
 #pragma unroll
-    for (int i = 0; i < 8; ++i) destination[i] = __float2bfloat16_rn(acc[i] * inverse);
+        for (int i = 0; i < 8; ++i) slot[lane * 8 + i] = acc[i];
+        if (lane == 0) {
+            slot[kHeadDim]     = running_max;
+            slot[kHeadDim + 1] = running_sum;
+        }
+    } else {
+        const float inverse = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+        __nv_bfloat16* destination =
+            out + (static_cast<std::int64_t>(t) * kQueryHeads + q_head) * kHeadDim + lane * 8;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) destination[i] = __float2bfloat16_rn(acc[i] * inverse);
+    }
+}
+
+// One CTA per (query, query head), one thread per output dim: the splits' partial softmaxes
+// rescaled to the common maximum. A split with no positions has a zero sum and adds nothing.
+__global__ void __launch_bounds__(kHeadDim)
+    sparse_attention_merge_kernel(const float* __restrict__ partial,
+                                  __nv_bfloat16* __restrict__ out) {
+    const int t = blockIdx.x, head = blockIdx.y, d = threadIdx.x;
+    const float* first_split =
+        partial + (static_cast<std::int64_t>(t) * kSplits * kQueryHeads + head) * kPartialFloats;
+    constexpr std::int64_t kStride = std::int64_t(kQueryHeads) * kPartialFloats;
+    float maximum                  = -INFINITY;
+    for (int s = 0; s < kSplits; ++s) {
+        const float* slot = first_split + s * kStride;
+        if (slot[kHeadDim + 1] > 0.0f) maximum = fmaxf(maximum, slot[kHeadDim]);
+    }
+    float sum = 0.0f, value = 0.0f;
+    for (int s = 0; s < kSplits; ++s) {
+        const float* slot = first_split + s * kStride;
+        if (slot[kHeadDim + 1] > 0.0f) {
+            const float weight = __expf(slot[kHeadDim] - maximum);
+            sum += slot[kHeadDim + 1] * weight;
+            value += slot[d] * weight;
+        }
+    }
+    out[(static_cast<std::int64_t>(t) * kQueryHeads + head) * kHeadDim + d] =
+        __float2bfloat16_rn(sum > 0.0f ? value / sum : 0.0f);
 }
 
 void require(bool condition, const char* message) {
@@ -136,9 +191,17 @@ void require(bool condition, const char* message) {
 
 } // namespace
 
+std::size_t sparse_softmax_attention_workspace_bytes(std::int32_t tokens) {
+    require(tokens > 0, "tokens must be positive");
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::FP32,
+                       {kPartialFloats, kQueryHeads, kSplits, std::min(tokens, kSplitTokens)});
+    return layout.peak_bytes(1);
+}
+
 void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, const Tensor& selected,
                               const Tensor& counts, const PagedKVLayerView& cache, float scale,
-                              Tensor& out, cudaStream_t stream) {
+                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     require(q.dtype == DType::BF16 && q.is_contiguous() && q.data != nullptr &&
                 q.ne[0] == kHeadDim && q.ne[1] == kQueryHeads && q.ne[2] > 0 && q.ne[3] == 1,
             "q must be contiguous BF16 [256, 24, tokens]");
@@ -161,13 +224,28 @@ void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, con
                 cache.block_table.data != nullptr,
             "cache must be a BF16 paged layer of 2 heads of 256");
     require(std::isfinite(scale) && scale > 0.0f, "scale must be positive and finite");
-    sparse_attention_kernel<<<dim3(tokens, kKvHeads), kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data), static_cast<const int*>(first_position.data),
-        static_cast<const int*>(selected.data), static_cast<const int*>(counts.data),
-        static_cast<const __nv_bfloat16*>(cache.k_pages.data),
-        static_cast<const __nv_bfloat16*>(cache.v_pages.data),
-        static_cast<const std::int32_t*>(cache.block_table.data), scale,
-        static_cast<__nv_bfloat16*>(out.data));
+    const auto* q_p      = static_cast<const __nv_bfloat16*>(q.data);
+    const auto* first_p  = static_cast<const int*>(first_position.data);
+    const auto* select_p = static_cast<const int*>(selected.data);
+    const auto* counts_p = static_cast<const int*>(counts.data);
+    const auto* k_p      = static_cast<const __nv_bfloat16*>(cache.k_pages.data);
+    const auto* v_p      = static_cast<const __nv_bfloat16*>(cache.v_pages.data);
+    const auto* table_p  = static_cast<const std::int32_t*>(cache.block_table.data);
+    auto* out_p          = static_cast<__nv_bfloat16*>(out.data);
+    if (tokens > kSplitTokens) {
+        sparse_attention_kernel<false><<<dim3(tokens, kKvHeads), kThreads, 0, stream>>>(
+            q_p, first_p, select_p, counts_p, k_p, v_p, table_p, scale, out_p, nullptr);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    auto scope      = workspace.scope();
+    Tensor partial  = workspace.alloc(DType::FP32, {kPartialFloats, kQueryHeads, kSplits, tokens});
+    auto* partial_p = static_cast<float*>(partial.data);
+    sparse_attention_kernel<true><<<dim3(tokens, kKvHeads, kSplits), kThreads, 0, stream>>>(
+        q_p, first_p, select_p, counts_p, k_p, v_p, table_p, scale, out_p, partial_p);
+    CUDA_CHECK(cudaGetLastError());
+    sparse_attention_merge_kernel<<<dim3(tokens, kQueryHeads), kHeadDim, 0, stream>>>(partial_p,
+                                                                                      out_p);
     CUDA_CHECK(cudaGetLastError());
 }
 

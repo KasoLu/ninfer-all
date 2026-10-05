@@ -498,8 +498,10 @@ struct Executor::Impl {
                       &plan.qsa->index, &plan.qsa->output}) {
                     bytes = std::max(bytes, projection_workspace(*p, t));
                 }
-                bytes = std::max(bytes, ops::qsa_indexer_select_workspace_bytes(
-                                            t, static_cast<std::int32_t>(pooled_slots)));
+                bytes = std::max({bytes,
+                                  ops::qsa_indexer_select_workspace_bytes(
+                                      t, static_cast<std::int32_t>(pooled_slots)),
+                                  ops::sparse_softmax_attention_workspace_bytes(t)});
             }
             if (plan.ple) {
                 bytes = std::max({bytes, projection_workspace(plan.ple->key, t),
@@ -896,8 +898,11 @@ struct Executor::Impl {
                                     counts, s);
         }
         Tensor attention(rank.f, DType::BF16, {d, nq, t});
-        ops::sparse_softmax_attention(qo, first, selected, counts, cache,
-                                      1.0F / std::sqrt(float(d)), attention, s);
+        {
+            auto scope = ws.scope();
+            ops::sparse_softmax_attention(qo, first, selected, counts, cache,
+                                          1.0F / std::sqrt(float(d)), ws, attention, s);
+        }
         Tensor flat(rank.f, DType::BF16, {d * nq, t});
         ops::sigmoid_mul(gate, flat, s);
         Tensor y(rank.y, DType::BF16, {h, t});

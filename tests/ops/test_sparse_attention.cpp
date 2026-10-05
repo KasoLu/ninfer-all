@@ -1,6 +1,7 @@
 // sparse_softmax_attention against an FP64 oracle over the selected blocks and the query's own
 // incomplete block, through a fragmented BF16 paged cache: a full 512-block selection at long
-// context, short contexts where every block is selected, and every tail length 0..3.
+// context, short contexts where every block is selected, and every tail length 0..3, both for up to
+// eight queries (positions split over CTAs, partial softmaxes merged) and for wider calls.
 #include "core/device.h"
 #include "ninfer/ops/sparse_attention.h"
 #include "ops/op_tester.h"
@@ -109,7 +110,8 @@ int run(int first_position, int tokens, std::uint32_t seed) {
     Tensor t_selected(d_selected.data(), DType::I32, {kTop, tokens});
     Tensor t_counts(d_counts.data(), DType::I32, {tokens});
     const Tensor t_first(d_first.data(), DType::I32, {1});
-    ops::sparse_softmax_attention(t_q, t_first, t_selected, t_counts, cache, scale, t_out, nullptr);
+    WorkspaceArena workspace(ops::sparse_softmax_attention_workspace_bytes(tokens));
+    ops::sparse_softmax_attention(t_q, t_first, t_selected, t_counts, cache, scale, workspace, t_out, nullptr);
     cuda_synchronize();
     const std::string label = "sparse attention p=" + std::to_string(first_position) + " T=" + std::to_string(tokens);
     int failures = verify_reduction(label, from_device_bf16(d_out.data(), q.size()), expected,
@@ -133,6 +135,7 @@ int main() {
     failures += run(2047, 9, 9102u);    // across the 512-block edge
     failures += run(4096, 3, 9103u);    // a full selection
     failures += run(9000, 1, 9104u);
+    failures += run(6001, 8, 9105u);    // the widest split call, every split busy
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " sparse_softmax_attention\n";
     return failures == 0 ? 0 : 1;
 }

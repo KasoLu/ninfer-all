@@ -1,7 +1,9 @@
 // ninfer::ops - the block indexer of Qwen3.8-Flash-Next's sparse attention (contract in
-// include/ninfer/ops/qsa_indexer.h). Pooling runs one CTA per completed block; selection one CTA
-// per query: scores into workspace, a four-pass radix select of the 512th key, then two ordered
-// passes that keep ties at the lower block index and write the blocks in increasing order.
+// include/ninfer/ops/qsa_indexer.h). Pooling runs one CTA per completed block. Selection scores the
+// blocks into workspace with CTAs of 64 blocks each (a grid sized by the capacity, so a graph
+// replays it at any position), then one CTA per query runs a four-pass radix select of the 512th
+// key and two ordered passes that keep ties at the lower block index and write the blocks in
+// increasing order.
 #include "ninfer/ops/qsa_indexer.h"
 
 #include "core/device.h"
@@ -25,6 +27,7 @@ constexpr int kBlock       = 4;
 constexpr int kTopBlocks   = 512;
 constexpr int kProjection  = kHeads * kHeadDim + kHeadDim;
 constexpr int kThreads     = 512;
+constexpr int kScoreBlocks = 64; // blocks one scoring CTA covers
 
 // fl32(1e7^(-2i/64)) for i < 32: the text RoPE frequencies of theta 1e7 over 64 rotary dims.
 __device__ __forceinline__ float rope_frequency(int pair) {
@@ -111,30 +114,21 @@ __device__ __forceinline__ unsigned order_key(float value) {
     return bits & 0x80000000u ? ~bits : bits | 0x80000000u;
 }
 
+// The scores of blocks [64 x, 64 x + 64) for query y (the 1/sqrt(128) scale does not change the
+// order), as orderable keys. A query that sees at most 512 blocks needs none.
 __global__ void __launch_bounds__(kThreads)
-    qsa_select_kernel(const __nv_bfloat16* __restrict__ projection, const int* __restrict__ first,
-                      const __nv_bfloat16* __restrict__ query_norm, float eps,
-                      const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
-                      int capacity, int* __restrict__ selected, int* __restrict__ counts) {
-    using Scan = cub::BlockScan<int, kThreads>;
-    __shared__ typename Scan::TempStorage scan_storage;
-    __shared__ float query[kHeads * kHeadDim];
+    qsa_score_kernel(const __nv_bfloat16* __restrict__ projection, const int* __restrict__ first,
+                     const __nv_bfloat16* __restrict__ query_norm, float eps,
+                     const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
+                     int capacity) {
+    __shared__ __align__(16) float query[kHeads * kHeadDim];
     __shared__ float reduce[kHeads][4];
-    __shared__ int histogram[256];
-    __shared__ unsigned prefix_shared;
-    __shared__ int remaining_shared;
-    __shared__ int carry;
-
-    const int t        = blockIdx.x;
+    const int t        = blockIdx.y;
     const int position = *first + t;
     const int blocks   = min((position + 1) / kBlock, capacity);
-    int* out           = selected + static_cast<std::int64_t>(t) * kTopBlocks;
-    const int tid      = threadIdx.x;
-    if (blocks <= kTopBlocks) {
-        for (int b = tid; b < blocks; b += kThreads) out[b] = b;
-        if (tid == 0) counts[t] = blocks;
-        return;
-    }
+    const int b0       = blockIdx.x * kScoreBlocks;
+    if (blocks <= kTopBlocks || b0 >= blocks) { return; }
+    const int tid = threadIdx.x;
 
     // Normalised, rotated query heads: four 128-thread groups.
     const int head = tid / kHeadDim, lane = tid % kHeadDim;
@@ -166,26 +160,50 @@ __global__ void __launch_bounds__(kThreads)
         __syncthreads();
     }
 
-    // Scores (the 1/sqrt(128) scale does not change the order), as orderable keys.
+    // One warp per block, four dims per lane against every head.
     unsigned* keys = keys_workspace + static_cast<std::int64_t>(t) * capacity;
     const int warp = tid >> 5, warp_lane = tid & 31;
-    for (int b = warp; b < blocks; b += kThreads / 32) {
-        const float* key = pooled + static_cast<std::int64_t>(b) * kHeadDim;
-        float score      = 0.0f;
+    float4 q[kHeads];
+#pragma unroll
+    for (int h = 0; h < kHeads; ++h) {
+        q[h] = reinterpret_cast<const float4*>(query + h * kHeadDim)[warp_lane];
+    }
+    for (int b = b0 + warp; b < min(b0 + kScoreBlocks, blocks); b += kThreads / 32) {
+        const float4 k = reinterpret_cast<const float4*>(pooled + static_cast<std::int64_t>(b) *
+                                                                      kHeadDim)[warp_lane];
+        float score    = 0.0f;
 #pragma unroll
         for (int h = 0; h < kHeads; ++h) {
-            float dot = 0.0f;
-#pragma unroll
-            for (int j = 0; j < kHeadDim / 32; ++j) {
-                dot = fmaf(query[h * kHeadDim + warp_lane + 32 * j], key[warp_lane + 32 * j], dot);
-            }
+            float dot = q[h].x * k.x + q[h].y * k.y + q[h].z * k.z + q[h].w * k.w;
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, offset);
             score += fmaxf(dot, 0.0f);
         }
         if (warp_lane == 0) keys[b] = order_key(score);
     }
-    __syncthreads();
+}
+
+__global__ void __launch_bounds__(kThreads)
+    qsa_select_kernel(const int* __restrict__ first, const unsigned* __restrict__ keys_workspace,
+                      int capacity, int* __restrict__ selected, int* __restrict__ counts) {
+    using Scan = cub::BlockScan<int, kThreads>;
+    __shared__ typename Scan::TempStorage scan_storage;
+    __shared__ int histogram[256];
+    __shared__ unsigned prefix_shared;
+    __shared__ int remaining_shared;
+    __shared__ int carry;
+
+    const int t        = blockIdx.x;
+    const int position = *first + t;
+    const int blocks   = min((position + 1) / kBlock, capacity);
+    int* out           = selected + static_cast<std::int64_t>(t) * kTopBlocks;
+    const int tid      = threadIdx.x;
+    if (blocks <= kTopBlocks) {
+        for (int b = tid; b < blocks; b += kThreads) out[b] = b;
+        if (tid == 0) counts[t] = blocks;
+        return;
+    }
+    const unsigned* keys = keys_workspace + static_cast<std::int64_t>(t) * capacity;
 
     // Radix select of the kTopBlocks-th largest key, eight bits at a time from the top.
     if (tid == 0) {
@@ -322,11 +340,16 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
     const std::int32_t capacity = pooled.ne[1];
     auto scope                  = workspace.scope();
     Tensor keys                 = workspace.alloc(DType::I32, {capacity, tokens});
-    qsa_select_kernel<<<tokens, kThreads, 0, stream>>>(
+    const dim3 score_grid(static_cast<unsigned>((capacity + kScoreBlocks - 1) / kScoreBlocks),
+                          static_cast<unsigned>(tokens));
+    qsa_score_kernel<<<score_grid, kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(projection.data), first,
         static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
-        static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), capacity,
-        static_cast<int*>(selected.data), static_cast<int*>(counts.data));
+        static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), capacity);
+    CUDA_CHECK(cudaGetLastError());
+    qsa_select_kernel<<<tokens, kThreads, 0, stream>>>(
+        first, static_cast<const unsigned*>(keys.data), capacity, static_cast<int*>(selected.data),
+        static_cast<int*>(counts.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

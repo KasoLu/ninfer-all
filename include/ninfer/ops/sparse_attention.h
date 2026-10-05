@@ -1,10 +1,12 @@
 #pragma once
 
+#include "core/arena.h"
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h> // cudaStream_t
 
+#include <cstddef>
 #include <cstdint>
 
 namespace ninfer::ops {
@@ -22,11 +24,13 @@ namespace ninfer::ops {
  * indexer's blocks; `cache` is the sequence's BF16 paged KV layer (2 heads of 256) holding every
  * selected and tail position, its block table covering every position the caller reaches; `out`
  * is BF16 [256, 24, tokens]. The oracle evaluates the softmax and the weighted sum in FP64 from
- * the represented cache and queries; the output is compared after its BF16 store. No workspace or
- * state.
+ * the represented cache and queries; the output is compared after its BF16 store. Up to eight
+ * queries keep partial softmaxes in FP32 workspace; no state.
  */
+[[nodiscard]] std::size_t sparse_softmax_attention_workspace_bytes(std::int32_t tokens);
+
 void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, const Tensor& selected,
                               const Tensor& counts, const PagedKVLayerView& cache, float scale,
-                              Tensor& out, cudaStream_t stream);
+                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

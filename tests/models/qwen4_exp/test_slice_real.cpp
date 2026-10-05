@@ -336,7 +336,9 @@ void qsa(Context& c, int layer, const Tensor& a, Tensor& y) {
     ops::qsa_indexer_select(t_index, c.positions, iw, kEps, t_pooled, sws, t_selected, t_counts, c.device.stream);
     Device attn(static_cast<std::size_t>(6144) * T * 2);
     Tensor t_attn(attn.buffer.p, DType::BF16, {256, 24, T});
-    ops::sparse_softmax_attention(qo, c.positions, t_selected, t_counts, cache, 1.0f / 16.0f, t_attn, c.device.stream);
+    WorkspaceArena attention_ws(ops::sparse_softmax_attention_workspace_bytes(T));
+    ops::sparse_softmax_attention(qo, c.positions, t_selected, t_counts, cache, 1.0f / 16.0f, attention_ws, t_attn,
+                                  c.device.stream);
     Tensor flat_attn(attn.buffer.p, DType::BF16, {6144, T});
     ops::sigmoid_mul(t_gate, flat_attn, c.device.stream);
     c.device.synchronize();
