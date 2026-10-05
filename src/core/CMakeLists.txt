@@ -10,7 +10,6 @@ add_library(ninfer_core STATIC
   disk_kv_store.cpp
   disk_kv_bridge.cpp
   direct_storage_reader.cpp
-  token_logprobs.cpp
   paged_kv_cache.cpp
   linear_attention_state.cpp
   layout.cpp

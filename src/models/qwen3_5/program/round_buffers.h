@@ -186,6 +186,10 @@ struct RoundStateLayout {
     TensorRegion logits;
     TensorRegion text_kv_table_row;
     TensorRegion backend_kv_table_row;
+    TensorRegion logprob_ids;
+    TensorRegion logprob_values;
+    TensorRegion logprob_lse;
+    TensorRegion logprob_active;
     std::optional<MtpPrefillStateLayout> mtp;
     std::optional<DFlashPrefillStateLayout> dflash_prefill;
     std::optional<MtpDecodeStateLayout> mtp_decode;
@@ -339,6 +343,13 @@ struct RoundState {
     Tensor logits;
     Tensor text_kv_table_row;
     Tensor backend_kv_table_row;
+    // The logprob records a round gathers when a request asks for them: I32 and FP32
+    // [kLogprobTopK, rows] and FP32 [rows], rows covering the widest round's [width, batch]; the
+    // gather runs while the I32 [1] flag is nonzero.
+    Tensor logprob_ids;
+    Tensor logprob_values;
+    Tensor logprob_lse;
+    Tensor logprob_active;
     std::optional<MtpPrefillState> mtp;
     std::optional<DFlashPrefillState> dflash_prefill;
     std::optional<MtpDecodeState> mtp_decode;

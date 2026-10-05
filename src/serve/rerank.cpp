@@ -96,34 +96,38 @@ GenerationRequest make_rerank_judgement(const RerankRequest& request, const std:
     out.messages.push_back(text_turn(ChatRole::User, "<Instruct>: " + request.instruction +
                                                          "\n<Query>: " + request.query +
                                                          "\n<Document>: " + document));
-    out.enable_thinking          = false;
-    out.max_tokens               = 1;
-    out.sampling.temperature     = 0.0;
-    out.first_token_top_logprobs = ninfer::kMaximumFirstTokenTopLogprobs;
+    out.enable_thinking      = false;
+    out.max_tokens           = 1;
+    out.sampling.temperature = 0.0;
+    out.logprobs             = true;
     // The server's default graft would be a hidden prefix the judging prompt does not expect.
     out.graft = std::string();
     return out;
 }
 
 double rerank_score(const GenerationOutcome& outcome) {
-    if (!outcome.first_token_logprobs || outcome.first_token_logprobs->top.empty()) {
-        throw std::logic_error("a rerank judgement returned no log probabilities");
+    if (outcome.content_logprobs.empty() || outcome.content_logprobs.front().top_ids[0] < 0) {
+        throw std::runtime_error("the rerank judgement produced no answer token");
     }
-    const std::vector<TokenLogprobView>& top = outcome.first_token_logprobs->top;
-    double yes                               = 0.0;
-    double no                                = 0.0;
-    bool has_yes                             = false;
-    bool has_no                              = false;
-    for (const TokenLogprobView& entry : top) {
-        if (entry.bytes == "yes" || entry.bytes == "Yes") {
-            yes += std::exp(static_cast<double>(entry.logprob));
+    // The answer token's most likely alternatives, under the greedy judge's raw distribution.
+    const ninfer::TokenLogprob& answer = outcome.content_logprobs.front();
+    double yes                         = 0.0;
+    double no                          = 0.0;
+    double least                       = 0.0;
+    bool has_yes                       = false;
+    bool has_no                        = false;
+    for (std::size_t k = 0; k < ninfer::kMaximumTokenLogprobs && answer.top_ids[k] >= 0; ++k) {
+        const std::string& bytes = answer.top_bytes[k];
+        const double probability = std::exp(static_cast<double>(answer.top_values[k]));
+        least                    = probability;
+        if (bytes == "yes" || bytes == "Yes") {
+            yes += probability;
             has_yes = true;
-        } else if (entry.bytes == "no" || entry.bytes == "No") {
-            no += std::exp(static_cast<double>(entry.logprob));
+        } else if (bytes == "no" || bytes == "No") {
+            no += probability;
             has_no = true;
         }
     }
-    const double least = std::exp(static_cast<double>(top.back().logprob));
     if (!has_yes) { yes = least; }
     if (!has_no) { no = least; }
     return yes + no > 0.0 ? yes / (yes + no) : 0.5;

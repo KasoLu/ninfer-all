@@ -451,7 +451,7 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.execution.post_thinking_sampling =
         resolve_post_thinking_overrides(request.post_thinking, server);
-    options.execution.first_token_top_logprobs = request.first_token_top_logprobs;
+    options.execution.logprobs = request.logprobs;
     options.output.raw                     = false;
     options.output.preserve_special_tokens =
         request.structured_output.kind == StructuredOutputKind::None &&

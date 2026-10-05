@@ -78,11 +78,7 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.allow_prefix_reuse      = options.execution.allow_prefix_reuse;
     resolved.execution.thinking                = options.execution.thinking;
     resolved.execution.structured_output       = std::move(options.execution.structured_output);
-    if (options.execution.first_token_top_logprobs > kMaximumFirstTokenTopLogprobs) {
-        throw std::invalid_argument("first_token_top_logprobs must be at most " +
-                                    std::to_string(kMaximumFirstTokenTopLogprobs));
-    }
-    resolved.execution.first_token_top_logprobs = options.execution.first_token_top_logprobs;
+    resolved.execution.logprobs                = options.execution.logprobs;
     resolved.stop                              = std::move(options.stop);
     resolved.output                            = options.output;
     resolved.ngram_session                      = std::move(options.ngram_session);

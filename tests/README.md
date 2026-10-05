@@ -210,6 +210,19 @@ NINFER_QWEN4_EXP_SLICE=$PWD/fn_slice \
   ctest --test-dir build -R ninfer_qwen4_exp_slice_real --output-on-failure
 ```
 
+Token log probabilities run through the public Engine on either family. The test checks that each
+record spells its token's text and that the drawn token tops its distribution under greedy
+decoding, that gathering them changes no generated token, that streaming, a stop string, three
+requests decoded as one batch and a JSON grammar's mask all reach the records, and that a request
+without them gathers none. `NINFER_LOGPROBS_ARTIFACT` names the artifact, and the test is skipped
+without it; `NINFER_LOGPROBS_NGRAM_TABLE` names a Qwen3.8-Flash-Next table artifact, and
+`NINFER_LOGPROBS_SPECULATIVE=mtp` or `dflash2` verifies the tokens in speculative rounds:
+
+```bash
+NINFER_LOGPROBS_ARTIFACT=$PWD/out/qwen3_8_27b.ninfer NINFER_LOGPROBS_SPECULATIVE=dflash2 \
+  ctest --test-dir build -R ninfer_engine_logprobs_real_test --output-on-failure
+```
+
 Without `NINFER_TEST_ARTIFACT`, CTest marks these real Engine tests as skipped. Run GPU integration
 tests serially. `NINFER_PREFIX_REAL_SCENARIO` selects a focused prefix scenario such as `vision`,
 `pressure-resume` or `concurrent`; the default is `all`. These integration checks

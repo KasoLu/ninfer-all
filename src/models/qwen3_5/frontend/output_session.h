@@ -1,5 +1,6 @@
 #pragma once
 #include "ninfer/types.h"
+#include "runtime/contract/execution.h"
 #include "runtime/contract/request.h"
 #include <array>
 #include <cstddef>
@@ -62,9 +63,10 @@ public:
     OutputSession(const OutputSession&)            = delete;
     OutputSession& operator=(const OutputSession&) = delete;
 
-    [[nodiscard]] runtime::OutputDecision preview_model(std::span<const TokenId> tokens,
-                                                        std::uint32_t total_budget_remaining,
-                                                        FinishReason limit_reason);
+    // `logprobs` is empty, or aligned with `tokens` when the request asked for logprobs.
+    [[nodiscard]] runtime::OutputDecision
+    preview_model(std::span<const TokenId> tokens, std::uint32_t total_budget_remaining,
+                  FinishReason limit_reason, std::span<const runtime::RawTokenLogprob> logprobs = {});
     [[nodiscard]] std::uint32_t
     model_token_budget_remaining(std::uint32_t total_budget_remaining) const noexcept;
     [[nodiscard]] std::span<const TokenId> pending_control_tokens() const noexcept;
@@ -75,6 +77,10 @@ public:
                                                           std::uint32_t total_budget_remaining);
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview();
+    // The logprob records of the content tokens whose first byte the last commit published, in
+    // generation order. A content token's bytes go to the content channel: after the reasoning
+    // block and its closing whitespace, including the markup of a tool call.
+    [[nodiscard]] std::vector<TokenLogprob> take_content_logprobs() noexcept;
     [[nodiscard]] std::shared_ptr<text::GrammarState> grammar_state() const;
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;

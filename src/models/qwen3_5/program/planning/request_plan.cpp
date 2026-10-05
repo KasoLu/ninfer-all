@@ -316,8 +316,8 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                                : FinishReason::ContextCapacity;
     base->sampling                       = translate_sampling(options.sampling);
     base->grammar                        = options.grammar;
+    base->logprobs                       = options.logprobs;
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
-    base->first_token_top_logprobs       = options.first_token_top_logprobs;
     base->summary.publish_continuation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
     if (!context_cache.kv_lease_growth) {
@@ -544,7 +544,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     plan->summary                     = base.summary;
     plan->sampling                    = base.sampling;
     plan->grammar                     = base.grammar;
-    plan->first_token_top_logprobs    = base.first_token_top_logprobs;
+    plan->logprobs                    = base.logprobs;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
     plan->root_rebuild_work           = base.root_rebuild_work;

@@ -96,7 +96,9 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         lifecycle->done(outcome);
         try {
             set_ngram_generation_header(res, outcome.metrics.ngram_archive);
-            set_owned_json_content(res, make_chat_completion_response(identity, outcome),
+            set_owned_json_content(res, make_chat_completion_response(
+                                       identity, outcome,
+                                       request.generation.reported_top_logprobs()),
                                    prepared.lifetime);
         } catch (const std::exception& exception) {
             lifecycle->response_failure(make_internal_request_failure(
@@ -116,7 +118,8 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         auto stream                  = std::make_shared<HttpGenerationStream>(std::move(prepared));
         auto encoder = std::make_shared<OpenAIChatStream>(identity, request.include_usage,
                                                           timings_per_token, return_progress,
-                                                          options_.usage_chunk_choice);
+                                                          options_.usage_chunk_choice,
+                                                          request.generation.reported_top_logprobs());
 
         prepare_sse_response(res);
         res.set_chunked_content_provider(
@@ -180,8 +183,10 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                             encoder->note_timing(timing);
                         };
                     }
-                    output.on_content = [&](const std::string& text) {
-                        render_and_write(transport, [&] { return encoder->content_delta(text); });
+                    output.on_content = [&](const std::string& text,
+                                            std::span<const ninfer::TokenLogprob> logprobs) {
+                        render_and_write(transport,
+                                         [&] { return encoder->content_delta(text, logprobs); });
                     };
                     output.on_reasoning = [&](const std::string& text) {
                         render_and_write(transport, [&] { return encoder->reasoning_delta(text); });

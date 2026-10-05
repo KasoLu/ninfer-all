@@ -42,7 +42,7 @@ PendingBatch ProgramImpl::wrap_pending(std::span<const std::uint32_t> lanes,
     pending_transaction_ = transaction;
     return ContractAccess::make_pending(
         this, transaction.id, std::span<const SequenceHandle>(handles.data(), lanes.size()),
-        round.tokens, round.row_counts, round.row_stride, round.timing);
+        round.tokens, round.row_counts, round.logprobs, round.row_stride, round.timing);
 }
 
 PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillStepResult step) {
@@ -51,12 +51,12 @@ PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillSt
     out.processed_prompt_tokens = step.processed_prompt_tokens;
     out.complete                = step.complete;
     out.timing                  = step.timing;
-    out.first_token_logprobs    = std::move(step.first_token_logprobs);
     if (step.complete) {
         const std::array<std::uint32_t, 1> lanes{lane};
         const runtime::BatchedGeneratedRound round{
             .tokens     = step.round.tokens,
             .row_counts = {},
+            .logprobs   = step.round.logprobs,
             .row_stride = 1,
         };
         out.pending.emplace(wrap_pending(lanes, round));

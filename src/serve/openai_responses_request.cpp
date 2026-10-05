@@ -1334,16 +1334,20 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
                         "background_not_supported");
         }
     }
+    bool logprobs_requested = false;
     if (body.contains("include")) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
         for (const Json& field : body.at("include")) {
             if (!field.is_string()) { bad_request("include entries must be strings", "include"); }
             const std::string value = field.get<std::string>();
-            if (value != "reasoning.encrypted_content") {
+            if (value == "reasoning.encrypted_content") {
+                out.include_reasoning_encrypted_content = true;
+            } else if (value == "message.output_text.logprobs") {
+                logprobs_requested = true;
+            } else {
                 bad_request("additional response field '" + value + "' is not supported", "include",
                             "include_not_supported");
             }
-            out.include_reasoning_encrypted_content = true;
         }
     }
     if (body.contains("stream_options") && !body.at("stream_options").is_null()) {
@@ -1373,11 +1377,10 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
         if (*top_logprobs < 0 || *top_logprobs > 20) {
             bad_request("top_logprobs must be in [0,20]", "top_logprobs");
         }
-        if (*top_logprobs != 0) {
-            bad_request("the Engine does not return token log probabilities", "top_logprobs",
-                        "logprobs_not_supported");
-        }
+        out.prompt.generation.top_logprobs = *top_logprobs;
+        if (*top_logprobs != 0) { logprobs_requested = true; }
     }
+    out.prompt.generation.logprobs = logprobs_requested;
     if (const std::optional<int> max_tool_calls = optional_int(body, "max_tool_calls")) {
         if (*max_tool_calls < 0) {
             bad_request("max_tool_calls must be non-negative", "max_tool_calls");

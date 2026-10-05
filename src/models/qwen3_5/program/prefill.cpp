@@ -3,9 +3,9 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
-#include "core/token_logprobs.h"
 #include "core/device.h"
 #include "ninfer/ops/gdn_replay.h"
+#include "ninfer/ops/logprob_topk.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/scatter.h"
@@ -66,6 +66,26 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
     }
 }
 
+LogprobGather logprob_gather(const qwen3_5::RoundState& io, std::int32_t width,
+                             std::int32_t batch) {
+    const std::int32_t rows = width * batch;
+    return LogprobGather{
+        .ids    = io.logprob_ids.slice(1, 0, rows).view({ops::kLogprobTopK, width, batch}),
+        .values = io.logprob_values.slice(1, 0, rows).view({ops::kLogprobTopK, width, batch}),
+        .lse    = io.logprob_lse.slice(0, 0, rows).view({width, batch}),
+        .active = io.logprob_active,
+    };
+}
+
+void gather_logprobs(ExecutionCore& execution, const Tensor& logits,
+                     const ops::SamplingConfig* sampling, const Tensor* drafts) {
+    LogprobGather gather = logprob_gather(execution.io, logits.ne[1], logits.ne[2]);
+    ops::logprob_topk(logits, sampling, drafts,
+                      dimension(execution.parameters.model.resources().public_token_count),
+                      gather.ids, gather.values, gather.lse, gather.active, execution.work,
+                      execution.device.stream);
+}
+
 PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const TokenId> ids,
                                       std::uint32_t nominal_length,
                                       std::optional<std::uint32_t> split_frontier,
@@ -79,7 +99,6 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_mtp_attention_window(state.execution.mtp_attention_window);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
-    card.set_first_token_logits(state.first_token_logits);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
@@ -107,7 +126,6 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
     card.set_mtp_attention_window(state.execution.mtp_attention_window);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
-    card.set_first_token_logits(state.first_token_logits);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
@@ -168,14 +186,8 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
     project(hidden, state.execution.parameters.text.output_head, logits, state.execution.work,
             state.execution.device.stream);
-    if (state.first_token_logits != nullptr) {
-        CUDA_CHECK(
-            cudaMemcpyAsync(state.first_token_logits, logits.data,
-                            static_cast<std::size_t>(dimension(
-                                state.execution.parameters.model.resources().public_token_count)) *
-                                sizeof(std::uint16_t),
-                            cudaMemcpyDeviceToHost, state.execution.device.stream));
-    }
+    // Before sampling adds the token to the penalty counts.
+    gather_logprobs(state.execution, logits.view({logits.ne[0], 1, 1}), state.sampling, nullptr);
     CUDA_CHECK(cudaMemcpyAsync(state.execution.io.pos.data, &absolute_position,
                                sizeof(absolute_position), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
@@ -670,8 +682,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
         ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
-        request.grammar                  = request_plan.grammar;
-        request.first_token_top_logprobs = request_plan.first_token_top_logprobs;
+        request.grammar  = request_plan.grammar;
+        request.logprobs = request_plan.logprobs;
         install_sampling(sequence, request, request_plan.sampling);
         sequence.rope_delta = staged.prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
@@ -1118,14 +1130,6 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             selectors.destination,
             staged.initial_mtp_extent,
             0};
-        const auto public_tokens =
-            static_cast<std::size_t>(dimension(parameters.model.resources().public_token_count));
-        if (request.first_token_top_logprobs != 0) {
-            if (!first_token_logits_host) {
-                first_token_logits_host.emplace(public_tokens * sizeof(std::uint16_t));
-            }
-            schedule_state.first_token_logits = first_token_logits_host->data();
-        }
         // The first pass after a Host restore waits for each layer's copies (hybrid spec §6.5).
         // The chunk function takes the events itself: they are a view into the landing batch, and
         // the KV commits between chunks (the MTP bridge's among them) poll the cache, which frees
@@ -1133,6 +1137,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         schedule_state.take_layer_ready = [this, lane = sequence.lane] {
             return hybrid_take_restore_layers(lane);
         };
+        arm_logprobs(request.logprobs);
 
         if (staged.mtp_bridge == MtpBridgeMode::BeforeSuffix) {
             if (staged.cursor != staged.base || staged.base == 0 ||
@@ -1323,6 +1328,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         }
 
         copy_round_token();
+        if (request.logprobs) { fetch_logprobs(1); }
         std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> initial_drafts{};
         if (staged.prepare_mtp && staged.initial_mtp_extent != 0) {
             CUDA_CHECK(cudaMemcpyAsync(initial_drafts.data(), io.mtp->draft_tokens.data,
@@ -1337,6 +1343,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
 
         validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
+        if (request.logprobs) { round_logprobs[0] = fetched_logprob(0, host_tokens[0]); }
         if (sequence.ledger.size() != prompt_tokens) {
             throw std::logic_error("candidate token ledger does not match prompt length");
         }
@@ -1376,14 +1383,6 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             staged.next_capture < staged.capture_groups.size() &&
             staged.capture_groups[staged.next_capture].frontier == prompt_tokens;
         if (!prompt_frontier_capture) { request.prefill.reset(); }
-        std::optional<FirstTokenLogprobs> first_token_logprobs;
-        if (request.first_token_top_logprobs != 0) {
-            first_token_logprobs = token_logprobs_from_bf16(
-                std::span<const std::uint16_t>(
-                    static_cast<const std::uint16_t*>(first_token_logits_host->data()),
-                    public_tokens),
-                host_tokens[0], request.first_token_top_logprobs);
-        }
         request.pending   = PendingCandidate{.kind          = PendingKind::Begin,
                                              .base_E        = 0,
                                              .base_S        = 0,
@@ -1392,11 +1391,15 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         request.lifecycle = Lifecycle::Pending;
         return runtime::PrefillStepResult{
             .summary = summary,
-            .round   = runtime::GeneratedRound{.tokens = std::span<const TokenId>(host_tokens, 1)},
+            .round   = runtime::GeneratedRound{
+                .tokens   = std::span<const TokenId>(host_tokens, 1),
+                .logprobs = request.logprobs
+                                ? std::span<const runtime::RawTokenLogprob>(round_logprobs.data(), 1)
+                                : std::span<const runtime::RawTokenLogprob>{},
+            },
             .processed_prompt_tokens = reported_tokens(),
             .complete                = true,
             .timing                  = timing.finish(),
-            .first_token_logprobs    = std::move(first_token_logprobs),
         };
     } catch (...) {
         timing.begin_wait();

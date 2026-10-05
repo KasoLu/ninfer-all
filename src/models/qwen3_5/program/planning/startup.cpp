@@ -15,6 +15,7 @@
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/context_kv_materialize.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
+#include "ninfer/ops/logprob_topk.h"
 #include "ninfer/ops/linear_topk.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
@@ -585,6 +586,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         scratch(text_prefill,
                 ops::sampling_workspace_capacity_bytes(
                     dimension(parameters.model.resources().public_token_count), 1, 1));
+        scratch(text_prefill, ops::logprob_topk_workspace_capacity_bytes(
+                                  dimension(parameters.model.resources().public_token_count), 1));
     }
     out.text_prefill = finish(text_prefill);
 
@@ -608,6 +611,9 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             scratch(ordinary,
                     ops::sampling_workspace_capacity_bytes(
                         dimension(parameters.model.resources().public_token_count), batch, batch));
+            scratch(ordinary,
+                    ops::logprob_topk_workspace_capacity_bytes(
+                        dimension(parameters.model.resources().public_token_count), batch));
             out.ordinary_round = std::max(out.ordinary_round, finish(ordinary));
         }
     }
@@ -686,8 +692,10 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
                     dimension(parameters.model.resources().public_token_count), narrowest_drafts,
                     verify_drafts, batch, batch);
+            const std::size_t gather = ops::logprob_topk_workspace_capacity_bytes(
+                dimension(parameters.model.resources().public_token_count), batch * verify);
             out.mtp_round = std::max({out.mtp_round, target_bytes, finish(alignment), finish(ar),
-                                      finish(proposal), batch_accept});
+                                      finish(proposal), batch_accept, gather});
         }
     }
 
@@ -868,9 +876,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 // A copy round above batch one also runs the drafter at its own window, and a
                 // round after a copy round appends up to the widest window of target features.
                 const std::size_t proposal = dflash_proposal_capacity(drafts + 1, batch);
+                const std::size_t gather   = ops::logprob_topk_workspace_capacity_bytes(
+                    dimension(parameters.model.resources().public_token_count), batch * verify);
                 out.dflash_round =
                     std::max({out.dflash_round, target_bytes, accept,
-                              dflash_context_capacity(verify, batch, true), proposal});
+                              dflash_context_capacity(verify, batch, true), proposal, gather});
             }
         }
     }

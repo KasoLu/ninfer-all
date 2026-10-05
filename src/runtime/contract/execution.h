@@ -2,6 +2,7 @@
 
 #include "runtime/contract/request.h"
 #include "runtime/contract/timing.h"
+#include <array>
 #include <compare>
 #include <span>
 
@@ -49,13 +50,26 @@ struct BeginSummary {
     [[nodiscard]] friend constexpr bool operator==(BeginSummary, BeginSummary) noexcept = default;
 };
 
+// One generated token's log probability and its top alternatives as the device gathered them,
+// before the frontend attaches token bytes.
+struct RawTokenLogprob {
+    TokenId id        = 0;
+    float logprob     = 0.0f;
+    std::array<TokenId, kMaximumTokenLogprobs> top_ids{};
+    std::array<float, kMaximumTokenLogprobs> top_values{};
+};
+
 struct GeneratedRound {
     std::span<const TokenId> tokens;
+    // Aligned with `tokens` when the request asked for logprobs, else empty.
+    std::span<const RawTokenLogprob> logprobs;
 };
 
 struct BatchedGeneratedRound {
     std::span<const TokenId> tokens;
     std::span<const std::int32_t> row_counts;
+    // Aligned with `tokens` ([rows,row_stride]) when a row asked for logprobs, else empty.
+    std::span<const RawTokenLogprob> logprobs;
     std::uint32_t row_stride = 1;
     ExecutionTiming timing;
 };
@@ -66,8 +80,6 @@ struct PrefillStepResult {
     std::uint32_t processed_prompt_tokens = 0;
     bool complete                         = false;
     ExecutionTiming timing;
-    // On the completing step of a request that asked for them.
-    std::optional<FirstTokenLogprobs> first_token_logprobs;
 };
 
 struct RoundBudget {

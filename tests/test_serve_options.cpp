@@ -968,7 +968,6 @@ int main() {
                                         "--embedding-q4",
                                         "--embedding-q6",
                                         "--fast-prefill-kernel",
-                                        "--first-token-logprobs",
                                         "--frequency-penalty",
                                         "--gdn-state-fp16",
                                         "--graft",
@@ -1172,10 +1171,6 @@ int main() {
                      "--adaptive-mtp"});
     } catch (const std::invalid_argument&) { adaptive_without_mtp_rejected = true; }
     failures += check(adaptive_without_mtp_rejected, "--adaptive-mtp was accepted without MTP");
-    failures += check(
-        !defaults.first_token_logprobs &&
-            parse({"ninfer-serve", "model.ninfer", "--first-token-logprobs"}).first_token_logprobs,
-        "--first-token-logprobs did not default off or was not preserved");
     failures += check(parse({"ninfer-serve", "model.ninfer", "--fast-prefill-kernel"})
                           .fast_prefill_kernel,
                       "--fast-prefill-kernel was not preserved");

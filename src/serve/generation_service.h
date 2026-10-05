@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -62,17 +63,6 @@ struct GenerationMetrics {
     ninfer::MaterializationDiagnostics materialization;
 };
 
-// One token's decoded bytes (not necessarily whole UTF-8) and its log probability.
-struct TokenLogprobView {
-    std::string bytes;
-    float logprob = 0.0F;
-};
-
-struct FirstTokenLogprobsView {
-    TokenLogprobView selected;
-    std::vector<TokenLogprobView> top;
-};
-
 struct GenerationOutcome {
     std::vector<ninfer::TokenId> tokens; // the generated token ids
     // The catalog cell and session digest the finished session was retained under; -1 and empty
@@ -81,6 +71,8 @@ struct GenerationOutcome {
     std::string session_digest;
     std::string text;
     std::string reasoning;
+    // The content tokens' logprob records, when the request asked for them.
+    std::vector<ninfer::TokenLogprob> content_logprobs;
     std::vector<ninfer::GeneratedToolCall> tool_calls;
     ninfer::ToolCallParseDiagnostics tool_call_parse;
     int prompt_tokens     = 0;
@@ -89,7 +81,6 @@ struct GenerationOutcome {
     ninfer::ThinkingBudgetStats thinking;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     std::optional<std::string> matched_stop_string;
-    std::optional<FirstTokenLogprobsView> first_token_logprobs;
     GenerationMetrics metrics;
 };
 
@@ -97,7 +88,11 @@ struct StreamSink {
     std::function<void(const ninfer::GenerationStart& start)> on_start;
     std::function<void(const ninfer::PromptProgress& progress)> on_progress;
     std::function<void(const ninfer::GenerationTimingObservation& timing)> on_timing;
-    std::function<void(const std::string& delta_text)> on_content;
+    // A content delta with the logprob records of its tokens (empty unless the request asked for
+    // them), so a route can publish both in one event.
+    std::function<void(const std::string& delta_text,
+                       std::span<const ninfer::TokenLogprob> logprobs)>
+        on_content;
     std::function<void(const std::string& delta_text)> on_reasoning;
     std::function<bool()> is_cancelled;
 };

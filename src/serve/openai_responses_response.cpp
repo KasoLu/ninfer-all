@@ -100,7 +100,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"text", Json{{"format", request.prompt.text_format}}},
         {"tool_choice", request.tool_choice},
         {"tools", request.tools},
-        {"top_logprobs", 0},
+        {"top_logprobs", request.prompt.generation.top_logprobs},
         {"top_p", runtime.top_p},
         {"truncation", "disabled"}};
 }
@@ -144,7 +144,11 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
                  {"role", "assistant"},
                  {"content", Json::array({Json{{"type", "output_text"},
                                                {"annotations", Json::array()},
-                                               {"text", outcome.text}}})}});
+                                               {"text", outcome.text},
+                                               {"logprobs", openai_token_logprobs_json(
+                                                                outcome.content_logprobs,
+                                                                request.prompt.generation.top_logprobs,
+                                                                true)}}})}});
     }
 
     ids.function_calls.resize(outcome.tool_calls.size());
@@ -333,7 +337,10 @@ public:
                            {"status", "in_progress"},
                            {"role", "assistant"},
                            {"content", Json::array()}};
-        const Json part = {{"type", "output_text"}, {"annotations", Json::array()}, {"text", ""}};
+        const Json part = {{"type", "output_text"},
+                           {"annotations", Json::array()},
+                           {"text", ""},
+                           {"logprobs", Json::array()}};
         return {sse(event("response.output_item.added",
                           Json{{"output_index", message_index}, {"item", item}})),
                 sse(event("response.content_part.added", Json{{"item_id", ids.message},
@@ -347,8 +354,14 @@ public:
         if (!message_started || message_done) { return {}; }
         message_done    = true;
         content_text    = final_text;
-        const Json part = {
-            {"type", "output_text"}, {"annotations", Json::array()}, {"text", content_text}};
+        // Streamed events carry the event shape of a record, without bytes; the response object
+        // carries them.
+        const Json aggregate = openai_token_logprobs_json(
+            content_logprobs, request.prompt.generation.top_logprobs, false);
+        const Json part = {{"type", "output_text"},
+                           {"annotations", Json::array()},
+                           {"text", content_text},
+                           {"logprobs", aggregate}};
         const Json item = {{"id", ids.message},
                            {"type", "message"},
                            {"status", item_status},
@@ -358,7 +371,7 @@ public:
                                                             {"output_index", message_index},
                                                             {"content_index", 0},
                                                             {"text", content_text},
-                                                            {"logprobs", Json::array()}})),
+                                                            {"logprobs", aggregate}})),
                 sse(event("response.content_part.done", Json{{"item_id", ids.message},
                                                              {"output_index", message_index},
                                                              {"content_index", 0},
@@ -384,6 +397,7 @@ public:
     bool terminal_emitted  = false;
     std::string reasoning_text;
     std::string content_text;
+    std::vector<ninfer::TokenLogprob> content_logprobs;
     ItemIds ids;
 };
 
@@ -424,22 +438,31 @@ std::vector<std::string> OpenAIResponsesEventStream::reasoning_delta(const std::
     return events;
 }
 
-std::vector<std::string> OpenAIResponsesEventStream::content_delta(const std::string& text) {
+std::vector<std::string>
+OpenAIResponsesEventStream::content_delta(const std::string& text,
+                                          std::span<const ninfer::TokenLogprob> logprobs) {
     if (!impl_->started || impl_->finish_built) {
         throw std::logic_error("invalid content delta event state");
     }
-    if (text.empty()) { return {}; }
+    if (text.empty() && logprobs.empty()) { return {}; }
     std::vector<std::string> events = impl_->close_reasoning(impl_->reasoning_text);
     std::vector<std::string> added  = impl_->ensure_message();
     events.insert(events.end(), std::make_move_iterator(added.begin()),
                   std::make_move_iterator(added.end()));
     impl_->content_text += text;
+    impl_->content_logprobs.insert(impl_->content_logprobs.end(), logprobs.begin(),
+                                   logprobs.end());
     events.push_back(
         sse(impl_->event("response.output_text.delta", Json{{"item_id", impl_->ids.message},
                                                             {"output_index", impl_->message_index},
                                                             {"content_index", 0},
                                                             {"delta", text},
-                                                            {"logprobs", Json::array()}})));
+                                                            {"logprobs", openai_token_logprobs_json(
+                                                                             logprobs,
+                                                                             impl_->request.prompt
+                                                                                 .generation
+                                                                                 .top_logprobs,
+                                                                             false)}})));
     return events;
 }
 

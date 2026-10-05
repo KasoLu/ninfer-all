@@ -7,6 +7,7 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen4_exp/ngram_component.h"
+#include "ninfer/ops/logprob_topk.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/target_logprobs.h"
 #include "runtime/engine/diagnostics.h"
@@ -22,8 +23,8 @@
 #include <cmath>
 #include <condition_variable>
 #include <deque>
+#include <iterator>
 #include <mutex>
-#include <numeric>
 #include <set>
 #include <stdexcept>
 #include <thread>
@@ -250,6 +251,7 @@ struct Qwen4ExpCore::Request {
     std::exception_ptr error;
     GenerationResult result;
     std::string content, reasoning;
+    std::vector<TokenLogprob> content_logprobs;
 
     // Where the context cache snapshots the sequence: the prompt's turn closure (the end of the
     // last user turn, which the next turn's prompt repeats although it renders this turn's answer
@@ -270,7 +272,6 @@ struct Qwen4ExpCore::Request {
     std::vector<TokenId> feed;   // what the next decode step feeds
     std::vector<TokenId> generated;
     std::optional<GenerationBudget> budget;
-    std::optional<FirstTokenLogprobs> first_token_logprobs;
     Clock::time_point admitted, prefill_start, prefill_end, first_token, last_token;
 };
 
@@ -292,6 +293,7 @@ struct Qwen4ExpCore::Impl {
         std::uint32_t position                   = 0;
         std::uint32_t slot                       = 0;
         bool counts                              = false;
+        bool logprobs                            = false;
         const text::GrammarState* grammar        = nullptr;
     };
 
@@ -324,9 +326,11 @@ struct Qwen4ExpCore::Impl {
     // bitmasks too. The host side is staged in pinned memory: configs, positions, sampled tokens.
     DeviceBuffer sample_config, sample_position, sample_out, token_counts, score_targets, score_out;
     DeviceBuffer token_mask;
-    std::unique_ptr<PinnedHostBuffer> host_mask, host_sample;
+    // The logprob gather of a sampling call whose rows ask for it: [kLogprobTopK, rows] ids and
+    // values, [rows] log-sum-exps and the gather's enabling flag, with the host copy.
+    DeviceBuffer logprob_ids, logprob_values, logprob_lse, logprob_flag;
+    std::unique_ptr<PinnedHostBuffer> host_mask, host_sample, host_logprobs;
     std::unique_ptr<WorkspaceArena> sample_workspace;
-    std::vector<__nv_bfloat16> host_logits;
 
     std::thread worker;
 
@@ -352,11 +356,21 @@ struct Qwen4ExpCore::Impl {
         token_counts     = DeviceBuffer(rows * domain * sizeof(std::int32_t));
         score_targets    = DeviceBuffer(4096 * sizeof(std::int32_t));
         score_out        = DeviceBuffer(4096 * sizeof(float));
+        const std::size_t top = rows * kMaximumTokenLogprobs;
+        logprob_ids           = DeviceBuffer(top * sizeof(std::int32_t));
+        logprob_values        = DeviceBuffer(top * sizeof(float));
+        logprob_lse           = DeviceBuffer(rows * sizeof(float));
+        logprob_flag          = DeviceBuffer(sizeof(std::int32_t));
+        host_logprobs =
+            std::make_unique<PinnedHostBuffer>(top * (sizeof(std::int32_t) + sizeof(float)));
+        const std::int32_t enabled = 1;
+        CUDA_CHECK(cudaMemcpy(logprob_flag.p, &enabled, sizeof(enabled), cudaMemcpyHostToDevice));
         sample_workspace = std::make_unique<WorkspaceArena>(std::max<std::size_t>(
-            ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(domain), 1,
-                                                   static_cast<std::int32_t>(rows)),
-            256));
-        host_logits.resize(i.model->config().vocab_size);
+            {ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(domain), 1,
+                                                    static_cast<std::int32_t>(rows)),
+             ops::logprob_topk_workspace_capacity_bytes(static_cast<std::int32_t>(domain),
+                                                        static_cast<std::int32_t>(rows)),
+             std::size_t{256}}));
         worker = std::thread([this] {
             device.bind_to_current_thread();
             loop();
@@ -608,10 +622,24 @@ struct Qwen4ExpCore::Impl {
         }
     }
 
+    // Publishes a committed preview with the logprob records it released, which a streaming
+    // request receives on the commit's content delta.
     void push_events(Request& r, models::qwen3_5::PublishedOutput published,
                      std::optional<GenerationTimingObservation> timing) {
-        const bool streaming = r.consumer_mode == OutputConsumerMode::Streaming;
-        if (published.empty() && !timing) { return; }
+        const bool streaming               = r.consumer_mode == OutputConsumerMode::Streaming;
+        std::vector<TokenLogprob> logprobs = r.output.take_content_logprobs();
+        if (published.empty() && !timing && logprobs.empty()) { return; }
+        if (streaming && !logprobs.empty()) {
+            OutputDelta* content = nullptr;
+            for (OutputDelta& delta : published) {
+                if (delta.channel == OutputChannel::Content) { content = &delta; }
+            }
+            if (content == nullptr) {
+                published.push_back(OutputDelta{.channel = OutputChannel::Content});
+                content = &published.back();
+            }
+            content->logprobs = logprobs;
+        }
         {
             std::lock_guard lock(r.mutex);
             if (streaming && timing) { r.events.emplace_back(*timing); }
@@ -619,13 +647,18 @@ struct Qwen4ExpCore::Impl {
                 (delta.channel == OutputChannel::Reasoning ? r.reasoning : r.content) += delta.text;
                 if (streaming) { r.events.emplace_back(std::move(delta)); }
             }
+            r.content_logprobs.insert(r.content_logprobs.end(),
+                                      std::make_move_iterator(logprobs.begin()),
+                                      std::make_move_iterator(logprobs.end()));
         }
         if (streaming) { r.cv.notify_all(); }
     }
 
     // Samples one token per row from the first rows.size() columns of the head logits; a grammar
-    // restricts its row to the tokens its current state allows.
-    void sample(std::span<const SampleRow> rows, std::int32_t purpose, std::span<TokenId> out) {
+    // restricts its row to the tokens its current state allows. A row that asks for logprobs gets
+    // the sampled token's record in `logprobs`, under the distribution its token was drawn from.
+    void sample(std::span<const SampleRow> rows, std::int32_t purpose, std::span<TokenId> out,
+                std::span<runtime::RawTokenLogprob> logprobs) {
         RankBinding bind(device, instance.executor->head_rank());
         const cudaStream_t stream = instance.executor->head_stream();
         const std::size_t n       = rows.size();
@@ -669,12 +702,31 @@ struct Qwen4ExpCore::Impl {
         const auto width = static_cast<std::int32_t>(n);
         Tensor sampled(sample_out.p, DType::I32, {width});
         const Tensor logical(sample_position.p, DType::I32, {width});
+        const Tensor logits = instance.executor->logits(static_cast<std::uint32_t>(n));
+        const auto* device_configs = static_cast<const ops::SamplingConfig*>(sample_config.p);
+        const bool gather = std::any_of(rows.begin(), rows.end(),
+                                        [](const SampleRow& row) { return row.logprobs; });
+        const std::size_t top = n * kMaximumTokenLogprobs;
+        auto* host_ids        = static_cast<std::int32_t*>(host_logprobs->data());
+        auto* host_values = reinterpret_cast<float*>(host_ids + slots.size() * kMaximumTokenLogprobs);
+        if (gather) {
+            // Before sampling adds the tokens to the penalty counts.
+            Tensor ids(logprob_ids.p, DType::I32, {ops::kLogprobTopK, 1, width});
+            Tensor values(logprob_values.p, DType::FP32, {ops::kLogprobTopK, 1, width});
+            Tensor lse(logprob_lse.p, DType::FP32, {1, width});
+            const Tensor flag(logprob_flag.p, DType::I32, {1});
+            ops::logprob_topk(logits.view({logits.ne[0], 1, width}), device_configs, nullptr,
+                              static_cast<std::int32_t>(domain), ids, values, lse, flag,
+                              *sample_workspace, stream);
+            CUDA_CHECK(cudaMemcpyAsync(host_ids, logprob_ids.p, top * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(host_values, logprob_values.p, top * sizeof(float),
+                                       cudaMemcpyDeviceToHost, stream));
+        }
         {
             auto scope = sample_workspace->scope();
-            ops::sample(instance.executor->logits(static_cast<std::uint32_t>(n)), sampled,
-                        static_cast<std::int32_t>(domain),
-                        static_cast<const ops::SamplingConfig*>(sample_config.p), logical, purpose,
-                        *sample_workspace, stream);
+            ops::sample(logits, sampled, static_cast<std::int32_t>(domain), device_configs,
+                        logical, purpose, *sample_workspace, stream);
         }
         CUDA_CHECK(cudaMemcpyAsync(tokens, sample_out.p, n * sizeof(std::int32_t),
                                    cudaMemcpyDeviceToHost, stream));
@@ -686,6 +738,15 @@ struct Qwen4ExpCore::Impl {
                 throw std::runtime_error("Qwen3.8-Flash-Next produced non-finite logits");
             }
             out[b] = token;
+            if (!rows[b].logprobs) { continue; }
+            runtime::RawTokenLogprob& record = logprobs[b];
+            record = runtime::RawTokenLogprob{.id = token, .logprob = kLogprobSentinel};
+            for (std::size_t k = 0; k < kMaximumTokenLogprobs; ++k) {
+                const std::size_t slot = b * kMaximumTokenLogprobs + k;
+                record.top_ids[k]      = host_ids[slot];
+                record.top_values[k]   = host_values[slot];
+                if (host_ids[slot] == token) { record.logprob = host_values[slot]; }
+            }
         }
     }
 
@@ -699,42 +760,8 @@ struct Qwen4ExpCore::Impl {
                          .position = r.position,
                          .slot     = r.slot,
                          .counts   = r.penalties,
+                         .logprobs = exec.logprobs,
                          .grammar  = r.output.grammar_state().get()};
-    }
-
-    FirstTokenLogprobs first_token_logprobs(TokenId selected, std::uint32_t count) {
-        RankBinding bind(device, instance.executor->head_rank());
-        const cudaStream_t stream = instance.executor->head_stream();
-        CUDA_CHECK(cudaMemcpyAsync(host_logits.data(), instance.executor->logits(1).data,
-                                   host_logits.size() * 2, cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        double maximum = -INFINITY;
-        for (std::uint32_t v = 0; v < domain; ++v) {
-            maximum = std::max(maximum, double(__bfloat162float(host_logits[v])));
-        }
-        double sum = 0.0;
-        for (std::uint32_t v = 0; v < domain; ++v) {
-            sum += std::exp(double(__bfloat162float(host_logits[v])) - maximum);
-        }
-        const double log_z = maximum + std::log(sum);
-        const auto logprob = [&](TokenId v) {
-            return static_cast<float>(double(__bfloat162float(host_logits[v])) - log_z);
-        };
-        std::vector<TokenId> order(domain);
-        std::iota(order.begin(), order.end(), 0);
-        const std::uint32_t top = std::min(count, domain);
-        std::partial_sort(order.begin(), order.begin() + top, order.end(),
-                          [&](TokenId a, TokenId b) {
-                              const float la = __bfloat162float(host_logits[a]),
-                                          lb = __bfloat162float(host_logits[b]);
-                              return la != lb ? la > lb : a < b;
-                          });
-        FirstTokenLogprobs out;
-        out.selected = {selected, logprob(selected)};
-        for (std::uint32_t i = 0; i < top; ++i) {
-            out.top.push_back({order[i], logprob(order[i])});
-        }
-        return out;
     }
 
     // Frees the request's sequence (keeping its state for the context cache) and completes it.
@@ -745,8 +772,9 @@ struct Qwen4ExpCore::Impl {
         result.generated_token_ids = std::move(r.generated);
         {
             std::lock_guard lock(r.mutex);
-            result.content   = std::move(r.content);
-            result.reasoning = std::move(r.reasoning);
+            result.content          = std::move(r.content);
+            result.reasoning        = std::move(r.reasoning);
+            result.content_logprobs = std::move(r.content_logprobs);
         }
         const auto now = Clock::now();
         if (r.first_token == Clock::time_point{}) { r.first_token = r.last_token = now; }
@@ -758,7 +786,6 @@ struct Qwen4ExpCore::Impl {
         result.matched_stop_string             = r.output.matched_stop_string();
         result.thinking                        = r.output.thinking_stats();
         result.thinking.post_thinking_sampling = r.post_thinking;
-        result.first_token_logprobs            = std::move(r.first_token_logprobs);
         result.reused_prompt_tokens            = r.reused;
         result.prefix_reuse_path               = r.reuse_path;
         result.timings.prepare_seconds         = r.prepare_seconds;
@@ -865,19 +892,22 @@ struct Qwen4ExpCore::Impl {
         r.decoding         = true;
         const SampleRow row = sample_row(r);
         TokenId token       = 0;
-        sample(std::span(&row, 1), ops::kSamplePurposePrefill, std::span(&token, 1));
-        if (exec.first_token_top_logprobs != 0) {
-            r.first_token_logprobs = first_token_logprobs(token, exec.first_token_top_logprobs);
-        }
-        accept(request, token);
+        runtime::RawTokenLogprob logprob;
+        sample(std::span(&row, 1), ops::kSamplePurposePrefill, std::span(&token, 1),
+               std::span(&logprob, 1));
+        accept(request, token, row.logprobs ? &logprob : nullptr);
     }
 
     // Applies the output policy to a sampled token: publishes what it accepts, then either
-    // finishes the request or queues what its next decode step feeds.
-    void accept(const std::shared_ptr<Request>& request, TokenId token) {
+    // finishes the request or queues what its next decode step feeds. `logprob` is the token's
+    // record when the request asked for logprobs.
+    void accept(const std::shared_ptr<Request>& request, TokenId token,
+                const runtime::RawTokenLogprob* logprob) {
         Request& r                    = *request;
         const OutputDecision decision = r.output.preview_model(
-            std::span<const TokenId>(&token, 1), r.budget->remaining(), r.budget->limit_reason());
+            std::span<const TokenId>(&token, 1), r.budget->remaining(), r.budget->limit_reason(),
+            logprob != nullptr ? std::span<const runtime::RawTokenLogprob>(logprob, 1)
+                               : std::span<const runtime::RawTokenLogprob>{});
         const auto now = Clock::now();
         if (r.first_token == Clock::time_point{}) { r.first_token = now; }
         r.last_token = now;
@@ -944,9 +974,11 @@ struct Qwen4ExpCore::Impl {
             r.position += static_cast<std::uint32_t>(r.feed.size());
             const SampleRow row = sample_row(r);
             TokenId token       = 0;
-            sample(std::span(&row, 1), ops::kSamplePurposeDecode, std::span(&token, 1));
+            runtime::RawTokenLogprob logprob;
+            sample(std::span(&row, 1), ops::kSamplePurposeDecode, std::span(&token, 1),
+                   std::span(&logprob, 1));
             try {
-                accept(request, token);
+                accept(request, token, row.logprobs ? &logprob : nullptr);
             } catch (...) { fail(request, std::current_exception()); }
         }
         if (!batch.empty()) {
@@ -964,10 +996,11 @@ struct Qwen4ExpCore::Impl {
                 rows.push_back(sample_row(*request));
             }
             std::vector<TokenId> sampled(batch.size());
-            sample(rows, ops::kSamplePurposeDecode, sampled);
+            std::vector<runtime::RawTokenLogprob> logprobs(batch.size());
+            sample(rows, ops::kSamplePurposeDecode, sampled, logprobs);
             for (std::size_t b = 0; b < batch.size(); ++b) {
                 try {
-                    accept(batch[b], sampled[b]);
+                    accept(batch[b], sampled[b], rows[b].logprobs ? &logprobs[b] : nullptr);
                 } catch (...) { fail(batch[b], std::current_exception()); }
             }
         }

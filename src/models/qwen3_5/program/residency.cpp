@@ -156,6 +156,7 @@ DeviceSnapshot::Stats ProgramImpl::resume_device_state(DeviceSnapshot& snapshot)
         throw;
     }
     snapshot.clear();
+    logprobs_armed.reset();
     return stats;
 }
 

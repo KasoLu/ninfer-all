@@ -805,9 +805,11 @@ public:
         : owner_(std::exchange(other.owner_, nullptr)),
           transaction_(std::exchange(other.transaction_, 0)), rows_(other.rows_),
           row_count_(std::exchange(other.row_count_, 0)), tokens_(other.tokens_),
-          row_counts_(other.row_counts_), row_stride_(other.row_stride_), timing_(other.timing_) {
+          row_counts_(other.row_counts_), logprobs_(other.logprobs_),
+          row_stride_(other.row_stride_), timing_(other.timing_) {
         other.tokens_     = {};
         other.row_counts_ = {};
+        other.logprobs_   = {};
         other.row_stride_ = 0;
         other.timing_     = {};
     }
@@ -822,6 +824,11 @@ public:
 
     [[nodiscard]] std::span<const std::int32_t> row_counts() const noexcept { return row_counts_; }
 
+    // Row-major [rows,row_stride] logprob records, or empty when logprobs were not requested.
+    [[nodiscard]] std::span<const runtime::RawTokenLogprob> logprobs() const noexcept {
+        return logprobs_;
+    }
+
     [[nodiscard]] std::uint32_t row_stride() const noexcept { return row_stride_; }
 
     [[nodiscard]] runtime::ExecutionTiming execution_timing() const noexcept { return timing_; }
@@ -833,6 +840,7 @@ private:
     std::size_t row_count_ = 0;
     std::span<const TokenId> tokens_;
     std::span<const std::int32_t> row_counts_;
+    std::span<const runtime::RawTokenLogprob> logprobs_;
     std::uint32_t row_stride_ = 0;
     runtime::ExecutionTiming timing_;
 
@@ -846,7 +854,6 @@ struct PrefillProgress {
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     std::optional<CaptureOffer> capture;
-    std::optional<FirstTokenLogprobs> first_token_logprobs;
 };
 
 enum class CaptureStatePlacement : std::uint8_t {
@@ -1343,7 +1350,8 @@ struct RuntimeContractAccess {
     [[nodiscard]] static PendingBatch
     make_pending(const void* owner, std::uint64_t transaction, std::span<const SequenceHandle> rows,
                  std::span<const TokenId> tokens, std::span<const std::int32_t> row_counts,
-                 std::uint32_t row_stride, runtime::ExecutionTiming timing) {
+                 std::span<const runtime::RawTokenLogprob> logprobs, std::uint32_t row_stride,
+                 runtime::ExecutionTiming timing) {
         PendingBatch out;
         out.owner_       = owner;
         out.transaction_ = transaction;
@@ -1351,6 +1359,7 @@ struct RuntimeContractAccess {
         for (std::size_t i = 0; i < rows.size(); ++i) { out.rows_[i] = rows[i]; }
         out.tokens_     = tokens;
         out.row_counts_ = row_counts;
+        out.logprobs_   = logprobs;
         out.row_stride_ = row_stride;
         out.timing_     = timing;
         return out;
@@ -1375,6 +1384,7 @@ struct RuntimeContractAccess {
         pending.row_count_   = 0;
         pending.tokens_      = {};
         pending.row_counts_  = {};
+        pending.logprobs_    = {};
         pending.row_stride_  = 0;
         pending.timing_      = {};
     }

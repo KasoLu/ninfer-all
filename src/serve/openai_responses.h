@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -116,7 +117,9 @@ public:
 
     std::vector<std::string> start();
     std::vector<std::string> reasoning_delta(const std::string& text);
-    std::vector<std::string> content_delta(const std::string& text);
+    // A content delta event carries the logprob records of the tokens whose text it publishes.
+    std::vector<std::string> content_delta(const std::string& text,
+                                           std::span<const ninfer::TokenLogprob> logprobs = {});
     OpenAIResponsesStreamFinish finish(const GenerationOutcome& outcome);
     std::string terminal(const BuiltOpenAIResponse& response);
     std::string failed(const ApiError& error);

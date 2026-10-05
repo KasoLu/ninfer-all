@@ -76,7 +76,7 @@ std::string require_function_name(const Json& object, std::string param) {
     return name;
 }
 
-void validate_standard_output_controls(const Json& body, const RequestLimits& limits) {
+void validate_standard_output_controls(const Json& body) {
     if (body.contains("functions") && !body.at("functions").is_null()) {
         const Json& functions = body.at("functions");
         if (!functions.is_array()) { bad_request("functions must be an array", "functions"); }
@@ -121,33 +121,21 @@ void validate_standard_output_controls(const Json& body, const RequestLimits& li
             }
         }
     }
+    bool logprobs = false;
     if (body.contains("logprobs") && !body.at("logprobs").is_null()) {
         if (!body.at("logprobs").is_boolean()) {
             bad_request("logprobs must be a boolean", "logprobs");
         }
-        if (body.at("logprobs").get<bool>()) {
-            bad_request("logprobs=true requires per-token log probabilities in the response, which "
-                        "NInfer does not provide",
-                        "logprobs", "logprobs_not_supported");
-        }
+        logprobs = body.at("logprobs").get<bool>();
     }
     if (const std::optional<int> top_logprobs = optional_int(body, "top_logprobs")) {
-        if (*top_logprobs != 0 && !limits.first_token_logprobs) {
-            bad_request(
-                "nonzero top_logprobs requires alternative-token probabilities in the response, "
-                "which this server does not provide without --first-token-logprobs",
-                "top_logprobs", "logprobs_not_supported");
-        }
-        if (*top_logprobs < 0 ||
-            *top_logprobs > static_cast<int>(ninfer::kMaximumFirstTokenTopLogprobs)) {
+        if (*top_logprobs < 0 || *top_logprobs > static_cast<int>(ninfer::kMaximumTokenLogprobs)) {
             bad_request("top_logprobs must be in [0," +
-                            std::to_string(ninfer::kMaximumFirstTokenTopLogprobs) + "]",
+                            std::to_string(ninfer::kMaximumTokenLogprobs) + "]",
                         "top_logprobs");
         }
-        if (*top_logprobs != 0 && body.contains("stream") && body.at("stream").is_boolean() &&
-            body.at("stream").get<bool>()) {
-            bad_request("top_logprobs is reported only for non-streaming requests", "top_logprobs",
-                        "logprobs_not_supported");
+        if (*top_logprobs != 0 && !logprobs) {
+            bad_request("top_logprobs requires logprobs to be true", "top_logprobs");
         }
     }
 
@@ -990,7 +978,7 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
 
 OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
     require_object(body, "request body must be a JSON object");
-    validate_standard_output_controls(body, limits);
+    validate_standard_output_controls(body);
     validate_constrained_decoding_extensions(body);
     validate_compatibility_hints(body);
 
@@ -1015,9 +1003,10 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_messages(body, limits.assistant_prefill, output.generation);
     parse_stop(body, output.generation);
     parse_sampling(body, output.generation);
-    if (const std::optional<int> top_logprobs = optional_int(body, "top_logprobs")) {
-        output.generation.first_token_top_logprobs = static_cast<std::uint32_t>(*top_logprobs);
+    if (body.contains("logprobs") && body.at("logprobs").is_boolean()) {
+        output.generation.logprobs = body.at("logprobs").get<bool>();
     }
+    output.generation.top_logprobs = optional_int(body, "top_logprobs").value_or(0);
     parse_stream_options(body, output);
     parse_response_observations(body, output);
     parse_output_limit(body, limits, output);

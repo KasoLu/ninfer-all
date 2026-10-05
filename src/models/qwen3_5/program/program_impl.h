@@ -210,6 +210,8 @@ struct RequestBasePlanImpl {
     qwen3_5::PreparedContextCache context_cache;
     ops::SamplingConfig sampling;
     std::shared_ptr<text::GrammarState> grammar;
+    // The request asked for each generated token's log probability.
+    bool logprobs = false;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_5::VisionControlPlan> vision_control_plan;
@@ -219,7 +221,6 @@ struct RequestBasePlanImpl {
     qwen3_5::detail::PrefixShortlistDigests prefix_digests;
     std::uint32_t prefix_identity_tag = 0;
     bool allow_prefix_reuse           = false;
-    std::uint32_t first_token_top_logprobs = 0;
 };
 
 // Program-owned physical planning state shared by request materialization and active capture.
@@ -276,7 +277,7 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     std::vector<CaptureGroup> shared_candidates;
     ops::SamplingConfig sampling;
     std::shared_ptr<text::GrammarState> grammar;
-    std::uint32_t first_token_top_logprobs    = 0;
+    bool logprobs                             = false;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     runtime::LaneId destination{};
@@ -526,7 +527,7 @@ struct RequestControl {
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
     std::shared_ptr<text::GrammarState> grammar;
-    std::uint32_t first_token_top_logprobs = 0;
+    bool logprobs = false;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
     // Adaptive MTP: how far this request's drafts survive.
@@ -943,12 +944,18 @@ public:
 
     std::optional<PinnedHostBuffer> round_host;
     std::optional<PinnedHostBuffer> score_logprobs_host;
-    // The logits behind a request's first token, copied when the request reports log
-    // probabilities.
-    std::optional<PinnedHostBuffer> first_token_logits_host;
     // Present under adaptive MTP: picks each round's verification width.
     std::optional<MtpAdaptiveBatchController> mtp_controller;
     TokenId* host_tokens = nullptr;
+    // The round's logprob records, [row, column]; a returned round's span points here until the
+    // Engine commits it. The host copy of the device gather lands in logprobs_host, and
+    // logprobs_armed mirrors the device flag that enables the gather, unknown after a resume.
+    std::array<runtime::RawTokenLogprob,
+               kMaximumConcurrency * std::max(kMtpDecodeMaximumWidth, kDFlashVerifyMaximumWidth)>
+        round_logprobs{};
+    std::optional<PinnedHostBuffer> logprobs_host;
+    std::optional<bool> logprobs_armed;
+
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_5::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
     qwen3_5::OrdinaryDecodeEgress* ordinary_host_egress   = nullptr;
@@ -1641,6 +1648,12 @@ private:
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
     void set_device_i32(Tensor& tensor, std::int32_t value);
+    // Enables the device logprob gather for the next round when one of its rows asked for it.
+    void arm_logprobs(bool any);
+    // Copies the first `rows` gathered records to the host, ordered after the enqueued round.
+    void fetch_logprobs(std::int32_t rows);
+    // The fetched record of gather row `row`, for the token that row produced.
+    [[nodiscard]] runtime::RawTokenLogprob fetched_logprob(std::int32_t row, TokenId token) const;
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
     void

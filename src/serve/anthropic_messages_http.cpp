@@ -196,7 +196,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                     output.on_reasoning = [&](const std::string& text) {
                         render_and_write(transport, [&] { return encoder->reasoning_delta(text); });
                     };
-                    output.on_content = [&](const std::string& text) {
+                    output.on_content = [&](const std::string& text,
+                                            std::span<const ninfer::TokenLogprob>) {
                         render_and_write(transport, [&] { return encoder->content_delta(text); });
                     };
                     output.is_cancelled = [&] { return transport.poll(); };

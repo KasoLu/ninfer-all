@@ -142,7 +142,9 @@ reused. A request goes to the free sequence that holds the longest such prefix o
 `--no-prefix-reuse` (ninfer-serve) prefills every prompt from scratch.
 
 Structured output (`--structured-output` for the server, `--json`/`--json-schema` for the CLI) works
-as for the Qwen3.5 family: the grammar's token mask applies to every sampled token.
+as for the Qwen3.5 family: the grammar's token mask applies to every sampled token. So do
+[token log probabilities](serving.md#token-log-probabilities): a request that asks gathers each
+sampled token's top 20 from the same logits before sampling.
 
 `--vision` loads the Vision tower of an artifact converted with it (0.9 GB of BF16 weights on the
 first device, beside the token embedding) and takes images and video as the Qwen3.5 family does:

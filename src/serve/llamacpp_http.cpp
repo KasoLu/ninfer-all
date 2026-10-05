@@ -403,7 +403,8 @@ void HttpServer::handle_text_completion(const httplib::Request& req, httplib::Re
                             encoder->note_timing(timing);
                         };
                     }
-                    output.on_content = [&](const std::string& text) {
+                    output.on_content = [&](const std::string& text,
+                                            std::span<const ninfer::TokenLogprob>) {
                         render_and_write(transport, [&] { return encoder->content_delta(text); });
                     };
                     output.is_cancelled = [&] { return transport.poll(); };

@@ -1,5 +1,7 @@
 #include "models/qwen3_5/program/round_buffers.h"
+
 #include "models/load_options.h"
+#include "ninfer/ops/logprob_topk.h"
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -90,6 +92,17 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
     if (!spec.causal_scoring) {
         layout.backend_kv_table_row =
             add_tensor(builder, DType::I32, {1}, "step backend KV table row");
+        const std::uint32_t width =
+            spec.backend == SpeculativeBackend::None
+                ? 1U
+                : std::max(spec.draft_window, spec.verify_window) + 1U;
+        const std::int32_t rows = checked_i32(spec.batch_capacity * width, "logprob rows");
+        layout.logprob_ids =
+            add_tensor(builder, DType::I32, {ops::kLogprobTopK, rows}, "logprob top ids");
+        layout.logprob_values =
+            add_tensor(builder, DType::FP32, {ops::kLogprobTopK, rows}, "logprob top values");
+        layout.logprob_lse    = add_tensor(builder, DType::FP32, {rows}, "logprob lse");
+        layout.logprob_active = add_tensor(builder, DType::I32, {1}, "logprob gather flag");
     }
     return layout;
 }
@@ -464,6 +477,10 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
         rope_pos             = layout.rope_pos.bind(backing);
         logits               = layout.logits.bind(backing);
         backend_kv_table_row = layout.backend_kv_table_row.bind(backing);
+        logprob_ids          = layout.logprob_ids.bind(backing);
+        logprob_values       = layout.logprob_values.bind(backing);
+        logprob_lse          = layout.logprob_lse.bind(backing);
+        logprob_active       = layout.logprob_active.bind(backing);
     }
     if (layout.mtp) { mtp.emplace(backing, *layout.mtp); }
     if (layout.dflash_prefill) { dflash_prefill.emplace(backing, *layout.dflash_prefill); }

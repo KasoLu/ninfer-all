@@ -23,6 +23,8 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                  envelope, frame.target_hidden, frame.target_logits,
                                  frame.target_tokens);
     }
+    // Before acceptance adds this round's tokens to the penalty counts.
+    gather_logprobs(execution, frame.target_logits, frame.sampling, &frame.drafts);
     if (frame.proposal_q.data != nullptr) {
         ops::speculative_accept_sparse_drafts(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,

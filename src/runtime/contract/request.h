@@ -24,7 +24,8 @@ struct ResolvedExecutionOptions {
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;
-    std::uint32_t first_token_top_logprobs = 0;
+    // Gather each generated token's log probability and its likely alternatives.
+    bool logprobs = false;
 };
 
 struct ResolvedRequestOptions {

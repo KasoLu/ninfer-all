@@ -289,9 +289,10 @@ From other forks:
   to the Qwen form, and go through the same recovery pass.
 - **Structured output** through xgrammar, speculative decoding included, opt-in with
   `--structured-output` (upstream PR #294 by Andrey Shvartsman).
-- **First-token log probabilities.** With `--first-token-logprobs`, a Chat Completions request may ask
-  for `top_logprobs` and gets the first generated token's log probability with its alternatives
-  (IMGillusion).
+- **Token log probabilities.** Chat Completions `logprobs`/`top_logprobs` and Responses
+  `include: ["message.output_text.logprobs"]` report each content token's log probability with up to
+  20 alternatives, streamed or not, on every model family (Fedor Suchkov's frinfer design; it replaces
+  IMGillusion's first-token export).
 - **Rolling retention.** `--context-cache-policy rolling` lets one long conversation keep rolling
   its cached frontier forward (IMGillusion).
 - **Diverged-branch release.** `--release-diverged-checkpoints` lets the cache drop first a private

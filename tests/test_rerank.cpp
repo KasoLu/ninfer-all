@@ -8,7 +8,9 @@
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <cstddef>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -33,14 +35,18 @@ std::string refusal(const char* body) {
 }
 
 GenerationOutcome judged(std::vector<std::pair<std::string, double>> alternatives) {
-    GenerationOutcome out;
-    FirstTokenLogprobsView logprobs;
-    for (const auto& [bytes, probability] : alternatives) {
-        logprobs.top.push_back(
-            {.bytes = bytes, .logprob = static_cast<float>(std::log(probability))});
+    ninfer::TokenLogprob answer;
+    answer.top_ids.fill(-1);
+    for (std::size_t k = 0; k < alternatives.size(); ++k) {
+        answer.top_ids[k]    = static_cast<ninfer::TokenId>(k);
+        answer.top_bytes[k]  = alternatives[k].first;
+        answer.top_values[k] = static_cast<float>(std::log(alternatives[k].second));
     }
-    logprobs.selected        = logprobs.top.front();
-    out.first_token_logprobs = std::move(logprobs);
+    answer.id      = answer.top_ids[0];
+    answer.bytes   = answer.top_bytes[0];
+    answer.logprob = answer.top_values[0];
+    GenerationOutcome out;
+    out.content_logprobs.push_back(std::move(answer));
     return out;
 }
 
@@ -71,8 +77,7 @@ void parsing() {
                    std::string::npos,
            "the judging prompt holds the query and the document");
     expect(judgement.enable_thinking == false && judgement.max_tokens == 1 &&
-               judgement.first_token_top_logprobs == ninfer::kMaximumFirstTokenTopLogprobs &&
-               judgement.graft && judgement.graft->empty(),
+               judgement.logprobs && judgement.graft && judgement.graft->empty(),
            "one answer token with its alternatives, no thinking, no graft");
 }
 
@@ -86,6 +91,11 @@ void scoring() {
            "a missing answer counts as likely as the least likely alternative");
     expect(near(rerank_score(judged({{"the", 0.5}, {"a", 0.2}})), 0.5),
            "a judgement that answers neither scores one half");
+    bool refused = false;
+    try {
+        (void)rerank_score(GenerationOutcome{});
+    } catch (const std::runtime_error&) { refused = true; }
+    expect(refused, "a judgement without an answer token is an error, not a score");
 }
 
 void response() {

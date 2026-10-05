@@ -8,9 +8,10 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <span>
 #include <string>
-#include <vector>
 #include <string_view>
+#include <vector>
 
 namespace ninfer::serve {
 
@@ -37,6 +38,13 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
 // Client-executed types stay rejected. Dropping one of those would leave the caller waiting for a
 // call that can never arrive, which is worse than a clear error.
 [[nodiscard]] bool is_hosted_openai_tool_type(std::string_view type) noexcept;
+
+// Generated tokens' log probability records in the OpenAI shape: each token's text (its bytes,
+// with U+FFFD for a sequence that is not valid UTF-8 on its own), logprob (OpenAI's -9999 for a
+// token outside its top set), and up to `top_logprobs` alternatives; with `bytes`, every entry
+// also carries its exact bytes.
+[[nodiscard]] nlohmann::json openai_token_logprobs_json(std::span<const ninfer::TokenLogprob> records,
+                                                        int top_logprobs, bool bytes);
 
 // What /v1/models advertises about the one resident model.
 struct ModelDescription {

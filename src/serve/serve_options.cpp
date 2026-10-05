@@ -412,9 +412,6 @@ std::string serve_usage_text(const char* argv0) {
            "  --lenient-assistant-history   accept Responses input whose assistant text or\n"
            "                                reasoning follows function_call Items; it joins\n"
            "                                that turn, rendered before its calls\n"
-           "  --first-token-logprobs        accept Chat Completions top_logprobs\n"
-           "                                (non-streaming) and report the first token's log\n"
-           "                                probability with its alternatives\n"
            "  --usage-chunk-choice          give the streamed usage chunk a zero-delta\n"
            "                                choice, for strict parsers that reject\n"
            "                                choices:[]\n"
@@ -630,10 +627,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
-            continue;
-        }
-        if (arg == "--first-token-logprobs") {
-            options.first_token_logprobs = true;
             continue;
         }
         if (arg == "--fast-prefill-kernel") {

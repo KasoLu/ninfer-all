@@ -422,9 +422,11 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                         render_and_write(transport,
                                          [&] { return stream->encoder->reasoning_delta(text); });
                     };
-                    output.on_content = [&](const std::string& text) {
-                        render_and_write(transport,
-                                         [&] { return stream->encoder->content_delta(text); });
+                    output.on_content = [&](const std::string& text,
+                                            std::span<const ninfer::TokenLogprob> logprobs) {
+                        render_and_write(transport, [&] {
+                            return stream->encoder->content_delta(text, logprobs);
+                        });
                     };
                     output.is_cancelled = [&] { return transport.poll(); };
 

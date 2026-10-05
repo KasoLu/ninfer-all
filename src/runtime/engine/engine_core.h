@@ -1122,6 +1122,33 @@ private:
         };
     }
 
+    // Attaches a commit's new content logprob records to its content delta, or to an added empty
+    // content delta when the commit withheld all of its content text.
+    static void attach_streaming_logprobs(PublishedOutput& output,
+                                          const std::vector<TokenLogprob>& records) {
+        for (OutputDelta& delta : output) {
+            if (delta.channel == OutputChannel::Content) {
+                delta.logprobs = records;
+                return;
+            }
+        }
+        output.push_back(OutputDelta{.channel = OutputChannel::Content, .logprobs = records});
+    }
+
+    // Commits the request's output preview and keeps the logprob records it published.
+    static PublishedOutput commit_output(Request& request) {
+        PublishedOutput published          = request.output.commit_preview();
+        std::vector<TokenLogprob> logprobs = request.output.take_content_logprobs();
+        if (logprobs.empty()) { return published; }
+        if (request.consumer_mode == OutputConsumerMode::Streaming) {
+            attach_streaming_logprobs(published, logprobs);
+        }
+        request.content_logprobs.insert(request.content_logprobs.end(),
+                                        std::make_move_iterator(logprobs.begin()),
+                                        std::make_move_iterator(logprobs.end()));
+        return published;
+    }
+
     void append_output(const std::shared_ptr<Request>& request, PublishedOutput output,
                        std::optional<GenerationTimingObservation> timing = std::nullopt) {
         apply_post_thinking_sampling(*request);
@@ -1330,6 +1357,7 @@ private:
         GenerationResult result;
         result.prompt                  = request->prompt_summary;
         result.generated_token_ids     = std::move(request->generated);
+        result.content_logprobs        = std::move(request->content_logprobs);
         result.content                 = std::move(request->content);
         result.reasoning               = std::move(request->reasoning);
         result.tool_calls              = request->output.take_tool_calls();
@@ -1345,7 +1373,6 @@ private:
         result.timings                 = request->generation_timings;
         result.timings.prepare_seconds = request->prepare_seconds;
         result.speculative             = std::move(request->speculative_stats);
-        result.first_token_logprobs    = std::move(request->first_token_logprobs);
         result.thinking                = request->output.thinking_stats();
         result.thinking.post_thinking_sampling = request->post_thinking_applied;
         if (request->ngram_archive) {
@@ -1399,7 +1426,7 @@ private:
 
     void complete_cancelled(const std::shared_ptr<Request>& request) {
         (void)request->output.preview_terminal(FinishReason::Cancelled);
-        append_output(request, request->output.commit_preview());
+        append_output(request, commit_output(*request));
         complete_success(request, FinishReason::Cancelled);
     }
 
@@ -1525,7 +1552,7 @@ private:
             request->speculative_stats  = std::move(aborted.speculative);
             if (aborted.salvaged) { ++cumulative_stats_.salvaged_continuations; }
             if (scheduler_.owns_prefill_lane(lane)) { scheduler_.clear_prefill_lane(lane); }
-            append_output(request, request->output.commit_preview());
+            append_output(request, commit_output(*request));
             finish_engine_phase(boundary, EngineHostPhase::Boundary);
             // Free the slot and publish the post-release snapshot before waking the caller so
             // runtime_stats() read after generate() returns reflects the released lane.
@@ -1650,8 +1677,16 @@ private:
                     finish_reasons[row] = FinishReason::Cancelled;
                     continue;
                 }
+                // A round carries records for every row once one of its requests asks; only a
+                // request that asked takes its row's.
+                std::span<const runtime::RawTokenLogprob> row_logprobs{};
+                if (request->options.execution.logprobs && !pending.logprobs().empty()) {
+                    row_logprobs = pending.logprobs().subspan(
+                        static_cast<std::size_t>(row) * pending.row_stride(), count);
+                }
                 const OutputDecision decision = request->output.preview_model(
-                    row_tokens, request->budget->remaining(), request->budget->limit_reason());
+                    row_tokens, request->budget->remaining(), request->budget->limit_reason(),
+                    row_logprobs);
                 if (decision.accepted_tokens == 0 || decision.accepted_tokens > count ||
                     (!decision.finished() && decision.accepted_tokens != count) ||
                     (decision.finished() && decision.continuation != ContinuationAction::Decode) ||
@@ -1768,7 +1803,7 @@ private:
                     request->budget->commit(accepted);
                     if (decode_round) { Scheduling::consume_service_work(*request, accepted); }
                 }
-                auto published = request->output.commit_preview();
+                auto published = commit_output(*request);
                 auto timing    = record_committed_output(request, accepted);
                 append_output(request, std::move(published), std::move(timing));
                 if (decisions[row].terminal) {
@@ -1932,8 +1967,7 @@ private:
             scheduler_.clear_prefill_lane(lane);
             request_admission_check();
         }
-        request->begin                = progress.summary;
-        request->first_token_logprobs = std::move(progress.first_token_logprobs);
+        request->begin = progress.summary;
         const std::array<std::uint32_t, 1> lanes{lane};
         phase.finish();
         commit_pending(std::move(*progress.pending), lanes, false, cancelled_at_unit_start);
@@ -2621,7 +2655,7 @@ private:
             Scheduling::consume_service_work(*request, membership.row_stride);
             cumulative_stats_.committed_decode_tokens += membership.row_stride;
             auto timing = record_committed_output(request, membership.row_stride);
-            append_output(request, request->output.commit_preview(), std::move(timing));
+            append_output(request, commit_output(*request), std::move(timing));
             request->model_state = EngineRequestState::DecodeReady;
         }
         publish_runtime_stats();

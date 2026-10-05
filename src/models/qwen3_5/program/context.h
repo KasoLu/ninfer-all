@@ -47,6 +47,24 @@ struct ExecutionCore {
     std::uint32_t mtp_attention_window = 0;
 };
 
+// The round's logprob gather outputs for a [width, batch] round: I32 and FP32 [kLogprobTopK,
+// width, batch] and FP32 [width, batch], with the flag that enables the gather.
+struct LogprobGather {
+    Tensor ids;
+    Tensor values;
+    Tensor lse;
+    Tensor active;
+};
+
+[[nodiscard]] LogprobGather logprob_gather(const qwen3_5::RoundState& io, std::int32_t width,
+                                           std::int32_t batch);
+
+// Gathers the sampler's distribution of logits [physical_rows, width, batch] (verification column
+// c reads the penalty overlay drafts[0..c), so drafts is [width-1, batch] when width > 1). A
+// device no-op unless a request in the round asked for logprobs.
+void gather_logprobs(ExecutionCore& execution, const Tensor& logits,
+                     const ops::SamplingConfig* sampling, const Tensor* drafts);
+
 struct PrefillContext {
     ExecutionCore execution;
     qwen3_5::PagedKVCacheView text_kv;
@@ -64,8 +82,6 @@ struct PrefillContext {
     // state_destination_slot at every chunk, because a checkpoint may fork the destination slot
     // between chunks of one step and decode rounds rewrite the shared frame controls.
     std::int32_t dflash_kv_table_row = 0;
-    // Pinned host destination for the logits behind the first generated token, or null.
-    void* first_token_logits = nullptr;
     // Takes the per-model-layer events of a Host restore still landing, which the chunk's first
     // pass over the layer stack waits on; empty once taken or landed. The events are a view into
     // the landing batch, which the cache's next poll() frees, so each chunk function calls this

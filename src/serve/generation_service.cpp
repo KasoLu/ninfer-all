@@ -243,12 +243,12 @@ public:
     }
 
     void publish(ninfer::OutputDelta delta) override {
-        if (delta.text.empty()) { return; }
         if (delta.channel == ninfer::OutputChannel::Reasoning) {
-            if (sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
-        } else {
-            if (sink_->on_content) { sink_->on_content(delta.text); }
+            if (!delta.text.empty() && sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
+            return;
         }
+        if (delta.text.empty() && delta.logprobs.empty()) { return; }
+        if (sink_->on_content) { sink_->on_content(delta.text, delta.logprobs); }
     }
 
 private:
@@ -632,23 +632,13 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.tokens              = result.generated_token_ids;
     outcome.text                = std::move(result.content);
     outcome.reasoning           = std::move(result.reasoning);
+    outcome.content_logprobs    = std::move(result.content_logprobs);
     outcome.prompt_tokens       = static_cast<int>(result.prompt.prompt_tokens);
     outcome.completion_tokens   = static_cast<int>(result.generated_token_ids.size());
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
     outcome.thinking            = result.thinking;
     outcome.finish_reason       = result.finish_reason;
     outcome.matched_stop_string = std::move(result.matched_stop_string);
-    if (result.first_token_logprobs) {
-        const auto view = [this](const ninfer::TokenLogprob& entry) {
-            return TokenLogprobView{.bytes   = engine_->token_bytes(entry.token),
-                                    .logprob = entry.logprob};
-        };
-        FirstTokenLogprobsView logprobs{.selected = view(result.first_token_logprobs->selected)};
-        for (const ninfer::TokenLogprob& entry : result.first_token_logprobs->top) {
-            logprobs.top.push_back(view(entry));
-        }
-        outcome.first_token_logprobs = std::move(logprobs);
-    }
 
     outcome.metrics.prepare_seconds = prepared.prepare_seconds;
     outcome.metrics.ttft_seconds =

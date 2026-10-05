@@ -48,8 +48,6 @@ struct RequestLimits {
     // request receives the Engine's concurrent lane budget once its prompt is prepared.
     std::optional<int> default_max_tokens;
     int max_context = 8192; // --max-context, the upper bound of any derived budget
-    // Accept top_logprobs for the first generated token (--first-token-logprobs).
-    bool first_token_logprobs = false;
     // Continue a trailing Chat Completions assistant message in place (--assistant-prefill).
     bool assistant_prefill = false;
     // Responses input: assistant message content or reasoning after function_call Items joins
@@ -250,8 +248,15 @@ struct GenerationRequest {
     // Sampling from the token after the reasoning block closes (a `post_thinking` object).
     std::optional<SamplingParams> post_thinking;
     StructuredOutputOptions structured_output;
-    // Log probabilities of the first generated token with this many alternatives; zero is off.
-    std::uint32_t first_token_top_logprobs = 0;
+    // Each generated content token's log probability, with `top_logprobs` (0 to
+    // kMaximumTokenLogprobs) of its most likely alternatives in the response.
+    bool logprobs    = false;
+    int top_logprobs = 0;
+
+    // The alternatives each reported token carries, absent unless the request asked for logprobs.
+    [[nodiscard]] std::optional<int> reported_top_logprobs() const noexcept {
+        return logprobs ? std::optional<int>(top_logprobs) : std::nullopt;
+    }
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;

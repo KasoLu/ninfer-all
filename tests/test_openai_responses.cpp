@@ -258,7 +258,7 @@ int test_reasoning_encrypted_content_request() {
                           .include_reasoning_encrypted_content,
                       "duplicate supported include entries are idempotent");
 
-    body["include"] = Json::array({"message.output_text.logprobs"});
+    body["include"] = Json::array({"file_search_call.results"});
     const ApiError unsupported =
         api_error([&] { (void)parse_openai_responses_create_request(body, limits()); });
     failures += check(unsupported.status == 400 && unsupported.param == "include" &&
@@ -1220,6 +1220,77 @@ int test_response_object() {
     return failures;
 }
 
+ninfer::TokenLogprob sample_logprob_record() {
+    ninfer::TokenLogprob record;
+    record.id      = 42;
+    record.logprob = -0.25F;
+    record.bytes   = "hi";
+    record.top_ids.fill(-1);
+    record.top_ids[0]    = 42;
+    record.top_values[0] = -0.25F;
+    record.top_bytes[0]  = "hi";
+    record.top_ids[1]    = 7;
+    record.top_values[1] = -1.0F;
+    record.top_bytes[1]  = "yo";
+    return record;
+}
+
+int test_logprobs_response() {
+    int failures    = 0;
+    const Json body = {{"model", "m"},
+                       {"input", "hello"},
+                       {"include", Json::array({"message.output_text.logprobs"})},
+                       {"top_logprobs", 2}};
+    const OpenAIResponsesCreateRequest request =
+        parse_openai_responses_create_request(body, limits());
+    failures += check(request.prompt.generation.logprobs &&
+                          request.prompt.generation.top_logprobs == 2,
+                      "Responses include and top_logprobs reach the Engine");
+    failures += check(
+        api_code([&] {
+            Json invalid = {{"model", "m"},
+                            {"input", "hello"},
+                            {"include", Json::array({"message.output_text.annotations"})}};
+            (void)parse_openai_responses_create_request(invalid, limits());
+        }) == "include_not_supported",
+        "unknown include entry is rejected");
+
+    GenerationOutcome outcome = sample_outcome();
+    outcome.content_logprobs.push_back(sample_logprob_record());
+    const BuiltOpenAIResponse built =
+        make_openai_response_object("resp_lp", 1, request, {}, outcome);
+    const Json& part = built.body.at("output").at(1).at("content").at(0);
+    failures += check(part.at("type") == "output_text" && part.at("logprobs").is_array(),
+                      "Responses output_text carries aggregate LogProb[]");
+    const Json& entry = part.at("logprobs").at(0);
+    failures += check(entry.at("token") == "hi" && entry.at("logprob") == -0.25 &&
+                          entry.at("bytes") == Json::array({104, 105}) &&
+                          entry.at("top_logprobs").size() == 2,
+                      "Responses aggregate LogProb has token, logprob, bytes and top_logprobs");
+    failures += check(built.body.at("top_logprobs") == 2,
+                      "Responses body reports the requested top_logprobs");
+
+    OpenAIResponsesEventStream encoder("resp_lp_stream", 1, request, {});
+    (void)encoder.start();
+    const std::vector<ninfer::TokenLogprob> records = {sample_logprob_record()};
+    bool found = false;
+    for (const std::string& wire : encoder.content_delta("hi", records)) {
+        const Json payload = parse_event(wire);
+        if (payload.at("type") == "response.output_text.delta") {
+            const Json& streamed = payload.at("logprobs");
+            found = payload.at("delta") == "hi" && streamed.size() == 1 &&
+                    streamed[0].at("token") == "hi" && !streamed[0].contains("bytes") &&
+                    streamed[0].at("top_logprobs").size() == 2;
+        }
+    }
+    failures += check(found, "a streamed text delta carries its tokens' log probabilities");
+    const OpenAIResponsesCreateRequest plain = parse_openai_responses_create_request(
+        Json{{"model", "m"}, {"input", "hello"}}, limits());
+    failures += check(!plain.prompt.generation.logprobs,
+                      "Responses gather no log probabilities unless asked");
+    return failures;
+}
+
 int test_sse_sequence_and_failures() {
     OpenAIResponsesCreateRequest request =
         parse_openai_responses_create_request(Json{{"model", "m"},
@@ -1479,6 +1550,7 @@ int main() {
     failures += test_prompt_cache_key_retention();
     failures += test_reasoning_summary_options();
     failures += test_response_object();
+    failures += test_logprobs_response();
     failures += test_sse_sequence_and_failures();
     failures += test_input_tokens_uses_shared_state_path();
     if (failures == 0) { std::cout << "ok\n"; }

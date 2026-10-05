@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -40,8 +41,11 @@ struct OpenAIChatResponseIdentity {
 };
 
 OpenAIChatResponseIdentity make_openai_chat_response_identity(std::string model);
+// `top_logprobs` is absent unless the request asked for logprobs, and is then the number of
+// alternatives each token reports.
 std::string make_chat_completion_response(const OpenAIChatResponseIdentity& identity,
-                                          const GenerationOutcome& outcome);
+                                          const GenerationOutcome& outcome,
+                                          std::optional<int> top_logprobs = std::nullopt);
 
 // Pieces the text-completion endpoints share with Chat Completions: llama.cpp's `timings` object of
 // a finished generation and the live snapshot of one under way, its `prompt_progress` object, and
@@ -57,7 +61,8 @@ class OpenAIChatStream {
 public:
     OpenAIChatStream(OpenAIChatResponseIdentity identity, bool include_usage,
                      bool timings_per_token = false, bool return_progress = false,
-                     bool usage_chunk_choice = false);
+                     bool usage_chunk_choice = false,
+                     std::optional<int> top_logprobs = std::nullopt);
 
     std::string start();
     void note_start(const ninfer::GenerationStart& start);
@@ -65,13 +70,16 @@ public:
     std::string prompt_progress(const ninfer::PromptProgress& progress);
     void note_timing(const ninfer::GenerationTimingObservation& timing);
     std::string reasoning_delta(const std::string& text);
-    std::string content_delta(const std::string& text);
+    // A content chunk carries the logprob records of the tokens whose text it publishes.
+    std::string content_delta(const std::string& text,
+                              std::span<const ninfer::TokenLogprob> logprobs = {});
     std::vector<std::string> finish(const GenerationOutcome& outcome);
 
 private:
     nlohmann::json live_timings_json() const;
 
     OpenAIChatResponseIdentity identity_;
+    std::optional<int> top_logprobs_;
     std::string reasoning_;
     std::string content_;
     std::optional<ninfer::GenerationTimingObservation> live_timing_;

@@ -791,19 +791,16 @@ The endpoint supports:
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes JSON constrained output on a server without `--structured-output` (unless
-it runs with `--unconstrained-response-format`), nonzero `logit_bias`, requested log probabilities
-(except `top_logprobs` with `--first-token-logprobs`), audio/file input or audio output,
-`required` tool choice over several callable tools, explicit low/high image detail, web search,
-moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
-`parallel_tool_calls:false` with enabled tools, explicit low/high image detail, web search,
-moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
+it runs with `--unconstrained-response-format`), nonzero `logit_bias`, audio/file input or audio
+output, `required` tool choice over several callable tools, explicit low/high image detail, web
+search, moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
 The vLLM/llama.cpp constrained-decoding extensions (`grammar`, `structured_outputs`, `guided_json`,
 `guided_regex`, `guided_choice`, and `guided_grammar`) are rejected explicitly instead of being
 treated as unknown hints; structured JSON is requested through `response_format`.
 
 Semantically neutral fields do not make an otherwise executable request fail. All-zero
-`logit_bias`, `logprobs:false`, `top_logprobs:0`, `verbosity:"medium"`, empty legacy tool controls,
+`logit_bias`, `logprobs:false`, `verbosity:"medium"`, empty legacy tool controls,
 text-only `audio` configuration, and `prediction` are accepted without changing Engine execution.
 Metadata, user/safety identifiers, service-tier and prompt-cache hints are likewise advisory.
 Unknown top-level fields are ignored.
@@ -951,12 +948,33 @@ and reasoning-token details; choices carry `logprobs: null` when log probabiliti
 requested, and aggregate assistant messages carry `refusal: null` because refusal output is not
 supported.
 
-With `--first-token-logprobs`, a non-streaming Chat Completions request with `top_logprobs: N`
-(`1..20`) gets `choices[0].logprobs.content` with one entry: the first generated token, its log
-probability and the `N` most likely tokens at that position, under the raw next-token distribution
-before temperature, penalties and filters. `token` is the token's text with any partial UTF-8
-sequence replaced and `bytes` its exact bytes. Later tokens carry none, and `logprobs: true` stays
-unsupported.
+#### Token log probabilities
+
+`logprobs: true` asks a Chat Completions request for each content token's log probability, and
+`top_logprobs` (`0..20`, which needs `logprobs: true`) for that many of the most likely tokens at
+its position. A Responses request asks with `include: ["message.output_text.logprobs"]` or a nonzero
+`top_logprobs`. Both routes answer with and without streaming, for every model family, speculative
+decoding included.
+
+The values describe the distribution the token was drawn from, before truncation: the logits after
+the structured-output mask and the presence and frequency penalties, divided by the temperature (1
+for greedy decoding) and normalized over the whole vocabulary. `top_k`, `top_p` and `min_p` do not
+change them. A token the mask excludes never appears among the alternatives, so a constrained
+position can report fewer than asked, and a sampled token outside its position's 20 most likely
+tokens reports OpenAI's `-9999.0`. Under speculative decoding a verified position's penalties count
+the drafts before it, as its sampling does.
+
+Records cover the content channel: every generated token after the reasoning block and the
+whitespace that closes it, the markup of a tool call included; reasoning tokens and the stop token
+have none. A record travels with its text: a stream sends it with the chunk that publishes the
+token's first byte (whitespace held back while a tool call may follow arrives after its record), and
+a stop string drops the records of the tokens it cuts. Each record has `token` (the token's bytes as
+text, with `U+FFFD` for a sequence that is not valid UTF-8 on its own), `logprob`, `bytes` and
+`top_logprobs`. A Chat Completions choice carries them as `logprobs.content` with `refusal: null`,
+streamed chunks as their choice's `logprobs`; a Responses `output_text` part carries them as
+`logprobs`, and `response.output_text.delta` and `.done` carry them without `bytes`.
+
+A request that does not ask gathers nothing.
 
 ### llama.cpp-compatible request observations
 
@@ -1241,10 +1259,10 @@ wire response contains typed `output` Items.
 | `parallel_tool_calls` | `true` by default; `false` is accepted only when no effective tool is callable |
 | `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; NInfer does not execute hosted tools |
 | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
-| `top_logprobs` | omitted or `0` |
+| `top_logprobs` | integer in `[0,20]`; a nonzero value also asks for [token log probabilities](#token-log-probabilities) |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
-| `include` | omitted, empty, or `["reasoning.encrypted_content"]`; the supported value requests the local raw-reasoning mirror described below |
+| `include` | omitted, empty, or any of `reasoning.encrypted_content`, which requests the local raw-reasoning mirror described below, and `message.output_text.logprobs`, which requests [token log probabilities](#token-log-probabilities) |
 | `stream_options.include_obfuscation` | optional boolean; accepted as a transport hint, but this local server emits no padding |
 | cache and client hints | valid `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, `safety_identifier`, and `user` values are accepted without being mapped to Engine session identity |
 
@@ -1788,7 +1806,6 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--disk-kv-gib N` | disk tier budget in GiB | `64` |
 | `--disk-kv-restore` | seed a new request's matching prefix from the disk tier | write-only |
 | `--disk-kv-directstorage` | read restores through Microsoft DirectStorage; Windows builds with `-DNINFER_DIRECTSTORAGE=ON` only, untested | mapped reads |
-| `--first-token-logprobs` | accept Chat Completions `top_logprobs` (`1..20`, non-streaming) and report the first generated token's log probability with that many alternatives under the raw next-token distribution; `logprobs: true` stays unsupported | off |
 | `--context-cache-policy default\|rolling` | `rolling`: within one cache session (a Responses `prompt_cache_key`), a capture that extends a resident checkpoint the request matched exactly inherits that resident's demand, so a conversation whose prompt only grows keeps rolling its frontier forward; with conversations sharing a prefix, one conversation's extension can evict the prefix the others use | `default` |
 | `--concurrent-prefill` | admit waiting requests to free lanes while other requests prefill, instead of holding admission until the staged prefill finishes | off |
 | `--kv-lease-growth` | admission reserves the prompt plus a 4096-token output window (or `--prefill-chunk` when larger) instead of the whole `max_tokens` budget and extends it at decode-round boundaries, releasing idle retained cache owners least recently used first when the pool is short; an answer whose smallest step still does not fit ends with `finish_reason=length` before `max_tokens` | off |

@@ -163,9 +163,6 @@ struct ServeOptions {
     // --assistant-prefill: a Chat Completions request whose last message is the assistant's
     // continues that message in place, as /v1/messages always does.
     bool assistant_prefill = false;
-    // Accept Chat Completions top_logprobs and report the first generated token's log
-    // probability with that many alternatives.
-    bool first_token_logprobs = false;
     // --usage-chunk-choice: emit the streaming usage chunk with a zero-delta choice instead of the
     // OpenAI-conformant empty choices array. Strict client parsers (GitHub Copilot) reject the
     // empty array as "Response contained no choices"; the extra choice is inert for other clients.
@@ -192,7 +189,6 @@ struct ServeOptions {
 [[nodiscard]] inline RequestLimits request_limits(const ServeOptions& options) noexcept {
     return RequestLimits{.default_max_tokens        = options.default_max_tokens,
                          .max_context               = static_cast<int>(options.max_context),
-                         .first_token_logprobs      = options.first_token_logprobs,
                          .assistant_prefill         = options.assistant_prefill,
                          .lenient_assistant_history = options.lenient_assistant_history};
 }

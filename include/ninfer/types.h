@@ -705,8 +705,6 @@ struct StructuredOutputOptions {
     bool strict = false;
 };
 
-inline constexpr std::uint32_t kMaximumFirstTokenTopLogprobs = 20;
-
 struct ExecutionOptions {
     StructuredOutputOptions structured_output;
     SamplingOverrides sampling;
@@ -717,9 +715,10 @@ struct ExecutionOptions {
     std::uint32_t requested_output_tokens = 0;
     bool allow_prefix_reuse               = true;
     ThinkingControlOptions thinking;
-    // Report the first generated token's log probability and this many likely alternatives
-    // (at most kMaximumFirstTokenTopLogprobs); zero reports nothing. Sampling is unaffected.
-    std::uint32_t first_token_top_logprobs = 0;
+    // Opt-in log probabilities: for every generated content token, its log probability and the
+    // kMaximumTokenLogprobs most likely tokens under the distribution the sampler draws from
+    // (see GenerationResult::content_logprobs). Sampling is unaffected.
+    bool logprobs = false;
 };
 
 struct OutputOptions {
@@ -1086,9 +1085,34 @@ enum class FinishReason : std::uint8_t {
     Cancelled,
 };
 
+// Log probabilities describe the distribution the sampler draws from, before truncation: the
+// logits after the structured-output mask and the presence and frequency penalties, divided by the
+// request's temperature (1 for greedy decoding) and normalized over the whole token domain. top_k,
+// top_p and min_p do not change them.
+inline constexpr std::size_t kMaximumTokenLogprobs = 20;
+
+// OpenAI's sentinel log probability for a generated token outside its reported top set.
+inline constexpr float kLogprobSentinel = -9999.0f;
+
+// One generated content token: its id, log probability and decoded bytes (possibly part of a UTF-8
+// sequence), and the kMaximumTokenLogprobs most likely tokens at its position in descending order,
+// the lower id first on a tie. Slots past the last token the mask admits hold id -1.
+struct TokenLogprob {
+    TokenId id        = 0;
+    float logprob     = 0.0f;
+    std::string bytes;
+    std::array<TokenId, kMaximumTokenLogprobs> top_ids{};
+    std::array<float, kMaximumTokenLogprobs> top_values{};
+    // Decoded byte string for each top-k alternative, aligned with top_ids.
+    std::array<std::string, kMaximumTokenLogprobs> top_bytes;
+};
+
 struct OutputDelta {
     OutputChannel channel = OutputChannel::Content;
     std::string text;
+    // The log probability records of the content tokens whose text this delta publishes, in token
+    // order. Empty unless the request asked for logprobs.
+    std::vector<TokenLogprob> logprobs;
 };
 
 // Exact prompt accounting selected at admission. Streaming consumers receive this once before any
@@ -1348,19 +1372,6 @@ struct MaterializationDiagnostics {
                const MaterializationDiagnostics&) noexcept = default;
 };
 
-// A token and its log probability under a raw next-token distribution.
-struct TokenLogprob {
-    TokenId token = 0;
-    float logprob = 0.0F;
-};
-
-// The first generated token and the most likely alternatives, under the full distribution at the
-// prompt's last position before temperature, penalties or filters.
-struct FirstTokenLogprobs {
-    TokenLogprob selected;
-    std::vector<TokenLogprob> top;
-};
-
 struct NgramArchiveStats {
     bool enabled              = false;
     bool bound                = false;
@@ -1376,6 +1387,8 @@ struct NgramArchiveStats {
 struct GenerationResult {
     PromptSummary prompt;
     std::vector<TokenId> generated_token_ids;
+    // One record per content token, in generation order, when the request enabled logprobs.
+    std::vector<TokenLogprob> content_logprobs;
     std::string content;
     std::string reasoning;
     std::vector<GeneratedToolCall> tool_calls;
@@ -1395,8 +1408,6 @@ struct GenerationResult {
     SpeculativeStats speculative;
     NgramArchiveStats ngram_archive;
     ThinkingBudgetStats thinking;
-    // Present when ExecutionOptions::first_token_top_logprobs asked for it.
-    std::optional<FirstTokenLogprobs> first_token_logprobs;
 };
 
 struct ArenaMemorySummary {

@@ -5,6 +5,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -256,6 +257,22 @@ int test_structured_output() {
     return failures;
 }
 
+// A record whose token has `bytes` and `logprob`, with the alternatives `bytes` and "a".
+ninfer::TokenLogprob logprob_record(std::string bytes, float logprob) {
+    ninfer::TokenLogprob record;
+    record.id    = 7;
+    record.bytes = bytes;
+    record.top_ids.fill(-1);
+    record.top_ids[0]    = 7;
+    record.top_values[0] = std::max(logprob, -0.5F);
+    record.top_bytes[0]  = std::move(bytes);
+    record.top_ids[1]    = 64;
+    record.top_values[1] = -1.5F;
+    record.top_bytes[1]  = "a";
+    record.logprob       = logprob;
+    return record;
+}
+
 int test_standard_field_policy() {
     int failures  = 0;
     auto rejected = [&](const char* key, Json value, const char* code) {
@@ -268,8 +285,6 @@ int test_standard_field_policy() {
 
     rejected("n", 2, "n_not_supported");
     rejected("logit_bias", Json{{"12", 1}}, "logit_bias_not_supported");
-    rejected("logprobs", true, "logprobs_not_supported");
-    rejected("top_logprobs", 2, "logprobs_not_supported");
     rejected("response_format", Json{{"type", "json_schema"}}, "invalid_response_format");
     rejected("modalities", Json::array({"text", "audio"}), "modality_not_supported");
     rejected("web_search_options", Json::object(), "web_search_not_supported");
@@ -302,29 +317,28 @@ int test_standard_field_policy() {
     failures += check(parse(neutral).generation.messages.size() == 1,
                       "neutral controls and advisory hints are accepted");
 
-    RequestLimits with_logprobs        = limits();
-    with_logprobs.first_token_logprobs = true;
-    const auto parse_with_logprobs     = [&](Json body) {
-        return parse_chat_completion_request(body, with_logprobs);
-    };
-    Json top                      = base_request();
-    top["top_logprobs"]           = 5;
-    const OpenAIChatRequest first = parse_with_logprobs(top);
-    failures += check(first.generation.first_token_top_logprobs == 5 &&
-                          options(first.generation).execution.first_token_top_logprobs == 5,
-                      "top_logprobs reaches Engine with --first-token-logprobs");
-    for (const auto& [key, value] :
-         std::vector<std::pair<const char*, Json>>{{"top_logprobs", 21}, {"logprobs", true}}) {
-        Json body = top;
+    Json logprobs             = base_request();
+    logprobs["logprobs"]      = true;
+    logprobs["top_logprobs"]  = 5;
+    logprobs["stream"]        = true;
+    const OpenAIChatRequest asked = parse(logprobs);
+    failures += check(asked.generation.reported_top_logprobs() == 5 &&
+                          options(asked.generation).execution.logprobs,
+                      "logprobs and top_logprobs reach the Engine, streamed or not");
+    failures += check(!parse(base_request()).generation.reported_top_logprobs() &&
+                          !options(parse(base_request()).generation).execution.logprobs,
+                      "a request without logprobs gathers none");
+    for (const auto& [key, value] : std::vector<std::pair<const char*, Json>>{
+             {"top_logprobs", 21}, {"top_logprobs", -1}, {"logprobs", "yes"}}) {
+        Json body = logprobs;
         body[key] = value;
-        failures += check(api_error([&] { (void)parse_with_logprobs(body); }).status == 400,
-                          std::string(key) + " beyond the first-token export was accepted");
+        failures += check(api_error([&] { (void)parse(body); }).param == key,
+                          std::string(key) + " outside its domain was accepted");
     }
-    Json streamed      = top;
-    streamed["stream"] = true;
-    failures += check(api_error([&] { (void)parse_with_logprobs(streamed); }).code ==
-                          "logprobs_not_supported",
-                      "streaming top_logprobs was accepted");
+    Json alternatives_only            = base_request();
+    alternatives_only["top_logprobs"] = 2;
+    failures += check(api_error([&] { (void)parse(alternatives_only); }).param == "top_logprobs",
+                      "top_logprobs without logprobs was accepted");
 
     Json zero_limit                     = base_request();
     zero_limit["max_completion_tokens"] = 0;
@@ -1039,18 +1053,30 @@ int test_aggregate_response() {
                       "aggregate response separates reasoning and content");
     failures += check(response["choices"][0]["logprobs"].is_null(),
                       "aggregate choice carries nullable logprobs");
-    GenerationOutcome with_logprobs    = outcome;
-    with_logprobs.first_token_logprobs = FirstTokenLogprobsView{
-        .selected = {.bytes = "\xE4\xBD", .logprob = -0.5F},
-        .top      = {{.bytes = "\xE4\xBD", .logprob = -0.5F}, {.bytes = "a", .logprob = -1.5F}}};
-    const Json first  = Json::parse(make_chat_completion_response(identity(), with_logprobs));
-    const Json& entry = first["choices"][0]["logprobs"]["content"][0];
+    GenerationOutcome with_logprobs = outcome;
+    with_logprobs.content_logprobs  = {logprob_record("\xE4\xBD", -0.5F),
+                                       logprob_record("x", -9999.0F)};
+    const Json reported =
+        Json::parse(make_chat_completion_response(identity(), with_logprobs, 2));
+    const Json& entry = reported["choices"][0]["logprobs"]["content"][0];
     failures +=
-        check(first["choices"][0]["logprobs"]["content"].size() == 1 &&
+        check(reported["choices"][0]["logprobs"]["content"].size() == 2 &&
+                  reported["choices"][0]["logprobs"]["refusal"].is_null() &&
                   entry["token"] == "\xEF\xBF\xBD\xEF\xBF\xBD" &&
                   entry["bytes"] == Json::array({0xE4, 0xBD}) && entry["logprob"] == -0.5 &&
-                  entry["top_logprobs"].size() == 2 && entry["top_logprobs"][1]["token"] == "a",
-              "first-token log probabilities have the OpenAI content shape");
+                  entry["top_logprobs"].size() == 2 && entry["top_logprobs"][1]["token"] == "a" &&
+                  entry["top_logprobs"][1]["bytes"] == Json::array({0x61}),
+              "token log probabilities have the OpenAI content shape");
+    failures += check(reported["choices"][0]["logprobs"]["content"][1]["logprob"] == -9999.0,
+                      "a token outside its top set reports OpenAI's sentinel");
+    const Json trimmed =
+        Json::parse(make_chat_completion_response(identity(), with_logprobs, 0));
+    failures += check(trimmed["choices"][0]["logprobs"]["content"][0]["top_logprobs"].empty(),
+                      "top_logprobs 0 reports no alternatives");
+    failures += check(Json::parse(make_chat_completion_response(identity(), with_logprobs))
+                          ["choices"][0]["logprobs"]
+                              .is_null(),
+                      "logprobs stay null unless the request asked for them");
     failures += check(response["usage"]["prompt_tokens_details"]["cached_tokens"] == 12 &&
                           response["usage"]["completion_tokens_details"]["reasoning_tokens"] == 3,
                       "aggregate usage exposes cache hits and reasoning tokens");
@@ -1099,8 +1125,21 @@ int test_stream_response() {
     Json reasoning = parse_sse(stream.reasoning_delta("thought"));
     Json content   = parse_sse(stream.content_delta("ans"));
     failures += check(reasoning["choices"][0]["delta"]["reasoning_content"] == "thought" &&
-                          content["choices"][0]["delta"]["content"] == "ans",
+                          content["choices"][0]["delta"]["content"] == "ans" &&
+                          content["choices"][0]["logprobs"].is_null(),
                       "stream separates reasoning and content deltas");
+
+    OpenAIChatStream logprob_stream(identity(), false, false, false, false, 1);
+    (void)logprob_stream.start();
+    const std::vector<ninfer::TokenLogprob> records = {logprob_record("an", -0.25F),
+                                                       logprob_record("s", -0.75F)};
+    const Json paired = parse_sse(logprob_stream.content_delta("ans", records));
+    failures += check(paired["choices"][0]["delta"]["content"] == "ans" &&
+                          paired["choices"][0]["logprobs"]["content"].size() == 2 &&
+                          paired["choices"][0]["logprobs"]["content"][1]["token"] == "s" &&
+                          paired["choices"][0]["logprobs"]["content"][0]["top_logprobs"].size() ==
+                              1,
+                      "a streamed content chunk carries its tokens' log probabilities");
 
     GenerationOutcome outcome             = sample_outcome();
     const std::vector<std::string> events = stream.finish(outcome);

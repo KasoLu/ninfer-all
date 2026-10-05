@@ -10,9 +10,10 @@
 #include <vector>
 
 // The CPU Vision residency against the resident device encoder on the same image and prompt: the
-// first generated token must agree, its log probability within a small margin, and the most
-// likely alternatives must largely coincide. The CPU encoder computes in FP32 where the device
-// rounds activations to BF16, so equality is not expected.
+// first answer token's distributions must agree -- the most likely alternatives largely coincide,
+// and each run's two likeliest tokens are likely in the other run too, within a small margin of
+// log probability. The CPU encoder computes in FP32 where the device rounds activations to BF16,
+// so equality is not expected, and a near tie for the first token may break either way.
 namespace {
 
 std::vector<std::uint8_t> test_image(int width, int height) {
@@ -69,11 +70,11 @@ Outcome run_with(const char* artifact, ninfer::VisionResidency residency) {
     input.options.enable_thinking = false;
 
     ninfer::RequestOptions request;
-    request.execution.requested_output_tokens  = 12;
-    request.execution.sampling.temperature     = 0.0F;
-    request.execution.allow_prefix_reuse       = false;
-    request.execution.first_token_top_logprobs = 8;
-    request.stop.include_model_defaults        = false;
+    request.execution.requested_output_tokens = 12;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = false;
+    request.execution.logprobs                = true;
+    request.stop.include_model_defaults       = false;
     return Outcome{engine.generate(engine.prepare(std::move(input)), request),
                    engine.load_summary().load_seconds};
 }
@@ -87,24 +88,33 @@ int run() {
               << "s: " << device.result.content << '\n'
               << "cpu vision " << cpu.result.timings.vision_seconds << "s (load "
               << cpu.load_seconds << "s): " << cpu.result.content << '\n';
-    if (!device.result.first_token_logprobs || !cpu.result.first_token_logprobs ||
+    if (device.result.content_logprobs.empty() || cpu.result.content_logprobs.empty() ||
         !device.result.prompt.has_media || !cpu.result.prompt.has_media) {
         std::cerr << "a run reported no media or no first-token log probabilities\n";
         return 1;
     }
-    const auto& a      = *device.result.first_token_logprobs;
-    const auto& b      = *cpu.result.first_token_logprobs;
+    // The first answer token's eight most likely alternatives in each run.
+    const ninfer::TokenLogprob& a = device.result.content_logprobs.front();
+    const ninfer::TokenLogprob& b = cpu.result.content_logprobs.front();
+    constexpr std::size_t kTop    = 8;
+    const auto logprob_in         = [&](const ninfer::TokenLogprob& run, ninfer::TokenId token) {
+        for (std::size_t i = 0; i < kTop; ++i) {
+            if (run.top_ids[i] == token) { return run.top_values[i]; }
+        }
+        return -INFINITY;
+    };
     std::size_t shared = 0;
-    for (const auto& candidate : a.top) {
-        shared += static_cast<std::size_t>(
-            std::any_of(b.top.begin(), b.top.end(),
-                        [&](const auto& other) { return other.token == candidate.token; }));
+    float margin       = 0.0F;
+    for (std::size_t i = 0; i < kTop; ++i) {
+        shared += std::isfinite(logprob_in(b, a.top_ids[i])) ? 1U : 0U;
     }
-    std::cout << "first token " << a.selected.token << '/' << b.selected.token << " logprob "
-              << a.selected.logprob << '/' << b.selected.logprob << ", top-8 shared " << shared
-              << '\n';
-    if (a.selected.token != b.selected.token ||
-        std::abs(a.selected.logprob - b.selected.logprob) > 0.25F || shared < 6) {
+    for (std::size_t i = 0; i < 2; ++i) {
+        margin = std::max({margin, std::abs(a.top_values[i] - logprob_in(b, a.top_ids[i])),
+                           std::abs(b.top_values[i] - logprob_in(a, b.top_ids[i]))});
+    }
+    std::cout << "first token " << a.id << '/' << b.id << " logprob " << a.logprob << '/'
+              << b.logprob << ", top-8 shared " << shared << ", top-2 margin " << margin << '\n';
+    if (shared < 6 || !(margin <= 0.25F)) {
         std::cerr << "the CPU encoder's embeddings steer the model away from the device's\n";
         return 1;
     }

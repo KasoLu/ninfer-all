@@ -174,6 +174,8 @@ struct RequestRecord {
     std::optional<BeginSummary> admitted_begin;
     std::optional<BeginSummary> begin;
     std::vector<TokenId> generated;
+    // The content tokens' logprob records in generation order, when the request asked for them.
+    std::vector<TokenLogprob> content_logprobs;
     std::string content;
     std::string reasoning;
     std::optional<LaneId> lane;
@@ -194,7 +196,6 @@ struct RequestRecord {
     GenerationTimings generation_timings;
     RequestHostTiming host_timing;
     SpeculativeStats speculative_stats;
-    std::optional<FirstTokenLogprobs> first_token_logprobs;
     // The switch to post-thinking sampling has been applied to this request's lane.
     bool post_thinking_applied = false;
     MaterializationDiagnostics materialization_diagnostics;

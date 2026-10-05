@@ -6,6 +6,7 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "core/nvtx.h"
 #include "core/device.h"
+#include "ninfer/ops/logprob_topk.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scatter.h"
@@ -58,6 +59,9 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                                    state_destinations, envelope, hidden, logits);
         ops::scatter(hidden, state_destinations, state.continuation_hidden_store,
                      state.execution.device.stream);
+        // Before sampling adds the round's tokens to the penalty counts.
+        gather_logprobs(state.execution, logits.view({logits.ne[0], 1, batch_size}),
+                        ordinary.sampling, nullptr);
         ops::sample(logits, sampled,
                     dimension(state.execution.parameters.model.resources().public_token_count),
                     ordinary.sampling, cache_positions, ops::kSamplePurposeDecode,
@@ -194,6 +198,45 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     CUDA_CHECK(cudaMemcpyAsync(config_lane.data, &request.sampling_host,
                                sizeof(request.sampling_host), cudaMemcpyHostToDevice,
                                device.stream));
+}
+
+void ProgramImpl::arm_logprobs(bool any) {
+    if (logprobs_armed == any) { return; }
+    set_device_i32(io.logprob_active, any ? 1 : 0);
+    logprobs_armed = any;
+}
+
+void ProgramImpl::fetch_logprobs(std::int32_t rows) {
+    static_assert(kMaximumTokenLogprobs == static_cast<std::size_t>(ops::kLogprobTopK));
+    const auto capacity = static_cast<std::size_t>(io.logprob_ids.ne[1]);
+    if (rows <= 0 || static_cast<std::size_t>(rows) > capacity) {
+        throw std::logic_error("logprob gather rows exceed the round buffer");
+    }
+    if (!logprobs_host) {
+        logprobs_host.emplace(capacity * kMaximumTokenLogprobs * (sizeof(TokenId) + sizeof(float)));
+    }
+    auto* ids                 = static_cast<unsigned char*>(logprobs_host->data());
+    const std::size_t entries = static_cast<std::size_t>(rows) * kMaximumTokenLogprobs;
+    CUDA_CHECK(cudaMemcpyAsync(ids, io.logprob_ids.data, entries * sizeof(TokenId),
+                               cudaMemcpyDeviceToHost, device.stream));
+    CUDA_CHECK(cudaMemcpyAsync(ids + capacity * kMaximumTokenLogprobs * sizeof(TokenId),
+                               io.logprob_values.data, entries * sizeof(float),
+                               cudaMemcpyDeviceToHost, device.stream));
+}
+
+runtime::RawTokenLogprob ProgramImpl::fetched_logprob(std::int32_t row, TokenId token) const {
+    const auto capacity = static_cast<std::size_t>(io.logprob_ids.ne[1]);
+    const auto* ids     = static_cast<const TokenId*>(logprobs_host->data());
+    const auto* values  = reinterpret_cast<const float*>(ids + capacity * kMaximumTokenLogprobs);
+    runtime::RawTokenLogprob record{.id = token, .logprob = kLogprobSentinel};
+    for (std::size_t k = 0; k < kMaximumTokenLogprobs; ++k) {
+        const std::size_t slot = static_cast<std::size_t>(row) * kMaximumTokenLogprobs + k;
+        record.top_ids[k]      = ids[slot];
+        record.top_values[k]   = values[slot];
+        // A drawn token outside the top set keeps the sentinel.
+        if (ids[slot] == token) { record.logprob = values[slot]; }
+    }
+    return record;
 }
 
 void ProgramImpl::copy_tail(SequenceState& sequence, const Tensor& source) {
@@ -448,6 +491,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             envelope   = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1};
         }
 
+        bool logprobs = false;
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence            = active_sequence(lanes[row]);
             const RequestControl& request      = requests[lanes[row]];
@@ -466,8 +510,10 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             if (request.grammar) {
                 structured_round->fill(sequence.lane, *request.grammar, {}, device.stream);
             }
+            logprobs = logprobs || request.logprobs;
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
         }
+        arm_logprobs(logprobs);
 
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, state_images->linear(0),
@@ -483,6 +529,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.ordinary_round);
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                          envelope, executable);
+        if (logprobs) { fetch_logprobs(static_cast<std::int32_t>(lanes.size())); }
         submit_range.reset();
         timing.begin_wait();
         {
@@ -500,6 +547,11 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t base_S = sequence.ledger_frontier;
             const TokenId token        = ordinary_host_egress->sampled_tokens[row];
             validate_licensed_tokens(std::span<const TokenId>(&token, 1));
+            // A round gathers every row when any of its requests asks; a row keeps a record only
+            // for a request that asked.
+            if (request.logprobs) {
+                round_logprobs[row] = fetched_logprob(static_cast<std::int32_t>(row), token);
+            }
             sequence.text_kv_valid = base_E + 1;
             commit_sequence_kv(sequence, sequence.text_kv_valid, 0);
             sequence.tail_hidden_valid = true;
@@ -518,6 +570,9 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         return runtime::BatchedGeneratedRound{
             .tokens =
                 std::span<const TokenId>(ordinary_host_egress->sampled_tokens.data(), lanes.size()),
+            .logprobs = logprobs ? std::span<const runtime::RawTokenLogprob>(round_logprobs.data(),
+                                                                             lanes.size())
+                                 : std::span<const runtime::RawTokenLogprob>{},
             .timing = timing.finish(),
         };
     } catch (...) {
@@ -620,6 +675,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                         verify_window, draft_window, capacity);
         }
 
+        bool logprobs = false;
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = active_sequence(lanes[row]);
             const RequestControl& request     = requests[lanes[row]];
@@ -658,6 +714,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->state_destination_slots[row] = selectors.destination;
             mtp_host_ingress->rope_deltas[row]             = sequence.rope_delta;
             mtp_host_ingress->sampling[row]                = request.sampling_host;
+            logprobs = logprobs || request.logprobs;
             if (request.grammar) {
                 structured_round->fill(
                     sequence.lane, *request.grammar,
@@ -668,6 +725,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                       std::min(capacity, frontier + extent + draft_window));
         }
 
+        arm_logprobs(logprobs);
         qwen3_5::MtpDecodeState frame = io.mtp_decode->verification_view(verify_window);
         execution::MtpBatchContext schedule_state{
             {device, parameters, work, state_images->linear(0),
@@ -684,6 +742,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.mtp_round);
         execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                     verify_window, draft_window, envelopes, executable);
+        if (logprobs) { fetch_logprobs(static_cast<std::int32_t>(lanes.size() * width)); }
         submit_range.reset();
         timing.begin_wait();
         {
@@ -714,6 +773,11 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
+            // The gather row of verification column c in batch row r is c + r * width.
+            for (std::size_t c = 0; request.logprobs && c < row_tokens.size(); ++c) {
+                round_logprobs[row * width + c] =
+                    fetched_logprob(static_cast<std::int32_t>(row * width + c), row_tokens[c]);
+            }
             const std::uint32_t pcur =
                 static_cast<std::uint32_t>(mtp_host_ingress->current_extents[row]);
             if (pcur == 0) {
@@ -760,6 +824,9 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                    lanes.size() * width),
             .row_counts = std::span<const std::int32_t>(mtp_host_egress->licensed_counts.data(),
                                                         lanes.size()),
+            .logprobs   = logprobs ? std::span<const runtime::RawTokenLogprob>(
+                                         round_logprobs.data(), lanes.size() * width)
+                                   : std::span<const runtime::RawTokenLogprob>{},
             .row_stride = width,
             .timing     = timing.finish(),
         };
@@ -882,6 +949,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                      verify_drafts + 1ULL))};
         }
 
+        bool logprobs = false;
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = active_sequence(lanes[row]);
             const RequestControl& request     = requests[lanes[row]];
@@ -918,9 +986,11 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             dflash_host_ingress->state_source_slots[row] = selectors.source;
             dflash_host_ingress->state_destination_slots[row] = selectors.destination;
             dflash_host_ingress->sampling[row]                = request.sampling_host;
+            logprobs = logprobs || request.logprobs;
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1U,
                                       backend_kv_cache() ? frontier : 0U);
         }
+        arm_logprobs(logprobs);
 
         if (structured_round) {
             structured_round->begin_dflash();
@@ -947,6 +1017,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.dflash_round);
         execution::dflash_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                        verify_drafts, envelopes, target_envelope, executable);
+        if (logprobs) { fetch_logprobs(static_cast<std::int32_t>(lanes.size() * width)); }
         submit_range.reset();
         timing.begin_wait();
         {
@@ -978,6 +1049,10 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
+            for (std::size_t c = 0; request.logprobs && c < row_tokens.size(); ++c) {
+                round_logprobs[row * width + c] =
+                    fetched_logprob(static_cast<std::int32_t>(row * width + c), row_tokens[c]);
+            }
             if (extent == 0) {
                 request.speculative_stats.fallback_steps += 1;
             } else {
@@ -1010,6 +1085,9 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                                    lanes.size() * width),
             .row_counts = std::span<const std::int32_t>(dflash_host_egress->licensed_counts.data(),
                                                         lanes.size()),
+            .logprobs   = logprobs ? std::span<const runtime::RawTokenLogprob>(
+                                         round_logprobs.data(), lanes.size() * width)
+                                   : std::span<const runtime::RawTokenLogprob>{},
             .row_stride = width,
             .timing     = timing.finish(),
         };
