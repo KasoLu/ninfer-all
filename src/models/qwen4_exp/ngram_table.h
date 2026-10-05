@@ -1,8 +1,10 @@
 #pragma once
 
 // Row reads from the Qwen3.8-Flash-Next n-gram table, which by default stays on disk: rows are
-// read where the file stores them, through the OS page cache, as the hash addresses them. The
-// RAM residency loads the whole payload once and serves rows from memory.
+// read where the file stores them, through the OS page cache, as the hash addresses them, several
+// at once. The RAM residency loads the whole payload once and serves rows from memory.
+
+#include "models/qwen4_exp/read_pool.h"
 
 #include <cstdint>
 #include <filesystem>
@@ -53,6 +55,7 @@ class NgramTableReader {
     std::vector<std::unique_ptr<File>> files_; // one per segment
     std::vector<std::uint64_t> starts_;        // table offset of each segment
     std::vector<std::uint8_t> resident_;
+    std::unique_ptr<ReadPool> pool_; // disk residency
 };
 
 } // namespace ninfer::models::qwen4_exp

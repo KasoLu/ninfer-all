@@ -1,5 +1,7 @@
 #include "models/qwen4_exp/expert_stream.h"
 
+#include "models/qwen4_exp/read_pool.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -7,6 +9,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #ifdef _WIN32
 #    ifndef NOMINMAX
@@ -26,6 +29,8 @@ namespace {
 constexpr std::uint64_t kAlign = 256;
 // Two halves of the page-locked ring: one fills from the files while the other's copies run.
 constexpr std::size_t kStagingHalf = 128ULL << 20;
+// Reads in flight at once: an NVMe drive reaches its bandwidth only with several requests queued.
+constexpr std::size_t kReadThreads = 8;
 
 std::uint64_t aligned(std::uint64_t value) { return (value + kAlign - 1) / kAlign * kAlign; }
 
@@ -97,6 +102,14 @@ private:
 #endif
 };
 
+// One read of a staged batch.
+struct Read {
+    const File* file       = nullptr;
+    std::uint64_t offset   = 0;
+    std::byte* destination = nullptr;
+    std::size_t bytes      = 0;
+};
+
 struct Slot {
     std::int32_t layer  = -1;
     std::int32_t expert = -1;
@@ -134,6 +147,17 @@ struct ExpertStream::Impl {
     cudaStream_t half_stream = nullptr;
     std::uint64_t call       = 0;
     ExpertStreamStats stats;
+    ReadPool reads{kReadThreads - 1}; // the caller reads too
+
+    // The batch being staged in the current half: its reads, then the copies out of the half.
+    struct Copy {
+        void* target            = nullptr;
+        const std::byte* source = nullptr;
+        std::size_t bytes       = 0;
+    };
+
+    std::vector<Read> batch_reads;
+    std::vector<Copy> batch_copies;
 
     Impl(DeviceContext& d, const std::vector<std::filesystem::path>& paths,
          std::vector<ExpertStreamLayer> specs, std::span<const std::uint64_t> bytes_by_rank)
@@ -194,11 +218,27 @@ struct ExpertStream::Impl {
         CUDA_CHECK(cudaEventSynchronize(half_done[half]));
     }
 
+    // Reads the staged batch in parallel and queues its copies on `stream`.
+    void flush(cudaStream_t stream) {
+        reads.run(batch_reads.size(), [&](std::size_t i) {
+            const Read& read = batch_reads[i];
+            read.file->read(read.offset, read.destination, read.bytes);
+        });
+        for (const Copy& copy : batch_copies) {
+            CUDA_CHECK(cudaMemcpyAsync(copy.target, copy.source, copy.bytes, cudaMemcpyHostToDevice,
+                                       stream));
+        }
+        batch_reads.clear();
+        batch_copies.clear();
+    }
+
     std::byte* stage(std::size_t bytes, std::size_t rank, cudaStream_t stream) {
         if (bytes > kStagingHalf) {
             throw std::logic_error("expert stream: an expert exceeds the staging half");
         }
         if (cursor + bytes > kStagingHalf || (half_stream != nullptr && half_stream != stream)) {
+            // The half closes behind the batch staged in it.
+            flush(half_stream != nullptr ? half_stream : stream);
             switch_half();
         }
         half_stream     = stream;
@@ -270,12 +310,12 @@ struct ExpertStream::Impl {
                 std::uint64_t at               = 0;
                 for (const auto& run : location.runs) {
                     if (run.bytes == 0) { continue; }
-                    files.at(run.file)->read(run.offset, buffer + at, run.bytes);
+                    batch_reads.push_back({files.at(run.file).get(), run.offset, buffer + at,
+                                           static_cast<std::size_t>(run.bytes)});
                     at += run.bytes;
                 }
                 std::byte* target = base + pool.offset[k];
-                CUDA_CHECK(cudaMemcpyAsync(target, buffer, location.bytes, cudaMemcpyHostToDevice,
-                                           stream));
+                batch_copies.push_back({target, buffer, static_cast<std::size_t>(location.bytes)});
                 layer.mirror[k][expert] = target;
                 stats.read_bytes += location.bytes;
             }
@@ -285,6 +325,7 @@ struct ExpertStream::Impl {
             slot.referenced       = true;
             layer.slot_of[expert] = static_cast<std::int32_t>(s);
         }
+        flush(stream);
         auto* tables = static_cast<std::byte*>(layer.table_staging->data());
         for (int k = 0; k < 3; ++k) {
             const std::size_t bytes = layer.mirror[k].size() * sizeof(void*);

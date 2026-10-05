@@ -19,6 +19,12 @@
 #endif
 
 namespace ninfer::models::qwen4_exp {
+namespace {
+
+// Rows in flight at once on disk residency.
+constexpr std::size_t kReadThreads = 8;
+
+} // namespace
 
 struct NgramTableReader::File {
 #ifdef _WIN32
@@ -127,6 +133,8 @@ NgramTableReader::NgramTableReader(NgramTableLayout layout, NgramResidency resid
         }
         resident_.resize(static_cast<std::size_t>(table_bytes));
         read(0, resident_.data(), resident_.size());
+    } else {
+        pool_ = std::make_unique<ReadPool>(kReadThreads - 1); // the caller reads too
     }
 }
 
@@ -155,19 +163,29 @@ void NgramTableReader::read_rows(std::span<const std::uint64_t> row_ids,
     if (out.size() != row_ids.size() * row_bytes) {
         throw std::invalid_argument("n-gram table: output size mismatch");
     }
-    for (std::size_t i = 0; i < row_ids.size(); ++i) {
-        const std::uint64_t row = row_ids[i];
+    for (const std::uint64_t row : row_ids) {
         if (row >= layout_.rows) {
             throw std::out_of_range("n-gram table: row " + std::to_string(row) + " past " +
                                     std::to_string(layout_.rows));
         }
-        std::uint8_t* destination = out.data() + i * row_bytes;
-        if (residency_ == NgramResidency::Ram) {
-            std::memcpy(destination, resident_.data() + row * row_bytes, row_bytes);
-        } else {
-            read(row * row_bytes, destination, row_bytes);
-        }
     }
+    if (residency_ == NgramResidency::Ram) {
+        for (std::size_t i = 0; i < row_ids.size(); ++i) {
+            std::memcpy(out.data() + i * row_bytes, resident_.data() + row_ids[i] * row_bytes,
+                        row_bytes);
+        }
+        return;
+    }
+    // Groups of rows, a few per thread, so a prompt chunk's thousands of rows share the threads
+    // without a hand-off per row.
+    const std::size_t groups = std::min<std::size_t>(row_ids.size(), 4 * kReadThreads);
+    const std::size_t per    = (row_ids.size() + groups - 1) / groups;
+    pool_->run(groups, [&](std::size_t group) {
+        const std::size_t end = std::min(row_ids.size(), (group + 1) * per);
+        for (std::size_t i = group * per; i < end; ++i) {
+            read(row_ids[i] * row_bytes, out.data() + i * row_bytes, row_bytes);
+        }
+    });
 }
 
 } // namespace ninfer::models::qwen4_exp

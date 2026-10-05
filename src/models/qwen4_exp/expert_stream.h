@@ -4,7 +4,8 @@
 // ones passes route to. Before a layer's experts run, prepare() makes every expert the layer's
 // tokens routed to resident: the slots of the least recently used experts (never one the same call
 // needs) take the missing ones, read from the files through the OS page cache into a page-locked
-// staging ring and copied on the layer's stream, and the layer's expert tables are pointed at them.
+// staging ring (several reads in flight at once) and copied on the layer's stream, and the layer's
+// expert tables are pointed at them.
 // The host memory this mode needs is the staging ring; the page cache keeps what the system can
 // spare.
 
