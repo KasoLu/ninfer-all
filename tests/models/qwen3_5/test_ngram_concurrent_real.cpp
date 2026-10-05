@@ -119,6 +119,13 @@ ninfer::EngineOptions options_for(const char* artifact, const std::string& backe
     options.use_cuda_graph      = true;
     if (std::getenv("NINFER_NGRAM_TEST_NO_GRAPH")) { options.use_cuda_graph = false; }
     options.kv_cache            = ninfer::KvCacheStorage::Nvfp4Group16;
+    // NINFER_NGRAM_TEST_KV=bf16|int8 runs the same checks over another KV storage.
+    if (const char* kv = std::getenv("NINFER_NGRAM_TEST_KV"); kv != nullptr) {
+        if (std::string_view(kv) == "bf16") { options.kv_cache = ninfer::KvCacheStorage::BFloat16; }
+        if (std::string_view(kv) == "int8") {
+            options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
+        }
+    }
     if (backend == "mtp") {
         options.speculative.backend = ninfer::SpeculativeBackend::Mtp;
     } else if (backend == "dflash") {
@@ -233,12 +240,36 @@ int main(int argc, char** argv) {
             const int seed_a = 100, seed_b = 200;
             const std::string source_a = make_source(seed_a);
             const std::string source_b = make_source(seed_b);
-            auto handle_a =
-                engine.submit(engine.prepare(copy_prompt(source_a, seed_a)), copy_request(256));
-            auto handle_b =
-                engine.submit(engine.prepare(copy_prompt(source_b, seed_b)), copy_request(256));
+            // Log probabilities ride along (gathering them changes no token) so that a lane that
+            // leaves its source can show the distribution it drew from there.
+            ninfer::RequestOptions traced = copy_request(256);
+            traced.execution.logprobs     = true;
+            auto handle_a = engine.submit(engine.prepare(copy_prompt(source_a, seed_a)), traced);
+            auto handle_b = engine.submit(engine.prepare(copy_prompt(source_b, seed_b)), traced);
             const auto result_a = handle_a.wait();
             const auto result_b = handle_b.wait();
+            // The record of the token that covers byte `at` of a run's output (the assistant
+            // prefix counted), with its index in the run's content tokens.
+            const auto record_at = [](const ninfer::GenerationResult& run, std::size_t offset,
+                                      std::size_t at, std::size_t& index)
+                -> const ninfer::TokenLogprob* {
+                index = 0;
+                for (const ninfer::TokenLogprob& record : run.content_logprobs) {
+                    if (offset + record.bytes.size() > at) { return &record; }
+                    offset += record.bytes.size();
+                    ++index;
+                }
+                return nullptr;
+            };
+            const auto describe_record = [](const ninfer::TokenLogprob& record) {
+                std::string out = "\"" + record.bytes + "\" at " + std::to_string(record.logprob) +
+                                  ", then";
+                for (std::size_t k = 0; k < 4 && record.top_ids[k] >= 0; ++k) {
+                    if (record.top_ids[k] == record.id) { continue; }
+                    out += " \"" + record.top_bytes[k] + "\" " + std::to_string(record.top_values[k]);
+                }
+                return out;
+            };
             // Where a lane left its source, what it wrote there instead and how it finished; then
             // the same request alone, which puts the fault on the concurrent round when it copies
             // exactly and on the artifact when it does not.
@@ -253,8 +284,17 @@ int main(int argc, char** argv) {
                           << static_cast<int>(result.finish_reason) << "): source \""
                           << source.substr(from, at + 40 - from) << "\" produced \""
                           << produced.substr(from, at + 40 - from) << "\"\n";
-                const auto alone = engine.generate(engine.prepare(copy_prompt(source, seed)),
-                                                   copy_request(256, false));
+                std::size_t index = 0;
+                if (const auto* record =
+                        record_at(result, assistant_prefix(seed).size(), at, index)) {
+                    std::cout << "c2-concurrent lane " << lane << " content token " << index
+                              << " (position " << result.prompt.prompt_tokens + index
+                              << ") drew " << describe_record(*record) << "\n";
+                }
+                ninfer::RequestOptions lone = copy_request(256, false);
+                lone.execution.logprobs     = true;
+                const auto alone =
+                    engine.generate(engine.prepare(copy_prompt(source, seed)), lone);
                 const std::string single = assistant_prefix(seed) + alone.content;
                 const std::size_t single_at = first_source_difference(source, single);
                 std::cout << "c2-concurrent lane " << lane << " alone: "
@@ -262,8 +302,22 @@ int main(int argc, char** argv) {
                                   ? std::string("exact")
                                   : "leaves its source at byte " + std::to_string(single_at))
                           << ", " << single.size() << " bytes (finish "
-                          << static_cast<int>(alone.finish_reason) << ")\n";
+                          << static_cast<int>(alone.finish_reason) << ")";
+                // The lone run's distribution for the token the concurrent run got wrong: a close
+                // second choice makes a reduction-order flip plausible, a remote one does not.
+                std::size_t lone_index = 0;
+                if (const auto* record =
+                        record_at(alone, assistant_prefix(seed).size(), at, lone_index)) {
+                    std::cout << "; its content token " << lone_index << " drew "
+                              << describe_record(*record);
+                }
+                std::cout << "\n";
             };
+            std::cout << "c2-concurrent lane A " << result_a.prompt.prompt_tokens << "+"
+                      << result_a.generated_token_ids.size() << " tokens (finish "
+                      << static_cast<int>(result_a.finish_reason) << "), lane B "
+                      << result_b.prompt.prompt_tokens << "+" << result_b.generated_token_ids.size()
+                      << " tokens (finish " << static_cast<int>(result_b.finish_reason) << ")\n";
             report("A", seed_a, source_a, result_a);
             report("B", seed_b, source_b, result_b);
             require(source_a.starts_with(assistant_prefix(seed_a) + result_a.content),
