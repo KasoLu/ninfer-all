@@ -2,11 +2,13 @@
 // include/ninfer/ops/hyper_connection.h). Four launches: per-stream RMSNorm into FP32 workspace,
 // the down and inject GEMVs with their activations, the up GEMV with the gated stream mix, and the
 // weighted write. Every product accumulates in FP32. Up to eight tokens, the two GEMVs stream their
-// 6.5 MB of weights in 16-byte vectors with every CTA busy at one token: the down rows split K over
-// a CTA's warps, the up rows of eight hidden indices are one contiguous run per stream. Wider calls
-// run the down and up products as cuBLAS tensor-core GEMMs over BF16 operands (the normalized stack
-// and the low-rank activation rounded to BF16, as the checkpoint's own arithmetic keeps them) and
-// keep the four inject rows on the FP32 GEMV.
+// 6.5 MB of weights each in 16-byte vectors, specialized for the token count: every thread issues
+// all of its weight loads before its first product, so a whole matrix is in flight at once; the
+// down rows split K over a CTA's warps, two rows a CTA sharing each activation load, and the up rows
+// of eight hidden indices are one contiguous run per stream, their low-rank input staged in shared
+// memory. Wider calls run the down and up products as cuBLAS tensor-core GEMMs over BF16 operands
+// (the normalized stack and the low-rank activation rounded to BF16, as the checkpoint's own
+// arithmetic keeps them) and keep the four inject rows on the FP32 GEMV.
 #include "ninfer/ops/hyper_connection.h"
 
 #include "core/device.h"
@@ -33,6 +35,9 @@ constexpr int kColumnChunk = 8;
 constexpr int kDownWarps = 8;
 constexpr int kDownSlice = kWidth / kDownWarps; // 1280 inputs, five 8-wide vectors per lane
 static_assert(kDownSlice % 256 == 0);
+constexpr int kDownVectors = kDownSlice / 256;
+// Rows of [down; inject] one narrow down CTA takes: they share each activation load.
+constexpr int kDownRows = 2;
 // The up GEMV: per CTA eight hidden indices, one warp per stream, four lanes per 320-wide row.
 constexpr int kUpRows    = 8;
 constexpr int kUpLanes   = 4;
@@ -152,58 +157,153 @@ __global__ void __launch_bounds__(kDownWarps * 32)
     }
 }
 
-// One block per (eight consecutive hidden indices, column chunk), one warp per stream c: the
-// eight gate rows c * hidden + d of `up` are contiguous (each lowrank wide), four lanes on each.
-// Then mixed[d] = (1/n) sum_c sigmoid(gate_c) xn[c, d].
+// The narrow form of hc_down_kernel for T tokens (all of them): one block per kDownRows rows of
+// [down; inject] (`rows` of them), each warp a 1280-wide slice of every row. A thread loads its
+// rows' weight vectors first and each activation vector once for all of them; every row
+// accumulates in the same order as hc_down_kernel, so the two agree bit for bit.
+template <int T>
+__global__ void __launch_bounds__(kDownWarps * 32)
+    hc_down_narrow_kernel(const float* __restrict__ normalized,
+                          const __nv_bfloat16* __restrict__ down,
+                          const __nv_bfloat16* __restrict__ inject, int rows,
+                          float* __restrict__ low, float* __restrict__ inject_weights) {
+    __shared__ float partial[kDownWarps][kDownRows][T];
+    const int row0 = static_cast<int>(blockIdx.x) * kDownRows;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int first = warp * kDownSlice;
+    uint4 w[kDownRows][kDownVectors];
+#pragma unroll
+    for (int r = 0; r < kDownRows; ++r) {
+        const int row = min(row0 + r, rows - 1);
+        const __nv_bfloat16* weights =
+            row < kLowrank ? down + static_cast<std::int64_t>(row) * kWidth
+                           : inject + static_cast<std::int64_t>(row - kLowrank) * kWidth;
+#pragma unroll
+        for (int i = 0; i < kDownVectors; ++i) {
+            w[r][i] = __ldg(reinterpret_cast<const uint4*>(weights + first + 8 * (lane + 32 * i)));
+        }
+    }
+    float acc[kDownRows][T] = {};
+#pragma unroll
+    for (int i = 0; i < kDownVectors; ++i) {
+        const int k = first + 8 * (lane + 32 * i);
+#pragma unroll
+        for (int j = 0; j < T; ++j) {
+            float x[8];
+            load_f32x8(normalized + static_cast<std::int64_t>(j) * kWidth + k, x);
+#pragma unroll
+            for (int r = 0; r < kDownRows; ++r) {
+                float v[8];
+                unpack_bf16x8(w[r][i], v);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) { acc[r][j] = fmaf(v[e], x[e], acc[r][j]); }
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < kDownRows; ++r) {
+#pragma unroll
+        for (int j = 0; j < T; ++j) {
+            const float v = warp_sum(acc[r][j]);
+            if (lane == 0) { partial[warp][r][j] = v; }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x >= kDownRows * T) { return; }
+    const int r = threadIdx.x / T, t = threadIdx.x % T;
+    const int row = row0 + r;
+    if (row >= rows) { return; }
+    float v = 0.0f;
+#pragma unroll
+    for (int w8 = 0; w8 < kDownWarps; ++w8) { v += partial[w8][r][t]; }
+    v /= kStreams;
+    if (row < kLowrank) {
+        low[static_cast<std::int64_t>(t) * kLowrank + row] = v * sigmoid_f(v);
+    } else {
+        inject_weights[static_cast<std::int64_t>(t) * kStreams + row - kLowrank] =
+            2.0f * sigmoid_f(v);
+    }
+}
+
+// One block per eight consecutive hidden indices, for T tokens (all of them), one warp per stream
+// c: the eight gate rows c * hidden + d of `up` are contiguous (each lowrank wide), four lanes on
+// each, their weight vectors loaded before the products and the low-rank input staged in shared
+// memory. Then mixed[d] = (1/n) sum_c sigmoid(gate_c) xn[c, d].
+template <int T>
 __global__ void __launch_bounds__(kStreams * 32)
     hc_up_mix_kernel(const float* __restrict__ normalized, const float* __restrict__ low,
-                     const __nv_bfloat16* __restrict__ up, int tokens,
-                     __nv_bfloat16* __restrict__ mixed) {
-    __shared__ float gated[kStreams][kUpRows][kColumnChunk];
+                     const __nv_bfloat16* __restrict__ up, __nv_bfloat16* __restrict__ mixed) {
+    constexpr int kVectors = kUpVectors / kUpLanes;
+    __shared__ float gated[kStreams][kUpRows][T];
+    __shared__ __align__(16) float staged[T][kLowrank];
     const int c    = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int r = lane / kUpLanes, part = lane % kUpLanes;
     const int d0                 = blockIdx.x * kUpRows;
     const int d                  = d0 + r;
-    const int t0                 = blockIdx.y * kColumnChunk;
-    const int count              = min(kColumnChunk, tokens - t0);
     const __nv_bfloat16* weights = up + static_cast<std::int64_t>(c * kHidden + d) * kLowrank;
-    float acc[kColumnChunk]      = {};
+    uint4 w[kVectors];
 #pragma unroll
-    for (int i = 0; i < kUpVectors / kUpLanes; ++i) {
+    for (int i = 0; i < kVectors; ++i) {
+        w[i] = __ldg(reinterpret_cast<const uint4*>(weights + 8 * (part + kUpLanes * i)));
+    }
+    for (int i = threadIdx.x; i < T * kLowrank / 4; i += kStreams * 32) {
+        reinterpret_cast<float4*>(&staged[0][0])[i] = reinterpret_cast<const float4*>(low)[i];
+    }
+    __syncthreads();
+    float acc[T] = {};
+#pragma unroll
+    for (int i = 0; i < kVectors; ++i) {
         const int v = part + kUpLanes * i;
-        float w[8];
-        unpack_bf16x8(__ldg(reinterpret_cast<const uint4*>(weights + 8 * v)), w);
+        float wf[8];
+        unpack_bf16x8(w[i], wf);
 #pragma unroll
-        for (int j = 0; j < kColumnChunk; ++j) {
-            if (j < count) {
-                float x[8];
-                load_f32x8(low + static_cast<std::int64_t>(t0 + j) * kLowrank + 8 * v, x);
+        for (int j = 0; j < T; ++j) {
+            float x[8];
+            load_f32x8(&staged[j][8 * v], x);
 #pragma unroll
-                for (int e = 0; e < 8; ++e) { acc[j] = fmaf(w[e], x[e], acc[j]); }
-            }
+            for (int e = 0; e < 8; ++e) { acc[j] = fmaf(wf[e], x[e], acc[j]); }
         }
     }
 #pragma unroll
-    for (int j = 0; j < kColumnChunk; ++j) {
+    for (int j = 0; j < T; ++j) {
         acc[j] += __shfl_xor_sync(0xffffffffu, acc[j], 1);
         acc[j] += __shfl_xor_sync(0xffffffffu, acc[j], 2);
-        if (part == 0 && j < count) {
-            gated[c][r][j] =
-                sigmoid_f(acc[j]) *
-                normalized[static_cast<std::int64_t>(t0 + j) * kWidth + c * kHidden + d];
+        if (part == 0) {
+            gated[c][r][j] = sigmoid_f(acc[j]) *
+                             normalized[static_cast<std::int64_t>(j) * kWidth + c * kHidden + d];
         }
     }
     __syncthreads();
-    if (threadIdx.x >= kUpRows * kColumnChunk) { return; }
-    const int row = threadIdx.x / kColumnChunk, j = threadIdx.x % kColumnChunk;
-    if (j < count) {
-        float sum = 0.0f;
+    if (threadIdx.x >= kUpRows * T) { return; }
+    const int row = threadIdx.x / T, j = threadIdx.x % T;
+    float sum = 0.0f;
 #pragma unroll
-        for (int s = 0; s < kStreams; ++s) { sum += gated[s][row][j]; }
-        mixed[static_cast<std::int64_t>(t0 + j) * kHidden + d0 + row] =
-            __float2bfloat16_rn(sum / kStreams);
-    }
+    for (int s = 0; s < kStreams; ++s) { sum += gated[s][row][j]; }
+    mixed[static_cast<std::int64_t>(j) * kHidden + d0 + row] = __float2bfloat16_rn(sum / kStreams);
+}
+
+// The narrow read's operands: `rows` of [down; inject] (the inject rows only with an inject).
+struct NarrowRead {
+    const float* normalized;
+    const __nv_bfloat16* down;
+    const __nv_bfloat16* inject;
+    int rows;
+    const __nv_bfloat16* up;
+    float* low;
+    float* inject_out;
+    __nv_bfloat16* mixed;
+};
+
+// The narrow read's two GEMVs for T tokens.
+template <int T>
+void narrow_products(const NarrowRead& a, cudaStream_t stream) {
+    hc_down_narrow_kernel<T><<<div_up(a.rows, kDownRows), kDownWarps * 32, 0, stream>>>(
+        a.normalized, a.down, a.inject, a.rows, a.low, a.inject_out);
+    CUDA_CHECK(cudaGetLastError());
+    hc_up_mix_kernel<T>
+        <<<kHidden / kUpRows, kStreams * 32, 0, stream>>>(a.normalized, a.low, a.up, a.mixed);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // The wide path's activation of the down product, v FP32 [tokens][lowrank]: silu(v / n) in BF16,
@@ -405,15 +505,24 @@ void hyper_connection_read(const Tensor& stack, const HyperConnectionWeights& we
         static_cast<const float*>(stack.data),
         static_cast<const __nv_bfloat16*>(weights.norm->data), eps, normalized_p, nullptr);
     CUDA_CHECK(cudaGetLastError());
-    const int rows = kLowrank + (inject_w != nullptr ? kStreams : 0);
-    hc_down_kernel<<<dim3(rows, chunks), kDownWarps * 32, 0, stream>>>(
-        normalized_p, down_w, inject_w, tokens, 0, static_cast<float*>(low.data), inject_out);
-    CUDA_CHECK(cudaGetLastError());
-    hc_up_mix_kernel<<<dim3(kHidden / kUpRows, chunks), kStreams * 32, 0, stream>>>(
-        static_cast<const float*>(normalized.data), static_cast<const float*>(low.data),
-        static_cast<const __nv_bfloat16*>(weights.up->data), tokens,
-        static_cast<__nv_bfloat16*>(mixed.data));
-    CUDA_CHECK(cudaGetLastError());
+    const NarrowRead read{.normalized = normalized_p,
+                          .down       = down_w,
+                          .inject     = inject_w,
+                          .rows       = kLowrank + (inject_w != nullptr ? kStreams : 0),
+                          .up         = static_cast<const __nv_bfloat16*>(weights.up->data),
+                          .low        = static_cast<float*>(low.data),
+                          .inject_out = inject_out,
+                          .mixed      = static_cast<__nv_bfloat16*>(mixed.data)};
+    switch (tokens) {
+    case 1: return narrow_products<1>(read, stream);
+    case 2: return narrow_products<2>(read, stream);
+    case 3: return narrow_products<3>(read, stream);
+    case 4: return narrow_products<4>(read, stream);
+    case 5: return narrow_products<5>(read, stream);
+    case 6: return narrow_products<6>(read, stream);
+    case 7: return narrow_products<7>(read, stream);
+    default: return narrow_products<8>(read, stream);
+    }
 }
 
 void hyper_connection_write(Tensor& stack, const Tensor& y, const Tensor& inject_weights,

@@ -238,7 +238,8 @@ int main() {
         return 77;
     }
     int failures = 0;
-    for (const int tokens : {1, 3, 8, 9, 16, 37}) {
+    // Every narrow width has its own kernels (1..8), then the wide path.
+    for (const int tokens : {1, 2, 3, 6, 7, 8, 9, 16, 37}) {
         failures += run_case(tokens, true, false, 4100u + tokens);
     }
     failures += run_case(1, false, false, 4200u);
