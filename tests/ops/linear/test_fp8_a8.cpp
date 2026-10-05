@@ -1,6 +1,8 @@
 #include "core/weight.h"
+#include "ops/linear/common/route_table.h"
 #include "ops/linear/linear_test_common.h"
 
+#include <algorithm>
 #include <array>
 #include <exception>
 #include <iostream>
@@ -183,40 +185,45 @@ int run_fp8_a8() {
          {Problem{14336, 5120, false, false}, Problem{16384, 5120, false, false},
           Problem{34816, 5120, false, false}, Problem{5120, 6144, false, false},
           Problem{5120, 17408, false, false}}) {
-        const std::size_t one = ops::linear_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16, problem.rows, problem.input_rows,
-            ops::LinearPolicy::AllowA8, 1, 1);
-        const std::size_t two = ops::linear_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16, problem.rows, problem.input_rows,
-            ops::LinearPolicy::AllowA8, 2, 2);
-        const std::size_t forty_eight = ops::linear_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16, problem.rows, problem.input_rows,
-            ops::LinearPolicy::AllowA8, 48, 48);
-        const std::size_t early_interval = ops::linear_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16, problem.rows, problem.input_rows,
-            ops::LinearPolicy::AllowA8, 2, 4);
-        const std::size_t hot_interval = ops::linear_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16, problem.rows, problem.input_rows,
-            ops::LinearPolicy::AllowA8, 1, 48);
-        const std::size_t exact_1024 = ops::linear_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16, problem.rows, problem.input_rows,
-            ops::LinearPolicy::AllowA8, 1024, 1024);
-        const std::size_t exact_1048 = ops::linear_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16, problem.rows, problem.input_rows,
-            ops::LinearPolicy::AllowA8, 1048, 1048);
-        const std::size_t spanning = ops::linear_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16, problem.rows, problem.input_rows,
-            ops::LinearPolicy::AllowA8, 1000, 1048);
-        const std::size_t a16 = ops::linear_workspace_capacity_bytes(
-            QType::FP8_E4M3FN_ROW_BF16, problem.rows, problem.input_rows,
-            ops::LinearPolicy::A16Only, 1, 2048);
+        const auto capacity = [&](std::int32_t first, std::int32_t last,
+                                  ops::LinearPolicy policy = ops::LinearPolicy::AllowA8) {
+            return ops::linear_workspace_capacity_bytes(QType::FP8_E4M3FN_ROW_BF16, problem.rows,
+                                                        problem.input_rows, policy, first, last);
+        };
+        // An interval reserves what its widest-reserving width uses. A device profile may give
+        // neighbouring widths different route tables, and then a narrower width can need more
+        // than the widest one (a split-K schedule's partials on one table, none on the other).
+        const auto widest = [&](std::int32_t first, std::int32_t last) {
+            std::size_t most = 0;
+            for (std::int32_t width = first; width <= last; ++width) {
+                most = std::max(most, capacity(width, width));
+            }
+            return most;
+        };
+        const auto table = [](std::int32_t width) {
+            return ops::detail::linear_route_table(ops::detail::LinearRouteFamily::Fp8, width);
+        };
+        const std::size_t one         = capacity(1, 1);
+        const std::size_t two         = capacity(2, 2);
+        const std::size_t forty_eight = capacity(48, 48);
+        const std::size_t exact_1024  = capacity(1024, 1024);
+        const std::size_t exact_1048  = capacity(1048, 1048);
+        // On one table a wider A8 launch reserves more; across tables only their own sizes count.
+        const bool wider_reserves_more =
+            table(1024) != table(1048) || exact_1048 > exact_1024;
         if (kA8Executable &&
             ((one != 0) != problem.a8_at_one || (two != 0) != problem.a8_at_two ||
-            early_interval != 0 || forty_eight <= two || hot_interval != forty_eight ||
-            exact_1024 <= forty_eight || exact_1048 <= exact_1024 || spanning != exact_1048 ||
-            a16 != 0)) {
+             capacity(2, 4) != 0 || forty_eight <= two || capacity(1, 48) != widest(1, 48) ||
+             exact_1024 <= forty_eight || !wider_reserves_more ||
+             capacity(1000, 1048) != widest(1000, 1048) ||
+             capacity(1, 2048, ops::LinearPolicy::A16Only) != 0)) {
             std::cerr << "FP8 A8 workspace interval contract mismatch for N=" << problem.rows
-                      << " K=" << problem.input_rows << '\n';
+                      << " K=" << problem.input_rows << ": 1=" << one << " 2=" << two
+                      << " 2..4=" << capacity(2, 4) << " 48=" << forty_eight
+                      << " 1..48=" << capacity(1, 48) << " (widest " << widest(1, 48)
+                      << ") 1024=" << exact_1024 << " 1048=" << exact_1048
+                      << " 1000..1048=" << capacity(1000, 1048) << " (widest "
+                      << widest(1000, 1048) << ")\n";
             ++failures;
         }
     }
