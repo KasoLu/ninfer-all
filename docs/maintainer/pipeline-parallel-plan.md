@@ -67,53 +67,52 @@ second GPU. Distinct ids are refused on Windows.
 
 ## What is not covered yet
 
-- **DFlash/DFlash2** do not run when the model spans more than one device: DFlash reads layer outputs
-  from several depths (its feature taps) into rank 0 buffers, which from a later stage are another
-  device's memory, so the layer loop stops with `layer feature capture does not cross pipeline
-  stages`. Nothing refuses the combination earlier: with CUDA Graphs the error ends startup at graph
-  preparation (its warm-up DFlash round), after the weights have loaded; with `--no-cuda-graph` the
-  first request raises it in the worker, an Engine-wide failure unless `--recover-invariant-failures`
-  turns it into a failed request. The taps need to cross the stage boundaries first; see the design
-  below.
-- **Vision** in overlay residency is refused with a split, since a later stage holds whole layers and
-  nothing a Vision window could borrow. Resident and CPU Vision are not refused, and the stage tests do
-  not cover them.
+- **Vision** is refused with a split, in every residency: overlay at load, before the weights (a
+  later stage holds whole layers and nothing a Vision window could borrow), resident and CPU Vision
+  at sequence planning, once they have loaded. The stage loop has not been taught the Vision
+  prefill.
 - **Prefill does not overlap stages.** A prefill chunk runs through the stages in turn and the
   engine synchronizes after each chunk, so at any moment one stage is busy. Overlapping stages needs
   micro-chunks inside a chunk (later stages start on micro-chunk 0 while stage 0 runs micro-chunk 1);
   that changes the chunk shapes the kernels see, and its benefit can only be measured on real cards.
 - **MTP works** across stages: the replay records and their fold are per state shard, on the shard's
-  own device, and the draft layer and head stay on rank 0. **The context cache works**: its
-  transactions copy each rank's planes and state shards on that rank's streams.
+  own device, and the draft layer and head stay on rank 0. **DFlash and DFlash2 work** too; see
+  below. **The context cache works**: its transactions copy each rank's planes and state shards on
+  that rank's streams.
 
-### DFlash across stages: the design
+### DFlash across stages
 
-The taps are few and narrow, so they can travel the way the residual does. Qwen3.8-27B's DFlash2
-adapter taps layers 5, 19, 33, 47 and 61 of 64 at width 5,120; the 35B-A3B DFlash adapter taps eight
-of 40 at width 2,048.
+A masked drafter reads target features, the outputs of a few layers spread through the model:
+Qwen3.8-27B's DFlash2 adapter taps layers 5, 19, 33, 47 and 61 of 64 at width 5,120, the 35B-A3B
+DFlash adapter layers 1, 6, 11, 16, 22, 27, 32 and 37 of 40 at width 2,048. The drafter, its context
+KV and the feature buffers live on rank 0 with the head, so a tapped layer on a later stage sends its
+output there, the way the residual travels.
 
-1. **A feature link per later stage that holds a tapped layer**, from that stage to rank 0, built
-   beside `back` in `make_stage_runtime`: a `StageLink` of two slots whose slot holds the widest
-   pass (`stage_boundary_columns`) times the stage's tap count times the hidden width in BF16.
-2. **Capture on the stage.** While a later stage runs its layers, a stage-local tap copies each
-   tapped layer's output into a staging tensor of the stage's workspace, one slab per tap in tap
-   order; after its last layer the stage sends the staging tensor over its feature link.
-3. **Re-capture on rank 0.** `run_staged` receives every stage's features before it returns and
-   replays the sink's own `capture_layer` for each received slab on rank 0's stream, so the prefill
-   copy, the batch scatter and the `captured_mask` check stay as they are. Stage 0's taps are
-   captured directly, as on one device.
-4. **Graphs and planning.** The links' send and receive halves are capture-safe, so the DFlash
-   decode graphs capture the extra copies as they capture the residual ones. The workspace plan
-   reserves the staging tensors on each later stage and one receive buffer on rank 0, and the
-   startup memory ledger reports the links' pinned host slots.
+1. **A link per tapped layer on a later stage** (`StageRuntime::features`), from that stage to rank
+   0, built beside `back` in `make_stage_runtime`: a `StageLink` of two slots, each holding the
+   widest pass (`stage_boundary_columns`) in BF16, plus a stream of the stage's own and the events
+   that hand work to it and back.
+2. **Capture on the stage.** As a tapped layer finishes, a stage-local tap copies its output into
+   that tap's slab of a staging tensor in the stage's workspace and starts the transfer on the
+   feature stream, so it crosses while the stage's later layers run. The stage's stream takes the
+   feature stream back after the residual has left, which keeps the staging alive until every
+   copy is done.
+3. **Re-capture on rank 0.** Rank 0 has nothing to do until the residual returns, so `run_staged`
+   queues the receives there first: each tapped output lands in one residual's room on rank 0's
+   stream and goes to the sink's own `capture_layer`, so the prefill copy, the batch scatter and the
+   check that every tapped layer was published are the ones one device runs. Stage 0's taps go to the
+   sink directly.
+4. **Graphs and planning.** The links' send and receive halves are capture-safe and the feature
+   stream joins the capture through its events, so the DFlash decode graphs capture the extra copies
+   with the residual's. The workspace plan reserves the staging slabs on each later stage and one
+   receive slab on rank 0, sized for the stage with the most taps, and the default split counts the
+   drafter's weights on the head stage, as it counts MTP's layer.
 
-Cost, for a 30/34 split of the 27B, which puts the taps 33, 47 and 61 on the second stage: 30 KiB
-per column, so 240 KiB for an eight-column DFlash2 verify and 120 MiB for a 4,096-token prefill
-chunk, a few milliseconds of PCIe beside the chunk's compute. Two slots of the widest chunk pin about
-240 MiB of host memory per such stage. Verification: the stage test's byte-identity rows under
-DFlash2 (and DFlash with the 35B-A3B artifact), graphs and eager, with `--devices 0,0` and forced
-staged links, then on two real cards. Until that lands, a startup refusal next to the overlay-Vision
-check in `plan_load` would end the combination before the weights load.
+Cost, for a 30/34 split of the 27B, which puts the taps 33, 47 and 61 on the second stage: 30 KiB per
+column, so 240 KiB for an eight-column DFlash2 verify and 30 MiB for the default 1,024-token prefill
+chunk, sent while the stage's later layers run; only what is still in flight when the stage's last
+layer finishes adds to the pass. Each tap's two slots pin twice the widest pass in host memory, 60 MiB
+for those three taps at that chunk, beside the residual links' own slots.
 
 ## Verification
 
@@ -127,8 +126,10 @@ check in `plan_load` would end the combination before the weights load.
   name the device.
 - `ninfer_qwen3_5_stages_real_test` (set `NINFER_TEST_ARTIFACT`): greedy output with `--devices 0,0`
   and `0,0,0` equals `--device 0` byte for byte, since the layers run the same kernels on the same
-  data. Rows: graphs and eager, forced pinned-host transport, an uneven split, MTP, and a
-  continuation that reuses the context cache. The 27B on the RTX 3090 passes every row.
+  data. Rows: graphs and eager, forced pinned-host transport, an uneven split
+  (`NINFER_TEST_STAGE_LAYERS`, 20,44 by default), MTP, DFlash or DFlash2 (whichever drafter the
+  artifact carries, each compared with the same backend on one device), and a continuation that
+  reuses the context cache. `NINFER_TEST_DEVICE_IDS=0,1` puts the stages on real cards.
 - `ninfer_qwen3_5_loading_real_test`: the default split covers the model, gives the head stage
   fewer layers, and gives a device with twice the memory more.
 

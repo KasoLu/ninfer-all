@@ -7,6 +7,7 @@
 #include <memory>
 #include <limits>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <variant>
 #include <vector>
@@ -83,6 +84,18 @@ struct TextParameters {
     [[nodiscard]] std::uint32_t stage_end(std::size_t stage) const {
         return stage + 1 < stage_begin.size() ? stage_begin[stage + 1]
                                               : static_cast<std::uint32_t>(layers.size());
+    }
+
+    // The DFlash feature taps among stage `stage`'s layers, in the drafter's order.
+    [[nodiscard]] std::vector<std::uint32_t> stage_taps(std::size_t stage,
+                                                        std::span<const std::uint32_t> taps) const {
+        const std::uint32_t begin = stage_begin.at(stage);
+        const std::uint32_t end   = stage_end(stage);
+        std::vector<std::uint32_t> out;
+        for (const std::uint32_t layer : taps) {
+            if (layer >= begin && layer < end) { out.push_back(layer); }
+        }
+        return out;
     }
 };
 

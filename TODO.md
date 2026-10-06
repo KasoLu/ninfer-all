@@ -393,11 +393,11 @@ what it says about kernels and measurements still holds except where this sectio
       submitting the source stream's copies, so the source stalls whether or not the fence is
       there (measured both ways). The graph assertion replaces it. On Linux the same test could
       also be run as a real race; worth doing if this ever runs there.
-- [ ] **Not built for pipeline stages yet:** vision and DFlash/DFlash2 refuse a split (DFlash needs
-      its feature taps carried across stage boundaries); the default split's per-stage
+- [ ] **Not built for pipeline stages yet:** vision refuses a split; the default split's per-stage
       overheads are constants, not measured (`default_stage_layers`);
       prefill does not overlap stages (micro-chunk wavefront); tensor parallelism is unbuilt.
-      `docs/maintainer/pipeline-parallel-plan.md` is the design of record.
+      `docs/maintainer/pipeline-parallel-plan.md` is the design of record. DFlash and DFlash2 run
+      across stages since 2026-10-06 (their feature taps cross to rank 0 on their own links).
 
 State as of 2026-09-09. Four passes: a profiling pass that closed six items and refuted five of its
 own hypotheses, a measurement-hygiene pass that closed three more, a counter pass that put a *cause*
@@ -775,10 +775,10 @@ Ordered by expected value, not by section.
 | Speculative decoding not bit-identical to greedy | 3 | decide whether it should be; the divergence is a reduction-order effect in k+1-column verification and MTP reproduces it, so it predates DFlash2 | judgement, not measurement |
 | DFlash2 corpus acceptance on real text | 3 | bake a diverse corpus with `make_bench_corpus.py --source-text`, or extend the real-text sweep to report acceptance | a local HF tokenizer, which this box lacks |
 | `27b_load_plan` DFlash2 binding matrix | 3 | **half of it can run now**: both groupwise artifacts are on this disk (the "old" one is `models/qwen3_8_27b.ninfer`, SHA-verified). The two NVFP4 ones were never published and would have to be converted locally | artifacts nobody has |
-| DFlash2 + pipeline stages | 2 | refused today: its feature taps must cross stage boundaries; then needs a second GPU to check | design, then a second GPU |
+| DFlash2 + pipeline stages | 2 | **done 2026-10-06**: each later stage sends its tapped layers' outputs to rank 0 after the residual; every row of the stage test is byte-identical to one device on two real cards, DFlash2 (27B) and DFlash (35B-A3B) | closed |
 
 Two of those fourteen are hard-blocked on things no amount of work here provides (a second GPU, and
-artifacts that no longer exist). One is a judgement call rather than a measurement. The remaining
+artifacts that no longer exist; the second-GPU item was done on rented cards on 2026-10-06). One is a judgement call rather than a measurement. The remaining
 eleven are all actionable, and four of them are kernel work on two closely related problems:
 narrow-extent weight streaming in `q5_linear_add`/`gdn_input`, and dequant-into-shared in the
 quantized attention kernels. **The three items that needed no GPU are done** — the A/B harness, the
@@ -956,8 +956,9 @@ editing this file with a script is worth reading before you edit this file with 
    by default, −0.0092%) plus `1c12516e` (−0.0101%). One build with the `rmsnorm.cuh` `FixedD`
    specializations forced off, then re-score. Everything else in that entry is closed.
 
-Two of the sixteen open items are hard-blocked — one on a second GPU (§2), one on NVFP4 artifacts
-that were never published rather than deleted (§3, checked upstream 2026-09-10). Everything else is
+Two of the sixteen open items are hard-blocked — one on a second GPU (§2, done on rented cards on
+2026-10-06), one on NVFP4 artifacts that were never published rather than deleted (§3, checked
+upstream 2026-09-10). Everything else is
 actionable, and **two of the five new screens need no GPU at all**: the register decomposition is
 one build with `-Xptxas -v`, and the parallelism arithmetic is pen and paper. Do the arithmetic
 first — it predicts which of the other screens can pay off on which kernel.
@@ -1218,15 +1219,18 @@ parents). The next merge from `neroued/master` will touch the same subsystem.
 ## 2. Genuinely blocked, and what by
 
 This section once read "blocked on hardware or artifacts" and lumped three items together. Two of
-those three were not blocked at all, and both have since been closed by going and looking. **Exactly
-one open item needs hardware this box does not have.** Check before assuming an entry here is
-unreachable — this section has a poor record of being right about that.
+those three were not blocked at all, and both have since been closed by going and looking. The third,
+the one item that needed a second GPU, was done on rented cards on 2026-10-06, so **no open item
+needs hardware this box does not have.** Check before assuming an entry here is unreachable — this
+section has a poor record of being right about that.
 
-### Needs a second GPU — one item, and it is the only one
+### Needs a second GPU — nothing is left here
 
-- [ ] **DFlash2 + pipeline stages.** DFlash refuses `--devices` with several stages: its feature
-      taps are read across layers, so they have to be carried across stage boundaries first. Once
-      they are, checking it needs a second card (`nvidia-smi` reports exactly one device here).
+- [x] **DFlash2 + pipeline stages** — done 2026-10-06. Each later stage that holds a tapped layer
+      sends those layers' outputs to rank 0 over its own `StageLink` after the residual, and rank 0
+      hands them to the feature sink as if the layers had run there
+      (`docs/maintainer/pipeline-parallel-plan.md`, "DFlash across stages"). Checked on rented pairs,
+      since this box has one card.
 
 ### Needs an artifact we do not have — nothing is left here
 

@@ -899,6 +899,22 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         out.general_capacity =
             checked_add(out.general_capacity, checked_add(residual, control, "stage boundary") + 1024U,
                         "stage boundary workspace");
+        // With a masked drafter a later stage also keeps a copy of each tapped layer's output until
+        // it has crossed, and rank 0 receives them one at a time into one residual's room; the
+        // stage with the most taps sets the size.
+        const auto& draft = parameters.model.config().draft;
+        if (plan.features.masked_draft() && draft) {
+            std::size_t widest = 0;
+            for (std::size_t stage = 1; stage < parameters.text.rank_count; ++stage) {
+                widest = std::max(
+                    widest, parameters.text.stage_taps(stage, draft->target_layer_ids).size());
+            }
+            if (widest != 0) {
+                const std::size_t features = checked_mul(residual, widest, "stage feature taps");
+                out.general_capacity       = checked_add(out.general_capacity, features + 256U,
+                                                         "stage feature tap workspace");
+            }
+        }
     }
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
@@ -963,19 +979,11 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
                                     " pipeline stages but " + std::to_string(device.size()) +
                                     " devices are attached");
     }
-    if (parameters.text.split_execution()) {
-        // The stage loop carries a plain forward pass and decode round. Everything below reads or
-        // writes state on the primary device only, and is refused until it is taught the stages.
-        const auto unsupported = [](const char* feature) {
-            throw std::invalid_argument(
-                std::string(feature) +
-                " is not yet supported with a multi-device --devices split");
-        };
-        if (options.speculative.backend == SpeculativeBackend::DFlash ||
-            options.speculative.backend == SpeculativeBackend::DFlash2) {
-            unsupported("DFlash speculative decoding");
-        }
-        if (options.enable_vision) { unsupported("vision"); }
+    if (parameters.text.split_execution() && options.enable_vision) {
+        // The stage loop carries the text passes, DFlash's feature taps included; Vision is refused
+        // until it is taught the stages.
+        throw std::invalid_argument(
+            "vision is not yet supported with a multi-device --devices split");
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
     const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);

@@ -1267,21 +1267,61 @@ private:
     std::array<const Tensor**, kControlTensors> slots_;
 };
 
+// A later stage's DFlash taps, taken in that stage's memory: each tapped layer's output is copied
+// into its own [hidden, columns] slab of `staging`, in the order of the link's layers, and leaves
+// for rank 0 on the link's stream while the stage's later layers run.
+struct StageFeatureTap {
+    static constexpr bool enabled = true;
+
+    StageRuntime::FeatureLink* link = nullptr;
+    Tensor staging;
+    std::uint32_t slot = 0;
+
+    void capture_layer(int layer, const Tensor& value, cudaStream_t stream) const {
+        const auto& layers = link->layers;
+        const auto it = std::find(layers.begin(), layers.end(), static_cast<std::uint32_t>(layer));
+        if (it == layers.end()) { return; }
+        const auto index = static_cast<std::size_t>(it - layers.begin());
+        if (value.dtype != staging.dtype || !value.is_contiguous() ||
+            value.ne[0] != staging.ne[0] ||
+            static_cast<std::int64_t>(value.ne[1]) * static_cast<std::int64_t>(layers.size()) !=
+                staging.ne[1]) {
+            throw std::logic_error("a pipeline stage feature tap does not match its staging");
+        }
+        Tensor slab = staging.slice(1, static_cast<std::int32_t>(index) * value.ne[1], value.ne[1]);
+        CUDA_CHECK(cudaMemcpyAsync(slab.data, value.data, value.bytes(), cudaMemcpyDeviceToDevice,
+                                   stream));
+        link->ready[index].record(stream);
+        link->ready[index].wait(link->stream.get());
+        link->links[index].send(slab.data, slab.bytes(), slot, link->stream.get());
+    }
+};
+
 } // namespace
 
 // Runs the layers across pipeline stages. Stage 0 is rank 0, where the caller's residual already
 // lives; each later stage receives the residual and the control tensors its layers read, runs, and
 // passes the residual on; the last stage returns it to rank 0 for the head.
-void TextContext::run_staged(Tensor& x, Phase ph) {
+//
+// A tap writes into rank 0's buffers, which a later stage's device cannot reach, so only stage 0
+// hands its layers to the tap directly. A later stage stages each tapped output in its own scratch
+// and sends it to rank 0 while its later layers run; rank 0, idle until the residual comes back,
+// receives each output as it lands and gives it to the tap as if that layer had run there.
+template <class Tap>
+void TextContext::run_staged(Tensor& x, Phase ph, Tap& tap) {
     StageRuntime& runtime    = *stage_runtime_;
     const std::size_t stages = parameters_.text.rank_count;
     if (runtime.forward.size() + 1 != stages || runtime.control.size() + 1 != stages ||
         !runtime.back.has_value() || ctx_.active_rank() != 0) {
         throw std::logic_error("stage runtime does not match the model's stages");
     }
+    if constexpr (Tap::enabled) {
+        if (runtime.features.size() + 1 != stages) {
+            throw std::logic_error("layer feature taps across pipeline stages have no links");
+        }
+    }
     const std::uint32_t slot = runtime.next_slot;
     runtime.next_slot        = (slot + 1U) % static_cast<std::uint32_t>(runtime.forward.front().slots());
-    NullTap tap;
 
     // Control tensors, packed in this order. Ones that are absent this pass (verify-only columns
     // and slots, say) are skipped.
@@ -1352,11 +1392,48 @@ void TextContext::run_staged(Tensor& x, Phase ph) {
         }
         ScopedControl bound(current, replacement, slots);
 
-        run_stage_layers(stage, stage_x, ph, tap);
+        StageRuntime::FeatureLink* features = nullptr;
+        if constexpr (Tap::enabled) {
+            if (runtime.features[stage - 1].has_value()) {
+                features = &*runtime.features[stage - 1];
+            }
+        }
+        if (features != nullptr) {
+            const auto taps = static_cast<std::int32_t>(features->layers.size());
+            StageFeatureTap stage_tap{
+                .link    = features,
+                .staging = work_.alloc(stage_x.dtype, {stage_x.ne[0], stage_x.ne[1] * taps}),
+                .slot    = slot};
+            run_stage_layers(stage, stage_x, ph, stage_tap);
+        } else {
+            NullTap none;
+            run_stage_layers(stage, stage_x, ph, none);
+        }
         if (stage + 1 < stages) {
             runtime.forward[stage].send(stage_x.data, stage_x.bytes(), slot, ctx_.stream);
         } else {
             runtime.back->send(stage_x.data, stage_x.bytes(), slot, ctx_.stream);
+        }
+        // The stage's stream takes the feature stream back, so the staging outlives its sends.
+        if (features != nullptr) {
+            features->sent.record(features->stream.get());
+            features->sent.wait(ctx_.stream);
+        }
+    }
+
+    if constexpr (Tap::enabled) {
+        // Each tapped output is received as it lands, so all but the last stage's last ones have
+        // crossed before the residual returns.
+        auto scope = work_.scope();
+        Tensor received;
+        for (std::size_t stage = 1; stage < stages; ++stage) {
+            if (!runtime.features[stage - 1].has_value()) { continue; }
+            StageRuntime::FeatureLink& features = *runtime.features[stage - 1];
+            if (received.data == nullptr) { received = work_.alloc(x.dtype, {x.ne[0], x.ne[1]}); }
+            for (std::size_t index = 0; index < features.layers.size(); ++index) {
+                features.links[index].recv(received.data, received.bytes(), slot, entry_stream);
+                tap.capture_layer(static_cast<int>(features.layers[index]), received, entry_stream);
+            }
         }
     }
     runtime.back->recv(x.data, x.bytes(), slot, entry_stream);
@@ -1368,16 +1445,10 @@ void TextContext::run_layers(Tensor& x, Phase ph, Tap& tap) {
         run_stage_layers(0, x, ph, tap);
         return;
     }
-    if constexpr (Tap::enabled) {
-        // Feature taps copy a layer's hidden state into rank 0's buffers; from a later stage that is
-        // another device's memory. DFlash under a split is not supported yet.
-        throw std::logic_error("layer feature capture does not cross pipeline stages");
-    } else {
-        if (stage_runtime_ == nullptr) {
-            throw std::logic_error("a split model needs its stage runtime");
-        }
-        run_staged(x, ph);
+    if (stage_runtime_ == nullptr) {
+        throw std::logic_error("a split model needs its stage runtime");
     }
+    run_staged(x, ph, tap);
 }
 
 void TextContext::run_layers(Tensor& x, Phase ph) {

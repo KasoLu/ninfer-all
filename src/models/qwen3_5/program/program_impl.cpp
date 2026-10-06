@@ -165,6 +165,35 @@ make_stage_runtime(DeviceContext& device, const execution::Parameters& parameter
     for (std::size_t stage = 1; stage < stages; ++stage) {
         runtime->control.emplace_back(device, 0, stage, control);
     }
+    // A masked drafter reads target features from layers that may sit on later stages; such a stage
+    // sends each tapped layer's output to rank 0 as soon as the layer has run, on a stream of its
+    // own, so the transfer overlaps the stage's later layers.
+    const auto& draft = parameters.model.config().draft;
+    if (plan.features.masked_draft() && draft) {
+        runtime->features.reserve(stages - 1);
+        for (std::size_t stage = 1; stage < stages; ++stage) {
+            std::vector<std::uint32_t> taps = text.stage_taps(stage, draft->target_layer_ids);
+            if (taps.empty()) {
+                runtime->features.emplace_back();
+                continue;
+            }
+            const RankContext& rank = device.rank(stage);
+            std::vector<StageLink> links;
+            std::vector<CudaCompletionEvent> ready;
+            links.reserve(taps.size());
+            ready.reserve(taps.size());
+            for (std::size_t tap = 0; tap < taps.size(); ++tap) {
+                links.emplace_back(device, stage, 0, residual);
+                ready.emplace_back(rank);
+            }
+            runtime->features.emplace_back(
+                execution::StageRuntime::FeatureLink{.layers = std::move(taps),
+                                                     .links  = std::move(links),
+                                                     .ready  = std::move(ready),
+                                                     .sent   = CudaCompletionEvent(rank),
+                                                     .stream = execution::SideStream(rank.device)});
+        }
+    }
     return runtime;
 }
 
