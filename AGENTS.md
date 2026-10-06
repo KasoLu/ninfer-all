@@ -41,11 +41,16 @@ in a separate table artifact the model names by digest (`--ngram-table`); it sta
 read a row at a time, unless `--ngram-ram` loads it, and a model without a table is refused unless
 `--no-ngram-table` overrides that. These are the only product modes in which model weights live off
 the GPU.
-This fork targets **`sm_86`** and is tuned on **NVIDIA GeForce RTX 3090** (24 GB), built with
-CUDA 12.8. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX 5090; that is where its schedules,
-route tables and published measurements come from, and none of it is authoritative here -- every
-route table this fork inherited and re-measured on sm_86 turned out to be wrong by 12-41%. Treat an
-upstream tuning constant as a hypothesis until measured on this card. The build environment and the
+This line builds for **`sm_86`** (the RTX 30 series; that build also runs the RTX 40 series),
+`sm_89`, and `120a` (the RTX 50 series and RTX PRO 6000 Blackwell, CUDA 13.1 or newer), with
+`sm_80` as an unmeasured compatibility target; the published Docker image carries the `86` and
+`120a` builds. It was tuned on the **NVIDIA GeForce RTX 3090** (24 GB) first, and each card's kernel
+routes now come from its measured device profile, built in for the RTX 3090, 4090, 5090 and the
+three RTX PRO 6000 editions. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX 5090 with native
+routes that this line's `120a` build does not compile by default; its schedules, route tables and
+published measurements are not authoritative here -- every route table this fork inherited and
+re-measured on sm_86 turned out to be wrong by 12-41%. Treat an upstream tuning constant as a
+hypothesis until measured on the card in question. The Windows build environment and its
 compatibility constraints are in "Windows build environment (RTX 3090 fork host)" below.
 
 Generation uses one resident model on one GPU, or split into pipeline stages over up to eight
@@ -279,11 +284,10 @@ Corrections to the previous revision of this section, all verified false:
 Use `cmake --build <build-dir> -j` by default. Adjust parallelism when actual resource pressure
 causes failures or interferes with the task, and briefly explain why.
 
-Use the selected Python 3.11 interpreter explicitly. On this machine it is
-`/home/neroued/miniconda3/envs/py311/bin/python`; the default shell's `python3` may be a different
-version. Use `python3` only after selecting the maintainer environment or checking its version.
-Normal resources are `build/`, `out/qwen3_6_27b.ninfer`, its `.conversion.json` report, and
-`profiles/ncu/`, `profiles/nsys/`, `profiles/bench/`; the local toolchain is CUDA 13.1.
+Use a Python 3.11 interpreter explicitly; the default shell's `python3` may be a different
+version, so check it before relying on it. Build trees, artifacts and profiles live where the host
+keeps them (by convention `build/`, `models/`, `profiles/ncu/`, `profiles/nsys/`,
+`profiles/bench/`); the toolchain is CUDA 12.8 or newer, and 13.1 or newer for `120a`.
 Select model artifacts by explicit path, never glob order, modification time, or unqualified
 “latest”. Source checkpoints and large artifacts are prerequisites; download or regenerate them
 only when that work is in scope. Install or upgrade dependencies only when the task needs it.

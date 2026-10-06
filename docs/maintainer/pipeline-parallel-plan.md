@@ -67,9 +67,13 @@ second GPU. Distinct ids are refused on Windows.
 
 ## What is not covered yet
 
-- **Vision** and **DFlash/DFlash2** are refused when the model spans more than one device. DFlash reads
-  layer outputs from several depths (its feature taps) into rank 0 buffers, which from a later stage
-  are another device's memory; they need to cross the stage boundaries first.
+- **DFlash/DFlash2** do not run when the model spans more than one device: DFlash reads layer outputs
+  from several depths (its feature taps) into rank 0 buffers, which from a later stage are another
+  device's memory, so the layer loop stops with `layer feature capture does not cross pipeline
+  stages`. The taps need to cross the stage boundaries first.
+- **Vision** in overlay residency is refused with a split, since a later stage holds whole layers and
+  nothing a Vision window could borrow. Resident and CPU Vision are not refused, and the stage tests do
+  not cover them.
 - **Prefill does not overlap stages.** A prefill chunk runs through the stages in turn and the
   engine synchronizes after each chunk, so at any moment one stage is busy. Overlapping stages needs
   micro-chunks inside a chunk (later stages start on micro-chunk 0 while stage 0 runs micro-chunk 1);
@@ -129,6 +133,12 @@ SMs, and its cooperative schedules need their whole grid resident, so the defaul
 failed at startup. The covering route now falls through to the first later route that fits the device
 (`ninfer_gdn_gating_proj_test` checks it against an independent grid model at 30 to 84 SMs and
 that the tuned 82-SM routes are unchanged). Its performance on the A4000 has not been tuned.
+
+Later checks on real pairs, none with peer access: Ternary Bonsai 2 27B on two RTX 4090s generates
+byte for byte what one GPU does in every row of the stage test, and suspends and resumes with its
+prefix reuse intact ([maintainer map](consolidated-line.md)); Qwen3.8-Flash-Next runs its experts
+over two RTX 3090 Ti, two RTX 4090 and two RTX 5090
+([measurements](../qwen3-8-flash-next.md#measurements)).
 
 Launch note for rentals: the CUDA base images carry a `compat` `libcuda.so.1` that GeForce cards
 refuse (`cudaErrorCompatNotSupportedOnDevice`); put `/usr/lib/x86_64-linux-gnu` first in

@@ -1,9 +1,10 @@
 # NInfer CLI
 
-`build/apps/ninfer` runs one request against one v3 `.ninfer` artifact. Build NInfer and
-download an artifact using the [project README](../README.md) before following this guide.
+`build/apps/ninfer` (the Docker image's `ninfer` command) runs one request against one v3
+`.ninfer` artifact. Build NInfer or pull the image, and download an artifact, as the
+[project README](../README.md) describes before following this guide.
 
-The examples use Qwen3.8-27B NVFP4 with FP8 KV storage.
+The examples use the Qwen3.8-27B NVFP4 artifact with INT8 KV storage.
 
 ## Text input
 
@@ -221,7 +222,7 @@ seven, both with the optimized proposal head.
 
 ## Common options
 
-The table lists executable defaults. The examples above select FP8 KV and MTP3.
+The table lists executable defaults. The examples above select INT8 KV and MTP3.
 
 | Option | Meaning | Default |
 |---|---|---:|
@@ -237,7 +238,12 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--device N` | CUDA device index | `0` |
 | `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see [pipeline stages](maintainer/pipeline-parallel-plan.md)); overrides `--device` | none |
 | `--stage-layers A,B,...` | layers per stage, in `--devices` order; omitted means a split chosen from each device's free memory | memory-balanced |
-| `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys and `rk4v4-e8` opt-in E8-lattice INT4 keys; all eight are accepted on this fork's sm_86/sm_89 targets | `bf16` |
+| `--expert-residency device\|host\|disk` | Qwen3.8-Flash-Next: routed expert banks in GPU memory, in pinned host memory read across the bus, or left in the artifact's files and streamed into the device expert cache (see [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#run)) | `device` |
+| `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; `0` turns the host-mode cache off, and disk mode needs one | `auto` (what is free after startup) |
+| `--ngram-table PATH` | Qwen3.8-Flash-Next: the n-gram table artifact of a model published without its table | the model's own table |
+| `--ngram-ram` | Qwen3.8-Flash-Next: load the n-gram table into RAM instead of reading its rows from the file | off |
+| `--no-ngram-table` | Qwen3.8-Flash-Next: run without the n-gram table, a non-standard experimental mode (the Q2_0 release's WikiText-2 perplexity rises from 2.66 to 5.01) | off |
+| `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys and `rk2v4-e8` opt-in E8 root-code keys; all nine are accepted on every build target (see [Context and memory](#context-and-memory)) | `bf16` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--lm-head-draft` | optimized proposal head | off |
@@ -247,11 +253,18 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--ngram-min-match N` | shortest match a copy is drawn from, `4..64` | `12` |
 | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
+| `--lm-head-q4`, `--lm-head-q6` | store the output head as Q4 or Q6 while loading | off |
+| `--embedding-q4`, `--embedding-q6` | store the token embedding as Q4 or Q6 while loading | off |
+| `--mtp-experts-q4` | Qwen3.6-35B-A3B: store the MTP layer's routed experts in the text layers' formats | off |
+| `--gdn-state-fp16` | keep the GDN recurrent state in FP16 | FP32 |
+| `--mlp-a8-decode` | integer-activation MLP gate_up at decode and verify widths | off |
+| `--no-prefill-a8` | return full prefill tiles to their A16 routes, which is how the integer routes are measured on a whole request | integer routes |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--vision-residency resident\|overlay\|cpu` | `overlay` keeps the Vision tower host-pinned and borrows device memory per image from the evictable text weight tail (no resident Vision cost; needs CUDA VMM). `--vision-offload on\|off` is accepted as an alias for `overlay\|resident`. `cpu` encodes on CPU threads from host FP32 weights, with no device Vision memory and `--vision-max-merged` capped at 256 unless given | `resident` |
 | `--vision-cpu` | `--vision` with `--vision-residency cpu` | off |
 | `--vision-max-merged N` | merged-token budget of one media item; larger media downscales at preprocessing | 16384 |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
+| `--wddm-evictable-budget` | Windows builds with `-DNINFER_D3D12_RESIDENCY=ON`: budget against dedicated memory, holding the device arenas resident | off |
 | `--chat-template FILE` | use a local Jinja template | artifact template |
 | `--no-thinking` | disable thinking | template default |
 | `--thinking-budget N` | positive model-origin thinking-token cap; omitted means unlimited | unset |
@@ -268,18 +281,21 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
 | `--seed N` | sampling seed | `0` |
 | `--log-colours on\|off` | `on` gives every statistic of the stderr summary a stable colour, even when stderr is redirected | off |
+| `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | stderr verbosity | `info` |
+
+[Quality trades](maintainer/quality-trade-experiments.md) measures what each precision option costs.
 
 When a sampling flag is omitted, Engine selects the general-task preset for the loaded architecture
-and rendered prompt mode. The current official models use:
+and rendered prompt mode:
 
 | Model | Prompt mode | Temperature | Top-p | Top-k | Min-p | Presence penalty |
 |---|---|---:|---:|---:|---:|---:|
-| Qwen3.6-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
-| Qwen3.6-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
-| Qwen3.8-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
-| Qwen3.8-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
+| Qwen3.6-27B, Qwen3.8-27B and the artifacts built from it | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
+| Qwen3.6-27B, Qwen3.8-27B and the artifacts built from it | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 | Qwen3.6-35B-A3B | thinking | `1.0` | `0.95` | `20` | `0` | `1.5` |
 | Qwen3.6-35B-A3B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
+| Qwen3.8-Flash-Next | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
+| Qwen3.8-Flash-Next | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
 
 Frequency penalty is `0` in every registered preset. Task-specific profiles such as Qwen's
 precise-coding profile use explicit sampling overrides.
@@ -293,7 +309,7 @@ Run `./build/apps/ninfer --help` for the exact option contract.
 ## CUDA synchronization
 
 `NINFER_CUDA_SYNC` selects the CUDA device synchronization schedule at startup for both the CLI
-and HTTP server, on every model-parallel rank. When unset, CUDA's own default applies (`auto`), a
+and HTTP server, on every device the Engine uses. When unset, CUDA's own default applies (`auto`), a
 heuristic that spins while the host has more cores than active CUDA contexts. `spin` always
 spins, trading one busy core for the lowest synchronization latency. Use `blocking` to let the
 waiting thread sleep; the decode performance cost depends on the host. `yield` yields the CPU
@@ -309,16 +325,15 @@ it does not override individual CUDA event creation flags.
 
 ## Context and memory
 
-The registered model IDs have a native context limit of 262,144 tokens. The practical allocation
-on one RTX 3090 depends on the selected artifact, media workload, output budget, and KV-cache type.
-Use `--kv-dtype int8` for the recommended large-context quality profile; BF16 is also available.
-The artifact describes its model configuration and weight representations; `--kv-dtype`
-independently selects runtime KV storage. All eight
-formats — `bf16`, `int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `k8v4`, `nvfp4` — are accepted on SM86; measured size,
-decode speed and perplexity for each are in
-[`docs/config-calculator.html`](config-calculator.html). The Blackwell-only
-`mma.sync...kind::f8f6f4` restriction applies to FP8/NVFP4 *weights and activations*, not to KV
-storage, which is why this paragraph used to say `fp8` KV was rejected here.
+The registered model IDs have a native context limit of 262,144 tokens. `--max-context` accepts up
+to four times that, 1,048,576 tokens, with plain RoPE or YaRN (`--rope-yarn`) past the native
+window. What fits depends on the card, the artifact, the media workload, the output budget and the
+KV format. The artifact describes its model configuration and weight representations;
+`--kv-dtype` independently selects runtime KV storage, BF16 by default. All nine formats — `bf16`,
+`int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`, `k8v4`, `nvfp4` — are accepted on every
+build target: the Blackwell-only `mma.sync...kind::f8f6f4` restriction applies to FP8/NVFP4
+*weights and activations*, not to KV storage. Measured size, decode speed and perplexity of seven of
+them on an RTX 3090 are in [`docs/config-calculator.html`](config-calculator.html).
 
 `rk8v4` is the best all-round choice: rotated INT8 keys with a packed signed int4 value plane,
 about 23% smaller than INT8 for about 0.082% perplexity, and the flattest decode curve of any
@@ -328,8 +343,12 @@ indices: 31% smaller than `rk8v4`, within 3% of `nvfp4`'s size, better perplexit
 (+0.21% against INT8) and `rk8v4`'s decode speed, so it is the choice when context is the limit.
 `rk4v4-e8` has `rk4v4`'s size but snaps each octet of a scaled G64 key group to the nearest E8
 lattice point before the codes are clamped to [-8, 7]; the coset bit is not stored, so per-value
-error is no better than plain INT4. `fp8` and `k8v4` are each beaten by `rk8v4` on size, speed and
-quality together, so neither has a niche. The prepared prompt must fit
+error is no better than plain INT4. `rk2v4-e8` stores each 8-dimension key block in two bytes, the
+nearest of E8's 240 roots and a byte holding a log-radius and a residual axis: 216 bytes per token
+and KV head against 280 for `rk4v4-e8` and 408 for `rk8v4`, the one format that holds 1,048,576
+tokens beside Ternary Bonsai 2 on a 24 GB card, at a quality cost (quick-corpus perplexity 5.631 to
+5.820 on Bonsai 2, and fewer accepted DFlash2 drafts). `fp8` and `k8v4` are each beaten by `rk8v4`
+on size, speed and quality together, so neither has a niche. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
 `--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU

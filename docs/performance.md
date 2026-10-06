@@ -1,15 +1,18 @@
 # Single-GPU serving performance
 
-> **Read the hardware label before the numbers.** This index and the per-model pages it links to
-> carry measurements from two different GPUs, and they must not be read against each other:
+> **Read the hardware label before the numbers.** This index and the pages it links to carry
+> measurements from several GPUs, by this line and by upstream, and they must not be read against
+> each other:
 >
 > | section | hardware | measured by |
 > |---|---|---|
-> | [Reference measurements, September 2026](performance/reference-2026-09.md): Ternary Bonsai 2 27B and Qwen3.8-27B at full context, the largest context per card, draft lengths 1 to 15 | RTX 3090, RTX 4090, RTX 5090, CUDA 13.1 | this line |
+> | [Reference measurements, September 2026](performance/reference-2026-09.md): Ternary Bonsai 2 27B and Qwen3.8-27B at full context, the largest context per card, draft lengths 1 to 15, and the October re-check | RTX 3090, RTX 4090, RTX 5090, RTX PRO 6000, CUDA 13.1 | this line |
+> | [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#measurements): every expert placement, perplexity against llama.cpp, AIME and GPQA | RTX 3090 and 3090 Ti, RTX 4090, RTX 5090, RTX PRO 6000, L40S | this line |
+> | [Ternary Bonsai 2 27B on RTX 5060 Ti and RTX 4090](performance/bonsai2-27b-rtx5060ti-rtx4090.md) (in Russian) | RTX 5060 Ti, RTX 4090 | this line |
 > | [RTX 3090 (`sm_86`) findings](#rtx-3090-sm_86-findings-this-fork) below | RTX 3090, `sm_86`, CUDA 12.8 | this fork |
 > | [RTX 5090 (`sm_120a`) against upstream](#rtx-5090-sm_120a-against-upstream-this-fork) below | RTX 5090, `sm_120a`, CUDA 12.9 | this fork |
 > | [Vision residency on RTX 3090](performance/qwen3.8-27b.md#vision-residency-on-rtx-3090-groupwise-int-sm_86) | RTX 3090, `sm_86` | this fork |
-> | Every per-model page under `performance/` | **RTX 5090, `sm_120a`, CUDA 13.1** | upstream |
+> | The per-model pages [Qwen3.6-27B](performance/qwen3.6-27b.md), [Qwen3.6-35B-A3B](performance/qwen3.6-35b-a3b.md) and [Qwen3.8-27B](performance/qwen3.8-27b.md), outside the sections they mark as this fork's | **RTX 5090, `sm_120a`, CUDA 13.1** | upstream |
 >
 > The upstream campaign is kept because it is the only corpus-scale evidence published for these
 > artifact profiles, and all of its tested revisions are reachable in this fork's history. It is
@@ -18,7 +21,7 @@
 > characterise `sm_86` kernel behaviour — where upstream's inherited route boundaries were wrong by
 > 12–41%.
 
-## RTX 3090 (`sm_86`) findings — this fork
+## RTX 3090 (`sm_86`) findings, this fork
 
 **DFlash2 measured on this fork (RTX 3090, Qwen3.8-27B groupwise-int, `--kv-dtype int8`,
 `--draft-tokens 7`, greedy, 96 new tokens).** Text: 20.0% acceptance, 2.38 tok/round.
@@ -549,7 +552,9 @@ DFlash2's `--lm-head-draft` is within noise of unset at every count and can be l
 
 ### Choosing a KV format (RTX 3090, Qwen3.8-27B)
 
-All seven SM86 KV formats, measured on Qwen3.8-27B.
+Seven of the nine KV formats, measured on Qwen3.8-27B. `rk4v4-e8` and `rk2v4-e8` were measured on
+Ternary Bonsai 2 ([reference measurements](performance/reference-2026-09.md), the
+[README](../README.md#from-other-forks)).
 
 | KV profile | Bytes/token | KV at 2,048 tokens | Perplexity | vs `bf16` | Decode at 32K depth |
 |---|---:|---:|---:|---:|---:|
@@ -575,17 +580,19 @@ figures are stated against those rather than this table's. The
 [`rk4v4` release notes](../RELEASE_NOTES_0.12.0.md#new-kv-format-rk4v4--nvfp4s-size-rk8v4s-speed-115)
 have its full writeup, and [Context and memory](cli.md#context-and-memory) the recommendations.
 
-**Not built: `rk2v4-e8` (2-bit E8 root keys).** The sibling RTX 4090 forks ship an `rk2v4-e8` mode:
-keys as one E8 root index, a 4-bit log radius and a 4-bit axis correction per 8 dimensions, about
-216 B per head and token here against `rk4v4`'s 280. Simulated on this build by passing `int8`'s
-rotated keys through that fork's encoder and decoder (`absmax/7` G64 scale) and storing the decoded
-keys as INT8, with values left at INT8, the same quick protocol measured **4.476942 against
-4.343155 (+3.08%)**, with every domain between +2.2% and +3.9% (2026-09-29). That is the keys
-alone, about fourteen times `rk4v4`'s whole +0.214%, and it agrees with the rule `rk4v4` found that
-any 3-bit key coding costs +0.7% or more. `rk4v4` already reaches the model's native 262,144-token
-context on the 27B, so the extra headroom does not pay for the quality.
+**`rk2v4-e8` (2-bit E8 root keys) on Qwen3.8-27B.** The line has carried this NInfer-4090 format
+since September 2026: keys as one E8 root index, a 4-bit log radius and a 4-bit axis correction per
+8 dimensions, about 216 B per head and token against `rk4v4-e8`'s 280. On the base line, which did
+not build it, it was simulated by passing `int8`'s rotated keys through that fork's encoder and
+decoder (`absmax/7` G64 scale) and storing the decoded keys as INT8, with values left at INT8; the
+same quick protocol
+measured **4.476942 against 4.343155 (+3.08%)**, with every domain between +2.2% and +3.9%
+(2026-09-29). That is the keys alone, about fourteen times `rk4v4`'s whole +0.214%, and it agrees
+with the rule `rk4v4` found that any 3-bit key coding costs +0.7% or more. `rk4v4` already reaches
+the 27B's native 262,144-token context on a 24 GB card, so on this model `rk2v4-e8` pays only for
+windows past it.
 
-## RTX 5090 (`sm_120a`) against upstream — this fork
+## RTX 5090 (`sm_120a`) against upstream, this fork
 
 **Context-cache TTFT, 2026-10-05.** One RTX 5090 (575 W, driver 570.195.03), Release `120a` builds
 with CUDA 12.9 of this fork at `3e842a91` and of upstream master at `68c54356f`, the official

@@ -74,8 +74,7 @@ maintainer has accepted both the product direction and the proposed ownership mo
 
 A pull request is appropriate only after its linked Issue has established the problem and the
 maintainer has agreed to its scope and implementation direction. Target pull requests at the
-`master` branch. Before implementation, also review the current `dev` branch to avoid duplicating
-or conflicting with maintainer work that has not yet reached `master`.
+`master` branch.
 
 Each pull request must represent one coherent engineering decision:
 

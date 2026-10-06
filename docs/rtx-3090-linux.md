@@ -1,17 +1,24 @@
-# Build NInfer for RTX 3090 on Linux
+# Build NInfer on Linux
 
-This guide builds the `sm_86` runtime for one NVIDIA GeForce RTX 3090 or RTX 3090 Ti.
-NInfer-3090 v0.6.1 publishes a Linux x64 archive built for this exact SM86 target.
+This guide runs NInfer on Linux from the published container image, or builds it natively.
+`CMAKE_CUDA_ARCHITECTURES` selects one target per build directory:
 
-Do not change `CMAKE_CUDA_ARCHITECTURES` to `89`.
-The RTX 4090 fork uses Ada-specific schedules that do not apply to the RTX 3090.
+| value | GPUs | toolkit |
+|---|---|---|
+| `86` (the default) | RTX 30 series; an `86` build also runs on the RTX 40 series | CUDA 12.8 or newer |
+| `89` | RTX 40 series only | CUDA 12.8 or newer |
+| `120a` | RTX 50 series and RTX PRO 6000 Blackwell | CUDA 13.1 or newer (configure refuses 12.8 and 12.9, which miscompile `sm_120a` kernels) |
+| `80` | A100 class (GA100), an unmeasured compatibility target | CUDA 12.8 or newer |
+
+An `89` or `120a` build does not run on an RTX 3090.
 
 ## Container image
 
 The published image, `ghcr.io/iamwavecut/ninfer-all:latest`, is the shortest path on Bazzite and
-other Linux distributions: CUDA 13.4 on Ubuntu 26.04, with an `sm_86` build that it starts on this
-card. It needs a driver of the CUDA 13 branch (580 or newer) and the NVIDIA Container Toolkit; make
-sure that Docker can access the GPU first:
+other Linux distributions: CUDA 13.4 on Ubuntu 26.04, with an `sm_86` build for the RTX 30 and 40
+series and an `sm_120a` build for Blackwell, and it starts the one that matches the GPU. It needs a
+driver of the CUDA 13 branch (580 or newer) and the NVIDIA Container Toolkit; make sure that Docker
+can access the GPU first:
 
 ```bash
 docker run --rm --gpus all nvidia/cuda:13.4.2-base-ubuntu26.04 nvidia-smi
@@ -26,12 +33,13 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
 ```
 
 The API is available at `http://127.0.0.1:8080/v1`. `docker build --build-arg ARCHS=86 -t ninfer .`
-builds the same image from source for this card alone; the [README](../README.md#docker) covers the
-container's commands, volumes and compose file.
+builds the same image from source with the `sm_86` build alone; the [README](../README.md#docker)
+covers the container's commands, volumes and compose file, and its [Running](../README.md#running)
+section the command for each published artifact.
 
 ## Native Ubuntu 24.04 build
 
-Install the CUDA Toolkit 12.8 or newer from NVIDIA.
+Install the CUDA Toolkit from NVIDIA (12.8 or newer, 13.1 or newer for `120a`).
 Then install the host compiler and media dependencies:
 
 ```bash
@@ -68,11 +76,14 @@ cmake -S . -B build-sm86 -G Ninja \
 cmake --build build-sm86 --parallel 2
 ```
 
-The build creates these applications:
+For another GPU family, set `CMAKE_CUDA_ARCHITECTURES` from the table above in a build directory
+of its own. The build creates these applications:
 
 ```text
 build-sm86/apps/ninfer
 build-sm86/apps/ninfer-serve
+build-sm86/apps/ninfer-calibrate
+build-sm86/apps/ninfer-perplexity
 ```
 
 ## Optional vcpkg dependencies

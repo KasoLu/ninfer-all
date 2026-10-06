@@ -1,8 +1,11 @@
 # Contributors
 
-NInfer-3090 is maintained by [Don-Chad](https://github.com/Don-Chad) and is
-derived from [Neroued/ninfer](https://github.com/Neroued/ninfer). This file
-keeps durable, human-visible credit for merged contributions.
+NInfer-all is maintained by [iamwavecut](https://github.com/iamwavecut). It
+consolidates the forks of [Neroued/ninfer](https://github.com/Neroued/ninfer) on
+the line [Don-Chad](https://github.com/Don-Chad) started as NInfer-3090; the
+[maintainer map](docs/maintainer/consolidated-line.md) credits every change it
+carries over that base. This file keeps durable, human-visible credit for
+pull requests merged into the NInfer-3090 line.
 
 | Contributor | Contribution | Pull request |
 | --- | --- | --- |

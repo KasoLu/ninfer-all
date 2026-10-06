@@ -1,7 +1,9 @@
 # Build system
 
 NInfer builds from its source tree with CMake 3.28+ and C++/CUDA 20.
-The supported architecture is `sm_120a`; CUDA 13.1 is the validated development toolkit.
+`CMAKE_CUDA_ARCHITECTURES` is `80`, `86` (the default), `89` or `120a`, one per build tree; configure
+refuses anything else. CUDA 12.8 builds the `sm_8x` targets, and a `120a` build needs CUDA 13.1 or
+newer.
 Product commands and prerequisites are in the README's [Running](../../README.md#running) and
 [Building](../../README.md#building) sections; test and measurement workflows live in
 [tests](../../tests/README.md) and [benchmarks](../../bench/README.md).
@@ -15,9 +17,13 @@ The default configuration is Release. Ninja links and archives share the single-
 
 | Cache option | Default | Scope |
 |---|---|---|
-| `NINFER_BUILD_APPS` | ON | CLI, HTTP server and perplexity evaluator |
+| `NINFER_BUILD_APPS` | ON | CLI, HTTP server, perplexity evaluator and `ninfer-calibrate` |
 | `BUILD_TESTING` | OFF | C++ tests and registered Python interoperability tests |
 | `NINFER_BUILD_BENCHMARKS` | OFF | Op, model, Engine and context-cost benchmarks |
+
+The opt-in kernel, build and platform options (`NINFER_SM120_NATIVE`, `NINFER_PDL`,
+`NINFER_MULTICALL`, the SFU and Windows options, and the rest) are listed in the
+[Linux build guide](../rtx-3090-linux.md#build-options).
 
 Apps or tests enable the internal product support components: media acquisition, prompt input,
 logging and serving. This is one derived condition, not a separate user option. FFmpeg belongs
@@ -25,7 +31,8 @@ to model media decoding and remains required when apps are disabled. Curl and sp
 only for product support. A Python 3 interpreter is found when tests are configured. The larger Python
 pytest suites and conversion/evaluation scripts run separately from CMake and CTest.
 
-CUDA 13.1 and Python 3.11 describe the maintained environment, not configuration version gates.
+Python 3.11 describes the maintained environment, not a configuration version gate. The one CUDA
+version gate is 13.1 for a `120a` build: CUDA 12.8 and 12.9 miscompile `sm_120a` kernels.
 CMake also discovers FFmpeg without imposing library version floors. Actual language/API support
 is exercised by compilation and tests. The libcurl 7.85 minimum has a concrete API basis:
 media acquisition uses `CURLOPT_PROTOCOLS_STR` and `CURLOPT_REDIR_PROTOCOLS_STR`, introduced in
@@ -139,7 +146,8 @@ or justify combining shape translation units or enabling unity builds.
 
 ## Consumers and verification
 
-`apps/CMakeLists.txt` explicitly defines the three product executables. Tests and benchmarks
+`apps/CMakeLists.txt` explicitly defines the four product executables, or with `NINFER_MULTICALL`
+one multi-call executable that bundles them. Tests and benchmarks
 include their domain registrations without creating new CMake subdirectories, preserving
 `build/tests/`, `build/bench/` and CTest working directories. The helpers are local to those
 consumers. Tests explicitly name their linked libraries; public-header and pure-host checks keep

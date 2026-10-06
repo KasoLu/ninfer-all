@@ -11,6 +11,11 @@ run.sh <model> [profile]
 | `qwen38-27b` | `tuned`, `int8`, `c8` | DFlash2, one lane, 262,144 tokens | DFlash2, one lane, 172,032 tokens |
 | `qwen36-35b-a3b` | `tuned` | MTP3, three lanes, 262,144-token pool | MTP3, two lanes, 262,144-token pool |
 
+The Docker image's `run <model> [profile]` command runs `run.sh` inside the container
+([README](../../README.md#docker)), so the profiles below apply there unchanged. Started that way with
+driver 580.159.03, `run qwen38-27b` took the full 262,144-token context on an RTX 5090 and 196,608
+on an RTX 3090 after two of the launcher's step-downs.
+
 Lanes share one KV pool: `--kv-capacity` is the pool and `--max-context` the per-request cap, and
 the `tuned` profiles set both to the same value. Any one request can use the whole context, but the
 lanes' requests together hold at most that many tokens at a time.

@@ -1,6 +1,6 @@
 # Pull Request Policy
 
-Thanks for contributing to `ninfer-3090`! I much appreciate anyone willing to put time and effort into empowering people on local hardware.
+Thanks for contributing to `ninfer-all`! I much appreciate anyone willing to put time and effort into empowering people on local hardware.
 
 This project is performance-sensitive C++/CUDA code running close to hardware. Small changes can have unexpected effects on correctness, determinism, VRAM usage, latency, throughput, or compatibility. Because of that, we prefer PRs that are easy to understand, test, benchmark, and revert.
 

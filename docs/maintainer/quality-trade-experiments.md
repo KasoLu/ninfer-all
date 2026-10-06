@@ -141,7 +141,7 @@ so the state is only rounded at three chunk boundaries per 4096-token window, wh
 every round. The drift test and the divergence check exist because of this gap, and both came back
 clean.
 
-## Vocabulary transcoding -- `--lm-head-q6` and `--embedding-q4`
+## Vocabulary transcoding: `--lm-head-q6` and `--embedding-q4`
 
 Qwen3.8-27B stores both vocabulary matrices as `W8G32_F16S`, 248320 x 5120: **1,288 MiB each**,
 together 2.5 GiB of a 17.9 GB resident model. Neither needs eight bits.
@@ -319,7 +319,7 @@ Quick corpus, RTX 3090, Qwen3.8-27B groupwise-int, `--kv-dtype int8`:
 
 | arm | overall perplexity | against A16 |
 |---|---:|---:|
-| `--no-prefill-a8` (every projection A16) | 4.342982 | — |
+| `--no-prefill-a8` (every projection A16) | 4.342982 | â€” |
 | every registered integer route (default) | 4.343155 | **+0.004%** |
 
 That is inside run-to-run noise, and inside the +0.05% this fork requires before a lossy route is

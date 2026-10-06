@@ -1,9 +1,9 @@
-# NInfer-3090 for Windows — release archive
+# NInfer for Windows (RTX 3090 build) — release archive
 
 This is the README that ships **inside** the Windows release archive, where every file sits in one
 directory. If you are reading it in a checkout instead, the launchers and downloaders it names live
 under `scripts/`, and
-[docs/rtx-3090-windows.md](https://github.com/ashalliants/ninfer-3090/blob/master/docs/rtx-3090-windows.md)
+[docs/rtx-3090-windows.md](https://github.com/iamwavecut/ninfer-all/blob/master/docs/rtx-3090-windows.md)
 is the fuller guide. Links here are absolute on purpose: the archive ships no `docs/` directory.
 
 Check `VERSION` for the release this archive was cut from, and `RELEASE_NOTES_*.md` for what
@@ -115,10 +115,10 @@ rungs are listed in the `run.bat` header, measured on this card — for
 Drop vision last: in overlay residency it costs almost nothing resident.
 
 To size a profile before running it, open
-[docs/config-calculator.html](https://github.com/ashalliants/ninfer-3090/blob/master/docs/config-calculator.html)
+[docs/config-calculator.html](https://github.com/iamwavecut/ninfer-all/blob/master/docs/config-calculator.html)
 from the repository — one self-contained file, no network needed, every constant in it measured on
 an RTX 3090. It is not in this archive.
 
 ## Full documentation
 
-<https://github.com/ashalliants/ninfer-3090>
+<https://github.com/iamwavecut/ninfer-all>

@@ -1,5 +1,11 @@
 # NInfer early RTX 4090 support
 
+> **Status, October 2026: superseded.** The RTX 4090 now has a measured route profile built in
+> ([device profiles](device-profiles.md)), runs the `86` build (the Docker image's) or an `89`
+> build, and its current numbers are in the
+> [reference measurements](performance/reference-2026-09.md). This page keeps the August 2026
+> first-run qualification.
+
 Run Qwen3.8-27B locally on a 24 GB RTX 4090 with the same ReplaySSM and MTP path used by the
 RTX 3090 release. This early build targets Ada `sm_89` natively. It prioritizes first-run
 compatibility; RTX 4090-specific tuning comes after runtime qualification.
@@ -29,7 +35,7 @@ KV pool; C8 used 16K. Results include complete request-wave time and were collec
 
 ```powershell
 cmake -S . -B build-sm89 -A x64 `
-  -DCMAKE_TOOLCHAIN_FILE=G:/python/custom-kernel-3090/.vcpkg-local/scripts/buildsystems/vcpkg.cmake `
+  -DCMAKE_TOOLCHAIN_FILE=C:/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake `
   -DCMAKE_CUDA_ARCHITECTURES=89 `
   -DNINFER_BUILD_APPS=ON `
   -DNINFER_BUILD_BENCHMARKS=ON

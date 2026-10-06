@@ -1,9 +1,9 @@
-# NInfer-3090 for Linux — release archive
+# NInfer for Linux (RTX 3090 build) — release archive
 
 This is the README that ships **inside** the Linux release archive, where every file sits in one
 directory. If you are reading it in a checkout instead, the launchers and downloaders it names live
 under `scripts/`, and
-[docs/rtx-3090-linux.md](https://github.com/ashalliants/ninfer-3090/blob/master/docs/rtx-3090-linux.md)
+[docs/rtx-3090-linux.md](https://github.com/iamwavecut/ninfer-all/blob/master/docs/rtx-3090-linux.md)
 is the guide to building from source. Links here are absolute on purpose: the archive ships no
 `docs/` directory.
 
@@ -109,4 +109,4 @@ clamps it hard. Same flag, different platform behaviour, by design.
 
 ## Full documentation
 
-<https://github.com/ashalliants/ninfer-3090>
+<https://github.com/iamwavecut/ninfer-all>

@@ -68,11 +68,13 @@ Then compile the trained checkpoint back to graft format:
 ## 3. Start ninfer-serve with the graft
 
 ```
-build-ninja\apps\ninfer-serve.exe ^
-  --model path\to\brand_q38_nf4.bin ^
+build-ninja\apps\ninfer-serve.exe models\qwen3_8_27b.ninfer ^
   --graft brand=artifacts\grafts\brand_trained.bin ^
   --port 8080
 ```
+
+The server takes the model's `.ninfer` artifact as its first argument; the graft is the
+`--graft` file.
 
 `--graft NAME=PATH` is repeatable — load multiple grafts side by side. Each
 direct-KV or softprompt-KV graft is injected into a pinned shared-prefix slot
@@ -151,7 +153,7 @@ The `--graft` flag points to the `.bin`; ninfer finds the `.json` beside it.
 
 ## Building ninfer (Windows)
 
-From the ninfer-3090 repo root:
+From the repository root:
 
 ```
 build_merge.bat
@@ -201,9 +203,8 @@ the `phantom-kv` repo root.
   --model Qwen/Qwen3.8-27B \
   --out artifacts/grafts/v1_q38_nf4_trained.bin
 
-# 4. Serve with ninfer (from ninfer-3090 repo root)
-build-ninja/apps/ninfer-serve.exe \
-  --model <path-to-artifact>/brand_q38_nf4.bin \
+# 4. Serve with ninfer (from the repository root)
+build-ninja/apps/ninfer-serve.exe <path-to-artifact>/qwen3_8_27b.ninfer \
   --graft v1=<phantom-kv>/artifacts/grafts/v1_q38_nf4_trained.bin
 ```
 
@@ -250,9 +251,8 @@ Same v1 prefill dataset (`data/grafts/v1_prefill.json`) and targets
   --model Qwen/Qwen3.6-35B-A3B \
   --out artifacts/grafts/v1_q36_35b_nf4_trained.bin
 
-# 4. Serve with ninfer (from ninfer-3090 repo root)
-build-ninja/apps/ninfer-serve.exe \
-  --model <path-to-artifact>/qwen3_6_35b_a3b.ninfer \
+# 4. Serve with ninfer (from the repository root)
+build-ninja/apps/ninfer-serve.exe <path-to-artifact>/qwen3_6_35b_a3b.ninfer \
   --graft v1=<phantom-kv>/artifacts/grafts/v1_q36_35b_nf4_trained.bin
 ```
 

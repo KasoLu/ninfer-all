@@ -522,7 +522,10 @@ lookahead prefetch); an option loads it, or a profile-selected hot part of it, i
   table-less models plus one table repository. A side companion file without a container came first; a single file
   per model replaced it, and the hybrid replaced that so that several published checkpoints share one table.
 
-**Runtime option surface** (CLI and serve config; names follow our `--kebab` convention):
+**Runtime option surface** (CLI and serve config; names follow our `--kebab` convention). **Status:** what
+shipped is the default positioned reads from the file, several rows in flight, and `--ngram-ram` for the whole
+table in RAM, beside `--ngram-table` and `--no-ngram-table`; the residency, I/O, budget, hot-profile, lock and
+depth options planned below were not built:
 
 | option | values | default | meaning |
 |---|---|---|---|

@@ -541,11 +541,9 @@ larger extents. The chunked route prepares 16-token packets and combines recurre
 its final packet is padded inside the kernels. `--batch-update` measures the public selected-slot
 update at `T=1`, with `B=1..8`; `--qk-norm composed` retains the B=1 two-L2Norm comparison.
 
-`--force-chunked` and `--recurrent-only` call the selected production launchers with fused Q/K
-normalization at matching prefill extents to measure their crossover. `--chunked-only` forces
-the chunked route with pre-normalized BF16 Q/K. These prefill comparisons are independent of
-decode and ReplaySSM. Adding `--breakdown` to a chunked measurement reports isolated
-`chunked.prepare` and `chunked.recurrence` timings using the same production launchers and
+`--chunked-only` measures the chunked route with pre-normalized BF16 Q/K, independently of decode
+and ReplaySSM. Adding `--breakdown` to it reports isolated `chunked.prepare_wy_wu`,
+`chunked.state_passing` and `chunked.output` timings using the same production launchers and
 workspace layout.
 
 `stage_share_pct` partitions the sum of isolated-stage medians. Each isolated stage receives its own

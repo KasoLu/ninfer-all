@@ -19,6 +19,8 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Measure the card's sustained memory bandwidth | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
+| Reference measurements against a running server (the suites behind the [reference tables](../docs/performance/reference-2026-09.md)) | [`bench/refbench.py`](bench/README.md#reference-measurements-refbenchpy) |
+| FP64 reference forward of Qwen3.8-Flash-Next for golden tensors | [`reference/qwen4_exp.py`](reference/qwen4_exp.py) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
 | Watch a resident server: dashboard, and restart on a wedge | [`monitor/`](monitor/README.md) |
 | Check long-context recall, cold prefill against a cached prefix | [`longctx_recall_probe.py`](longctx_recall_probe.py) |
@@ -29,14 +31,18 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 ## Standalone HBM probe
 
 This maintainer probe has an explicit standalone CUDA build, independent of the CMake benchmark
-targets. Build it with the project's CUDA toolkit and run it from the repository root:
+targets. Build it with the project's CUDA toolkit for the card's architecture (`sm_86` for the RTX
+30 and 40 series, `sm_120a` for Blackwell) and run it from the repository root:
 
 ```bash
 mkdir -p build
-nvcc -O3 -std=c++17 -arch=sm_120a tools/hbm_bandwidth_probe.cu \
+nvcc -O3 -std=c++17 -arch=sm_86 tools/hbm_bandwidth_probe.cu \
   -o build/hbm_bandwidth_probe
 ./build/hbm_bandwidth_probe
 ```
+
+The other `*_probe.cu` files in this directory are one-off measurements built the same way; most
+give their purpose and build command at the top of the file.
 
 ## Artifact workflow
 

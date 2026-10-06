@@ -21,7 +21,7 @@
 
 Generation purpose 的 NInfer Engine 固定运行：
 
-- 一张 GPU；
+- 一张 GPU，或 Linux 上按层切成最多八个 pipeline stage 的多张 GPU（见第 8 节）；
 - 一个常驻模型实例；
 - 启动时确定的 `max_concurrency=1..8`；
 - 一个有界 FIFO 等待队列；
@@ -50,7 +50,10 @@ inactive cache 的保留而丢失完成能力。
 
 模型代码拥有数学公式、调用顺序、组件交接和状态转移。Config 提供层数、维度、Attention/GDN
 分布和 expert 几何等实例参数。当前标准架构入口是 `Qwen3_5ForCausalLM` 与
-`Qwen3_5MoeForCausalLM`；训练实例和物理权重分配作为数据进入对应实现。
+`Qwen3_5MoeForCausalLM`；训练实例和物理权重分配作为数据进入对应实现。Qwen3.8-Flash-Next
+（`Qwen4ExpForCausalLM`，`models/qwen4_exp`）是第二个显式模型族：它有自己的 load、executor 和
+Engine core（`runtime/engine/qwen4_exp_core`），共享 Qwen3.5 的 Frontend 与 Vision tower，并通过同一个
+公共 `ninfer::Engine` 服务请求。
 
 V3 artifact 保存配置、物理对象、逻辑参数的 Binding、使用位置的 Use，以及 Frontend 资源。
 Converter 负责源映射、量化或保值导入、融合存储、packing 和 layout 转换；loader 根据实际绑定
@@ -621,6 +624,8 @@ checkpoint catalog。
 | 原生参数与固定模型调用 | `src/models/qwen3_5/execution/` |
 | Program 规划、存储与事务 | `src/models/qwen3_5/program/` |
 | Frontend 与模型状态布局 | `src/models/qwen3_5/frontend/`, `state/` |
+| Qwen3.8-Flash-Next 模型族与其 Engine core | `src/models/qwen4_exp/`, `src/runtime/engine/qwen4_exp_core.*` |
+| 每卡 route profile 与 calibration | `src/runtime/engine/device_profile.*`, `src/calibration/`, `src/ops/common/device_route.*` |
 | device primitives, tensors/views, checked layouts, arenas, graph RAII, physical KV, raw transfers | `src/core/` |
 | generic `.ninfer` framing, descriptors, binding primitives, materialization | `src/artifact/` |
 | semantic Ops | `src/ops/`, `include/ninfer/ops/` |

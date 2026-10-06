@@ -1,14 +1,16 @@
-# NInfer-3090 for Windows
+# NInfer on Windows
 
 > Not the archive README. This is the checkout-side Windows guide, so the scripts it names live
 > under `scripts/`. The README shipped inside the release archive is
 > [`release-archive-windows.md`](release-archive-windows.md), and `VERSION` in the archive says
 > which release you have.
 
-This native Windows release supports Qwen3.8-27B, Qwen3.6-27B, and the compact, text-only
-Qwen3.6-35B-A3B v0.3.1 artifact. The runtime provides paged KV, concurrent request execution,
-compatible-prefix reuse, bounded admission, ReplaySSM, reasoning-effort control, and
-OpenAI/Anthropic serving APIs.
+Native Windows builds run the same engine as Linux: paged KV, concurrent request execution,
+compatible-prefix reuse, bounded admission, ReplaySSM, reasoning-effort control, and the
+OpenAI/Anthropic serving APIs. Several GPUs (`--devices` with distinct ids) are Linux-only, and
+this line's Windows checks ran on an RTX 3090. The launcher scripts in `scripts\` serve
+Qwen3.8-27B and Qwen3.6-35B-A3B; any other artifact starts with `ninfer-serve.exe` and the flags
+the [README](../README.md#running) gives for it.
 
 ## Requirements
 
@@ -106,14 +108,13 @@ Graph shapes are reserved in advance.
 
 Qwen3.8 supports `low`, `medium`, and `xhigh` reasoning effort. For Chat Completions add the
 top-level field `"reasoning_effort": "xhigh"`; Responses uses
-`"reasoning": {"effort": "xhigh"}`. The CLI accepts
-`--reasoning-effort low|medium|xhigh`.
+`"reasoning": {"effort": "xhigh"}`. The CLI's `--reasoning-effort` takes the same values; another
+value renders as the nearest one the template accepts.
 
-The paged cache supports seven KV formats — `bf16`, `int8`, `fp8`, `rk8v4`, `rk4v4`, `k8v4` and `nvfp4`.
-INT8 remains the
-recommended default. On the development RTX 3090, `rk8v4` raises the measured automatic-sizing
-boundary from 171,648 to 226,560 tokens at 1 GiB headroom, for 5.51 GiB of KV against INT8's
-5.40 GiB.
+The paged cache supports nine KV formats, compared in the CLI guide's
+[Context and memory](cli.md#context-and-memory). On the development RTX 3090, `rk8v4` raises the
+measured automatic-sizing boundary from 171,648 to 226,560 tokens at 1 GiB headroom, for 5.51 GiB
+of KV against INT8's 5.40 GiB.
 
 Since the port onto the `kv_cache_append` Op, that context gain has a measured quality cost of
 **+0.092% perplexity** (`ninfer-perplexity`, `ninfer-ppl-1m-v1` quick, 261,167 scored tokens:
@@ -172,9 +173,10 @@ and whose DLLs are staged beside every executable; `NINFER_VCVARS`, `NINFER_GENE
 FFmpeg tree may have no PNG decoder) and pass the NVFP4 TMA descriptors through device memory,
 since MSVC cannot pass them by value.
 
-## Release validation
+## Validation
 
-The v0.5 Windows release gate rebuilt `ninfer.exe`, `ninfer-serve.exe`, and `ninfer_bench.exe`,
-loaded the official Qwen3.8 artifact, generated coherent output, and completed C1-C4 plus C8/8K
-serving checks. Focused tests cover artifact reading/materialization, request memory, admission,
-paged KV, prefix append, speculative rounds, and the relevant SM86 W8 linear paths.
+In September 2026 the whole tree, all 444 targets, built natively on an RTX 3090 Windows host
+(Visual Studio 2022 BuildTools, MSVC v143, CUDA 12.8), and the full suite of 100 tests passed. The
+v0.5 Windows release gate before it rebuilt `ninfer.exe`, `ninfer-serve.exe`, and
+`ninfer_bench.exe`, loaded the official Qwen3.8 artifact, generated coherent output, and completed
+C1-C4 plus C8/8K serving checks.

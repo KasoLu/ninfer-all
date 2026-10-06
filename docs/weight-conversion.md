@@ -61,9 +61,16 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_35b_a3b_nvfp4` | Imported NVFP4 routed and shared experts, Q8 projection weights, Q8/Q6 vocabulary weights | `quantized` |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
+| `qwen3_8_27b_nvfp4_nvidia` | nvidia/Qwen3.8-27B-NVFP4 (ModelOpt AutoQuant): imported NVFP4 MLP projections and per-row FP8 attention and GDN projections; FP8 embedding, and the NVFP4 output head re-quantized to FP8 | `quantized` |
+| `qwen3_8_27b_nvfp4_orcarouter` | orcarouter/Qwen3.8-27B-Uncensored-NVFP4 (GPTQ compressed-tensors): imported NVFP4 MLP projections in layers 0-55, per-row FP8 everywhere else; FP8 embedding and output head from BF16 | `quantized` |
 | `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses, Q8 primal embedding | `ternary` (GGUF) |
 | `qwen3_8_27b_gguf` | Every text, embedding, head and MTP tensor in its GGUF block format, byte for byte | `gguf` (GGUF), `vision` (mmproj GGUF) |
 | `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL rows in the same artifact or in a table artifact of their own | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF) |
+
+The QUASAR Qwen3.8-27B NVFP4 checkpoint, which quantizes every Linear layer to NVFP4, has a driver
+of its own, `python3 -m tools.convert.quasar_nvfp4 --model DIR --dflash2 REFERENCE.ninfer --out
+PATH`: it imports the NVFP4 codes verbatim, keeps the BF16 parameters, and takes the DFlash2 draft
+from a reference v3 artifact.
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
@@ -190,19 +197,19 @@ tensor set and Hadamard metadata before reading anything.
 ### A mixed-precision Qwen3.8-27B GGUF
 
 `qwen3_8_27b_gguf` ([`gguf_blocks.py`](../tools/convert/gguf_blocks.py)) imports a Qwen3.8-27B GGUF
-that assigns its own ggml block type to every tensor, such as ISTA-DASLab's
-[GSQ-RCO releases](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF). The text
-projections, token table, output head and, in an `-mtp` file, the MTP head keep their blocks: each
-is stored as the matching `gguf_*` format in the `gguf_blocks_v1` layout, so a row of the artifact
-is a row of the GGUF, byte for byte, and nothing is requantized. All fifteen block types llama.cpp
-writes for dense models are supported: Q8_0, Q2_K to Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S,
-IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS. The recipe undoes llama.cpp's Qwen3.5 exporter conventions the
-same way `bonsai2_27b_ternary` does, by row gathers and exact small-tensor transforms. The one
-convention a row copy cannot undo is the tiled value-head order of the GDN output projection's
-input columns: its Use carries an `input_columns` auxiliary, and the runtime reads the activation
-through that permutation when it quantizes it. Vision comes from the release's `mmproj` file in the
-official Vision formats, DFlash2 from `--source dflash2`, and `--proposal` gathers the proposal
-head's rows from the output head in its own block format.
+that assigns its own ggml block type to every tensor, such as ISTA-DASLab's [GSQ-RCO
+releases](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF). The text projections, token
+table, output head and, in an `-mtp` file, the MTP head keep their blocks: each is stored as the
+matching `gguf_*` format in the `gguf_blocks_v1` layout, so a row of the artifact is a row of the
+GGUF, byte for byte, and nothing is requantized. All eighteen `gguf_*` block types are supported:
+Q8_0, Q2_0, Q4_0, Q5_0, Q2_K to Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL
+and IQ4_XS ([GGUF block formats](gguf.md)). The recipe undoes llama.cpp's Qwen3.5 exporter
+conventions the same way `bonsai2_27b_ternary` does, by row gathers and exact small-tensor
+transforms. The one convention a row copy cannot undo is the tiled value-head order of the GDN
+output projection's input columns: its Use carries an `input_columns` auxiliary, and the runtime
+reads the activation through that permutation when it quantizes it. Vision comes from the release's
+`mmproj` file in the official Vision formats, DFlash2 from `--source dflash2`, and `--proposal`
+gathers the proposal head's rows from the output head in its own block format.
 
 ```bash
 python3 -m tools.convert \

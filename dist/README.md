@@ -17,8 +17,9 @@ contain build products. Upload the `.zip` and versioned checksum file as GitHub 
 The packaging guide itself is tracked.
 
 Model artifacts are not included. Download the recommended `qwen3_8_27b.ninfer` (Qwen3.8-27B) with
-`download-model.bat qwen38-27b`, or one of the other artifacts listed in the project README's Models
-table; the downloader pins a revision and verifies size and SHA-256.
+`download-model.bat qwen38-27b`, which pins a revision and verifies size and SHA-256 (it also
+fetches `qwen36-27b` and `qwen36-35b-a3b`), or any other artifact from the project README's
+artifact table.
 
 The Windows bundle includes its FFmpeg/curl/zlib DLLs and requires the NVIDIA driver and Microsoft
 Visual C++ 2022 runtime.
