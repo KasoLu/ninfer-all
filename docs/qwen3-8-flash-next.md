@@ -237,6 +237,47 @@ to the short-answer decode on the two GPUs in the two runs (91.5-91.7 tok/s eage
 pinned host experts (49.9-50.1 tok/s eager). Host memory is the process's peak resident set, device
 memory the most `nvidia-smi` showed in use.
 
+Both releases on Blackwell, 2026-10-06, a `120a` build with CUDA 13.1, the table as the separate
+artifact, the single-GPU rows pinned to the CPUs of the GPU's NUMA node, two runs where a range is
+given:
+
+- RTX PRO 6000 Blackwell Workstation Edition: 600 W, a PCIe 4.0 x16 host link, 64 vCPUs and
+  1.1 TB of RAM.
+- RTX 5090s: boards with a 600 W default limit, PCIe 5.0 x16, 512 threads and 1 TB of RAM.
+
+The short answer is 78 tokens for Q2_0, and 87 (PRO 6000) or 81 (RTX 5090) for IQ3_S.
+
+| Hardware and placement | Release | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
+|---|---|---:|---:|---:|---:|---:|
+| RTX PRO 6000, experts on the GPU | Q2_0 | 37.7 GiB | 0.8 GiB | 136.0-139.7 tok/s | 160.7-162.6 tok/s | 2,925-2,952 tok/s |
+| RTX PRO 6000, experts on the GPU | IQ3_S | 53.7 GiB | 1.0 GiB | 123.8-125.9 tok/s | 146.8-146.9 tok/s | 2,540-2,541 tok/s |
+| RTX PRO 6000, experts in pinned host memory | Q2_0 | 38.5 GiB | 34.0 GB pinned | 54.8-55.0 tok/s | 67.7-70.0 tok/s | 1,296-1,297 tok/s |
+| RTX PRO 6000, experts in pinned host memory | IQ3_S | 55.0 GiB | 50.3 GB pinned | 29.3 tok/s | 31.2 tok/s | 803 tok/s |
+| RTX PRO 6000, experts on disk, the files in the page cache | Q2_0 | 93.6 GiB | 1.0 GiB + page cache | 75.9 tok/s | 115.8 tok/s | 2,024 tok/s |
+| RTX PRO 6000, experts on disk, the files in the page cache | IQ3_S | 93.5 GiB | 1.2 GiB + page cache | 65.6 tok/s | 106.0 tok/s | 1,661 tok/s |
+| RTX PRO 6000, experts on disk, the files' pages evicted every second | Q2_0 | 93.5 GiB | 1.0 GiB | 35.1 tok/s | 87.1 tok/s | 1,000 tok/s |
+| RTX PRO 6000, experts on disk, the files' pages evicted every second | IQ3_S | 93.5 GiB | 1.2 GiB | 28.7 tok/s | 78.6 tok/s | 773 tok/s |
+| 2× RTX 5090, experts on the GPUs (`--devices 0,1`) | Q2_0 | 18.8 + 19.6 GiB | 0.9 GiB | 136.1-136.3 tok/s | 157.0-157.2 tok/s | 3,807-3,811 tok/s |
+| 2× RTX 5090, experts on the GPUs (`--devices 0,1`) | IQ3_S | 26.5 + 27.8 GiB | 1.0 GiB | 121.6-121.9 tok/s | 141.8-142.0 tok/s | 3,310-3,341 tok/s |
+| RTX 5090, experts in pinned host memory | Q2_0 | 30.0 GiB | 34.0 GB pinned | 74.1-74.2 tok/s | 93.9-94.2 tok/s | 1,676-1,678 tok/s |
+| RTX 5090, experts in pinned host memory | IQ3_S | 30.0 GiB | 50.3 GB pinned | 40.7 tok/s | 41.0 tok/s | 1,100 tok/s |
+| RTX 5090, experts on disk, the files in the page cache | Q2_0 | 29.9 GiB | 1.0 GiB + page cache | 67.5 tok/s | 76.7 tok/s | 1,739 tok/s |
+| RTX 5090, experts on disk, the files in the page cache | IQ3_S | 29.9 GiB | 1.1 GiB + page cache | 55.3 tok/s | 44.3 tok/s | 439 tok/s |
+| RTX 5090, experts on disk, the files' pages evicted every second | Q2_0 | 29.9 GiB | 1.0 GiB | 25.3 tok/s | 28.7 tok/s | 694 tok/s |
+| RTX 5090, experts on disk, the files' pages evicted every second | IQ3_S | 29.9 GiB | 1.1 GiB | 18.8 tok/s | 14.9 tok/s | 171 tok/s |
+
+**Device expert cache.** With host or disk experts the device expert cache takes the memory the GPU
+has free, and the generate test answers its prompts right after the load. The rows therefore
+measure a cache that is still filling: 94 GB of it on the PRO 6000, where nearly every expert ends
+up resident, and 30 GB on the RTX 5090.
+
+**Host link.** Host and disk experts cross the host link: PCIe 5.0 x16 on the RTX 5090 host,
+PCIe 4.0 x16 on the PRO 6000 host. That is the likeliest reason the RTX 5090's host-expert row beats
+the PRO 6000's.
+
+**CUDA graphs.** Graphs add 27% to the short-answer decode on the two RTX 5090s (107.0 tok/s eager)
+and 23 to 26% on the PRO 6000 (111.0-111.2 tok/s eager).
+
 On the current code every GSQ-RCO release, converted into one file with its table, answers the
 generate test's prompts (the facts and the 4,463-token needle) on that card with disk experts and
 with host experts, with CUDA graphs and without: Q2_0, IQ2_XS (39.2 GB, 35.5 GB pinned), IQ3_XXS

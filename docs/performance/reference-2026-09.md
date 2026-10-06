@@ -431,6 +431,48 @@ Window 262,144 tokens, one request.
 | `rk4v4-e8` | none | 261,018 | 3/3 | yes | 104.0 |
 | `rk8v4` | none | 261,021 | 3/3 | yes | 100.9 |
 
+### Re-check, October 2026
+
+The PRO 6000's rows were measured again on 2026-10-06, next to an RTX 5090.
+
+- **Cards.** Another RTX PRO 6000 Workstation Edition at 600 W (RunPod), and one card of an RTX 5090
+  pair whose boards default to 600 W (Vast.ai).
+- **Build.** `796f98500`, `sm_120a`, CUDA 13.1.
+- **Method.** The same server flags and `refbench.py` suites as above, the server pinned to the
+  GPU's NUMA node.
+
+Two other hosts were rejected before measuring:
+
+- a PRO 6000 host capped at 500 W;
+- a 5090 host whose clocks stopped at 1.98 GHz under load. Bonsai 2 short chat decoded at 132 tok/s
+  there, 23% below this card.
+
+Decode in tok/s, prompt time in seconds, acceptance in brackets:
+
+| model, KV, speculation, request | RTX PRO 6000, September | RTX PRO 6000, October | RTX 5090, October |
+|---|---:|---:|---:|
+| Bonsai 2, `rk8v4`, none, short chat | 167.5 | 167.7 | 170.4 |
+| Bonsai 2, `rk8v4`, DFlash2 7 drafts, short chat | 381 | 378.8 | 372.1 |
+| Bonsai 2, `rk8v4`, MTP 3 drafts, short chat | 314.7 | 313.9 | 321.2 |
+| Bonsai 2, `rk8v4`, none, prompt of 261,120 tokens | 78.3 s | 75.0 s | 76.7 s |
+| Bonsai 2, `rk8v4`, none, decode after it | 96.4 | 96.7 | 99.0 |
+| Bonsai 2, `rk4v4`, MTP 3 drafts, decode after it | 217.9 (0.56) | 220.9 (0.56) | 194.8 (0.46) |
+| Bonsai 2, `rk8v4`, MTP 3 drafts, decode after it | 210.5 (0.60) | 186.4 (0.49) | 207.6 (0.57) |
+| Bonsai 2, `rk8v4`, MTP 3 drafts, eight requests at once | 1,155.3 | 1,159.6 | 1,081.5 |
+| Qwen3.8, `rk8v4`, none, short chat | 89.6 | 90.0 | 92.1 |
+| Qwen3.8, `rk8v4`, DFlash2 7 drafts, short chat | 237 | 238.5 | 233.5 |
+| Qwen3.8, `rk8v4`, MTP 3 drafts, eight requests at once | 739.3 | 749.5 | 709.9 |
+
+The PRO 6000 reproduces September within 2% wherever the drafts accepted match. The 261K prompt
+is 4% faster on the newer build. The two MTP rows after 261K follow their acceptance, which moves
+with the answer.
+
+The PRO 6000 decodes one request no faster than the RTX 5090 because that decode is bound by memory
+bandwidth, and both cards have 1.79 TB/s of GDDR7: 167.7 against 170.4 tok/s for Bonsai 2 without
+speculation. Its 188 SMs against the RTX 5090's 170 show where compute decides. It prefills the
+261K prompt 2% faster, and runs eight requests at once 7% faster with Bonsai 2 and 6% faster with
+Qwen3.8.
+
 ## Largest context per card
 
 The largest `--max-context` (= `--kv-capacity`, one request, `--rope-yarn` past 262,144) the server starts with, found by bisection in 4,096-token steps. Each cell gives it without speculation / with MTP (3 drafts) / with DFlash2 (5 drafts); 1,048,576 is the engine's ceiling. The RTX PRO 6000 starts every configuration at the ceiling with at least 50 GiB free.

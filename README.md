@@ -47,28 +47,56 @@ otherwise; each number's setup and the full tables are in the
 \* The engine's ceiling, which the RTX PRO 6000 (96 GB) starts with every KV storage and drafter;
 filled to it, both models find two of the three needles.
 
-**Qwen3.8-Flash-Next** by where its routed experts live, measured in October 2026: the GSQ-RCO Q2_0
-release unless the row says otherwise, one request, greedy, decode after the 4,463-token prompt over
-its first five tokens. The setups, memory and further rows are in
-[Qwen3.8-Flash-Next](docs/qwen3-8-flash-next.md#measurements).
+The PRO 6000 column was measured again in October beside an RTX 5090, both at 600 W. It came back
+within 2% of September's values wherever the drafts accepted the same share, and it is not slow.
 
-| Cards | Experts | Decode, short answer | Decode after 4,463 tokens | Prefill |
-|---|---|---:|---:|---:|
-| 2× RTX 4090 | on the GPUs (`--devices 0,1`) | 93-101 tok/s | 116-120 tok/s | 3,482-3,734 tok/s |
-| 2× RTX 3090 Ti | on the GPUs | 90 tok/s | 107 tok/s | 1,504 tok/s |
-| RTX 4090 | in pinned host memory (`--expert-residency host`) | 53 tok/s | 44 tok/s | 1,138 tok/s |
-| RTX 3090 | in pinned host memory | 49 tok/s | 42 tok/s | 842 tok/s |
-| RTX 4090 | on disk, the file in the page cache (`--expert-residency disk`) | 42 tok/s | 46 tok/s | 723 tok/s |
-| RTX 3090 | on disk, the file in the page cache | 47 tok/s | 39 tok/s | 630 tok/s |
-| RTX 4090 | on disk, the file's pages evicted every second | 18 tok/s | 12 tok/s | 160 tok/s |
-| RTX 3090 | on disk, the page cache dropped every second (NVMe) | 17 tok/s | 11 tok/s | 195 tok/s |
-| RTX 3090, IQ3_S release | in pinned host memory | 34 tok/s | 30 tok/s | 533 tok/s |
-| RTX 3090, IQ3_S release | on disk, the file in the page cache | 19 tok/s | 22 tok/s | 209 tok/s |
+- **One request.** Decode is bound by memory bandwidth, and both cards have 1.79 TB/s of GDDR7:
+  Bonsai 2 without speculation runs at 167.7 tok/s on the PRO 6000 and 170.4 on the RTX 5090.
+- **Prompts and batches.** The PRO 6000's 188 SMs against 170 pay off where compute decides: the
+  261K prompt is 2% faster, and eight requests at once are 6 to 7% faster.
 
-The RTX 4090 rows ran in a two-socket cloud VM, pinned to the CPUs of the GPUs' NUMA node; left
-unpinned, host experts decode there at 40 tok/s and disk experts at 32 to 33. Serving six reasoning
-requests at once on two RTX 5090s (the AIME 2025 and GPQA-Diamond campaigns, answers up to 106,000
-tokens), the Q2_0 release produced 193 tok/s of output.
+The [reference measurements](docs/performance/reference-2026-09.md#re-check-october-2026) have the
+table.
+
+**Qwen3.8-Flash-Next** by card and by where its routed experts live, measured in October 2026: one
+request, greedy, decode after the 4,463-token prompt over its first five tokens. The setups, memory
+and power limits are in [Qwen3.8-Flash-Next](docs/qwen3-8-flash-next.md#measurements).
+
+| Cards | Release | Experts | Decode, short answer | Decode after 4,463 tokens | Prefill |
+|---|---|---|---:|---:|---:|
+| RTX PRO 6000 | Q2_0 | on the GPU | 136-140 tok/s | 161-163 tok/s | 2,925-2,952 tok/s |
+| RTX PRO 6000 | IQ3_S | on the GPU | 124-126 tok/s | 147 tok/s | 2,540 tok/s |
+| RTX PRO 6000 | Q2_0 | in pinned host memory (`--expert-residency host`) | 55 tok/s | 68-70 tok/s | 1,297 tok/s |
+| RTX PRO 6000 | IQ3_S | in pinned host memory | 29 tok/s | 31 tok/s | 803 tok/s |
+| RTX PRO 6000 | Q2_0 | on disk, the files in the page cache (`--expert-residency disk`) | 76 tok/s | 116 tok/s | 2,024 tok/s |
+| RTX PRO 6000 | IQ3_S | on disk, the files in the page cache | 66 tok/s | 106 tok/s | 1,661 tok/s |
+| RTX PRO 6000 | Q2_0 | on disk, the files' pages evicted every second | 35 tok/s | 87 tok/s | 1,000 tok/s |
+| RTX PRO 6000 | IQ3_S | on disk, the files' pages evicted every second | 29 tok/s | 79 tok/s | 773 tok/s |
+| 2× RTX 5090 | Q2_0 | on the GPUs (`--devices 0,1`) | 136 tok/s | 157 tok/s | 3,807-3,811 tok/s |
+| 2× RTX 5090 | IQ3_S | on the GPUs | 122 tok/s | 142 tok/s | 3,310-3,341 tok/s |
+| RTX 5090 | Q2_0 | in pinned host memory | 74 tok/s | 94 tok/s | 1,676-1,678 tok/s |
+| RTX 5090 | IQ3_S | in pinned host memory | 41 tok/s | 41 tok/s | 1,100 tok/s |
+| RTX 5090 | Q2_0 | on disk, the files in the page cache | 68 tok/s | 77 tok/s | 1,739 tok/s |
+| RTX 5090 | IQ3_S | on disk, the files in the page cache | 55 tok/s | 44 tok/s | 439 tok/s |
+| RTX 5090 | Q2_0 | on disk, the files' pages evicted every second | 25 tok/s | 29 tok/s | 694 tok/s |
+| RTX 5090 | IQ3_S | on disk, the files' pages evicted every second | 19 tok/s | 15 tok/s | 171 tok/s |
+| 2× RTX 4090 | Q2_0 | on the GPUs | 93-101 tok/s | 116-120 tok/s | 3,482-3,734 tok/s |
+| RTX 4090 | Q2_0 | in pinned host memory | 53 tok/s | 44 tok/s | 1,138 tok/s |
+| RTX 4090 | Q2_0 | on disk, the files in the page cache | 42 tok/s | 46 tok/s | 723 tok/s |
+| RTX 4090 | Q2_0 | on disk, the files' pages evicted every second | 18 tok/s | 12 tok/s | 160 tok/s |
+| 2× RTX 3090 Ti | Q2_0 | on the GPUs | 90 tok/s | 107 tok/s | 1,504 tok/s |
+| RTX 3090 | Q2_0 | in pinned host memory | 49 tok/s | 42 tok/s | 842 tok/s |
+| RTX 3090 | Q2_0 | on disk, the file in the page cache | 47 tok/s | 39 tok/s | 630 tok/s |
+| RTX 3090 | Q2_0 | on disk, the page cache dropped every second (NVMe) | 17 tok/s | 11 tok/s | 195 tok/s |
+| RTX 3090 | IQ3_S | in pinned host memory | 34 tok/s | 30 tok/s | 533 tok/s |
+| RTX 3090 | IQ3_S | on disk, the file in the page cache | 19 tok/s | 22 tok/s | 209 tok/s |
+
+Host and disk rows depend on the host as much as on the card. The RTX 5090 host had PCIe 5.0 x16;
+the others had PCIe 4.0 x16. On the 96 GB PRO 6000 the device expert cache ends up holding nearly
+every expert. The RTX 4090 rows ran in a two-socket cloud VM pinned to the CPUs of the GPUs' NUMA
+node; left unpinned, host experts decode there at 40 tok/s and disk experts at 32 to 33. Serving six
+reasoning requests at once on two RTX 5090s (the AIME 2025 and GPQA-Diamond campaigns, answers up to
+106,000 tokens), the Q2_0 release produced 193 tok/s of output.
 
 - **Against the previous `master` on the same card**, a 261K-token Bonsai prompt takes 215 s instead
   of 315 s on the RTX 3090, 102 s instead of 138 s on the RTX 4090 and 82 s instead of 115 s on the
