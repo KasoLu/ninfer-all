@@ -40,6 +40,55 @@ Not started: NInfer's own quantized expert formats and KV codecs for the new Ops
 context cache's disk KV tier, and MTP, which needs the BF16 checkpoint's MTP layer: no GSQ-RCO GGUF release carries
 one.
 
+### What the milestones left (October 2026)
+
+| milestone | not done | instead or note |
+|---|---|---|
+| M2 | the quality recipe from the BF16 checkpoint (`qwen3_8_flash_next`, Q4/Q5 experts), the FP8 row-scale n-gram table writer from the BF16 row shards, the `q2_g64_fp16` format, the MTP range-fetch helper, `--layers a..b` slice artifacts | Q2_0 experts run as the stored `gguf_q2_0` blocks; the slice test fetches its tensors with `tools/reference/fetch_slice.py` |
+| M3 | KV codecs for the QSA layers (their KV is BF16 only), NInfer's own expert formats and their A8 routes | the expert banks keep the releases' GGUF blocks |
+| M5 | MTP: the draft layer with its own QSA KV, multi-column verify with ReplaySSM records, pooled-key rollback and PLE history snapshots, commit and abort, verify-width graphs; the pooled-key plane in the Host and disk tiers | done: decode graphs, prefix reuse with live and turn-closure states, structured output, Vision, up to eight requests |
+| M6 | `ram-hot`, the hot-row profile tool, the I/O mode and depth options, io_uring/IOCP, draft lookahead, `/stats` I/O counters | shipped: positioned reads from the file, several rows in flight, and `--ngram-ram` |
+| M7 | a recorded byte-identity check of a split against one card | the generate test and perplexity ran on two RTX 3090 Ti, two RTX 4090 and two RTX 5090 |
+| M8 | the hybrid MoE with CPU expert compute (doorbell, CPU kernels, DMA share) | shipped instead: host experts with a device expert cache and disk experts streamed into it, every expert computed on the GPU |
+| M9 | A8 int8 MoE prefill, the fused HC write and read, multi-column verify forms, BF16 pooled keys, indexer prefill MMA, expert-cache tuning options | done: wide MoE calls through ggml's matrix kernel, wide HC reads as cuBLAS GEMMs, decode-width GEMVs, spread sparse attention and block scoring, parallel disk reads, host-expert prefill from device slots |
+
+M0, M1, M4 and M10 are complete.
+
+### Speculative decoding: what exists (October 2026)
+
+**MTP.** The checkpoint's MTP module (section 1.9) is one QSA layer with a full 512-expert MoE, about 2.6 B parameters
+without the shared embedding. Sources beside the BF16 checkpoint's `mtp.*` tensors: Unsloth's MTP GGUFs
+(`unsloth/Qwen3.8-Flash-Next-GGUF`, folder `MTP/`: the shared modules in BF16, 5.2 GB, Q8_0, 2.8 GB, and Q4_K_M,
+1.9 GB), which the GGUF block path could import as stored; NVIDIA's NVFP4 release, which ships the MTP layer in FP8;
+and `quimmedes/Qwen3.8-Flash-Next-MTP-GGUF` (Q4_0 and Q2_K; its earlier files came from a broken conversion). What
+others measured: vLLM on two DGX Spark (TP2 + EP, eager, one request, greedy, non-thinking, 256-token answers)
+24.9 tok/s without speculation and 50.4 with MTP at four drafts, 3.37 tokens per round (3.00 at three drafts), from
+PixelML's drafter card below; Unsloth's llama.cpp branch 1.3-1.7x, 100 to 170 tok/s on one RTX PRO 6000 (its own
+docs); one Reddit user reports 95 to 170 tok/s in vLLM (anecdotal). Strata measured per-step acceptance 0.89, 0.86 and
+0.85 for the first three drafts.
+
+Expected here: a token reads about 4 GB of weights (Measurements, docs/qwen3-8-flash-next.md), the routed experts
+0.66 GB of it. A round of three drafts reads the dense weights once, the routed experts of four columns (up to four
+times 0.66 GB) and three MTP steps (one MoE layer and the head each), about 1.8-1.9 times a plain step, for 3.0-3.3
+tokens: about 1.6-1.8x decode with every expert on the GPUs. With host or disk experts each extra column brings its own
+uncached experts across the bus, so the gain shrinks with the cache's miss rate; on the RTX PRO 6000, whose cache ends
+up holding nearly every expert, it should approach the device figure. These are estimates from the byte counts, not
+measurements.
+
+What MTP needs here is M5's speculative half above, plus an `mtp` component in the converter (from the BF16 tensors or
+an MTP GGUF) and the MTP layer's KV and state in the Program, StateImages and context cache. Rank 0 keeps the MTP
+layer and head under a `--devices` split, as the qwen3_5 family does.
+
+**DFlash and DFlash2.** No DFlash2 drafter exists for this model: z-lab and incoai publish theirs for Qwen3.8-27B,
+Qwen3.6-35B-A3B and other models, not for Flash-Next, and a Reddit thread asking for one (r/LocalLLaMA, September
+2026) points at the training cost. The one public DFlash-family drafter is
+`PixelML/Qwen3.8-Flash-Next-NVFP4-DFlash` (DeepSpec DFlash, `Qwen3DSparkModel`, 498 M parameters in five layers,
+block 7, taps `[3, 15, 23, 35, 43]` on each tapped layer's HC-contracted 2,560-wide residual, trained on the NVFP4
+release's own outputs, embedding and head bound from the target at load). Its card measures +3.9% aggregate
+throughput over MTP at four drafts (95% CI +2.1% to +5.8%) in the same vLLM setup, ahead on maths, even on code and
+slower on chat, and calls it a research artifact. It would need the same verify path as MTP plus a drafter
+architecture of its own here; MTP comes first.
+
 ---
 
 ## 1. Forward mathematics

@@ -70,7 +70,11 @@ second GPU. Distinct ids are refused on Windows.
 - **DFlash/DFlash2** do not run when the model spans more than one device: DFlash reads layer outputs
   from several depths (its feature taps) into rank 0 buffers, which from a later stage are another
   device's memory, so the layer loop stops with `layer feature capture does not cross pipeline
-  stages`. The taps need to cross the stage boundaries first.
+  stages`. Nothing refuses the combination earlier: with CUDA Graphs the error ends startup at graph
+  preparation (its warm-up DFlash round), after the weights have loaded; with `--no-cuda-graph` the
+  first request raises it in the worker, an Engine-wide failure unless `--recover-invariant-failures`
+  turns it into a failed request. The taps need to cross the stage boundaries first; see the design
+  below.
 - **Vision** in overlay residency is refused with a split, since a later stage holds whole layers and
   nothing a Vision window could borrow. Resident and CPU Vision are not refused, and the stage tests do
   not cover them.
@@ -81,6 +85,35 @@ second GPU. Distinct ids are refused on Windows.
 - **MTP works** across stages: the replay records and their fold are per state shard, on the shard's
   own device, and the draft layer and head stay on rank 0. **The context cache works**: its
   transactions copy each rank's planes and state shards on that rank's streams.
+
+### DFlash across stages: the design
+
+The taps are few and narrow, so they can travel the way the residual does. Qwen3.8-27B's DFlash2
+adapter taps layers 5, 19, 33, 47 and 61 of 64 at width 5,120; the 35B-A3B DFlash adapter taps eight
+of 40 at width 2,048.
+
+1. **A feature link per later stage that holds a tapped layer**, from that stage to rank 0, built
+   beside `back` in `make_stage_runtime`: a `StageLink` of two slots whose slot holds the widest
+   pass (`stage_boundary_columns`) times the stage's tap count times the hidden width in BF16.
+2. **Capture on the stage.** While a later stage runs its layers, a stage-local tap copies each
+   tapped layer's output into a staging tensor of the stage's workspace, one slab per tap in tap
+   order; after its last layer the stage sends the staging tensor over its feature link.
+3. **Re-capture on rank 0.** `run_staged` receives every stage's features before it returns and
+   replays the sink's own `capture_layer` for each received slab on rank 0's stream, so the prefill
+   copy, the batch scatter and the `captured_mask` check stay as they are. Stage 0's taps are
+   captured directly, as on one device.
+4. **Graphs and planning.** The links' send and receive halves are capture-safe, so the DFlash
+   decode graphs capture the extra copies as they capture the residual ones. The workspace plan
+   reserves the staging tensors on each later stage and one receive buffer on rank 0, and the
+   startup memory ledger reports the links' pinned host slots.
+
+Cost, for a 30/34 split of the 27B, which puts the taps 33, 47 and 61 on the second stage: 30 KiB
+per column, so 240 KiB for an eight-column DFlash2 verify and 120 MiB for a 4,096-token prefill
+chunk, a few milliseconds of PCIe beside the chunk's compute. Two slots of the widest chunk pin about
+240 MiB of host memory per such stage. Verification: the stage test's byte-identity rows under
+DFlash2 (and DFlash with the 35B-A3B artifact), graphs and eager, with `--devices 0,0` and forced
+staged links, then on two real cards. Until that lands, a startup refusal next to the overlay-Vision
+check in `plan_load` would end the combination before the weights load.
 
 ## Verification
 

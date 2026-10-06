@@ -28,8 +28,9 @@ The published conversions store the models without the table, which is published
 
 The model runs with up to eight concurrent requests, a context cache of prompt prefixes, structured
 output, and images and video through its Vision tower (`--vision`, from an artifact converted with
-the tower). MTP drafting is not available: no GSQ-RCO release carries the MTP layer (the
-[plan](maintainer/qwen3-8-flash-next-plan.md) tracks what remains).
+the tower). MTP drafting is not available yet: no GSQ-RCO release carries the MTP layer, and the engine
+does not read the MTP modules published separately. The [plan](maintainer/qwen3-8-flash-next-plan.md)
+records what MTP needs here and what other engines measured with it.
 
 ## Convert
 
