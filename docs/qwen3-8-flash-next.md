@@ -78,7 +78,11 @@ table artifact whose digest or row format differs from the one the model names.
 ## Run
 
 ```bash
-# Two 24 GB GPUs: every expert in device memory, one pipeline stage per GPU (Linux).
+# One GPU with room for every expert (48 GB for Q2_0, the 96 GB RTX PRO 6000 for IQ3_S).
+./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --ngram-table models/flash-next-ngram-table.ninfer \
+  --max-context 32768
+
+# Two 24 GB GPUs (two 32 GB for IQ3_S): every expert in device memory, one pipeline stage per GPU (Linux).
 ./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --ngram-table models/flash-next-ngram-table.ninfer \
   --devices 0,1 --max-context 32768
 
@@ -92,7 +96,8 @@ table artifact whose digest or row format differs from the one the model names.
 ```
 
 A model converted with its table needs no `--ngram-table`. `ninfer` and `ninfer-perplexity` take
-the same options.
+the same options, and the Docker image's `serve` command takes them with the files under `/models`
+([Running](../README.md#running)).
 
 | Option | Meaning |
 |---|---|
