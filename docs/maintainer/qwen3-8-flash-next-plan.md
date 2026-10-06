@@ -27,7 +27,7 @@ HF repository, and Strata is github.com/Niko1221/Strata (MIT).
 | M0 | the text config normalised by the converter and parsed strictly in C++, one shared fixture | `tools/convert/qwen4_exp.py`, `src/models/qwen4_exp/config.*`, `tests/fixtures/qwen4_exp/` |
 | M1 | an FP64 reference forward of the text path (PLE, hyper-connections, GDN, QSA, MoE, mixer, head) loading tensors lazily from the checkpoint | `tools/reference/qwen4_exp.py` |
 | M2 | the converter's logical parameters for the text component; the PLE n-gram hash constants (held to the checkpoint's stored buffers) and row ids; n-gram table rows read from disk (default) or RAM | `tools/convert/qwen4_exp.py`, `src/models/qwen4_exp/ngram_hash.*`, `ngram_table.*` |
-| M3 | `hyper_connection` read/write, `ple_inject`, `ngram_embed_rows` (FP8 row-scale, BF16), the sigmoid gate of `gated_rmsnorm`, `qsa_indexer` (pooled keys, top-512 block selection), `sparse_softmax_attention` (BF16 KV), `moe_route` (512-expert top-10 and shared gate), `moe_experts_bf16`, each against its FP64 oracle | `src/ops/{hyper_connection,ple_inject,qsa_indexer,sparse_attention,moe_route,moe_experts}/` |
+| M3 | `hyper_connection` read/write, `ple_inject`, `ngram_embed_rows` (FP8 row-scale, BF16), the sigmoid gate of `gated_rmsnorm`, `qsa_indexer` (pooled keys, top-512 block selection), `sparse_softmax_attention` (every `--kv-dtype` storage since October 2026), `moe_route` (512-expert top-10 and shared gate), `moe_experts_bf16`, each against its FP64 oracle | `src/ops/{hyper_connection,ple_inject,qsa_indexer,sparse_attention,moe_route,moe_experts}/` |
 | M3 | the Ops composed over the checkpoint's first four layers (three GDN, one QSA) and the head on BF16 weights, against the FP64 reference on 16 tokens: stack relative L2 ≈ 1.1e-2 per layer, top-1 agreement 16/16 (RTX 3090) | `tests/models/qwen4_exp/test_slice_real.cpp`, `tools/reference/fetch_slice.py` |
 
 | M4 | the family's own load and execution behind the public Engine (CLI, serving, perplexity): GGUF block banks bound as stored, the stage split over `--devices` (balanced by stored bytes, shared auxiliaries copied to every rank that reads them), one FIFO sequence, decode replaying one CUDA graph per stage | `src/models/qwen4_exp/{model,executor}.*`, `src/runtime/engine/qwen4_exp_core.*` |
@@ -36,16 +36,16 @@ HF repository, and Strata is github.com/Niko1221/Strata (MIT).
 
 | M5 | the n-gram table described by every model and stored inside it or in a table artifact of its own, refused when missing or different; up to eight concurrent requests with batched decode (the experts read once per batch), FIFO admission between prefill chunks; the context cache's live and turn-closure reuse of a sequence's recurrent state; structured output through the grammar's token masks; the Qwen3.5 Vision tower from the release's mmproj with three-axis RoPE for media prompts | `src/models/qwen4_exp/ngram_component.*`, `executor.*`, `src/runtime/engine/qwen4_exp_core.*`, `tools/convert/qwen4_exp_gguf.py` |
 
-Not started: NInfer's own quantized expert formats and KV codecs for the new Ops, the RadixArk NVFP4 checkpoint, the
-context cache's disk KV tier, and MTP, which needs the BF16 checkpoint's MTP layer: no GSQ-RCO GGUF release carries
-one.
+Not started: NInfer's own quantized expert formats, the RadixArk NVFP4 checkpoint, the context cache's disk KV tier,
+and MTP, which needs the BF16 checkpoint's MTP layer: no GSQ-RCO GGUF release carries one. The sparse-attention layers'
+KV takes every `--kv-dtype` format since October 2026.
 
 ### What the milestones left (October 2026)
 
 | milestone | not done | instead or note |
 |---|---|---|
 | M2 | the quality recipe from the BF16 checkpoint (`qwen3_8_flash_next`, Q4/Q5 experts), the FP8 row-scale n-gram table writer from the BF16 row shards, the `q2_g64_fp16` format, the MTP range-fetch helper, `--layers a..b` slice artifacts | Q2_0 experts run as the stored `gguf_q2_0` blocks; the slice test fetches its tensors with `tools/reference/fetch_slice.py` |
-| M3 | KV codecs for the QSA layers (their KV is BF16 only), NInfer's own expert formats and their A8 routes | the expert banks keep the releases' GGUF blocks |
+| M3 | NInfer's own expert formats and their A8 routes | the expert banks keep the releases' GGUF blocks. Done since: the QSA layers' KV in all nine `--kv-dtype` formats (`sparse_softmax_attention` decodes them, October 2026) |
 | M5 | MTP: the draft layer with its own QSA KV, multi-column verify with ReplaySSM records, pooled-key rollback and PLE history snapshots, commit and abort, verify-width graphs; the pooled-key plane in the Host and disk tiers | done: decode graphs, prefix reuse with live and turn-closure states, structured output, Vision, up to eight requests |
 | M6 | `ram-hot`, the hot-row profile tool, the I/O mode and depth options, io_uring/IOCP, draft lookahead, `/stats` I/O counters | shipped: positioned reads from the file, several rows in flight, and `--ngram-ram` |
 | M7 | a recorded byte-identity check of a split against one card | the generate test and perplexity ran on two RTX 3090 Ti, two RTX 4090 and two RTX 5090 |

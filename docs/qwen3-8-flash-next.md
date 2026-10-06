@@ -126,12 +126,18 @@ practical use. On the Q2_0 release it nearly doubles WikiText-2 perplexity, 2.66
 fourteen windows of the comparison below; short factual answers survive, but nothing measured
 improves.
 
-The KV cache of the 12 sparse-attention layers is BF16 whatever `--kv-dtype` asks (the engine says
-so at startup, and reports BF16).
+`--kv-dtype` stores the KV cache of the 12 sparse-attention layers in any of the nine formats the
+Qwen3.5 family uses. A position costs 24 KiB in `bf16` (the default), 12.4 KiB in `int8`, 12.1 KiB
+in `fp8`, 9.6 KiB in `rk8v4`, 9.4 KiB in `k8v4`, 6.8 KiB in `nvfp4`, 6.6 KiB in `rk4v4` and
+`rk4v4-e8`, and 5.1 KiB in `rk2v4-e8`; the indexer's pooled keys stay FP32 beside it, another
+1.5 KiB a position in every format. The sparse attention decodes each row it reads, keys in the
+rotated basis the cache stores them in. What the quantized formats cost in quality has not been
+measured on this model yet.
 
 `--max-concurrency N` (one to eight) runs that many requests at once, each on its own sequence with
 its own KV and recurrent state, so every sequence costs device memory (the KV of `--max-context`
-positions in BF16, about 25 KB a position, plus 74 MiB of recurrent state). Requests are admitted
+positions, 24 KiB a position in BF16 and less in a quantized `--kv-dtype`, plus 74 MiB of recurrent
+state). Requests are admitted
 in arrival order. Prompts prefill one at a time, a chunk at a time; between two chunks every request
 that is decoding produces one token, all of them in one batched pass whose experts read their
 weights once for the whole batch, so the batch costs little more than one token while the experts

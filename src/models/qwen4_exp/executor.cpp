@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "core/paged_kv_cache.h"
+#include "core/paged_kv_storage.h"
 #include "core/weight_view.h"
 #include "models/qwen4_exp/ngram_hash.h"
 #include "models/qwen4_exp/expert_stream.h"
@@ -317,6 +318,7 @@ struct LayerPlan {
 struct LayerState {
     DeviceBuffer ssm, conv;                      // Gated DeltaNet
     DeviceBuffer k_pages, v_pages, pooled, tail; // sparse attention
+    DeviceBuffer k_scales, v_scales;             // a quantized KV's scale planes
     DeviceBuffer history;                        // PLE
 };
 
@@ -409,6 +411,7 @@ struct Executor::Impl {
     std::vector<RankState> ranks;
     std::vector<SequenceState> sequences;
     std::uint32_t pages          = 0; // KV pages per sequence and attention layer
+    PagedKVStorageLayout kv_layout;   // the planes of every sparse-attention layer's KV
     std::uint32_t pooled_slots   = 0; // indexer blocks per sequence and attention layer
     std::uint32_t max_logit_rows = 0;
     ExecutorMemory memory;
@@ -462,6 +465,8 @@ struct Executor::Impl {
         max_logit_rows = std::min<std::uint32_t>(options.prefill_chunk, 512);
         pages          = (options.max_context + kPagedKVPageSize - 1) / kPagedKVPageSize;
         pooled_slots   = options.max_context / config.indexer_compress_ratio + 1;
+        kv_layout =
+            paged_kv_storage_layout(options.kv_cache, static_cast<std::int32_t>(config.head_dim));
         memory.ranks.resize(device.size());
         plan_weights();
         plan_segments();
@@ -794,18 +799,32 @@ struct Executor::Impl {
                     memory.ranks[plan.rank].state_bytes += state.ssm.bytes + state.conv.bytes;
                 }
                 if (plan.qsa) {
-                    const std::uint64_t page = std::uint64_t(config.head_dim) * kPagedKVPageSize *
-                                               config.num_key_value_heads * 2;
-                    state.k_pages            = DeviceBuffer(page * pages);
-                    state.v_pages            = DeviceBuffer(page * pages);
+                    // One plane per K or V vector and per scale, each [leading, page, head, page].
+                    const auto plane = [&](std::int32_t leading, DType dtype) {
+                        return DeviceBuffer(std::uint64_t(leading) * kPagedKVPageSize *
+                                            config.num_key_value_heads * pages * dtype_size(dtype));
+                    };
+                    state.k_pages =
+                        plane(kv_layout.key.data_leading_extent, kv_layout.key.data_dtype);
+                    state.v_pages =
+                        plane(kv_layout.value.data_leading_extent, kv_layout.value.data_dtype);
+                    if (kv_layout.key.has_scale()) {
+                        state.k_scales =
+                            plane(kv_layout.key.scale_leading_extent, kv_layout.key.scale_dtype);
+                    }
+                    if (kv_layout.value.has_scale()) {
+                        state.v_scales = plane(kv_layout.value.scale_leading_extent,
+                                               kv_layout.value.scale_dtype);
+                    }
                     state.pooled =
                         DeviceBuffer(std::uint64_t(config.indexer_head_dim) * pooled_slots * 4);
                     state.tail = DeviceBuffer(std::uint64_t(config.indexer_head_dim) *
                                               (config.indexer_compress_ratio - 1) * 4);
-                    memory.ranks[plan.rank].state_bytes += state.k_pages.bytes +
-                                                           state.v_pages.bytes +
-                                                           state.pooled.bytes + state.tail.bytes;
-                    memory.kv_bytes += state.k_pages.bytes + state.v_pages.bytes;
+                    const std::uint64_t kv = state.k_pages.bytes + state.v_pages.bytes +
+                                             state.k_scales.bytes + state.v_scales.bytes;
+                    memory.ranks[plan.rank].state_bytes +=
+                        kv + state.pooled.bytes + state.tail.bytes;
+                    memory.kv_bytes += kv;
                 }
                 if (plan.ple) {
                     state.history = DeviceBuffer(width * (config.ple_conv_kernel_size - 1) *
@@ -1197,18 +1216,29 @@ struct Executor::Impl {
             const Tensor rope(rank.rope + part.column, DType::I32, {t});
             ops::rmsnorm_rope(rope, a.query_norm, a.key_norm, q3, k3, qo, ko, s);
         }
+        const auto plane = [&](const DeviceBuffer& memory, std::int32_t leading, DType dtype) {
+            return Tensor(memory.p, dtype,
+                          {leading, static_cast<std::int32_t>(kPagedKVPageSize), nk,
+                           static_cast<std::int32_t>(pages)});
+        };
         PagedKVLayerView cache{};
-        cache.k_pages = Tensor(
-            state.k_pages.p, DType::BF16,
-            {d, static_cast<std::int32_t>(kPagedKVPageSize), nk, static_cast<std::int32_t>(pages)});
-        cache.v_pages = Tensor(
-            state.v_pages.p, DType::BF16,
-            {d, static_cast<std::int32_t>(kPagedKVPageSize), nk, static_cast<std::int32_t>(pages)});
+        cache.k_pages =
+            plane(state.k_pages, kv_layout.key.data_leading_extent, kv_layout.key.data_dtype);
+        cache.v_pages =
+            plane(state.v_pages, kv_layout.value.data_leading_extent, kv_layout.value.data_dtype);
+        if (kv_layout.key.has_scale()) {
+            cache.k_scale_pages = plane(state.k_scales, kv_layout.key.scale_leading_extent,
+                                        kv_layout.key.scale_dtype);
+        }
+        if (kv_layout.value.has_scale()) {
+            cache.v_scale_pages = plane(state.v_scales, kv_layout.value.scale_leading_extent,
+                                        kv_layout.value.scale_dtype);
+        }
         cache.block_table =
             Tensor(rank.block_table.p, DType::I32, {static_cast<std::int32_t>(pages)});
         cache.head_dim     = d;
         cache.num_kv_heads = nk;
-        cache.storage      = KvCacheStorage::BFloat16;
+        cache.storage      = options.kv_cache;
         const Tensor v3(v.data, DType::BF16, {d, nk, t});
         ops::kv_cache_append(ko, v3, positions, cache, s);
         const auto di = static_cast<std::int32_t>(config.indexer_head_dim);

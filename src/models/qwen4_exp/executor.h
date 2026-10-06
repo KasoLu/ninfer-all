@@ -10,6 +10,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/tensor.h"
+#include "ninfer/types.h"
 #include "models/qwen4_exp/expert_cache.h"
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/ngram_component.h"
@@ -43,6 +44,9 @@ struct ExecutorOptions {
     // A model loaded with its Vision tower: the most merged tokens the media of one prompt may
     // hold, which sizes the encoder's workspace and the embeddings a prefill reads.
     std::uint32_t vision_max_merged_tokens = 16384;
+    // How the sparse-attention layers store their paged KV: any storage kv_cache_append writes
+    // for two heads of 256.
+    KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
 };
 
 // One media item of a prompt for the Vision tower: its patches and the frontend's control.
@@ -61,7 +65,7 @@ struct ExecutorMemory {
     std::uint64_t state_bytes        = 0;
     std::uint64_t workspace_bytes    = 0;
     std::uint64_t expert_cache_bytes = 0;
-    std::uint64_t kv_bytes           = 0; // the sparse-attention layers' KV pages, in state_bytes
+    std::uint64_t kv_bytes = 0; // the sparse-attention layers' KV and scale pages, in state_bytes
     std::vector<Rank> ranks; // by device rank
 };
 

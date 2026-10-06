@@ -151,6 +151,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         options.expert_cache_bytes.value_or(models::qwen4_exp::ExecutorOptions::kAutoExpertCache);
     executor.cuda_graphs = options.use_cuda_graph;
     executor.vision_max_merged_tokens = options.vision_max_merged_tokens;
+    executor.kv_cache                 = options.kv_cache;
     instance->executor = std::make_unique<models::qwen4_exp::Executor>(*model, device, executor);
     device.synchronize();
     program.complete();
@@ -176,11 +177,6 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                            "a non-standard experimental mode. The model was trained with the "
                            "table and degrades badly without it (WikiText-2 perplexity 2.66 -> "
                            "5.01 on GSQ-RCO Q2_0); use it only for experiments");
-    }
-    if (options.kv_cache != KvCacheStorage::BFloat16) {
-        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
-                           "Qwen3.8-Flash-Next keeps its KV in BF16; the requested KV storage does "
-                           "not apply");
     }
 
     ConstructedQwen4Exp out;
@@ -1277,6 +1273,7 @@ MemorySummary Qwen4ExpCore::memory_summary() const {
     out.device                    = devices.front().device;
     out.max_context               = impl_->max_context;
     out.kv_capacity               = impl_->max_context;
+    out.kv_cache                      = impl_->instance.executor->options().kv_cache;
     out.weights                   = devices.front().weights;
     out.sequence                  = devices.front().sequence;
     out.workspace                 = devices.front().workspace;
