@@ -684,6 +684,7 @@ int main() {
                                                {"--long-anchor-spacing", "0"},
                                                {"--auto-long-anchors"},
                                                {"--branch-anchors"},
+                                               {"--no-endpoint-anchors"},
                                                {"--auto-prefix-grid"},
                                                {"--derive-session-keys"},
                                                {"--context-cache-policy", "rolling"},
@@ -1012,6 +1013,7 @@ int main() {
                                         "--ngram-native-sessions",
                                         "--ngram-session-mib",
                                         "--no-cuda-graph",
+                                        "--no-endpoint-anchors",
                                         "--no-prefill-a8",
                                         "--no-prefill-cublas-projections",
                                         "--no-prefix-reuse",
@@ -1450,6 +1452,10 @@ int main() {
                               parse({"ninfer-serve", "model.ninfer", "--branch-anchors"})
                                   .context_cache.branch_anchors,
                           "--branch-anchors was not an off-by-default switch");
+        failures += check(parse({"ninfer-serve", "model.ninfer"}).context_cache.endpoint_anchors &&
+                              !parse({"ninfer-serve", "model.ninfer", "--no-endpoint-anchors"})
+                                   .context_cache.endpoint_anchors,
+                          "--no-endpoint-anchors did not turn the default endpoint anchors off");
         bool spacing_without_anchors_rejected = false;
         try {
             (void)parse({"ninfer-serve", "model.ninfer", "--long-anchor-spacing", "512"});

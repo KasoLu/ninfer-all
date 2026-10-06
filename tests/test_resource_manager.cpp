@@ -752,6 +752,9 @@ public:
         if (source != nullptr) {
             inspected_private_sources.push_back(source->id);
             if (source->content_key != prompt.content_key || !checkpoint) { return std::nullopt; }
+            if (refuse_endpoint_admission && checkpoint->kind == CheckpointKind::SessionEndpoint) {
+                return std::nullopt;
+            }
         }
         if (shared_source != nullptr) {
             inspected_shared_sources.push_back(shared_source->id);
@@ -801,8 +804,10 @@ public:
         }
         plan.identity.machine_work.remaining_prefill_work = plan.remaining;
         plan.identity.machine_work.reused_prompt_tokens   = plan.value.reusable_prompt_tokens;
+        const bool unforkable_anchor = retained_long_anchor_infeasible && must_retain_source &&
+                                       checkpoint && checkpoint->kind == CheckpointKind::LongAnchor;
         plan.identity.physical_status =
-            target_feasible(std::span<const FakeTargetDecision>{})
+            target_feasible(std::span<const FakeTargetDecision>{}) && !unforkable_anchor
                 ? ninfer::runtime::MaterializationPhysicalStatus::Feasible
                 : ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
         plan.identity.source_mode = plan.source_mode;
@@ -879,8 +884,9 @@ public:
     start_resource_transaction(FakeResourcePlan&& plan, FakePreparedPrompt&& prompt,
                                CancellationFlagView cancellation) {
         ++start_calls;
-        started_source_id   = plan.admission.private_source_id;
-        started_source_mode = plan.admission.source_mode;
+        started_source_id     = plan.admission.private_source_id;
+        started_source_mode   = plan.admission.source_mode;
+        started_reused_tokens = plan.admission.value.reusable_prompt_tokens;
         started_action_ids.clear();
         for (const auto& action : plan.private_actions) { started_action_ids.push_back(action.id); }
         for (const auto& action : plan.shared_actions) { started_action_ids.push_back(action.id); }
@@ -1201,6 +1207,10 @@ public:
         if (finish_with_rewrite) {
             result.summary.rewrite = rewrite_checkpoint(key, finish_frontier - 1U);
         }
+        for (std::size_t index = 0; index < finish_long_anchor_frontiers.size(); ++index) {
+            result.summary.long_anchors.push_back(long_anchor(
+                key, finish_long_anchor_frontiers[index], static_cast<std::uint32_t>(index + 1)));
+        }
         result.continuation.emplace(sequence.id, key);
         return result;
     }
@@ -1298,6 +1308,12 @@ public:
     std::uint64_t seal_window_claims                     = 0;
     bool finish_release                                  = false;
     bool finish_with_rewrite                             = false;
+    // Long anchors a finished continuation publishes besides its endpoint.
+    std::vector<std::uint32_t> finish_long_anchor_frontiers;
+    // A prompt that diverges below every endpoint: private endpoints refuse admission.
+    bool refuse_endpoint_admission = false;
+    // A long anchor that cannot fork beside its conversation as the cache stands.
+    bool retained_long_anchor_infeasible = false;
     // The private replacement the most recent capture inspection was asked to price.
     mutable std::optional<CheckpointRef> last_capture_private_replacement;
     bool abort_salvage_next                              = false;
@@ -1326,6 +1342,7 @@ public:
     std::uint32_t finish_frontier             = 16;
     std::uint32_t started_source_id           = 0;
     PrivateSourceMode started_source_mode     = PrivateSourceMode::ConsumeToActive;
+    std::uint32_t started_reused_tokens       = 0;
     std::vector<std::uint32_t> inspected_private_sources;
     std::vector<std::uint32_t> inspected_shared_sources;
     std::vector<std::vector<std::uint64_t>> seal_attempts;
@@ -2774,6 +2791,93 @@ void test_branch_anchor_frontier_follows_the_deepest_unrestorable_match() {
     require(anchor && *anchor == 4096, "the deepest unrestorable match was not anchored");
     require(!manager.branch_anchor_frontier(program, FakePreparedPrompt{8}),
             "a prompt of other content produced a branch anchor");
+}
+
+// An endpoint anchor is proposed at a catalogued endpoint the prompt matches all the way through,
+// only where it lies at least kEndpointAnchorMinimumGainTokens above that owner's long anchors.
+void test_endpoint_anchor_frontier_keeps_a_matched_endpoint_far_above_its_anchors() {
+    using ninfer::runtime::kEndpointAnchorMinimumGainTokens;
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    program.finish_long_anchor_frontiers = {512};
+    const ActiveRequest first = start_active(manager, program, 7, make_base(7), 1);
+    (void)finish_active(manager, program, first, 4096);
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "terminal continuation was not catalogued");
+    const FakePreparedPrompt prompt{7};
+    require(!manager.endpoint_anchor_frontier(program, prompt),
+            "an owner with no measured match produced an endpoint anchor");
+    program.matched_tokens[first.sequence.id] = 4095;
+    require(!manager.endpoint_anchor_frontier(program, prompt),
+            "a prompt that diverges before the endpoint produced an endpoint anchor");
+    program.matched_tokens[first.sequence.id] = 4200;
+    const auto anchor = manager.endpoint_anchor_frontier(program, prompt);
+    require(anchor && *anchor == 4096, "an endpoint the prompt extends was not anchored");
+    require(!manager.endpoint_anchor_frontier(program, FakePreparedPrompt{8}),
+            "a prompt of other content produced an endpoint anchor");
+
+    // The same endpoint just above a deeper anchor of its own conversation gains too little.
+    FakeManager near_manager = make_manager(1, 2);
+    FakeProgram near_program;
+    near_program.finish_long_anchor_frontiers = {4096 - kEndpointAnchorMinimumGainTokens + 1};
+    const ActiveRequest near = start_active(near_manager, near_program, 7, make_base(7), 1);
+    (void)finish_active(near_manager, near_program, near, 4096);
+    near_program.matched_tokens[near.sequence.id] = 4200;
+    require(!near_manager.endpoint_anchor_frontier(near_program, prompt),
+            "an endpoint within the minimum gain of an anchor was anchored again");
+    near_program.finish_long_anchor_frontiers = {4096 - kEndpointAnchorMinimumGainTokens};
+    FakeManager far_manager = make_manager(1, 2);
+    const ActiveRequest far = start_active(far_manager, near_program, 7, make_base(7), 1);
+    (void)finish_active(far_manager, near_program, far, 4096);
+    near_program.matched_tokens[far.sequence.id] = 4200;
+    require(far_manager.endpoint_anchor_frontier(near_program, prompt) == 4096U,
+            "an endpoint a full minimum gain above an anchor was not anchored");
+}
+
+// A request that diverges from its conversation at a long anchor branches off it where the anchor
+// forks beside the conversation as the cache stands. Where it does not, the request rewrites the
+// conversation from the anchor, as a rewrite restore does from its checkpoint, rather than
+// re-prefilling from root.
+void test_long_anchor_reuse_retains_the_conversation_only_where_it_forks() {
+    FakeManager manager = make_manager(1, 3);
+    FakeProgram program;
+    program.finish_long_anchor_frontiers = {8};
+    const ActiveRequest owner = start_active(manager, program, 61, make_base(61), 1);
+    (void)finish_active(manager, program, owner, 16);
+    program.finish_long_anchor_frontiers.clear();
+    program.refuse_endpoint_admission = true;
+
+    const ActiveRequest branch = start_active(manager, program, 61, make_base(61), 2);
+    require(program.started_source_id == owner.sequence.id && program.started_reused_tokens == 8 &&
+                program.started_source_mode == PrivateSourceMode::Retain,
+            "a branch that forks beside its conversation consumed it");
+    (void)finish_active(manager, program, branch, 16);
+    require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued &&
+                manager.catalog_state(1) == FakeManager::CatalogState::Catalogued,
+            "the conversation and its branch were not both catalogued");
+
+    program.retained_long_anchor_infeasible = true;
+    const ActiveRequest rewrite = start_active(manager, program, 61, make_base(61), 3);
+    require(program.started_source_id == owner.sequence.id && program.started_reused_tokens == 8 &&
+                program.started_source_mode == PrivateSourceMode::ConsumeToActive,
+            "a branch that cannot fork beside its conversation did not rewrite it from the anchor");
+    (void)finish_active(manager, program, rewrite, 16);
+
+    // A request that must keep its source never consumes it, fork or not.
+    FakeManager kept_manager = make_manager(1, 3);
+    program.finish_long_anchor_frontiers = {8};
+    const ActiveRequest kept_owner = start_active(kept_manager, program, 62, make_base(62), 1);
+    (void)finish_active(kept_manager, program, kept_owner, 16);
+    program.finish_long_anchor_frontiers.clear();
+    FakeRequestBasePlan read_only        = make_base(62);
+    read_only.value.publish_continuation = false;
+    const ActiveRequest reader = start_active(kept_manager, program, 62, read_only, 2);
+    require(program.started_source_id != kept_owner.sequence.id ||
+                program.started_source_mode == PrivateSourceMode::Retain,
+            "a read-only request consumed the conversation at its anchor");
+    (void)finish_active(kept_manager, program, reader, 16);
+    require(kept_manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "a read-only request left its conversation uncatalogued");
 }
 
 void test_state_transfer_statistics_use_payload_bytes() {
@@ -5348,6 +5452,10 @@ int main() {
     run_test("state transfer payload statistics", test_state_transfer_statistics_use_payload_bytes);
     run_test("branch anchor at the deepest unrestorable match",
              test_branch_anchor_frontier_follows_the_deepest_unrestorable_match);
+    run_test("endpoint anchor frontier keeps a matched endpoint far above its anchors",
+             test_endpoint_anchor_frontier_keeps_a_matched_endpoint_far_above_its_anchors);
+    run_test("long-anchor reuse keeps the conversation only where it forks",
+             test_long_anchor_reuse_retains_the_conversation_only_where_it_forks);
     run_test("independent complete-target oracle",
              test_complete_search_against_small_exhaustive_oracle);
     run_test("publication-only construction",

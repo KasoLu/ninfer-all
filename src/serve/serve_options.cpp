@@ -239,6 +239,10 @@ std::string serve_usage_text(const char* argv0) {
            "                                a retained conversation, when no checkpoint lies\n"
            "                                near that depth, so the next request diverging\n"
            "                                there resumes from it (off)\n"
+           "  --no-endpoint-anchors         do not keep the endpoint a request resumes and\n"
+           "                                extends as a long anchor; a later request that\n"
+           "                                diverges there (another reply, an edited last\n"
+           "                                message) then re-prefills the conversation (kept)\n"
            "  --long-anchor-spacing N       with --auto-long-anchors, minimum tokens between\n"
            "                                anchors, doubling per anchor back from the\n"
            "                                prompt end (default 1024; 0 anchors every\n"
@@ -901,6 +905,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--branch-anchors") {
             legacy_cache_flag                    = "--branch-anchors";
             options.context_cache.branch_anchors = true;
+            continue;
+        }
+        if (arg == "--no-endpoint-anchors") {
+            legacy_cache_flag                      = "--no-endpoint-anchors";
+            options.context_cache.endpoint_anchors = false;
             continue;
         }
         if (arg == "--long-anchor-spacing") {

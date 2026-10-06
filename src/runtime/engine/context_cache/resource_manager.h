@@ -36,6 +36,10 @@ inline constexpr std::uint32_t kInvalidCatalogSlot = std::numeric_limits<std::ui
 // owner's deepest restorable checkpoint, since the capture itself costs a prefill split and a
 // StateImage.
 inline constexpr std::uint32_t kBranchAnchorMinimumGainTokens = 1024;
+// An endpoint anchor is kept only where the endpoint lies at least this far above the
+// conversation's deeper long anchors: a branch diverging nearer one of them re-prefills less than
+// that from it, and a turn after turn of short exchanges would otherwise pay a StateImage each.
+inline constexpr std::uint32_t kEndpointAnchorMinimumGainTokens = 1024;
 
 enum class LogicalLaneState : std::uint8_t {
     Free,
@@ -322,6 +326,40 @@ public:
         return best;
     }
 
+    // The endpoint at which a request should capture an endpoint anchor, or nothing: the deepest
+    // endpoint of a catalogued continuation that the prompt matches token for token (and in
+    // identity), when it lies at least kEndpointAnchorMinimumGainTokens above that owner's long
+    // anchors. A request that resumes there moves the endpoint with the conversation, so the plan
+    // keeps it as a long anchor captured before the suffix is prefilled; a later request that
+    // diverges right after it (another reply to the same answer, an edited last message) resumes
+    // from the anchor instead of from root. The plan drops it when the prompt ends at the endpoint
+    // or the request resumes from deeper, and captures it in the prefill when it resumes from
+    // shallower.
+    [[nodiscard]] std::optional<std::uint32_t>
+    endpoint_anchor_frontier(const Program& program, const PreparedPrompt& prompt) const {
+        std::uint32_t best = 0;
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            const CatalogEntry& entry = catalog_[slot];
+            if (entry.state != CatalogState::Catalogued || !entry.handle ||
+                !entry.summary.endpoint) {
+                continue;
+            }
+            const std::uint32_t endpoint = entry.summary.endpoint->ref.frontier;
+            if (endpoint <= best || program.matched_prefix_tokens(*entry.handle, prompt) < endpoint) {
+                continue;
+            }
+            std::uint32_t anchored = 0;
+            for (const auto& anchor : entry.summary.long_anchors) {
+                if (anchor.ref.frontier <= endpoint) {
+                    anchored = std::max(anchored, anchor.ref.frontier);
+                }
+            }
+            if (endpoint - anchored >= kEndpointAnchorMinimumGainTokens) { best = endpoint; }
+        }
+        if (best == 0) { return std::nullopt; }
+        return best;
+    }
+
     [[nodiscard]] Inspection inspect(Program& program, const PreparedPrompt& prompt,
                                      const RequestBasePlan& base, std::uint64_t publication_order,
                                      PlanningAllowance allowance = {}) {
@@ -496,14 +534,38 @@ public:
                                        opportunity.evidence,
                                        SharedCandidateEvidence::ExplicitBoundary);
                         });
-                    const bool retain =
+                    bool retain =
                         !base.summary().publish_continuation || declares_boundary_here ||
                         (entry.session && (!base.context_cache().session_key ||
                                            *entry.session != *base.context_cache().session_key ||
                                            !base.context_cache().update_session_index));
-                    std::optional<AdmissionCandidate> plan =
-                        program.inspect_admission(prompt, base, *destination, &*entry.handle,
-                                                  nullptr, index.checkpoint, retain);
+                    // A request that consumes its conversation at a long anchor rewrites it from
+                    // there, and the turns above the anchor go. Where the anchor forks into a new
+                    // branch as the cache stands -- its state and KV fit beside the conversation
+                    // and a catalog slot is free to publish the branch -- the request keeps the
+                    // conversation instead; only one the cache cannot hold beside it is rewritten.
+                    std::optional<AdmissionCandidate> plan;
+                    if (!retain && index.checkpoint.kind == CheckpointKind::LongAnchor &&
+                        std::any_of(catalog_.begin(),
+                                    catalog_.begin() + static_cast<std::ptrdiff_t>(catalog_count_),
+                                    [](const CatalogEntry& slot) {
+                                        return slot.state == CatalogState::Vacant;
+                                    })) {
+                        plan = program.inspect_admission(prompt, base, *destination,
+                                                         &*entry.handle, nullptr,
+                                                         index.checkpoint, true);
+                        if (plan && plan->identity_assessment().physical_status ==
+                                        MaterializationPhysicalStatus::Feasible) {
+                            retain = true;
+                        } else {
+                            plan.reset();
+                        }
+                    }
+                    if (!plan) {
+                        plan = program.inspect_admission(prompt, base, *destination,
+                                                         &*entry.handle, nullptr,
+                                                         index.checkpoint, retain);
+                    }
                     if (!plan) {
                         cdbg_log("[candgen] priv SKIP slot=%u inspect_admission=nullopt\n",
                                  index.slot);

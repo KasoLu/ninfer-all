@@ -143,6 +143,11 @@ filled to it, both models find two of the three needles.
   `NINFER_ATTN_PARALLEL_TILES=1`.
 - **Branch anchors (opt-in).** `--branch-anchors` captures a request where its prompt stops
   matching a retained conversation, so an edited or forked conversation resumes from there.
+- **Endpoint anchors.** A turn that continues a retained conversation keeps the point it resumed
+  from as an anchor, so another reply to the same answer or an edited last message resumes there
+  instead of re-prefilling the conversation. On an RTX 4090 with the default cache, the first token
+  of such a branch of a 30.7K-token conversation comes after 110 ms instead of 9.5 s; the continued
+  turn pays 7-8 ms for a Host copy of the state. `--no-endpoint-anchors` turns it off.
 - **Blackwell kernels.** FP8 A8 projections use the block-scaled MX FP8 MMA with TMA split-K
   schedules; an NVFP4 KV cache prefills past 2048 visible keys with QK on FP4 tensor cores under
   `--fast-prefill-kernel` or the profile's `attn_prompt_fast`; the unified kernels launch as

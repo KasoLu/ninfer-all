@@ -106,6 +106,26 @@ int main() {
         const EngineOptions normalized = normalize_engine_options(options);
         failures += check(*normalized.context_cache.max_shared_prefixes == 0,
                           "disabled context cache did not normalize shared-prefix capacity to zero");
+        failures += check(!normalized.context_cache.endpoint_anchors,
+                          "disabled context cache kept endpoint anchors");
+    }
+
+    // Endpoint anchors are a default of the checkpoint catalog. They need long-anchor capacity,
+    // and the hybrid prefix cache, which keeps no long anchors, turns them off rather than
+    // refusing the default.
+    {
+        EngineOptions options;
+        options.max_concurrency = 1;
+        failures += check(normalize_engine_options(options).context_cache.endpoint_anchors,
+                          "the default catalog did not keep endpoint anchors");
+        options.context_cache.max_long_anchors_per_continuation = 0;
+        failures += check(!normalize_engine_options(options).context_cache.endpoint_anchors,
+                          "endpoint anchors stayed on without long-anchor capacity");
+        EngineOptions hybrid;
+        hybrid.max_concurrency    = 1;
+        hybrid.context_cache.mode = ninfer::ContextCacheMode::Hybrid;
+        failures += check(!normalize_engine_options(hybrid).context_cache.endpoint_anchors,
+                          "the hybrid prefix cache kept endpoint anchors");
     }
 
     // A comfortable budget buys anchors. 64 MiB halves to a 32 MiB state cap; the mandatory

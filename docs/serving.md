@@ -43,8 +43,8 @@ continuation** — up to the count whose re-prefill gap still outweighs one Stat
 pool for the grown count, gives Host KV the remaining bytes, and refuses to start if that state
 footprint would exceed half the budget. A budget therefore never lowers the configured anchor
 count, and the count it resolves is the one the frontend grid, the ResourceManager and the Program
-all use; without automatic anchoring only client markers create anchors, so the count stays as
-configured. Both unit costs and the derived split are reported in the `server_start` memory
+all use; without automatic anchoring only client markers and the engine's endpoint and branch
+anchors create anchors, so the count stays as configured. Both unit costs and the derived split are reported in the `server_start` memory
 ledger.
 
 Other artifacts use the same command shape with their own path. For 35B-A3B DFlash, replace the MTP
@@ -1798,6 +1798,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--derive-session-keys` | a request that names no session -- Chat Completions and Messages carry none -- gets a key derived from its instruction messages and first user message, which stay fixed for the conversation's life. The conversation then keeps a session lineage and live-session retention for its checkpoints, as a Responses conversation does. A client compaction rewrites the first user message and starts a new key | off |
 | `--auto-long-anchors` | the engine anchors up to that many message boundaries of every request itself, so a later request that rewrites earlier history -- a compacted or edited transcript -- resumes from the nearest retained anchor instead of root; each anchor costs a prefill split and a StateImage whether or not the client ever rewrites | off |
 | `--branch-anchors` | before a request is planned, the engine finds the deepest point its prompt matches a retained conversation or shared prefix token for token; when that owner's checkpoints all end at least 1024 tokens below it, the request captures a private long anchor there, so the next request that diverges at the same point (an agent branching off a long shared history) resumes from it instead of re-prefilling the matched tail. Costs a catalog scan per planned request and, where it fires, a prefill split and a StateImage; it uses the long-anchor capacity. Not with `--use-alt-prefix-caching`. | off |
+| `--no-endpoint-anchors` | do not keep endpoint anchors. By default a request that resumes a retained conversation at its endpoint and extends it keeps that endpoint as a private long anchor, taken from the resumed state before the new turn is prefilled (no prefill split), so a later request that diverges right there -- another reply to the same answer, an edited last message -- resumes from it instead of re-prefilling the conversation from root. Such a request keeps the conversation where the cache holds the branch beside it, and otherwise rewrites the conversation from the anchor, as a regenerated reply does from its turn checkpoint. On an RTX 4090 with Qwen3.8-27B (IQ3_S) and the default cache, the first token of such a branch of a 30.7K-token conversation came after 108-110 ms instead of 9.4-9.5 s; the continued turn that takes the anchor paid 7-8 ms more (110-111 ms instead of 102-104 ms), a Host copy of the 147 MiB state because both Device slots were taken. It fires where the endpoint lies at least 1024 tokens above the conversation's deeper long anchors, costs a StateImage per firing and uses the long-anchor capacity. Not with `--use-alt-prefix-caching`. | kept |
 | `--long-anchor-spacing N` | with `--auto-long-anchors`, the minimum token gap between automatic anchors, doubling per anchor walking back from the prompt end (anchor k sits at least `N * 2^k` tokens below the previous grid point), so short tool-loop turns do not each cost an anchor and deep history stays covered; `0` anchors every one of the last boundaries | `1024` |
 | `--max-cache-markers-per-request N` | caller marker input-complexity bound | `4` |
 | `--slot-save-path DIR` | enable `POST /slots/{id}` save/restore/erase with files in `DIR` (created at startup); see [Slots](#slots) | disabled |
@@ -2013,7 +2014,8 @@ without CUDA Graphs); the startup log warns when the second exceeds the first.
 request-local, and `--ngram-session-mib`), and `ngram_native_sessions`. Its `context_cache` object
 records the resolved capacities and the `rolling_retention`, `release_diverged_checkpoints`,
 `thorough_admission_search`, `recency_eviction`, `value_aware_demote`, `kv_lease_growth`,
-`automatic_long_anchors` and `long_anchor_min_spacing_tokens` settings, the cache `mode` (`legacy` or `hybrid`), the
+`automatic_long_anchors`, `branch_anchors`, `endpoint_anchors` and `long_anchor_min_spacing_tokens` settings, the
+cache `mode` (`legacy` or `hybrid`), the
 `host_cache_budget_bytes`, and under `--use-alt-prefix-caching` a `hybrid` object with the resolved
 snapshot slots, taps per request, tap ladder and minimum gap and whether the Host tier persists.
 

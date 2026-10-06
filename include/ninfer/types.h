@@ -394,6 +394,17 @@ struct ContextCacheOptions {
     // from an older checkpoint. Costs a scan of the catalog per planned request and, where it
     // fires, a prefill split and a StateImage. Off by default.
     bool branch_anchors = false;
+    // Endpoint anchors: a request that resumes a retained conversation at its endpoint and
+    // extends it keeps that endpoint as a private long anchor, taken from the resumed state
+    // before the new suffix is prefilled. Resuming moves the endpoint with the conversation, so a
+    // later request that diverges there -- another reply to the same answer, an edited last
+    // message -- would otherwise find no checkpoint between root and the new turn. Fires where
+    // the endpoint lies at least 1024 tokens above the conversation's deeper long anchors. Costs
+    // a StateImage per firing, a Host copy when the Device slots are full, within the long-anchor
+    // capacity; no prefill split. A request that diverges at any private long anchor branches off
+    // the conversation where the cache holds the branch beside it as it stands, and otherwise
+    // rewrites the conversation from the anchor, as a rewrite restore does from its checkpoint.
+    bool endpoint_anchors = true;
 };
 
 struct ContextCostOptions {

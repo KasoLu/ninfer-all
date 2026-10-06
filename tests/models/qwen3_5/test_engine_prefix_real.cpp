@@ -2146,6 +2146,123 @@ int exercise_engine_automatic_long_anchor_capture(const char* artifact) {
     return 0;
 }
 
+ninfer::EngineOptions endpoint_anchor_engine_options(const char* artifact,
+                                                     std::uint32_t device_state_slots,
+                                                     bool endpoint_anchors, bool mtp) {
+    ninfer::EngineOptions options;
+    options.artifact_path = artifact;
+    options.max_context   = 4096;
+    options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+    options.prefill_chunk = 512;
+    if (mtp) {
+        options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+        options.speculative.draft_tokens  = 3;
+        options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    } else {
+        options.speculative.backend = ninfer::SpeculativeBackend::None;
+    }
+    options.max_concurrency                         = 1;
+    options.max_pending_requests                    = 1;
+    options.context_cache.device_state_slots        = device_state_slots;
+    options.context_cache.host_state_slots          = 4;
+    options.context_cache.host_kv_capacity_bytes    = 256ULL << 20;
+    options.context_cache.max_private_continuations = 2;
+    options.context_cache.max_shared_prefixes       = 0;
+    options.context_cache.endpoint_anchors          = endpoint_anchors;
+    return options;
+}
+
+// Endpoint anchors. A request that resumes a conversation at its endpoint and extends it keeps
+// that endpoint as a long anchor, captured from the resumed state before its new turn is
+// prefilled. A later request that diverges right after it -- another reply to the same answer --
+// resumes from the anchor instead of from root and generates exactly what a request resuming the
+// untouched endpoint generates; the continued turn itself generates what it does without the
+// anchor. Both with a Device pool that holds the anchor and with one the endpoint and the turn
+// closure already fill (C=1, H=1), where the anchor becomes a Host copy; with and without MTP.
+int exercise_endpoint_anchor_sibling(const char* artifact) {
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 12;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    // A first turn long enough that the endpoint after its reply lies more than the 1024-token
+    // minimum gain above root.
+    std::string notes = "Read these workshop notes and keep them in mind.\n";
+    for (std::uint32_t index = 0; index < 120; ++index) {
+        notes += "Note " + std::to_string(index) +
+                 ": the lathe was serviced and its belt tension was recorded.\n";
+    }
+    const std::vector<std::string> first{notes};
+    const auto next_turn = [&](const ninfer::GenerationResult& reply, const char* question) {
+        std::vector<std::string> turns = first;
+        turns.push_back(reply.content);
+        turns.emplace_back(question);
+        return slot_conversation(turns);
+    };
+    constexpr const char* kContinued = "Which note mentions the belt tension first?";
+    constexpr const char* kSibling   = "Summarize the notes in one sentence.";
+
+    for (const bool mtp : {false, true}) {
+        // Controls without endpoint anchors: each turn resumes from the first reply's endpoint.
+        std::vector<ninfer::TokenId> control_continued;
+        std::vector<ninfer::TokenId> control_sibling;
+        std::uint32_t endpoint = 0;
+        for (const bool sibling : {false, true}) {
+            ninfer::Engine control(endpoint_anchor_engine_options(artifact, 4, false, mtp));
+            const ninfer::GenerationResult reply =
+                control.generate(control.prepare(slot_conversation(first)), request);
+            const ninfer::GenerationResult next = control.generate(
+                control.prepare(next_turn(reply, sibling ? kSibling : kContinued)), request);
+            if (next.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
+                next.reused_prompt_tokens < 1024) {
+                std::cerr << "endpoint-anchor control did not resume the first reply's endpoint: "
+                             "path="
+                          << static_cast<int>(next.prefix_reuse_path)
+                          << " reused=" << next.reused_prompt_tokens << '\n';
+                return 1;
+            }
+            (sibling ? control_sibling : control_continued) = next.generated_token_ids;
+            endpoint                                        = next.reused_prompt_tokens;
+        }
+
+        for (const std::uint32_t device_state_slots : {4U, 1U}) {
+            ninfer::Engine engine(
+                endpoint_anchor_engine_options(artifact, device_state_slots, true, mtp));
+            const ninfer::GenerationResult reply =
+                engine.generate(engine.prepare(slot_conversation(first)), request);
+            const ninfer::RuntimeStats before = engine.runtime_stats();
+            const ninfer::GenerationResult continued =
+                engine.generate(engine.prepare(next_turn(reply, kContinued)), request);
+            const ninfer::RuntimeStats after_continued = engine.runtime_stats();
+            const ninfer::GenerationResult sibling =
+                engine.generate(engine.prepare(next_turn(reply, kSibling)), request);
+            std::cout << "endpoint-anchor: mtp=" << mtp
+                      << " device_state_slots=" << device_state_slots
+                      << " endpoint=" << endpoint
+                      << " continued_path=" << static_cast<int>(continued.prefix_reuse_path)
+                      << " continued_reused=" << continued.reused_prompt_tokens
+                      << " captures=" << (after_continued.active_captures_completed -
+                                          before.active_captures_completed)
+                      << " sibling_path=" << static_cast<int>(sibling.prefix_reuse_path)
+                      << " sibling_reused=" << sibling.reused_prompt_tokens << '\n';
+            if (continued.prefix_reuse_path != ninfer::PrefixReusePath::PrivateEndpoint ||
+                continued.reused_prompt_tokens != endpoint ||
+                continued.generated_token_ids != control_continued) {
+                std::cerr << "the continued turn changed under an endpoint anchor\n";
+                return 1;
+            }
+            if (sibling.prefix_reuse_path != ninfer::PrefixReusePath::PrivateLongAnchor ||
+                sibling.reused_prompt_tokens != endpoint ||
+                sibling.generated_token_ids != control_sibling) {
+                std::cerr << "the sibling turn did not resume exactly from the endpoint anchor\n";
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 int exercise_salvage_mid_prefill(const char* artifact) {
     ninfer::Engine engine(salvage_mid_prefill_engine_options(artifact));
 
@@ -3243,6 +3360,9 @@ int exercise_artifact(const char* artifact) {
     if (const int result = exercise_engine_automatic_long_anchor_capture(artifact); result != 0) {
         return result;
     }
+    if (const int result = exercise_endpoint_anchor_sibling(artifact); result != 0) {
+        return result;
+    }
     if (const int result = exercise_salvage_mid_prefill(artifact); result != 0) { return result; }
     if (const int result = exercise_last_private_alias_eviction(artifact); result != 0) {
         return result;
@@ -4126,6 +4246,8 @@ int run() {
             result = exercise_private_long_anchor_capture_and_replacement(artifact);
         } else if (scenario == "engine-automatic-long-anchor") {
             result = exercise_engine_automatic_long_anchor_capture(artifact);
+        } else if (scenario == "endpoint-anchor") {
+            result = exercise_endpoint_anchor_sibling(artifact);
         } else if (scenario == "salvage-mid-prefill") {
             result = exercise_salvage_mid_prefill(artifact);
         } else if (scenario == "rewrite-checkpoint-shared") {

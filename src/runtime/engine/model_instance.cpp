@@ -326,6 +326,9 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         cache.max_long_anchors_per_continuation = 0;
         cache.host_state_slots                  = 0;
         cache.host_kv_capacity_bytes            = 0;
+        // Endpoint anchors are a default of the catalog; the hybrid tree resumes a branch from its
+        // content-addressed blocks and ladder snapshots instead.
+        cache.endpoint_anchors = false;
         return options;
     }
     if (!cache.enabled) {
@@ -357,6 +360,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         cache.kv_lease_growth              = false;
         cache.automatic_long_anchors       = false;
         cache.branch_anchors               = false;
+        cache.endpoint_anchors             = false;
         return options;
     }
 
@@ -370,6 +374,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     cache.max_long_anchors_per_continuation =
         cache.max_long_anchors_per_continuation.value_or(cache.automatic_long_anchors ? 4U : 2U);
     cache.max_cache_markers_per_request     = cache.max_cache_markers_per_request.value_or(4U);
+    // An endpoint anchor is a long anchor: without long-anchor capacity it has nowhere to stay.
+    if (*cache.max_long_anchors_per_continuation == 0) { cache.endpoint_anchors = false; }
 
     if (*cache.max_private_continuations < concurrency) {
         throw std::invalid_argument(

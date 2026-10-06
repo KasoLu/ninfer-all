@@ -113,8 +113,9 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
     }
     const std::uint64_t suffix = summary.prompt_tokens - segment_begin;
     prefill_units += suffix == 0 ? 1ULL : 1ULL + (suffix - 1ULL) / prefill_chunk;
-    // A shared promotion at the selected reuse base is offered before the ordinary zero/suffix
-    // prefill step. It executes no model work, but it is still one scheduler service unit.
+    // A capture at the selected reuse base (a shared promotion, an endpoint anchor) is offered
+    // before the ordinary zero/suffix prefill step. It executes no model work, but it is still one
+    // scheduler service unit.
     prefill_units += static_cast<std::uint64_t>(
         std::count_if(captures.begin(), captures.end(), [reuse_base](const CaptureGroup& capture) {
             return capture.frontier == reuse_base;
@@ -270,7 +271,7 @@ std::uint32_t ProgramImpl::matched_prefix_tokens(const SharedPrefixHandle& owner
 
 RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                           const runtime::ResolvedExecutionOptions& options,
-                                          std::optional<std::uint32_t> branch_anchor) {
+                                          std::span<const std::uint32_t> engine_anchors) {
     if (prompt.token_ids.empty()) { throw std::invalid_argument("prompt must contain tokens"); }
     if (prompt.token_ids.size() > capacity) {
         throw std::invalid_argument("prompt exceeds configured context capacity");
@@ -442,11 +443,13 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                         opportunity.kind == PromptCacheMarkerKind::PrivateLongAnchor,
                         opportunity.evidence);
         }
-        // The branch anchor joins through the plan's own capture list, so it is merged, ordered,
+        // Engine anchors join through the plan's own capture list, so they are merged, ordered,
         // given an identity and priced like a client marker. A capture added after the plan is
         // sealed has no identity, and the Engine refuses it.
-        if (branch_anchor && *branch_anchor != 0 && *branch_anchor < base->summary.prompt_tokens) {
-            add_capture(*branch_anchor, 0, std::nullopt, false, true, SharedCandidateEvidence::None);
+        for (const std::uint32_t anchor : engine_anchors) {
+            if (anchor != 0 && anchor < base->summary.prompt_tokens) {
+                add_capture(anchor, 0, std::nullopt, false, true, SharedCandidateEvidence::None);
+            }
         }
         std::sort(base->capture_groups.begin(), base->capture_groups.end(),
                   [](const CaptureGroup& left, const CaptureGroup& right) {
@@ -620,9 +623,11 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                                                  selected.frontier)) {
                 return std::nullopt;
             }
-            plan->reuse              = ReusePath::PrivateLongAnchor;
-            plan->reuse_base         = selected.frontier;
-            plan->source_mode = runtime::PrivateSourceMode::Retain;
+            // A retained source keeps its conversation; a consumed one is rewritten from the
+            // anchor, as a rewrite restore is from its checkpoint: its endpoint, rewrite checkpoint
+            // and later anchors go, and the anchor stays a checkpoint of the new lineage.
+            plan->reuse      = ReusePath::PrivateLongAnchor;
+            plan->reuse_base = selected.frontier;
         } else {
             if (selected.ordinal != 0) {
                 throw std::logic_error("private rewrite checkpoint ordinal is invalid");
@@ -748,7 +753,9 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
             selected_state_requires_fork(*source, plan->reuse, plan->rewrite_disposition,
                                          plan->selected_checkpoint, plan->reuse_base);
     }
-    if (source != nullptr && is_rewrite_checkpoint_restore(plan->reuse) &&
+    if (source != nullptr &&
+        (is_rewrite_checkpoint_restore(plan->reuse) ||
+         plan->reuse == ReusePath::PrivateLongAnchor) &&
         plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive) {
         std::vector<StateImageHandle> optional_states;
         optional_states.reserve(1U + source->long_anchors.size());
@@ -781,8 +788,21 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         }
     }
 
+    // An endpoint resumed in place moves with the conversation: the request writes its suffix into
+    // the endpoint's own state. A long anchor asked for exactly there is captured before the
+    // suffix is prefilled, the last moment that state exists. Every other capture at or below the
+    // reuse base is the source's own content already.
+    const bool resumes_endpoint_in_place =
+        source != nullptr && plan->reuse == ReusePath::PrivateEndpoint &&
+        plan->source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
+        !plan->state_fork_required;
     plan->capture_groups.reserve(base.capture_groups.size());
     for (CaptureGroup group : base.capture_groups) {
+        if (group.frontier == plan->reuse_base && group.long_anchor && resumes_endpoint_in_place) {
+            group.rewrite.reset();
+            plan->capture_groups.push_back(std::move(group));
+            continue;
+        }
         if (group.frontier <= plan->reuse_base) { continue; }
         if (group.rewrite &&
             (plan->rewrite_disposition !=

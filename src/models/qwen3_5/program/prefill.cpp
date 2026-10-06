@@ -668,6 +668,38 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             sequence.prefix_digests.truncate(base);
             reserve_state_entitlement(sequence, state_slots);
             refresh_state_views(sequence);
+        } else if (request_plan.reuse == ReusePath::PrivateLongAnchor) {
+            // The consumed conversation is rewritten from the anchor: prepare_consumed_source
+            // dropped its endpoint, its rewrite checkpoint and the anchors above the base, and the
+            // anchor itself stays a checkpoint of the new lineage, so its state is forked.
+            if (!sequence.kv || sequence.text_kv_valid < base || sequence.endpoint_valid) {
+                throw std::logic_error("consumed long-anchor source is not at its anchor");
+            }
+            activate_consumed_state(
+                selected_state(sequence, request_plan.reuse, request_plan.selected_checkpoint));
+            sequence.text_kv_valid = base;
+            if (speculative_backend == SpeculativeBackend::Mtp) {
+                const std::uint32_t mtp_base = base == 0 ? 0 : base - 1;
+                if (!request_plan.prepare_mtp || sequence.mtp_kv_valid < mtp_base) {
+                    throw std::logic_error("long-anchor MTP KV is shorter than the bridge frontier");
+                }
+                sequence.mtp_kv_valid = mtp_base;
+            } else if (is_masked_draft_backend(speculative_backend)) {
+                if (!dflash || (backend_kv_cache() && !sequence.kv->backend) ||
+                    sequence.dflash_context_frontier < base) {
+                    throw std::logic_error("planned DFlash long anchor is unavailable");
+                }
+                sequence.dflash_context_frontier = base;
+            }
+            bind_sequence_kv(sequence);
+            trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
+            resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
+                                           request_plan.backend_kv_page_entitlement);
+            sequence.tail_hidden_valid = base == prompt_tokens;
+            sequence.ledger.resize(base);
+            sequence.prefix_digests.truncate(base);
+            reserve_state_entitlement(sequence, state_slots);
+            refresh_state_views(sequence);
         } else {
             throw std::logic_error("request plan has an invalid prefix reuse path");
         }
@@ -1068,11 +1100,16 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
     try {
         if (staged.next_capture < staged.capture_groups.size() &&
             staged.capture_groups[staged.next_capture].frontier == staged.cursor) {
-            if (staged.cursor != staged.base ||
-                !staged.capture_groups[staged.next_capture].shared ||
-                staged.capture_groups[staged.next_capture].rewrite ||
-                staged.capture_groups[staged.next_capture].long_anchor) {
-                throw std::logic_error("zero-prefill capture is not a shared base promotion");
+            // A capture before any prefill records the resumed state itself: a shared promotion of
+            // the base, or a long anchor on an endpoint resumed in place, whose state is still the
+            // endpoint's own image (planning/request_plan.cpp).
+            const CaptureGroup& group = staged.capture_groups[staged.next_capture];
+            const bool in_place = !sequence.state.fork_pending &&
+                                  sequence.state.read == sequence.state.write;
+            if (staged.cursor != staged.base || group.rewrite ||
+                (group.long_anchor ? !in_place : !group.shared)) {
+                throw std::logic_error(
+                    "zero-prefill capture is neither a shared promotion nor an endpoint anchor");
             }
             if (++next_capture_offer_id_ == 0) { ++next_capture_offer_id_; }
             staged.pending_capture_offer = next_capture_offer_id_;

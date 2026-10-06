@@ -260,11 +260,17 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
                           }))) {
             throw std::logic_error("planned rewrite checkpoint capture is invalid");
         }
+        // A capture at the reuse base records the resumed state itself: a shared promotion, or a
+        // long anchor on an endpoint the request resumes from in place (request_plan.cpp).
+        const bool resumes_endpoint_in_place =
+            request_plan.reuse == ReusePath::PrivateEndpoint &&
+            request_plan.source_mode == runtime::PrivateSourceMode::ConsumeToActive &&
+            !request_plan.state_fork_required;
         for (const CaptureGroup& group : request_plan.capture_groups) {
-            const bool base_shared_promotion = group.frontier == request_plan.reuse_base &&
-                                               group.shared && !group.rewrite && !group.long_anchor;
-            if (!group.identity ||
-                (group.frontier <= request_plan.reuse_base && !base_shared_promotion) ||
+            const bool base_capture =
+                group.frontier == request_plan.reuse_base && !group.rewrite &&
+                (group.long_anchor ? resumes_endpoint_in_place : group.shared);
+            if (!group.identity || (group.frontier <= request_plan.reuse_base && !base_capture) ||
                 group.frontier > prompt_tokens ||
                 group.identity->shortlist_key.frontier != group.frontier ||
                 group.identity->prefix_identity() == nullptr ||
@@ -505,7 +511,10 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
         }
     };
 
-    if (source.endpoint_valid && source.execution_frontier > details.reuse_base) {
+    // A long-anchor resume rewrites the conversation from the anchor, so its endpoint goes even
+    // where it ends there too.
+    if (source.endpoint_valid && (source.execution_frontier > details.reuse_base ||
+                                  details.reuse == ReusePath::PrivateLongAnchor)) {
         const StateImageHandle endpoint = source.state.read;
         source.endpoint_valid           = false;
         source.state                    = {};
@@ -522,7 +531,8 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
                                   static_cast<std::ptrdiff_t>(index - 1U));
         release_if_unreferenced(state);
     }
-    if (details.reuse == ReusePath::PrivateEndpoint &&
+    if ((details.reuse == ReusePath::PrivateEndpoint ||
+         details.reuse == ReusePath::PrivateLongAnchor) &&
         details.rewrite_disposition != RewriteCheckpointDisposition::RetainExisting &&
         source.rewrite_state) {
         const StateImageHandle rewrite = *source.rewrite_state;

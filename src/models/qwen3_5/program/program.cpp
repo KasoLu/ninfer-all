@@ -315,8 +315,8 @@ std::uint32_t Program::matched_prefix_tokens(const SharedPrefixHandle& owner,
 
 RequestBasePlan Program::plan_request(const PreparedPrompt& prompt,
                                       const runtime::ResolvedExecutionOptions& options,
-                                      std::optional<std::uint32_t> branch_anchor) {
-    return impl_->plan_request(PreparedPromptAccess::view(prompt), options, branch_anchor);
+                                      std::span<const std::uint32_t> engine_anchors) {
+    return impl_->plan_request(PreparedPromptAccess::view(prompt), options, engine_anchors);
 }
 
 std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target) {

@@ -626,7 +626,7 @@ public:
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
                                                const runtime::ResolvedExecutionOptions& options,
-                                               std::optional<std::uint32_t> branch_anchor = {});
+                                               std::span<const std::uint32_t> engine_anchors = {});
     [[nodiscard]] std::uint32_t matched_prefix_tokens(const ContinuationHandle& owner,
                                                       const PreparedPromptData& prompt) const;
     [[nodiscard]] std::uint32_t matched_prefix_tokens(const SharedPrefixHandle& owner,
