@@ -174,6 +174,55 @@ prefix reuse intact ([maintainer map](consolidated-line.md)); Qwen3.8-Flash-Next
 over two RTX 3090 Ti, two RTX 4090 and two RTX 5090
 ([measurements](../qwen3-8-flash-next.md#measurements)).
 
+### DFlash across stages, measured (2026-10-06)
+
+Rented Linux pairs, none with peer access, so every hop goes through pinned host memory; CUDA 12.8
+builds for `80`, `86` and `89`, CUDA 13.1 for `120a`; the pinned Qwen3.8-27B (DFlash2 bundle,
+`1cbd84e7`) and Qwen3.6-35B-A3B (DFlash bundle, `ee449580`) artifacts; int8 KV.
+
+`ninfer_qwen3_5_stages_real_test` with the stages on two cards (`NINFER_TEST_DEVICE_IDS=0,1`) passed
+all 22 rows, 11 per artifact, on 2x RTX 3090 (sm_86), 2x RTX 4090 (sm_89), 2x RTX 5090 (sm_120a) and
+2x A100 PCIe 40 GB (sm_80): two and three stages, graphs and eager, forced staged transport, an
+uneven split, MTP, and DFlash2 or DFlash in two stages, staged transport, three stages eager and an
+uneven split, each over a 1,300-token prompt in three chunks and a continuation served from the
+context cache, byte-identical to the same backend on one card.
+
+Speed with the CLI (`--greedy --no-thinking`, seven drafts): a 37-token chat prompt with 256 new
+tokens ("short") and a 3,322-token prompt with 64 ("long"), tok/s on one card and then split over the
+two by the default split, mean of two or three runs. Every split run generated the one-card text.
+
+| | 2x RTX 3090 | 2x RTX 4090 | 2x RTX 5090 | 2x A100 PCIe |
+|---|---|---|---|---|
+| 27B DFlash2, short, decode | 206.1 / 223.2 | 264.8 / 264.8 | 416.4 / 418.4 | 242.5 / 233.8 |
+| 27B DFlash2, long, prefill | 1,247 / 1,270 | 2,267 / 2,227 | 2,965 / 2,990 | 1,357 / 1,297 |
+| 27B DFlash2, long, decode | 106.5 / 114.6 | 135.6 / 135.6 | 213.6 / 214.3 | 125.7 / 130.9 |
+| 27B plain, short, decode | 47.9 / 48.9 | 55.8 / 55.5 | 91.7 / 91.0 | 52.3 / 54.7 |
+| 35B-A3B DFlash, short, decode | 482.8 / 490.7 | 837.0 / 818.2 | 1,260 / 1,225 | 475.0 / 365.9 |
+| 35B-A3B DFlash, long, prefill | 6,320 / 6,233 | 12,033 / 11,667 | 11,300 / 11,750 | 7,327 / 5,173 |
+| 35B-A3B DFlash, long, decode | 195.8 / 205.5 | 343.0 / 337.3 | 471.7 / 462.2 | 199.2 / 197.2 |
+| 35B-A3B plain, short, decode | 206.1 / 207.9 | 274.0 / 268.7 | not run | 207.6 / 181.9 |
+
+The 3090 column comes from the first implementation, which sent a stage's taps together after its
+last layer (a second 3090 pair, rented for the final code, had its cards capped at 250 W, so one card
+ran slower than the split and its comparison means nothing; its correctness rows passed). On the 4090
+and A100 pairs both implementations ran interleaved on the same host: decode was equal within 1%,
+and sending each tap as its layer finishes raised the 35B-A3B's long prefill from 11,433 to 11,667
+tok/s (4090) and from 4,777 to 5,173 (A100). The weights per card in the default split were
+10.3 + 7.74 GiB for the 27B with DFlash2 (18.0 GiB on one card) and 10.6 + 9.41 GiB for the 35B-A3B
+(20.0 GiB); the 27B's workspace grew from 183.9 to 233.9 MiB per card for the boundary and the tap
+staging.
+
+What this says: on the GeForce pairs the split costs DFlash and DFlash2 no more than it costs plain
+decoding, within about 3% either way (the 3090 pair is faster split, as it was on 2026-09-21), and
+the features ride along at no measurable price at decode. The A100 pair is the exception, and not
+because of DFlash: the 35B-A3B lost 12% split without speculation and 23% with DFlash. The same split
+with both stages on one A100 (`--devices 0,0`, local or forced staged links) cost nothing (466-473
+tok/s on one card, 476-481 split), each A100 alone ran at the same speed, and an nsys profile of the
+split showed the kernels themselves running longer (the MoE path kernel +21%, the verify GDN layers
++46%) rather than gaps opening between them. That points at the cards' clocks while they wait for each
+other (the two sit on different sockets of that host); GPU clock metrics are not permitted in the
+container, so the cause is not confirmed.
+
 Launch note for rentals: the CUDA base images carry a `compat` `libcuda.so.1` that GeForce cards
 refuse (`cudaErrorCompatNotSupportedOnDevice`); put `/usr/lib/x86_64-linux-gnu` first in
 `LD_LIBRARY_PATH`. Ubuntu 22.04 needs CMake 3.28+, FFmpeg 6 development packages and libcurl 7.85+

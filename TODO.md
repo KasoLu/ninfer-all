@@ -398,6 +398,12 @@ what it says about kernels and measurements still holds except where this sectio
       prefill does not overlap stages (micro-chunk wavefront); tensor parallelism is unbuilt.
       `docs/maintainer/pipeline-parallel-plan.md` is the design of record. DFlash and DFlash2 run
       across stages since 2026-10-06 (their feature taps cross to rank 0 on their own links).
+- [ ] **A split runs 12-24% slower on two A100 PCIe cards** (35B-A3B decode, plain and DFlash;
+      2026-10-06, one rented host whose cards sit on different sockets) while the same split on one
+      A100 costs nothing and each card alone is as fast as the other. The profile shows the kernels
+      themselves running longer, so the first suspect is the cards' clocks while each waits for the
+      other. Needs a host where GPU clock metrics or locked clocks are allowed; the GeForce pairs do
+      not show it.
 
 State as of 2026-09-09. Four passes: a profiling pass that closed six items and refuted five of its
 own hypotheses, a measurement-hygiene pass that closed three more, a counter pass that put a *cause*
