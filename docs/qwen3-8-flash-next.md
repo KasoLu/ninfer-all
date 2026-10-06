@@ -237,11 +237,6 @@ to the short-answer decode on the two GPUs in the two runs (91.5-91.7 tok/s eage
 pinned host experts (49.9-50.1 tok/s eager). Host memory is the process's peak resident set, device
 memory the most `nvidia-smi` showed in use.
 
-Serving the AIME 2025 and GPQA-Diamond campaigns of [the evaluation guide](../eval/README.md) on two
-RTX 5090s with its experts on the GPUs, six requests at once and answers of up to 106,000 tokens,
-the Q2_0 release produced 182 and 195 tok/s of output over each run's wall time (782,537 tokens in
-71.7 minutes, 4,584,960 tokens in 6.5 hours).
-
 On the current code every GSQ-RCO release, converted into one file with its table, answers the
 generate test's prompts (the facts and the 4,463-token needle) on that card with disk experts and
 with host experts, with CUDA graphs and without: Q2_0, IQ2_XS (39.2 GB, 35.5 GB pinned), IQ3_XXS

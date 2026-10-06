@@ -68,7 +68,7 @@ its first five tokens. The setups, memory and further rows are in
 The RTX 4090 rows ran in a two-socket cloud VM, pinned to the CPUs of the GPUs' NUMA node; left
 unpinned, host experts decode there at 40 tok/s and disk experts at 32 to 33. Serving six reasoning
 requests at once on two RTX 5090s (the AIME 2025 and GPQA-Diamond campaigns, answers up to 106,000
-tokens), the Q2_0 release produced 182 and 195 tok/s of output.
+tokens), the Q2_0 release produced 193 tok/s of output.
 
 - **Against the previous `master` on the same card**, a 261K-token Bonsai prompt takes 215 s instead
   of 315 s on the RTX 3090, 102 s instead of 138 s on the RTX 4090 and 82 s instead of 115 s on the
