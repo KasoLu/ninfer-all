@@ -217,6 +217,31 @@ the short answer:
 | IQ3_S, experts on disk, the file's pages evicted every second | 22.1 GiB | — | 10.7 tok/s | 5.4 tok/s | 47 tok/s |
 | Q2_0, experts in pinned host memory | 22.1 GiB | 34.0 GB pinned | 50.2 tok/s | 43.7 tok/s | 847 tok/s |
 
+The Q2_0 release (with the separate table artifact) on RTX 4090s at 450 W (PCIe 4.0 x16, no peer
+access) in a cloud VM with two EPYC 7543 sockets of 60 vCPUs each, both GPUs on NUMA node 0, 694 GB
+of RAM and its container disk, 2026-10-06. The single-GPU rows ran pinned to node 0's CPUs
+(`taskset -c 0-59`; the container refuses a memory policy, so first touch places the pages there);
+the ranges are two runs:
+
+| Hardware and placement | Device memory | Host memory | Decode, short answer | Decode after 4,463 tokens | Prefill |
+|---|---:|---:|---:|---:|---:|
+| 2× RTX 4090, experts on the GPUs (`--devices 0,1`) | 18.5 + 19.4 GiB | 0.8 GiB | 92.6-100.7 tok/s | 116-120 tok/s | 3,482-3,734 tok/s |
+| RTX 4090, experts in pinned host memory, 15.9 GB expert cache | 20.7 GiB | 34.0 GB pinned | 52.6-52.7 tok/s | 44.3-44.6 tok/s | 1,137-1,139 tok/s |
+| RTX 4090, experts on disk, artifact in the page cache | 20.7 GiB | 1.0 GiB + page cache | 42.0 tok/s | 45.6 tok/s | 723 tok/s |
+| RTX 4090, experts on disk, the artifact's and table's pages evicted every second | 20.5 GiB | 1.0 GiB | 17.7 tok/s | 12.2 tok/s | 160 tok/s |
+
+Left unpinned on that VM, the host-expert row decodes at 39.5-40.1 tok/s and prefills at 775-827
+tok/s, the page-cache row at 31.9-33.0 tok/s and 571-674 tok/s, and the evicted row at 15.7 tok/s
+and 144 tok/s: the copies out of host memory then cross the socket link. CUDA graphs add 1% and 10%
+to the short-answer decode on the two GPUs in the two runs (91.5-91.7 tok/s eager) and 5 to 6% with
+pinned host experts (49.9-50.1 tok/s eager). Host memory is the process's peak resident set, device
+memory the most `nvidia-smi` showed in use.
+
+Serving the AIME 2025 and GPQA-Diamond campaigns of [the evaluation guide](../eval/README.md) on two
+RTX 5090s with its experts on the GPUs, six requests at once and answers of up to 106,000 tokens,
+the Q2_0 release produced 182 and 195 tok/s of output over each run's wall time (782,537 tokens in
+71.7 minutes, 4,584,960 tokens in 6.5 hours).
+
 On the current code every GSQ-RCO release, converted into one file with its table, answers the
 generate test's prompts (the facts and the 4,463-token needle) on that card with disk experts and
 with host experts, with CUDA graphs and without: Q2_0, IQ2_XS (39.2 GB, 35.5 GB pinned), IQ3_XXS
