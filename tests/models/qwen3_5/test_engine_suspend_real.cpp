@@ -15,6 +15,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -122,11 +123,26 @@ Outputs run_requests(ninfer::Engine& engine, const std::vector<ninfer::TokenId>*
     return out;
 }
 
-std::size_t free_device_bytes() {
-    std::size_t free = 0;
-    std::size_t total = 0;
-    if (cudaMemGetInfo(&free, &total) != cudaSuccess) { return 0; }
-    return free;
+// Free memory of the current device, or summed over the distinct devices a split runs its stages
+// on: a suspend releases every stage's memory, not only the first device's.
+std::size_t free_device_bytes(std::vector<int> devices) {
+    std::sort(devices.begin(), devices.end());
+    devices.erase(std::unique(devices.begin(), devices.end()), devices.end());
+    int current = 0;
+    if (cudaGetDevice(&current) != cudaSuccess) { return 0; }
+    if (devices.empty()) { devices.push_back(current); }
+    std::size_t sum = 0;
+    for (const int device : devices) {
+        std::size_t free  = 0;
+        std::size_t total = 0;
+        if (cudaSetDevice(device) != cudaSuccess || cudaMemGetInfo(&free, &total) != cudaSuccess) {
+            sum = 0;
+            break;
+        }
+        sum += free;
+    }
+    (void)cudaSetDevice(current);
+    return sum;
 }
 
 int failures = 0;
@@ -159,9 +175,10 @@ void run_configuration(const char* artifact, const Configuration& configuration,
 
     // Suspend with automatic resume: the next request brings the model back on its own, and the
     // continuation reuses the long run's state retained before the suspend.
-    const std::size_t free_resident = free_device_bytes();
+    const std::vector<int> devices = stage_devices(configuration.devices);
+    const std::size_t free_resident = free_device_bytes(devices);
     const ninfer::ResidencyStatus suspended = engine.suspend();
-    const std::size_t free_suspended = free_device_bytes();
+    const std::size_t free_suspended = free_device_bytes(devices);
     check(suspended.state == ninfer::ModelResidency::Suspended, "state is suspended");
     check(suspended.host_snapshot_bytes > 0, "the retained state is in host memory");
     check(free_suspended > free_resident + suspended.releasable_device_bytes * 9 / 10,
