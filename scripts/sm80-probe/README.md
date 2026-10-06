@@ -19,9 +19,8 @@ summary say which.
 ## Running it
 
 sm_80 is a build target of `master` (`CMAKE_CUDA_ARCHITECTURES=80`). The script clones `NINFER_REPO`
-at `NINFER_BRANCH`, whose defaults still name the base fork's `feat/sm80-cmp170hx-probe` branch: set
-`NINFER_REPO=https://github.com/iamwavecut/ninfer-all.git NINFER_BRANCH=master` to test this line.
-The branch must be pushed first.
+at `NINFER_BRANCH`, by default this repository's `master`; a branch named instead must be pushed
+first.
 
 Rent with a CUDA **devel** image on Ubuntu 24.04, for example
 `nvidia/cuda:12.8.1-devel-ubuntu24.04` (`nvcc` is needed, and CMake 3.28 for `--engine`; 22.04

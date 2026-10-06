@@ -12,8 +12,8 @@ set -uo pipefail
 exec 2>&1
 echo "=== pipeline execution test $(date -u +%FT%TZ) ==="
 
-BRANCH="${NINFER_BRANCH:-feat/dual-gpu-graph-mode}"
-REPO="${NINFER_REPO:-https://github.com/ashalliants/ninfer-3090.git}"
+BRANCH="${NINFER_BRANCH:-master}"
+REPO="${NINFER_REPO:-https://github.com/iamwavecut/ninfer-all.git}"
 MODEL_URL="${MODEL_URL:-https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer/resolve/ee4495803bc4f8015b8a7e22d4cf9b67de8e27c6/qwen3_6_35b_a3b.ninfer}"
 MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-7200}"
 PROMPT="${PROMPT:-List the first eight prime numbers, then explain briefly why 1 is not prime.}"
@@ -28,12 +28,23 @@ fi
 nvidia-smi --query-gpu=index,name,memory.total,compute_cap --format=csv
 nvidia-smi topo -m 2>&1 | head -6
 
+# The build target follows the first GPU unless NINFER_ARCH names one: 8.6 and 8.9 take the `86`
+# build (it runs on both), 12.0 takes `120a` (which needs CUDA 13.1 or newer), 8.0 takes `80`.
+cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | tr -d ' ')"
+case "$cc" in
+  12.0) detected_arch=120a ;;
+  8.0) detected_arch=80 ;;
+  *) detected_arch=86 ;;
+esac
+ARCH="${NINFER_ARCH:-$detected_arch}"
+echo "build target: ${ARCH} (compute capability ${cc:-unknown})"
+
 echo "--- installing build dependencies ---"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq git cmake ninja-build build-essential pkg-config \
   libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libavfilter-dev \
-  libswresample-dev >/dev/null 2>&1
+  libswresample-dev libcurl4-openssl-dev >/dev/null 2>&1
 
 echo "--- cloning ${BRANCH} ---"
 git clone --depth 1 --branch "$BRANCH" "$REPO" /root/src || { echo "CLONE_FAILED"; exit 1; }
@@ -51,7 +62,7 @@ apt-get install -y -qq aria2 >/dev/null 2>&1
 
 echo "--- configuring ---"
 cmake -S /root/src -B /root/build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="${NINFER_ARCH:-86}" \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$ARCH" \
   -DCMAKE_CUDA_COMPILER="$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)" \
   2>&1 | tail -3 || { echo "CONFIGURE_FAILED"; exit 1; }
 
@@ -80,7 +91,7 @@ echo "SINGLE_EXIT=$?"
 grep -E "gpu weights used|free after weights|free after startup|decode speed" /root/single.err || true
 echo "--- output ---"; cat /root/single.txt
 
-echo "=== B: EXPERT OFFLOAD ACROSS TWO GPUs ==="
+echo "=== B: PIPELINE STAGES ACROSS TWO GPUs ==="
 /root/build/apps/ninfer "$MODEL" "${COMMON[@]}" --devices 0,1 >/root/split.txt 2>/root/split.err
 echo "SPLIT_EXIT=$?"
 grep -E "gpu weights used|free after weights|free after startup|decode speed" /root/split.err || true

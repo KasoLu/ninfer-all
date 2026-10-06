@@ -6,9 +6,10 @@ rented dual-GPU hardware. The tests that need a real second card are
 measures the boundary-transfer cost the pipeline pays and decides whether tensor parallelism is
 worth building on that box.
 They assume a vast.ai instance, but nothing here is specific to that provider beyond the CLI calls
-in `iterate.sh`. The scripts clone and fetch `NINFER_REPO` at `NINFER_BRANCH`, whose defaults still
-name the base fork's `feat/dual-gpu-graph-mode` branch: set
-`NINFER_REPO=https://github.com/iamwavecut/ninfer-all.git NINFER_BRANCH=master` to test this line.
+in `iterate.sh`. The scripts clone and fetch `NINFER_REPO` at `NINFER_BRANCH`, by default this
+repository's `master`; the build target follows the first GPU's compute capability unless
+`NINFER_ARCH` names one (`86` for the RTX 30 and 40 series, `120a` for Blackwell, which needs CUDA
+13.1 or newer in the image).
 
 | script | what it does |
 |---|---|

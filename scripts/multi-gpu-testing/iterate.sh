@@ -32,7 +32,7 @@ run() {
       -o ConnectTimeout=25 -o BatchMode=yes -p "$port" "root@$addr" "$@"
 }
 
-BRANCH="${NINFER_BRANCH:-feat/dual-gpu-graph-mode}"
+BRANCH="${NINFER_BRANCH:-master}"
 MODE="${1:-}"
 
 if [[ "$MODE" != "--run-only" ]]; then

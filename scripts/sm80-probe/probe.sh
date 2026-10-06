@@ -20,8 +20,8 @@
 # --tests to build and run the op correctness suites on the card itself.
 #
 # Environment:
-#   NINFER_BRANCH   branch to test (default feat/sm80-cmp170hx-probe)
-#   NINFER_REPO     git URL
+#   NINFER_BRANCH   branch to test (default master)
+#   NINFER_REPO     git URL (default this repository, iamwavecut/ninfer-all)
 #   NINFER_ARCH     CUDA arch number (default: from nvidia-smi, else 80)
 #   PROBE_GPU       which GPU index to test (default 0)
 #   MAX_RUNTIME_SECONDS  dead-man switch that powers the box off (default 3600; 0 disables)
@@ -30,8 +30,8 @@
 set -uo pipefail
 exec 2>&1
 
-BRANCH="${NINFER_BRANCH:-feat/sm80-cmp170hx-probe}"
-REPO="${NINFER_REPO:-https://github.com/ashalliants/ninfer-3090.git}"
+BRANCH="${NINFER_BRANCH:-master}"
+REPO="${NINFER_REPO:-https://github.com/iamwavecut/ninfer-all.git}"
 GPU="${PROBE_GPU:-0}"
 SRC="${SRC:-/root/src}"
 OUT="${OUT:-/root/probe-out}"
