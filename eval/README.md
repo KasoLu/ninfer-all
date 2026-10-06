@@ -203,6 +203,27 @@ full 262,144-token context, concurrency four and GPQA-Diamond at one (run direct
 | AIME 2026 | 100.00% | 30 / 30 |
 | GPQA-Diamond | 88.38% | 175 / 198 |
 
+Qwen3.8-Flash-Next's GSQ-RCO Q2_0 release ([Qwen3.8-Flash-Next](../docs/qwen3-8-flash-next.md)) ran
+AIME 2025 and GPQA-Diamond from `eval/configs/qwen3_8_flash_next_reasoning.yaml`, with the same
+sampling, against a server on two RTX 5090s (`ninfer-serve <model> --ngram-table <table> --devices
+0,1 --max-context 110000 --max-concurrency 6`): concurrency six and at most 106,000 output tokens an
+answer, what six sequences hold there beside the weights (run directory
+`eval/runs/20261005T165416Z-8e096a79`).
+
+| Benchmark | Accuracy | Correct / total |
+|---|---:|---:|
+| AIME 2025 | 93.33% | 28 / 30 |
+| GPQA-Diamond | 84.34% | 167 / 198 |
+
+One AIME answer and ten GPQA answers reached the limit without answering. Each was continued from
+where it stopped up to this protocol's budget, 122,880 and 245,760 output tokens: a raw-prompt
+completion (`/v1/completions`) of the request's rendered chat prompt (`/apply-template`) followed by
+the reasoning so far, with the same sampling, scored by EvalScope's own answer extraction. Four of
+the ten GPQA answers came out right and four wrong, and two ran out without an answer (one still
+reasoning at 245,760 tokens, one repeating a codon of its question's DNA sequence); the AIME answer
+reached 122,880 tokens still calculating. With those budgets the run scores 93.33% (28 / 30) on AIME
+2025 and 86.36% (171 / 198) on GPQA-Diamond.
+
 Prepare and inspect Needle-in-a-Haystack without issuing model requests:
 
 ```bash

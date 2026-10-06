@@ -155,7 +155,10 @@ filled to it, both models find two of the three needles.
   (`--expert-residency host`, 48 tok/s on one RTX 3090), or left in the artifact's files and
   streamed into a GPU cache (`--expert-residency disk`, under 1 GB of RAM). It serves up to eight
   requests at once with prompt-prefix reuse and structured output, and reads images and video with
-  `--vision`; MTP is not available (no release carries its layer). See
+  `--vision`; MTP is not available (no release carries its layer). On two RTX 5090s the Q2_0
+  release scores 93.3% on AIME 2025 and 86.4% on GPQA-Diamond with the Qwen3.8-27B campaigns' output
+  budgets (84.3% within 106,000 tokens; its card, from llama.cpp: 96.67 and 89.39), and its
+  perplexity matches llama.cpp's to 0.04% over 65,536-token windows. See
   [Qwen3.8-Flash-Next](docs/qwen3-8-flash-next.md).
 - **Reference measurements** of Ternary Bonsai 2 27B and Qwen3.8-27B on the RTX 3090, 4090 and
   5090 up to the full window, the largest context each card serves and fills, every draft length

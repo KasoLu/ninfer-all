@@ -261,3 +261,57 @@ hyper-connection reads to BF16 GEMMs. On an L40S the four combinations of the tw
 2.6489 (both, today's kernels), 2.6494 (the matrix kernel alone), 2.6495 (neither) and 2.6555 (the
 GEMMs alone): rounding-order differences within 0.25% that move with the kernel mix and the GPU,
 not a loss from either change.
+
+The two agree as closely deep into a long context. On the four PG-19 streams of `perplexity-1m`
+joined (261,412 tokens), 65,536-token windows advancing by 32,768 targets (llama.cpp's
+`--ppl-stride 32768 -c 49152`) score only the last 32,768 positions of each window, all of them
+far past the 2,051 below which the sparse layers attend densely. The five windows both evaluate
+identically (163,840 targets), on two RTX 5090s with a BF16 KV cache:
+
+| Window | NInfer | llama.cpp | Difference |
+|---|---:|---:|---:|
+| 1 | 7.6956 | 7.6874 | +0.0011 nats |
+| 2 | 8.9497 | 8.9476 | +0.0002 nats |
+| 3 | 9.8699 | 9.8700 | 0.0000 nats |
+| 4 | 9.0243 | 9.0153 | +0.0010 nats |
+| 5 | 5.6261 | 5.6275 | -0.0002 nats |
+| All five | 8.0834 | 8.0802 | +0.0004 nats |
+
+NInfer is the CUDA 12.9 `120a` build that served the evaluation below, llama.cpp `a7fb71f` with
+CUDA 12.9 and every layer on the GPUs (2026-10-06). llama.cpp's window values come from its
+running perplexity, printed to four decimals, so they are good to about 0.0003 nats. Perplexity
+runs prompt passes only; the decode steps that wrote the evaluation's answers are not part of it.
+
+Accuracy on the two reasoning benchmarks of the GSQ-RCO card that EvalScope scores without a code
+sandbox, for the Q2_0 release with its table, every expert on two RTX 5090s (`--devices 0,1`), a
+BF16 KV cache and six requests at a time: thinking on, temperature 1.0, top-p 0.95, top-k 20 and
+one sampled run as in the Qwen3.8-27B campaigns, but at most 106,000 output tokens, what six
+sequences hold on the two cards beside the weights
+([`eval/configs/qwen3_8_flash_next_reasoning.yaml`](../eval/configs/qwen3_8_flash_next_reasoning.yaml),
+2026-10-05). The answers cut at that limit were then continued from where they stopped up to the
+27B campaigns' budgets, 122,880 output tokens for AIME and 245,760 for GPQA:
+
+| Benchmark | NInfer, 106,000 tokens | Cut there | NInfer, 27B budgets | Q2_0, model card | BF16, model card |
+|---|---:|---:|---:|---:|---:|
+| AIME 2025 | 93.33 (28/30) | 1 | 93.33 (28/30) | 96.67 | 100.00 |
+| GPQA-Diamond | 84.34 (167/198) | 10 | 86.36 (171/198) | 89.39 | 91.92 |
+
+The card does not state its sampling, output limit or number of runs. A cut answer has given no
+answer and counts as wrong; of the answers that finished within 106,000 tokens, 28 of 29 (AIME)
+and 167 of 188 (GPQA) are right. One run of GPQA-Diamond's 198 questions has a standard error of
+about 2.6 points, so the 106,000-token score sits two standard errors below the card. Nine of the
+ten cut GPQA answers were still reasoning coherently at the limit and one was repeating a codon of
+its question's DNA sequence; the cut AIME answer was still calculating. Continued by the same server
+binary with the same sampling (the request's rendered chat prompt and the reasoning so far, sent as
+a raw prompt; EvalScope's own answer extraction scores the result), four of the ten GPQA answers
+came out right and four wrong, and two ran out without an answer, one still reasoning at 245,760
+tokens and the looping one at the server's 247,000-token context; the AIME answer reached 122,880
+still calculating. With those budgets GPQA-Diamond sits 3.0 points below the card, about 1.2
+standard errors.
+
+The answers are long: AIME 2025's averaged 26,100 output tokens (median 13,700), GPQA-Diamond's
+23,200 (median 9,100), and 27 GPQA answers ran past 65,536. The run took 7 h 44 min (AIME
+1 h 12 min, GPQA 6 h 33 min): 5.37 million output tokens at 193 tokens per second across the six
+requests. The server was a `120a` build of `3e842a91` with CUDA 12.9, from before `120a` builds
+moved to CUDA 13.1; the kernels 12.9 was found to miscompile serve an NVFP4 KV cache, which this
+run did not use, and the same binary's prompt passes match llama.cpp over the long windows above.
