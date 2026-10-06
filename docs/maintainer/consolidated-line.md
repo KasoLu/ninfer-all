@@ -184,8 +184,10 @@ Assessed and not taken:
   branching policy did not help and sometimes hurt; the context-cache fixes above are what keep
   prefills from being triggered.
 
-The ternary path is measured on one GPU; a ternary artifact split across devices by the base's
-pipeline stages (`--devices A,B,...`) has not been run. The Windows-only options
+The ternary path is measured on one GPU. Split across two RTX 4090s without peer access by the
+base's pipeline stages (`--devices 0,1`), Ternary Bonsai 2 27B generates byte for byte what one GPU
+does in every row of the stage test (two and three stages, graphs and eager, staged transport,
+uneven layers, MTP), and suspends and resumes with its prefix reuse intact. The Windows-only options
 (`NINFER_D3D12_RESIDENCY`, `NINFER_DIRECTSTORAGE`) pass a syntax check against Windows headers
 and have not been run.
 
