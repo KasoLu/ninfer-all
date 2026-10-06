@@ -69,6 +69,15 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     std::abort();
 }
 
+int memory_device(const void* pointer) {
+    if (pointer == nullptr) { return -1; }
+    cudaPointerAttributes attributes{};
+    CUDA_CHECK(cudaPointerGetAttributes(&attributes, pointer));
+    return attributes.type == cudaMemoryTypeDevice || attributes.type == cudaMemoryTypeManaged
+               ? attributes.device
+               : -1;
+}
+
 DeviceBinding::DeviceBinding(int device) {
     const cudaError_t get = cudaGetDevice(&previous_);
     if (get != cudaSuccess) {

@@ -358,6 +358,9 @@ private:
     DeviceKVPagePoolSpec spec_;
     std::vector<Tensor> planes_;
     std::vector<std::size_t> plane_ranks_;
+    // The device holding each plane: its copies and memsets run with that device current
+    // (HoldingDeviceBinding).
+    std::vector<int> plane_devices_;
     std::size_t rank_count_ = 1;
     std::vector<KVPageRun> free_page_runs_;
     std::vector<std::uint32_t> page_generations_;

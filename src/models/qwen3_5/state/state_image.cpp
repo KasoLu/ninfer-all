@@ -320,6 +320,10 @@ StateImageDevicePool::StateImageDevicePool(std::span<const DeviceSpan> backings,
     if (layout.shards.empty() || layout.shards.size() != layout.linear.size()) {
         throw std::invalid_argument("StateImage shard inventory is inconsistent");
     }
+    rank_devices_.reserve(backings.size());
+    for (const DeviceSpan& backing : backings) {
+        rank_devices_.push_back(memory_device(backing.data));
+    }
     linear_.reserve(layout.shards.size());
     for (std::size_t index = 0; index < layout.shards.size(); ++index) {
         if (layout.shards[index].rank >= backings.size()) {
@@ -393,8 +397,10 @@ const CyclicKVCache* StateImageDevicePool::dflash_local() const noexcept {
 void StateImageDevicePool::zero_slot(std::int32_t slot, RankStreams streams) {
     validate_slot(slot, slot_count(), "StateImage zero slot is out of range");
     for (std::size_t index = 0; index < linear_.size(); ++index) {
+        const HoldingDeviceBinding bind(rank_devices_[shards_[index].rank]);
         linear_[index]->zero_slot(slot, streams[shards_[index].rank]);
     }
+    const HoldingDeviceBinding bind(rank_devices_[0]);
     const cudaStream_t stream = streams[0];
     const Tensor hidden       = continuation_hidden_slot(slot);
     CUDA_CHECK(cudaMemsetAsync(hidden.data, 0, hidden.bytes(), stream));
@@ -411,8 +417,10 @@ void StateImageDevicePool::zero_slot(std::int32_t slot, RankStreams streams) {
 
 void StateImageDevicePool::zero_all(RankStreams streams) {
     for (std::size_t index = 0; index < linear_.size(); ++index) {
+        const HoldingDeviceBinding bind(rank_devices_[shards_[index].rank]);
         linear_[index]->zero_all(streams[shards_[index].rank]);
     }
+    const HoldingDeviceBinding bind(rank_devices_[0]);
     const cudaStream_t stream = streams[0];
     CUDA_CHECK(cudaMemsetAsync(continuation_hidden_.data, 0, continuation_hidden_.bytes(), stream));
     if (dflash_local_) {
@@ -430,8 +438,10 @@ void StateImageDevicePool::copy_slot(std::int32_t source, std::int32_t destinati
     validate_slot(destination, slot_count(), "StateImage copy destination is out of range");
     if (source == destination) { return; }
     for (std::size_t index = 0; index < linear_.size(); ++index) {
+        const HoldingDeviceBinding bind(rank_devices_[shards_[index].rank]);
         linear_[index]->copy_slot(source, destination, streams[shards_[index].rank]);
     }
+    const HoldingDeviceBinding bind(rank_devices_[0]);
     const cudaStream_t stream       = streams[0];
     const Tensor source_hidden      = continuation_hidden_slot(source);
     const Tensor destination_hidden = continuation_hidden_slot(destination);
@@ -444,6 +454,7 @@ void StateImageDevicePool::copy_slot(std::int32_t source, std::int32_t destinati
 
 void StateImageDevicePool::copy_dflash_local(std::int32_t source, std::int32_t destination,
                                              RankStreams streams) {
+    const HoldingDeviceBinding bind(rank_devices_[0]);
     const cudaStream_t stream = streams[0];
     validate_slot(source, slot_count(), "StateImage DFlash copy source is out of range");
     validate_slot(destination, slot_count(), "StateImage DFlash copy destination is out of range");
@@ -524,6 +535,7 @@ void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView 
     // Each shard's layers land at their global offsets in the one host image.
     for (std::size_t index = 0; index < linear_.size(); ++index) {
         const cudaStream_t shard_stream = streams[shards_[index].rank];
+        const HoldingDeviceBinding bind(rank_devices_[shards_[index].rank]);
         for (std::uint32_t local = 0; local < linear_[index]->layer_count(); ++local) {
             const std::size_t layer = shards_[index].first_layer + local;
             const Tensor conv       = linear_[index]->conv_slot(local, source);
@@ -539,6 +551,7 @@ void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView 
                 recurrent.data, recurrent.bytes(), cudaMemcpyDeviceToHost, shard_stream));
         }
     }
+    const HoldingDeviceBinding bind(rank_devices_[0]);
     const cudaStream_t stream = streams[0];
     const Tensor hidden       = continuation_hidden_slot(source);
     CUDA_CHECK(
@@ -568,6 +581,7 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
     validate_host_layout(source.layout, source.data);
     for (std::size_t index = 0; index < linear_.size(); ++index) {
         const cudaStream_t shard_stream = streams[shards_[index].rank];
+        const HoldingDeviceBinding bind(rank_devices_[shards_[index].rank]);
         for (std::uint32_t local = 0; local < linear_[index]->layer_count(); ++local) {
             const std::size_t layer = shards_[index].first_layer + local;
             const Tensor conv       = linear_[index]->conv_slot(local, destination);
@@ -584,6 +598,7 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
                 recurrent.bytes(), cudaMemcpyHostToDevice, shard_stream));
         }
     }
+    const HoldingDeviceBinding bind(rank_devices_[0]);
     const cudaStream_t stream = streams[0];
     const Tensor hidden       = continuation_hidden_slot(destination);
     CUDA_CHECK(cudaMemcpyAsync(hidden.data,
@@ -644,6 +659,7 @@ void StateImageDevicePool::copy_to_host_segments(std::int32_t source,
     validate_segments(segments.size(), segment_bytes, host_layout_.image_bytes);
     for_each_host_component(
         source, [&](std::size_t rank, void* device, std::size_t offset, std::size_t bytes) {
+            const HoldingDeviceBinding bind(rank_devices_[rank]);
             split_segments(
                 offset, bytes, segment_bytes,
                 [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t count) {
@@ -678,6 +694,7 @@ void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* co
     for_each_host_component(
         destination, part,
         [&](std::size_t rank, void* device, std::size_t offset, std::size_t bytes) {
+            const HoldingDeviceBinding bind(rank_devices_[rank]);
             split_segments(
                 offset, bytes, segment_bytes,
                 [&](std::size_t segment, std::size_t within, std::size_t done, std::size_t count) {

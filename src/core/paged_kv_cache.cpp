@@ -234,6 +234,7 @@ DeviceKVPagePool::DeviceKVPagePool(std::span<const DeviceSpan> backings,
         checked_i32(spec_.page_group_count, "Paged KV physical page count");
     planes_.reserve(layout.planes.size());
     plane_ranks_.reserve(layout.planes.size());
+    plane_devices_.reserve(layout.planes.size());
     for (std::size_t index = 0; index < layout.planes.size(); ++index) {
         const DeviceKVPlaneLayout& planned = layout.planes[index];
         const KVPlaneGeometry& expected    = spec_.geometry.planes[index];
@@ -259,6 +260,7 @@ DeviceKVPagePool::DeviceKVPagePool(std::span<const DeviceSpan> backings,
         } else if (plane.ne[2] != physical_pages || plane.ne[3] != expected.head_extent) {
             throw std::logic_error("Paged KV HeadMajor plane shape is inconsistent");
         }
+        plane_devices_.push_back(memory_device(plane.data));
         planes_.push_back(plane);
     }
 
@@ -670,6 +672,7 @@ void DeviceKVPagePool::zero_pages(std::span<const DeviceKVPageHandle> pages,
         for (std::size_t plane_index = 0; plane_index < planes_.size(); ++plane_index) {
             const Tensor& plane      = planes_[plane_index];
             const cudaStream_t stream = streams[plane_ranks_[plane_index]];
+            const HoldingDeviceBinding bind(plane_devices_[plane_index]);
             auto* base                = static_cast<unsigned char*>(plane.data);
             if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
                 CUDA_CHECK(cudaMemsetAsync(base + static_cast<std::int64_t>(first) * plane.nb[3], 0,
@@ -693,6 +696,7 @@ void DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPageHandle d
     for (std::size_t plane_index = 0; plane_index < planes_.size(); ++plane_index) {
         const Tensor& plane       = planes_[plane_index];
         const cudaStream_t stream = streams[plane_ranks_[plane_index]];
+        const HoldingDeviceBinding bind(plane_devices_[plane_index]);
         auto* base                = static_cast<unsigned char*>(plane.data);
         if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
             CUDA_CHECK(
@@ -717,6 +721,7 @@ void DeviceKVPagePool::copy_host_run(cudaMemcpyKind kind, std::size_t plane_begi
     for (std::size_t plane_index = plane_begin; plane_index < plane_end; ++plane_index) {
         const Tensor& plane                 = planes_[plane_index];
         const cudaStream_t stream           = streams[plane_ranks_[plane_index]];
+        const HoldingDeviceBinding bind(plane_devices_[plane_index]);
         const HostKVPlaneLayout& host_plane = host.planes[plane_index];
         std::byte* host_plane_base          = host_base + host_plane.offset;
         auto* device_base                   = static_cast<unsigned char*>(plane.data);

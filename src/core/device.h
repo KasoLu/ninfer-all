@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -194,6 +195,23 @@ public:
 
 private:
     DeviceBinding binding_;
+};
+
+// The device whose memory `pointer` addresses, or -1 for memory no device holds.
+[[nodiscard]] int memory_device(const void* pointer);
+
+// Makes the device that holds some memory (memory_device()) current for a scope. Work on memory of
+// a suspendable region has to be issued with its own device current: the region maps its pages for
+// that device alone, so a copy issued with another device current is refused where the devices
+// lack peer access. A -1 device, memory no device holds, leaves the current device alone.
+class HoldingDeviceBinding {
+public:
+    explicit HoldingDeviceBinding(int device) {
+        if (device >= 0) { binding_.emplace(device); }
+    }
+
+private:
+    std::optional<DeviceBinding> binding_;
 };
 
 // One CUDA stream per rank, indexed by rank. An object whose memory lives on several ranks takes one

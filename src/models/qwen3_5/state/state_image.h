@@ -232,6 +232,9 @@ private:
     void for_each_host_component(std::int32_t slot, StateImagePart part, Visit&& visit) const;
 
     std::vector<StateImageShard> shards_;
+    // The device holding each rank's backing: a rank's copies and memsets run with that device
+    // current (HoldingDeviceBinding).
+    std::vector<int> rank_devices_;
     std::vector<std::unique_ptr<LinearAttentionStatePool>> linear_;
     Tensor continuation_hidden_;
     std::optional<CyclicKVCache> dflash_local_;

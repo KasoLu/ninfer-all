@@ -74,7 +74,8 @@ filled to it, both models find two of the three needles.
   the card from 7.9 GiB in use to 0.3 GiB (the CUDA context) in 0.33 s, and a resume takes 1.1 s,
   almost all of it the weights read again from a warm page cache (0.8 s with `--suspend-weights
   host`). Greedy output and prefix reuse are identical before and after, on one device, across
-  pipeline stages, with MTP, with the hybrid prefix cache and with overlay Vision. See
+  pipeline stages (also on two RTX 4090s without peer access, where suspending the second stage's
+  state used to fail), with MTP, with the hybrid prefix cache and with overlay Vision. See
   [Model suspend](docs/serving.md#model-suspend).
 - **Several models behind one server.** Started with `--models-dir` or a llama.cpp-style
   `--models-preset` INI instead of an artifact, `ninfer-serve` is a router with llama.cpp's API:
