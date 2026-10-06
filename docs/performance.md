@@ -571,9 +571,9 @@ unaffected). An earlier revision of this table carried the pre-fix scores, inclu
 +0.36%.
 The `rk4v4` row comes from a later session and build (2026-09-23), where `int8` measured 4.343155,
 `rk8v4` 4.347943 and `nvfp4` 4.353589, and `rk4v4` decoded within ±1% of `rk8v4` at 4K-32K; its
-figures are stated against those rather than this table's. See the README's
-[`rk4v4` section](../README.md#lloyd-max-4-bit-keys-rk4v4).
-See [the README](../README.md#choosing-a-kv-format) for the fuller writeup and recommendations.
+figures are stated against those rather than this table's. The
+[`rk4v4` release notes](../RELEASE_NOTES_0.12.0.md#new-kv-format-rk4v4--nvfp4s-size-rk8v4s-speed-115)
+have its full writeup, and [Context and memory](cli.md#context-and-memory) the recommendations.
 
 **Not built: `rk2v4-e8` (2-bit E8 root keys).** The sibling RTX 4090 forks ship an `rk2v4-e8` mode:
 keys as one E8 root index, a 4-bit log radius and a 4-bit axis correction per 8 dimensions, about
