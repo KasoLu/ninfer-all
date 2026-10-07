@@ -1,4 +1,5 @@
 #include "serve/serve_options.h"
+#include "product/ngram_table_options.h"
 #include "product/post_thinking_options.h"
 #include "product/rope_yarn_options.h"
 #include "product/speculative_options.h"
@@ -108,15 +109,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                and streamed into the device expert cache\n"
            "  --expert-cache-mib N|auto     with host or disk experts: device memory for the\n"
            "                                most used experts (default auto: what is free;\n"
-           "                                0 turns the host cache off; disk needs one)\n"
-           "  --ngram-table PATH            Qwen3.8-Flash-Next: the n-gram table artifact,\n"
-           "                                for a model published without its table\n"
-           "  --ngram-ram                   Qwen3.8-Flash-Next: load the n-gram table into\n"
-           "                                RAM instead of reading its rows from the file\n"
-           "  --no-ngram-table              Qwen3.8-Flash-Next: run without the n-gram table.\n"
-           "                                Non-standard experimental mode: the model was\n"
-           "                                trained with the table and degrades badly\n"
-           "                                without it (WikiText-2 perplexity 2.66 -> 5.01)\n"
+           "                                0 turns the host cache off; disk needs one)\n" +
+           std::string(ninfer::product::kNgramTableHelp) +
            "  --no-cuda-graph               decode without CUDA Graphs (on by default)\n"
            "  --cuda-graph-allowance-mib N  CUDA Graph driver-state allowance taken from the\n"
            "                                KV sizing budget (default 0: computed per\n"
@@ -994,16 +988,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             continue;
         }
-        if (arg == "--ngram-table") {
-            options.ngram_table.path = require_value("--ngram-table");
-            continue;
-        }
-        if (arg == "--ngram-ram") {
-            options.ngram_table.ram = true;
-            continue;
-        }
-        if (arg == "--no-ngram-table") {
-            options.ngram_table.disabled = true;
+        if (product::parse_ngram_table_option(arg, options.ngram_table,
+                                              [&] { return require_value(arg.c_str()); })) {
             continue;
         }
         if (arg == "--stage-layers") {

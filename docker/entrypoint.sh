@@ -4,8 +4,8 @@
 #
 #   run <model> [profile]     scripts/run.sh: the measured serving profiles (default: run qwen38-27b)
 #   download <model>          scripts/download-model.sh into /models
-#   ninfer | serve | perplexity | calibrate [args]   the binary itself; serve listens on
-#                             NINFER_HOST:NINFER_PORT unless --host/--port are given
+#   ninfer | serve | perplexity | calibrate | ngram-profile [args]   the binary itself; serve
+#                             listens on NINFER_HOST:NINFER_PORT unless --host/--port are given
 #   anything else             executed as given
 #
 # NINFER_IMAGE_ARCH=sm86|sm120a skips detection.
@@ -61,5 +61,6 @@ case "$command" in
     exec "$bin/ninfer-serve" "$@" ${listen[@]+"${listen[@]}"} ;;
   perplexity) exec "$bin/ninfer-perplexity" "$@" ;;
   calibrate) exec "$bin/ninfer-calibrate" "$@" ;;
+  ngram-profile) exec "$bin/ninfer-ngram-profile" "$@" ;;
   *) exec "$command" "$@" ;;
 esac

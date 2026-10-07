@@ -473,14 +473,43 @@ enum class ExpertResidency : std::uint8_t {
     Disk,
 };
 
+// Qwen3.8-Flash-Next: where the n-gram table's rows come from.
+enum class NgramResidency : std::uint8_t {
+    // The table's file: each token's rows are read as the hash addresses them.
+    Disk,
+    // RAM: the whole table is read at startup.
+    Ram,
+    // RAM for the rows a hot-row profile ranks most frequent, as many as the RAM budget holds,
+    // read at startup; the other rows come from the file.
+    RamHot,
+};
+
+// Qwen3.8-Flash-Next: how rows are read from the table's file.
+enum class NgramIo : std::uint8_t {
+    // Positioned reads through the OS page cache.
+    Buffered,
+    // Reads that bypass the page cache (O_DIRECT, FILE_FLAG_NO_BUFFERING): the table takes no
+    // RAM beyond what the residency keeps, and every read reaches the drive.
+    Direct,
+    // Copies out of a read-only mapping of the file, faulted in through the page cache.
+    Mapped,
+};
+
 // The n-gram table of Qwen3.8-Flash-Next's per-layer embedding: the model artifact's own rows, or
-// a separate table artifact holding the table the model names by digest. The rows stay in their
-// file and are read a row at a time.
+// a separate table artifact holding the table the model names by digest.
 struct NgramTableOptions {
     // A table artifact to read the rows from; empty takes the model artifact's own.
     std::filesystem::path path;
-    // Loads the whole table into RAM at startup.
-    bool ram = false;
+    NgramResidency residency = NgramResidency::Disk;
+    NgramIo io               = NgramIo::Buffered;
+    // RamHot: the RAM its rows and their index take at most. Empty takes 4 GiB.
+    std::optional<std::uint64_t> ram_budget_bytes;
+    // RamHot: the hot-row profile (ninfer-ngram-profile) the rows are chosen by.
+    std::filesystem::path hot_profile;
+    // Ram, RamHot: lock the resident rows into physical memory (mlock, VirtualLock).
+    bool lock = false;
+    // Row reads in flight at once.
+    std::uint32_t io_depth = 64;
     // Runs the model without its table: a non-standard, experimental mode that badly degrades the
     // output, since the model was trained with the table.
     bool disabled = false;
@@ -1563,6 +1592,22 @@ struct RuntimeHostWorkStats {
     std::uint64_t stats_publication_invocations = 0;
 };
 
+// Qwen3.8-Flash-Next's n-gram table reads, monotonic. A batch is the rows of one pass; its latency
+// runs from the pass's request to its last row, and latency_histogram[b] counts the batches that
+// took [2^(b-1), 2^b) microseconds (b = 0: under one). A stall is a pass whose stage waited for
+// the rows after the layers before the first PLE layer, and stall_seconds is the device time it
+// waited.
+struct NgramTableStats {
+    static constexpr std::size_t kLatencyBuckets = 24;
+    std::uint64_t rows                           = 0; // rows the passes addressed
+    std::uint64_t resident_rows                  = 0; // of them, served from RAM
+    std::uint64_t batches                        = 0;
+    double read_seconds                          = 0.0; // latency summed over the batches
+    std::array<std::uint64_t, kLatencyBuckets> latency_histogram{};
+    std::uint64_t stalls = 0;
+    double stall_seconds = 0.0;
+};
+
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
@@ -1702,6 +1747,7 @@ struct RuntimeStats {
     // Host-side failures the worker survived by failing the in-flight requests and clearing the
     // context cache instead of latching the Engine unavailable.
     std::uint64_t engine_recoveries = 0;
+    NgramTableStats ngram_table;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

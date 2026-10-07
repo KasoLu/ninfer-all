@@ -12,8 +12,9 @@ embedding (PLE), byte for byte the same in every release, the Coder build's incl
 model artifact describes the table it reads in its `ngram` component (the hash constants, the row
 format and the SHA-256 of the rows) and either stores the rows too, as one self-contained file, or
 leaves them to a table artifact of their own that every Flash-Next model can share. Nothing reads
-the table at load; each token reads the 16 rows it addresses from the file, or `--ngram-ram` loads
-the table into RAM. A model stored without its rows takes them from `--ngram-table PATH`, which
+the table at load; each token reads the 16 rows it addresses from the file, unless the table, or the
+part of it a profile ranks most used, is loaded into RAM ([the n-gram rows](#the-n-gram-rows)). A
+model stored without its rows takes them from `--ngram-table PATH`, which
 must hold the table the model names; without a table the engine refuses to start
 ([running without it](#without-the-n-gram-table) is an experiment, not a mode).
 
@@ -27,10 +28,9 @@ The published conversions store the models without the table, which is published
 | [Coder IQ1_M](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GSQ-RCO-Coder-IQ1_M-NInfer-v3) | 28.42 GiB | 256 experts per layer, with the Vision tower |
 
 The model runs with up to eight concurrent requests, a context cache of prompt prefixes, structured
-output, and images and video through its Vision tower (`--vision`, from an artifact converted with
-the tower). MTP drafting is not available yet: no GSQ-RCO release carries the MTP layer, and the engine
-does not read the MTP modules published separately. The [plan](maintainer/qwen3-8-flash-next-plan.md)
-records what MTP needs here and what other engines measured with it.
+output, images and video through its Vision tower (`--vision`, from an artifact converted with the
+tower), and MTP speculative decoding (`--spec mtp`, from an artifact converted with the MTP block,
+which no GSQ-RCO release carries: it comes from Unsloth's MTP GGUFs, see [MTP](#mtp-speculative-decoding)).
 
 ## Convert
 
@@ -67,6 +67,25 @@ the model records the digest of the table it reads whether or not it stores the 
 `mmproj-Qwen3.8-Flash-Next-BF16.gguf` (`--source vision=PATH`): the same tower as Qwen3.5/3.6
 (27 blocks of width 1152, merging 2×2 patches onto the text model's 2,560), kept in BF16, 0.9 GB.
 `--model` then also needs `preprocessor_config.json` and `video_preprocessor_config.json`.
+
+`--components text,mtp` (with or without `ngram` and `vision`) adds the MTP block from one of
+Unsloth's MTP GGUFs (`--source mtp=PATH`; [`unsloth/Qwen3.8-Flash-Next-GGUF`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF),
+folder `MTP/`, a `shared-` file, which borrows the model's token embedding and head):
+
+```bash
+python3 -m tools.convert --model /path/to/Qwen3.8-Flash-Next \
+  --recipe qwen3_8_flash_next_gguf --components text,ngram,mtp \
+  --source gguf=/path/to/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf \
+  --source ngram=/path/to/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf \
+  --source mtp=/path/to/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+  --device cpu --rows-per-chunk 65536 \
+  --name qwen3.8-flash-next --out models/flash-next-q2_0-mtp.ninfer
+```
+
+The block keeps its matrices in the GGUF's blocks and its 512 experts, also beside the Coder
+build's 256; its norms drop their stored `1 + w`, and its hyper-connection matrices, which the
+`shared-Q8_0` file stores quantized, are decoded to BF16, the form their kernels read. The
+`shared-Q8_0` block adds 2.8 GB to the model.
 
 Every matrix keeps the block type the release chose (see [GGUF block formats](gguf.md)); the expert
 banks keep the exporter's expert-major layout, so one expert is one contiguous range of bytes. The
@@ -105,7 +124,11 @@ the same options, and the Docker image's `serve` command takes them with the fil
 | `--expert-residency device\|host\|disk` | expert banks in the stage devices' memory (default); in page-locked host memory that the expert kernels read across the bus; or left in the artifact's files, each layer's routed experts read into a device cache before they run |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts: `auto` (default) takes what each device has free after startup less a margin; `0` disables the host-mode cache (disk mode needs one) |
 | `--ngram-table PATH` | the table artifact to read the n-gram rows from; required for a model stored without its table, and it must hold the table the model names (same SHA-256 and row format) |
-| `--ngram-ram` | load the 28.8 GB n-gram table into RAM instead of reading the 16 rows each token needs from its file |
+| `--ngram-residency disk\|ram\|ram-hot` | where the n-gram rows come from: the table's file, 16 rows a token (default); the whole 28.8 GB table in RAM; or the rows a hot-row profile ranks first in RAM and the rest from the file ([the n-gram rows](#the-n-gram-rows)) |
+| `--ngram-io buffered\|direct\|mmap` | how rows are read from the file: positioned reads through the OS page cache (default), reads past it (`O_DIRECT`, `FILE_FLAG_NO_BUFFERING`), or copies out of a mapping |
+| `--ngram-io-depth N` | row reads in flight (1 to 1024, default 64) |
+| `--ngram-hot-profile PATH`, `--ngram-ram-mib N` | `ram-hot`: the profile `ninfer-ngram-profile` writes, and the RAM its rows and their index take (default 4096 MiB) |
+| `--ngram-lock` | `ram`, `ram-hot`: lock the resident rows in physical memory (`mlock`, `VirtualLock`; needs the memlock limit or the privilege) |
 | `--no-ngram-table` | run without the n-gram table: see [below](#without-the-n-gram-table) |
 | `--devices A,B,...` | one pipeline stage per GPU; layers are split so that every stage holds about the same stored bytes (`--stage-layers` overrides) |
 
@@ -114,8 +137,38 @@ per-request state and the expert cache; the host needs the expert banks in page-
 (34 GB for Q2_0). With disk experts the host needs no copy of the banks at all: the expert cache
 reads the missing experts from the artifact's files through the OS page cache, eight reads in
 flight, into a 256 MB page-locked staging ring, so the page cache keeps whatever the system can
-spare and the rest comes from the disk. The n-gram rows are read the same way unless `--ngram-ram`
-is given.
+spare and the rest comes from the disk.
+
+### The n-gram rows
+
+A pass reads the 16 rows each of its tokens addresses (2.5 KiB a token in IQ4_NL) as soon as it
+has hashed them, `--ngram-io-depth` reads at once, and uploads them just before the PLE layer
+(block 1): the GPU embeds the tokens and runs block 0 while the rows are read, and waits only if
+the read takes longer. `--ngram-io` chooses how the file is read. `buffered` (the default) goes
+through the OS page cache, which then keeps a 4 KiB page for each row it read; `direct` bypasses the
+cache, so the table takes no RAM and every row is a read from the drive; `mmap` copies the rows out
+of a read-only mapping of the file.
+
+`--ngram-residency ram` reads the whole table into RAM at startup (2 MiB pages where Linux offers
+them), and `ram-hot` reads only the rows a hot-row profile ranks most used, as many as
+`--ngram-ram-mib` holds beside their index (a bit per table row, 40 MiB), and reads the rest from
+the file as `disk` does. A row depends on its token and the two before it and nothing else, so a
+profile is counted from text alone, without running the model:
+
+```bash
+# Count the rows a corpus addresses: UTF-8 files, or .jsonl with a "text" or chat "messages" per line.
+./build/apps/ninfer-ngram-profile models/flash-next-q2_0.ninfer --out models/flash-next.hot \
+  corpus/*.jsonl
+# The share of a held-out corpus's row reads the profile's leading rows serve, per RAM budget.
+./build/apps/ninfer-ngram-profile models/flash-next-q2_0.ninfer --evaluate models/flash-next.hot \
+  heldout/*.jsonl
+./build/apps/ninfer-serve models/flash-next-q2_0.ninfer --ngram-table models/flash-next-ngram-table.ninfer \
+  --ngram-residency ram-hot --ngram-hot-profile models/flash-next.hot --ngram-ram-mib 4096
+```
+
+`--ngram-lock` keeps the resident rows in physical memory. `/stats` reports the rows the passes
+read, how many RAM served, the read latency and the time the PLE layer waited
+([Stats](serving.md#structured-request-log)), and `ninfer` prints them after its answer.
 
 ### Without the n-gram table
 
@@ -153,6 +206,16 @@ Either way only the new tokens are prefilled; the response's prompt summary repo
 reused. A request goes to the free sequence that holds the longest such prefix of its prompt.
 `--no-prefix-reuse` (ninfer-serve) prefills every prompt from scratch.
 
+What a sequence gives up for a new request (its turn-closure snapshot and the state it ended in,
+each of 128 tokens or more) is kept as an image in pinned host memory: the paged KV and pooled keys
+of its positions, its recurrent state, and the MTP block's, about 114 MB plus 26 KiB a position in
+BF16 KV. A prompt that continues a kept prefix further than any free sequence resumes from its
+image, copied back into a sequence. `--host-kv-mib` (or `--host-cache-mib`) is the budget, 8 GiB by
+default; past it the least recently used images go to the disk tier with `--disk-kv-path DIR`
+(`--disk-kv-gib`, 64 by default), one file each under a directory per artifact, KV format and MTP
+use, or are dropped without one. With `--disk-kv-restore` a prompt also resumes from an image on
+disk, which a later run finds there too.
+
 Structured output (`--structured-output` for the server, `--json`/`--json-schema` for the CLI) works
 as for the Qwen3.5 family: the grammar's token mask applies to every sampled token. So do
 [token log probabilities](serving.md#token-log-probabilities): a request that asks gathers each
@@ -165,6 +228,32 @@ chunk, and their merged embeddings replace those tokens' embeddings. A media pro
 positions on the three RoPE axes the frontend computes (text positions on all three, then each
 later token at its index plus the prompt's offset); it prefills in a pass of its own and is not
 kept for reuse by the context cache.
+
+### MTP speculative decoding
+
+`--spec mtp --draft-tokens N` (1 to 15) decodes with the MTP block of an artifact converted with it
+([Convert](#convert)); without the block the engine refuses to start. Every decoding request then
+runs rounds: the MTP block (one more sparse-attention layer with its own 512-expert MoE, its own
+final mixer and the model's head) drafts N tokens greedily from the stack the model left at the
+request's last position, the model verifies the last sampled token and the N drafts in one pass,
+and the acceptance keeps the drafts the model's own sampling agrees with, then one token sampled
+from the model at the first disagreement (or after the last draft). The acceptance samples as the
+request does (greedy, temperature and top-k/top-p/min-p, presence and frequency penalties counting
+the drafts kept before each position, the grammar's masks, logprobs from each position's own
+distribution), so the output follows the model's distribution; greedy output is the plain decode's.
+
+The verification leaves the sequence's state where it was: each Gated DeltaNet layer records its
+transitions and the commit replays the kept ones into the state (the Qwen3.5 family's ReplaySSM
+fold), the sparse-attention indexer's tail and the PLE convolution history advance over the kept
+positions from what the verification recorded, and the n-gram context is hashed again over them.
+The MTP block follows every token the model takes in (prompt chunks too), with a KV cache of its own
+the size of one sparse-attention layer's (2 KiB a position in BF16), so a request can draft as soon
+as its prompt is in, a prefix the context cache restores included. Up to eight requests run their
+rounds together, one MTP pass for all of them per draft and one verification pass. A request
+decodes without drafts when its prompt has media, near the end of its context, and while a
+`--post-thinking` request still reasons. N-gram copy proposals (`--ngram-draft-tokens`) are not
+available for this model; `--lookup-ngram`, `--adaptive-mtp`, `--mtp-attention-window` and
+`--lm-head-draft` are refused.
 
 ## Execution
 
@@ -195,6 +284,10 @@ kept for reuse by the context cache.
   second decode step; the token's position reaches the sparse-attention kernels in device memory.
   Disk experts need the host between a layer's routing and its experts, so their steps stay eager.
   `--no-cuda-graph` decodes eagerly everywhere.
+- With MTP, a verification of one request (at most eight tokens, so its experts take the vector
+  products) replays graphs of its own the same way, and so does the draft chain of one request on
+  one GPU with its experts there; several requests' rounds, the MTP catch-up and disk experts run
+  eagerly.
 
 ## Measurements
 
@@ -277,6 +370,28 @@ The short answer is 78 tokens for Q2_0, and 87 (PRO 6000) or 81 (RTX 5090) for I
 | RTX 5090, experts on disk, the files in the page cache | IQ3_S | 29.9 GiB | 1.1 GiB + page cache | 55.3 tok/s | 44.3 tok/s | 439 tok/s |
 | RTX 5090, experts on disk, the files' pages evicted every second | Q2_0 | 29.9 GiB | 1.0 GiB | 25.3 tok/s | 28.7 tok/s | 694 tok/s |
 | RTX 5090, experts on disk, the files' pages evicted every second | IQ3_S | 29.9 GiB | 1.1 GiB | 18.8 tok/s | 14.9 tok/s | 171 tok/s |
+
+**MTP.** The Q2_0 release with Unsloth's `shared-Q8_0` MTP block, converted into one file with its
+table, on two RTX 3090s (350 W, PCIe 4.0 x16, one GPU per socket of an EPYC 7663 host with 629 GB
+of RAM, no peer access), 2026-10-07: greedy decoding of a 117-token answer to a 37-token coding
+prompt, two runs each. Every speculative output is the plain decode's, token for token.
+
+| Placement | Drafts | Decode | Drafts accepted | Tokens a round |
+|---|---:|---:|---:|---:|
+| 2× RTX 3090, experts on the GPUs | none | 92.9-93.0 tok/s | | |
+| 2× RTX 3090, experts on the GPUs | 1 | 130.1-130.9 tok/s | 96.6% | 1.97 |
+| 2× RTX 3090, experts on the GPUs | 2 | 150.3-150.5 tok/s | 91.5% | 2.83 |
+| 2× RTX 3090, experts on the GPUs | 3 | 167.8-171.0 tok/s | 95.6% | 3.87 |
+| 2× RTX 3090, experts on the GPUs | 4 | 171.9-173.6 tok/s | 91.0% | 4.64 |
+| RTX 3090, experts in pinned host memory | none | 39.3-44.1 tok/s | | |
+| RTX 3090, experts in pinned host memory | 3 | 47.4-49.4 tok/s | 95.6% | 3.87 |
+
+Before verification and drafting replayed CUDA graphs the same runs decoded at 89.5-90.7 tok/s plain
+(128.3-128.9, 146.2-147.9, 165.9-166.5 and 167.3-169.0 with one to four drafts). Coding answers are what MTP drafts best; a prose answer (80 tokens on the water cycle) keeps 38.6% of three drafts, 2.16 tokens a round, and decodes at 91.6 tok/s, no faster than without drafts.
+With host experts a verification's four columns route to up to four times as many experts, each
+missing one crossing the bus, so three drafts gain about 12% (three runs each, pinned to the GPU's NUMA node). The first prompt after startup
+prefills in 102-121 ms (379-406 ms before the startup warm-up, which loads the
+kernels the first request would otherwise load).
 
 **Device expert cache.** With host or disk experts the device expert cache takes the memory the GPU
 has free, and the generate test answers its prompts right after the load. The rows therefore

@@ -36,8 +36,9 @@ HF repository, and Strata is github.com/Niko1221/Strata (MIT).
 
 | M5 | the n-gram table described by every model and stored inside it or in a table artifact of its own, refused when missing or different; up to eight concurrent requests with batched decode (the experts read once per batch), FIFO admission between prefill chunks; the context cache's live and turn-closure reuse of a sequence's recurrent state; structured output through the grammar's token masks; the Qwen3.5 Vision tower from the release's mmproj with three-axis RoPE for media prompts | `src/models/qwen4_exp/ngram_component.*`, `executor.*`, `src/runtime/engine/qwen4_exp_core.*`, `tools/convert/qwen4_exp_gguf.py` |
 
-Not started: NInfer's own quantized expert formats, the RadixArk NVFP4 checkpoint, the context cache's disk KV tier,
-and MTP, which needs the BF16 checkpoint's MTP layer: no GSQ-RCO GGUF release carries one. The sparse-attention layers'
+| M5 | MTP speculative decoding (October 2026): the `mtp` component from Unsloth's MTP GGUFs (`eh_proj` split between blocks into `fc_embedding` and `fc_hidden`, hyper-connections decoded to BF16); the MTP block's own sparse-attention KV, pooled keys and indexer tail, its catch-up over every token the model commits; verification of every decoding request's anchor and drafts in one pass, Gated DeltaNet replay records and their fold, the indexer tails and the PLE history advanced over the kept positions (`ple_inject_record`, `ple_history_advance`); the Qwen3.5 family's acceptance (`speculative_accept_greedy_drafts`) with penalties, grammar masks and logprobs; the context cache's sequence images (KV, pooled keys, recurrent and MTP state) in pinned host memory and in disk files | `tools/convert/qwen4_exp*.py`, `src/models/qwen4_exp/{model,executor}.*`, `src/runtime/engine/qwen4_exp_core.*`, `src/ops/{hyper_connection,ple_inject}/` |
+
+Not started: NInfer's own quantized expert formats and the RadixArk NVFP4 checkpoint. The sparse-attention layers'
 KV takes every `--kv-dtype` format since October 2026.
 
 ### What the milestones left (October 2026)
@@ -46,8 +47,8 @@ KV takes every `--kv-dtype` format since October 2026.
 |---|---|---|
 | M2 | the quality recipe from the BF16 checkpoint (`qwen3_8_flash_next`, Q4/Q5 experts), the FP8 row-scale n-gram table writer from the BF16 row shards, the `q2_g64_fp16` format, the MTP range-fetch helper, `--layers a..b` slice artifacts | Q2_0 experts run as the stored `gguf_q2_0` blocks; the slice test fetches its tensors with `tools/reference/fetch_slice.py` |
 | M3 | NInfer's own expert formats and their A8 routes | the expert banks keep the releases' GGUF blocks. Done since: the QSA layers' KV in all nine `--kv-dtype` formats (`sparse_softmax_attention` decodes them, October 2026) |
-| M5 | MTP: the draft layer with its own QSA KV, multi-column verify with ReplaySSM records, pooled-key rollback and PLE history snapshots, commit and abort, verify-width graphs; the pooled-key plane in the Host and disk tiers | done: decode graphs, prefix reuse with live and turn-closure states, structured output, Vision, up to eight requests |
-| M6 | `ram-hot`, the hot-row profile tool, the I/O mode and depth options, io_uring/IOCP, draft lookahead, `/stats` I/O counters | shipped: positioned reads from the file, several rows in flight, and `--ngram-ram` |
+| M5 | a needle past 32K positions (the generate test's needle sits at 4,463) | done: MTP with its own KV and catch-up, multi-column verification with ReplaySSM records and their fold, verification and draft graphs, the indexer tail and PLE history advanced over the kept positions, the Host and disk tiers of the context cache (sequence images with the pooled keys), decode graphs, prefix reuse with live and turn-closure states, structured output, Vision, up to eight requests; long-context perplexity over 65,536-position windows agrees with llama.cpp |
+| M6 | io_uring/IOCP (threads issue the reads), reads started from the drafts or one prompt chunk ahead, `WILLNEED` hints for draft candidates, a user-space row cache for `disk`, a profile shipped in the table artifact | shipped: `--ngram-residency disk\|ram\|ram-hot`, `--ngram-io buffered\|direct\|mmap`, `--ngram-io-depth`, `--ngram-ram-mib`, `--ngram-lock`, the hot-row profile tool (`ninfer-ngram-profile`), rows read while the layers before the PLE layer run, `/stats` row counters with the PLE layer's stall time |
 | M7 | a recorded byte-identity check of a split against one card | the generate test and perplexity ran on two RTX 3090 Ti, two RTX 4090 and two RTX 5090 |
 | M8 | the hybrid MoE with CPU expert compute (doorbell, CPU kernels, DMA share) | shipped instead: host experts with a device expert cache and disk experts streamed into it, every expert computed on the GPU |
 | M9 | A8 int8 MoE prefill, the fused HC write and read, multi-column verify forms, BF16 pooled keys, indexer prefill MMA, expert-cache tuning options | done: wide MoE calls through ggml's matrix kernel, wide HC reads as cuBLAS GEMMs, decode-width GEMVs, spread sparse attention and block scoring, parallel disk reads, host-expert prefill from device slots |
@@ -75,9 +76,27 @@ uncached experts across the bus, so the gain shrinks with the cache's miss rate;
 up holding nearly every expert, it should approach the device figure. These are estimates from the byte counts, not
 measurements.
 
-What MTP needs here is M5's speculative half above, plus an `mtp` component in the converter (from the BF16 tensors or
-an MTP GGUF) and the MTP layer's KV and state in the Program, StateImages and context cache. Rank 0 keeps the MTP
-layer and head under a `--devices` split, as the qwen3_5 family does.
+**Built (October 2026).** The `mtp` component comes from Unsloth's `shared-` MTP GGUFs (block 48, `nextn.*`); its
+norms are stored as `1 + w` (their `w` is BF16-exact, checked on the `shared-Q8_0` file), `eh_proj` is
+`[fc_embedding | fc_hidden]` with the embedding's columns first and splits between blocks, and its hyper-connection
+matrices are Q8_0 there, decoded to BF16 for the HC kernels. The hidden norm follows vLLM: one RMSNorm over all 10240
+values of a cell (llama.cpp normalises per stream). The block runs on the head rank (the last stage); a split looks
+the token embedding up on rank 0 and copies the rows over. Its cells are vLLM's: cell i pairs the target's pre-mixer
+stack of position i with token i + 1 and rotates at i; the executor advances it over every token the model commits
+(prompt chunks, plain decode steps, verified prefixes) and keeps the stack of the last committed position for the
+next cell. Drafting is greedy over the public tokens, with the block's QSA run on scratch copies of its indexer tails
+(a catch-up redoes those cells), each step selecting its own blocks rather than reusing step 0's. A round verifies
+every speculating request's anchor and drafts in one target pass whose Gated DeltaNet layers record their
+transitions (`gated_delta_net_replay_record`, the convolution's raw input in the record) and whose QSA indexers and
+PLE layer work on scratch state; the commit folds the kept transitions (`GdnReplayFoldPlan`), appends the kept
+positions' recorded indexer projections to the live tails, advances the PLE history over the recorded convolution
+input, hashes the n-gram context over the kept tokens and runs the MTP catch-up. Pooled keys and KV written for
+rejected positions stay where they are: no query reads a block or a position past its own before the sequence
+writes it again. A verification of one request replays a graph per stage, and so does the draft chain of one
+request on one GPU with its experts there; several requests' rounds, the catch-up and disk experts run eagerly.
+Measured on two RTX 3090s with every expert on the GPUs (docs/qwen3-8-flash-next.md, Measurements): a 117-token
+coding answer decodes at 92.9-93.0 tok/s plain and 167.8-171.0 tok/s with three drafts (3.87 tokens a
+round), 171.9-173.6 with four; with host experts on one card three drafts gain about 12% (three runs each, pinned to the GPU's NUMA node).
 
 **DFlash and DFlash2.** No DFlash2 drafter exists for this model: z-lab and incoai publish theirs for Qwen3.8-27B,
 Qwen3.6-35B-A3B and other models, not for Flash-Next, and a Reddit thread asking for one (r/LocalLLaMA, September
@@ -571,16 +590,19 @@ lookahead prefetch); an option loads it, or a profile-selected hot part of it, i
   table-less models plus one table repository. A side companion file without a container came first; a single file
   per model replaced it, and the hybrid replaced that so that several published checkpoints share one table.
 
-**Runtime option surface** (CLI and serve config; names follow our `--kebab` convention). **Status:** what
-shipped is the default positioned reads from the file, several rows in flight, and `--ngram-ram` for the whole
-table in RAM, beside `--ngram-table` and `--no-ngram-table`; the residency, I/O, budget, hot-profile, lock and
-depth options planned below were not built:
+**Runtime option surface** (CLI and serve config; names follow our `--kebab` convention). **Status (October
+2026):** built as planned below, with the budget as `--ngram-ram-mib N` (default 4096) and no built-in profile:
+`ram-hot` takes the file `ninfer-ngram-profile` writes. Reads go through a pool of `--ngram-io-depth` threads, not
+io_uring or IOCP; a pass starts its reads when it hashes its tokens and uploads the rows just before the PLE layer, so
+the embedding and block 0 run meanwhile (no reads from the drafts or a chunk ahead, no `WILLNEED` hints); `disk` has
+no user-space row cache, the page cache serving repeats; `ram-hot` keeps its rows in row order behind a bit per table
+row (40 MiB) instead of an open-addressing table, and admits nothing online. The table as planned:
 
 | option | values | default | meaning |
 |---|---|---|---|
 | `--ngram-residency` | `disk`, `ram`, `ram-hot` | `disk` | where rows come from |
 | `--ngram-io` | `buffered`, `direct`, `mmap` | `buffered` | disk mode: `pread` into a bounded row cache through the OS page cache (`posix_fadvise(RANDOM)`; Windows `FILE_FLAG_RANDOM_ACCESS`); `direct` = O_DIRECT / `FILE_FLAG_NO_BUFFERING` 4 KiB-aligned reads that bypass the page cache (Strata's default on Windows: keeps RAM for the expert arena); `mmap` = map + `madvise(MADV_RANDOM)`, prefetch via `madvise(WILLNEED)` / `PrefetchVirtualMemory` |
-| `--ngram-ram-budget GiB` | number | 4 (ram-hot) | resident budget for `ram-hot`; also caps the user-space row cache in `disk` mode |
+| `--ngram-ram-mib N` | number | 4096 (ram-hot) | resident budget for `ram-hot` (planned as `--ngram-ram-budget GiB`, also capping a `disk` row cache that was not built) |
 | `--ngram-hot-profile PATH` | file | built-in profile shipped in the artifact | row-frequency profile for `ram-hot` |
 | `--ngram-lock` | flag | off | `mlock`/`VirtualLock` the resident rows (`ram`, `ram-hot`) |
 | `--ngram-io-depth N` | int | 64 | outstanding reads (io_uring on Linux, overlapped I/O / IOCP on Windows) |

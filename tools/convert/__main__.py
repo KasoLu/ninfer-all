@@ -16,7 +16,7 @@ from .qwen3_5 import build_model as build_qwen3_5
 from .qwen4_exp import _ARCHITECTURES as QWEN4_EXP_ARCHITECTURES
 from .qwen4_exp import build_model as build_qwen4_exp
 from .qwen4_exp_gguf import RECIPES as QWEN4_EXP_GGUF_RECIPES
-from .qwen4_exp_gguf import with_gguf_expert_count
+from .qwen4_exp_gguf import with_gguf_expert_count, with_mtp_expert_count
 from .recipe import Recipe
 from .sources.gguf import GGUFFile
 from .sources.safetensors import SafetensorsSource
@@ -24,10 +24,10 @@ from .gguf_blocks import RECIPES as GGUF_RECIPES
 from .ternary import RECIPES as TERNARY_RECIPES
 
 
-def _open_named_source(name: str, path: Path):
+def _open_named_source(name: str, path: Path, block_sources: frozenset[str]):
     if path.suffix == ".gguf":
         # The ternary and GGUF block recipes read their block formats themselves, without gguf-py.
-        if name in ("ternary", "gguf", "ngram"):
+        if name in block_sources:
             return GGUFFile(path)
         from .sources.gguf_source import GGUFSource
 
@@ -38,10 +38,11 @@ def _open_named_source(name: str, path: Path):
 class SourceInputs(Mapping):
     """Named optional sources are opened only when a recipe or component requests one."""
 
-    def __init__(self, base, paths, stack):
+    def __init__(self, base, paths, stack, block_sources):
         self._sources = {"base": base}
         self._paths = dict(paths)
         self._stack = stack
+        self._block_sources = block_sources
 
     def __getitem__(self, name):
         if name not in self._sources:
@@ -50,7 +51,7 @@ class SourceInputs(Mapping):
                     f"selected recipe requires source {name!r}; provide --source {name}=PATH"
                 )
             self._sources[name] = self._stack.enter_context(
-                _open_named_source(name, self._paths[name])
+                _open_named_source(name, self._paths[name], self._block_sources)
             )
         return self._sources[name]
 
@@ -139,7 +140,7 @@ def main(argv=None):
         help="comma-separated text,vision,mtp,dflash,dflash2 (default text); for "
         "Qwen3.8-Flash-Next text,ngram (the default: the model with its n-gram table), text (the "
         "model alone, its table read from a table artifact at run time) or ngram (that table "
-        "artifact), and vision beside text",
+        "artifact), and vision or mtp (from --source mtp=MTP.gguf) beside text",
     )
     parser.add_argument(
         "--resource",
@@ -172,9 +173,11 @@ def main(argv=None):
     overrides = _pairs(args.resource, "resource")
     with ExitStack() as stack:
         base = stack.enter_context(SafetensorsSource(args.model))
-        sources = SourceInputs(base, paths, stack)
         architectures = base.config.get("architectures") or [None]
         flash_next = architectures[0] in QWEN4_EXP_ARCHITECTURES
+        # Flash-Next's MTP GGUF is read block by block, as its model shard is.
+        block_sources = frozenset(("ternary", "gguf", "ngram") + (("mtp",) if flash_next else ()))
+        sources = SourceInputs(base, paths, stack, block_sources)
         if args.components is None:
             components = ("text", "ngram") if flash_next else ("text",)
         else:
@@ -190,6 +193,9 @@ def main(argv=None):
         if build_model is build_qwen4_exp and "gguf" in paths:
             # An expert-pruned release takes the model's config with its own expert count.
             base.config = with_gguf_expert_count(base.config, paths["gguf"])
+        if build_model is build_qwen4_exp and "mtp" in components and "mtp" in paths:
+            # The MTP block keeps the experts its GGUF holds, whatever the model kept.
+            base.config = with_mtp_expert_count(base.config, paths["mtp"])
         model = build_model(
             base,
             components=components,

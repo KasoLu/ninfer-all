@@ -29,7 +29,8 @@ each format's size and decode speed, are in [`docs/config-calculator.html`](conf
 `ninfer-serve --fast-prefill-kernel` prefills); `report.json` records it as `fast_prefill_kernel`.
 The evaluator also takes the server's `--devices` (one pipeline stage per GPU), its
 Qwen3.8-Flash-Next options (`--expert-residency`, `--expert-cache-mib`, `--ngram-table`,
-`--ngram-ram`, `--no-ngram-table`) and its precision options (`--prefill-cublas`,
+`--ngram-residency`, `--ngram-io`, `--ngram-io-depth`, `--ngram-hot-profile`, `--ngram-ram-mib`,
+`--ngram-lock`, `--no-ngram-table`) and its precision options (`--prefill-cublas`,
 `--lm-head-q4/q6`, `--embedding-q4/q6`, `--gdn-state-fp16`, `--mlp-a8-decode`, `--no-prefill-a8`).
 
 ```bash

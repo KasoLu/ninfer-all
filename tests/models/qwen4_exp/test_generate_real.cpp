@@ -2,13 +2,20 @@
 // pinned host memory or on disk), feed chat prompts and greedy-decode short answers, checking that
 // each answer names the expected fact and reporting prefill and decode throughput. Where decode
 // replays CUDA graphs (experts not on disk), the prompts run again on an eager executor and every
-// generated token must be the same.
+// generated token must be the same. An artifact with its MTP block also decodes the prompts by
+// speculative rounds (MTP drafts, one verification, the greedy run kept, the rest dropped by the
+// commit), alone and two sequences at once: every token must be the plain decode's, since a
+// verification of up to eight tokens computes each the way a decode step does. The context cache's
+// sequence images (live and at a snapshot) must continue as the sequence they were taken from.
 //
 //   NINFER_QWEN4_EXP_ARTIFACT  the model's .ninfer (required; skips without it)
+//   NINFER_QWEN4_EXP_DRAFTS    MTP drafts a round (default 3; 0 skips the speculative check)
 //   NINFER_QWEN4_EXP_DEVICES   comma-separated device ids, one pipeline stage each (default 0)
 //   NINFER_QWEN4_EXP_EXPERTS   device | host | disk (default device)
 //   NINFER_QWEN4_EXP_NGRAM_TABLE  the n-gram table artifact of a model stored without its table
-//   NINFER_QWEN4_EXP_NGRAM_RAM 1 loads the n-gram table into RAM
+//   NINFER_QWEN4_EXP_NGRAM_RESIDENCY  disk | ram | ram-hot (default disk); ram-hot takes the
+//                                     profile NINFER_QWEN4_EXP_NGRAM_PROFILE and 4 GiB of RAM
+//   NINFER_QWEN4_EXP_NGRAM_IO  buffered | direct | mmap (default buffered)
 //   NINFER_QWEN4_EXP_PREFILL_CHUNK  tokens per prefill call (default 512)
 //   NINFER_QWEN4_EXP_EXPERT_CACHE_MIB  host or disk experts: the device expert cache (default: what
 //                                      the devices have free)
@@ -18,6 +25,7 @@
 #include "models/qwen4_exp/executor.h"
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/ngram_component.h"
+#include "models/qwen4_exp/ngram_profile.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -40,6 +48,11 @@ using Clock = std::chrono::steady_clock;
 
 double seconds(Clock::time_point a, Clock::time_point b) {
     return std::chrono::duration<double>(b - a).count();
+}
+
+std::string env_or(const char* name, const char* fallback) {
+    const char* value = std::getenv(name);
+    return value != nullptr ? value : fallback;
 }
 
 std::vector<int> device_list() {
@@ -134,6 +147,13 @@ std::vector<std::vector<int>> generate(const Model& model, DeviceContext& device
         }
         out.push_back(std::move(generated));
     }
+    // The n-gram rows: read per pass, and the time the PLE layer's device waited for them.
+    const NgramTableStats rows = executor.ngram_stats();
+    std::cout << "n-gram rows: " << rows.rows << " in " << rows.batches << " passes, "
+              << rows.resident_rows << " from RAM, "
+              << 1e6 * rows.read_seconds / double(std::max<std::uint64_t>(rows.batches, 1))
+              << " us a pass; " << rows.stalls << " stalls, " << 1e3 * rows.stall_seconds
+              << " ms waited\n";
     return out;
 }
 
@@ -232,6 +252,191 @@ int check_batch_and_snapshot(const Model& model, DeviceContext& device, Executor
     return failures;
 }
 
+// Greedy tokens of one speculative round per step for `sequences` (prefilled, their first tokens
+// in `rows`), until each row holds `steps` tokens: the MTP block drafts from each row's last
+// token, the target verifies the anchor and the drafts, the drafts up to the first that differs
+// from the verification's argmax are accepted with the argmax after them, and the commit keeps the
+// tokens fed up to there. Counts the drafts proposed and accepted.
+// With `wrong`, one draft of each round (a different one each round) is replaced by another
+// token, so rounds keep every number of tokens from one to all.
+void decode_speculative(Executor& executor, const Model& model,
+                        std::span<const std::uint32_t> sequences,
+                        std::vector<std::vector<int>>& rows, int steps, std::uint64_t& drafted,
+                        std::uint64_t& accepted, bool wrong = false) {
+    const std::size_t k      = executor.draft_tokens();
+    const std::size_t w      = k + 1;
+    const std::size_t b      = sequences.size();
+    const std::size_t vocab  = model.config().vocab_size;
+    const std::size_t domain = model.resources().public_token_count;
+    std::vector<__nv_bfloat16> logits(vocab * w * b);
+    for (std::size_t round = 0;; ++round) {
+        std::vector<std::uint32_t> live;
+        std::vector<std::size_t> index;
+        for (std::size_t j = 0; j < b; ++j) {
+            if (int(rows[j].size()) < steps) {
+                live.push_back(sequences[j]);
+                index.push_back(j);
+            }
+        }
+        if (live.empty()) { return; }
+        std::vector<std::int32_t> anchors, proposed(live.size() * k), tokens;
+        for (const std::size_t j : index) { anchors.push_back(rows[j].back()); }
+        executor.draft(live, anchors, proposed);
+        if (wrong && round % (k + 1) < k) {
+            for (std::size_t r = 0; r < live.size(); ++r) {
+                auto& draft = proposed[r * k + round % (k + 1)];
+                draft       = (draft + 1) % static_cast<std::int32_t>(domain);
+            }
+        }
+        for (std::size_t r = 0; r < live.size(); ++r) {
+            tokens.push_back(anchors[r]);
+            tokens.insert(tokens.end(), proposed.begin() + std::ptrdiff_t(r * k),
+                          proposed.begin() + std::ptrdiff_t((r + 1) * k));
+        }
+        executor.verify(live, tokens);
+        const std::size_t columns = live.size() * w;
+        if (cudaStreamSynchronize(executor.head_stream()) != cudaSuccess ||
+            cudaMemcpy(logits.data(), executor.logits(std::uint32_t(columns)).data,
+                       columns * vocab * 2, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            throw std::runtime_error("reading the verification logits failed");
+        }
+        std::vector<std::uint32_t> kept;
+        for (std::size_t r = 0; r < live.size(); ++r) {
+            auto& row       = rows[index[r]];
+            std::size_t col = 0;
+            for (;; ++col) {
+                const std::vector<__nv_bfloat16> column(
+                    logits.begin() + std::ptrdiff_t((r * w + col) * vocab),
+                    logits.begin() + std::ptrdiff_t((r * w + col + 1) * vocab));
+                const int target = argmax(column, domain);
+                row.push_back(target);
+                if (col == k || target != proposed[r * k + col] || int(row.size()) >= steps) {
+                    break;
+                }
+            }
+            drafted += k;
+            accepted += col < k ? col : k;
+            kept.push_back(std::uint32_t(col + 1));
+        }
+        executor.commit(live, kept);
+    }
+}
+
+// Speculative greedy decoding must produce the plain decode's tokens: each prompt alone, then the
+// first two together.
+int check_speculative(const Model& model, DeviceContext& device, ExecutorOptions options,
+                      const std::vector<Prompt>& prompts,
+                      const std::vector<std::vector<int>>& plain) {
+    options.sequences = 2;
+    Executor executor(model, device, options);
+    std::vector<__nv_bfloat16> logits(model.config().vocab_size);
+    int failures          = 0;
+    std::uint64_t drafted = 0, accepted = 0;
+    const auto start   = Clock::now();
+    std::size_t tokens = 0;
+    for (std::size_t i = 0; i < prompts.size(); ++i) {
+        executor.reset(0);
+        std::vector<std::vector<int>> rows{
+            {prefill(executor, model, 0, prompts[i].text, options.prefill_chunk, logits)}};
+        const std::uint32_t sequence = 0;
+        std::uint64_t prompt_drafted = 0, prompt_accepted = 0;
+        decode_speculative(executor, model, std::span(&sequence, 1), rows, int(plain[i].size()),
+                           prompt_drafted, prompt_accepted);
+        drafted += prompt_drafted;
+        accepted += prompt_accepted;
+        tokens += rows[0].size();
+        const bool same = rows[0] == plain[i];
+        std::cout << (same ? "OK   " : "FAIL ") << "speculative decode of prompt " << i << " ("
+                  << prompt_accepted << " of " << prompt_drafted << " drafts accepted): \""
+                  << model.resources().tokenizer->decode(rows[0]) << "\"\n";
+        failures += same ? 0 : 1;
+    }
+    const double elapsed = seconds(start, Clock::now());
+    std::cout << "     " << executor.draft_tokens() << " drafts a round: "
+              << double(accepted) / double(std::max<std::uint64_t>(drafted, 1))
+              << " of the drafts accepted, " << tokens / elapsed
+              << " tok/s over the prompts (prefill included)\n";
+    // Drafts made wrong on purpose, and a speculative continuation from a snapshot: both must
+    // still give the plain decode's tokens.
+    {
+        std::uint64_t ignored = 0, kept = 0;
+        executor.reset(0);
+        const int first =
+            prefill(executor, model, 0, prompts[0].text, options.prefill_chunk, logits);
+        SequenceSnapshot snapshot;
+        executor.snapshot(0, snapshot);
+        const std::uint32_t sequence = 0;
+        std::vector<std::vector<int>> wrong{{first}};
+        decode_speculative(executor, model, std::span(&sequence, 1), wrong, int(plain[0].size()),
+                           ignored, kept, true);
+        const bool same = wrong[0] == plain[0];
+        std::cout << (same ? "OK   " : "FAIL ") << "speculative decode with wrong drafts\n";
+        failures += same ? 0 : 1;
+        executor.restore(0, snapshot);
+        std::vector<std::vector<int>> restored{{first}};
+        decode_speculative(executor, model, std::span(&sequence, 1), restored, int(plain[0].size()),
+                           ignored, kept);
+        const bool again = restored[0] == plain[0];
+        std::cout << (again ? "OK   " : "FAIL ") << "speculative decode from a snapshot\n";
+        failures += again ? 0 : 1;
+    }
+    std::vector<std::vector<int>> rows;
+    for (std::uint32_t s = 0; s < 2; ++s) {
+        executor.reset(s);
+        rows.push_back(
+            {prefill(executor, model, s, prompts[s].text, options.prefill_chunk, logits)});
+    }
+    const std::vector<std::uint32_t> both{0, 1};
+    decode_speculative(executor, model, both, rows, int(std::max(plain[0].size(), plain[1].size())),
+                       drafted, accepted);
+    for (std::uint32_t s = 0; s < 2; ++s) {
+        rows[s].resize(std::min(rows[s].size(), plain[s].size()));
+        const bool same = rows[s] == plain[s];
+        std::cout << (same ? "OK   " : "FAIL ") << "speculative rounds of two sequences, sequence "
+                  << s << "\n";
+        failures += same ? 0 : 1;
+    }
+    return failures;
+}
+
+// The context cache's images: a sequence's live state and the state at an earlier snapshot, saved
+// to host memory and loaded into another sequence, must continue as the original did (greedy
+// tokens identical to the plain decode), the snapshot's after the original moved on.
+int check_images(const Model& model, DeviceContext& device, ExecutorOptions options,
+                 const std::vector<Prompt>& prompts, const std::vector<std::vector<int>>& plain) {
+    options.sequences = 2;
+    Executor executor(model, device, options);
+    std::vector<__nv_bfloat16> logits(model.config().vocab_size);
+    int failures = 0;
+    executor.reset(0);
+    const int first = prefill(executor, model, 0, prompts[0].text, options.prefill_chunk, logits);
+    SequenceSnapshot snapshot;
+    executor.snapshot(0, snapshot);
+    const std::uint32_t position = executor.position(0);
+    std::vector<std::byte> live_bytes(executor.image_bytes(position));
+    std::vector<std::byte> snapshot_bytes(executor.image_bytes(position));
+    // Pageable memory: the copies are synchronous then, which is what the test needs.
+    const SequenceImage live = executor.save_image(0, nullptr, live_bytes);
+    // The original moves on; the snapshot's positions stay as they were.
+    (void)decode_alone(executor, model, 0, first, 8, logits);
+    const SequenceImage earlier = executor.save_image(0, &snapshot, snapshot_bytes);
+    const auto decoded = [&](const SequenceImage& image, std::span<const std::byte> bytes) {
+        executor.reset(1);
+        executor.load_image(1, image, bytes);
+        return decode_alone(executor, model, 1, first, int(plain[0].size()), logits);
+    };
+    for (const auto& [label, tokens] : {std::pair{"live", decoded(live, live_bytes)},
+                                        std::pair{"snapshot", decoded(earlier, snapshot_bytes)}}) {
+        const bool same = tokens == plain[0];
+        std::cout << (same ? "OK   " : "FAIL ") << "sequence image (" << label
+                  << ") continues as the original\n";
+        failures += same ? 0 : 1;
+    }
+    std::cout << "     an image of " << position << " positions is "
+              << double(executor.image_bytes(position)) / 1e6 << " MB\n";
+    return failures;
+}
+
 int run(const char* artifact_path) {
     const auto start   = Clock::now();
     const auto devices = device_list();
@@ -245,7 +450,11 @@ int run(const char* artifact_path) {
     load.experts = residency == "host"   ? ExpertResidency::Host
                    : residency == "disk" ? ExpertResidency::Disk
                                          : ExpertResidency::Device;
-    auto model   = load_model(reader, load, device);
+    const char* drafts_env      = std::getenv("NINFER_QWEN4_EXP_DRAFTS");
+    const std::uint32_t drafts =
+        drafts_env != nullptr ? static_cast<std::uint32_t>(std::stoul(drafts_env)) : 3;
+    load.mtp   = drafts > 0 && reader.directory().components.contains("mtp");
+    auto model = load_model(reader, load, device);
     device.synchronize();
     const auto loaded = Clock::now();
     std::cout << "loaded in " << seconds(start, loaded) << " s: stages";
@@ -265,9 +474,19 @@ int run(const char* artifact_path) {
     const char* table     = std::getenv("NINFER_QWEN4_EXP_NGRAM_TABLE");
     options.ngram         = ngram_table_source(reader, artifact_path, model->config(),
                                                table != nullptr ? table : "");
-    const char* ram       = std::getenv("NINFER_QWEN4_EXP_NGRAM_RAM");
-    options.ngram_residency =
-        ram != nullptr && std::string(ram) == "1" ? NgramResidency::Ram : NgramResidency::Disk;
+    const std::string rows_from  = env_or("NINFER_QWEN4_EXP_NGRAM_RESIDENCY", "disk");
+    const std::string rows_io    = env_or("NINFER_QWEN4_EXP_NGRAM_IO", "buffered");
+    options.ngram_read.residency = rows_from == "ram"       ? NgramResidency::Ram
+                                   : rows_from == "ram-hot" ? NgramResidency::RamHot
+                                                            : NgramResidency::Disk;
+    options.ngram_read.io        = rows_io == "direct" ? NgramIo::Direct
+                                   : rows_io == "mmap" ? NgramIo::Mapped
+                                                       : NgramIo::Buffered;
+    if (options.ngram_read.residency == NgramResidency::RamHot) {
+        const auto profile = read_ngram_profile(env_or("NINFER_QWEN4_EXP_NGRAM_PROFILE", ""));
+        options.ngram_read.hot_rows     = profile.rows;
+        options.ngram_read.budget_bytes = std::uint64_t{4} << 30U;
+    }
     std::cout << "n-gram table: " << options.ngram->layout.rows << " rows of "
               << options.ngram->layout.row_bytes << " bytes in "
               << options.ngram->layout.segments.size() << " file segment(s) of "
@@ -304,6 +523,14 @@ int run(const char* artifact_path) {
     int failures = 0;
     const auto replayed = generate(*model, device, options, prompts, failures);
     failures += check_batch_and_snapshot(*model, device, options);
+    failures += check_images(*model, device, options, prompts, replayed);
+    if (load.mtp) {
+        ExecutorOptions speculative = options;
+        speculative.draft_tokens    = drafts;
+        failures += check_speculative(*model, device, speculative, prompts, replayed);
+    } else {
+        std::cout << "speculative decoding: not checked (no MTP block, or no drafts)\n";
+    }
     if (load.experts != ExpertResidency::Disk) {
         std::cout << "eager decode (no CUDA graphs):\n";
         options.cuda_graphs = false;

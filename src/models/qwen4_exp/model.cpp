@@ -193,6 +193,25 @@ PleWeights bind_ple(Bindings& b, const TextConfig& c, const std::string& p) {
     return out;
 }
 
+MtpWeights bind_mtp(Bindings& b, const TextConfig& c, const MtpConfig& mtp,
+                    ExpertResidency residency) {
+    const std::uint64_t h = c.hidden_size, width = std::uint64_t(c.hc_count) * h;
+    MtpWeights out;
+    out.embedding_norm  = b.direct("mtp/embedding_norm", {h});
+    out.hidden_norm     = b.direct("mtp/hidden_norm", {width});
+    out.fc_embedding    = b.parameter("mtp/fc_embedding", {h, h}, {"mtp/embedding_normalized"});
+    out.fc_hidden       = b.parameter("mtp/fc_hidden", {h, h}, {"mtp/hidden_normalized"});
+    const std::string p = "mtp/layer/";
+    out.layer.attn_hc   = bind_hc(b, c, p + "attn_hc/", true);
+    out.layer.mlp_hc    = bind_hc(b, c, p + "mlp_hc/", true);
+    out.layer.mixer     = bind_attention(b, c, p);
+    TextConfig experts  = c;
+    experts.num_experts = mtp.num_experts;
+    out.layer.moe       = bind_moe(b, experts, p, residency);
+    out.final_mixer     = bind_hc(b, c, "mtp/final_mixer/", false);
+    return out;
+}
+
 // Every parameter a layer owns, which moves with it to its stage.
 std::vector<WeightId> layer_weights(const LayerWeights& layer, bool with_experts) {
     std::vector<WeightId> out;
@@ -221,6 +240,13 @@ std::vector<WeightId> layer_weights(const LayerWeights& layer, bool with_experts
         out.insert(out.end(),
                    {p.key, p.value, p.norm_key, p.norm_query, p.norm_conv, p.convolution});
     }
+    return out;
+}
+
+std::vector<WeightId> mtp_parameters(const MtpWeights& mtp, bool with_experts) {
+    std::vector<WeightId> out = layer_weights(mtp.layer, with_experts);
+    out.insert(out.end(), {mtp.embedding_norm, mtp.hidden_norm, mtp.fc_embedding, mtp.fc_hidden,
+                           mtp.final_mixer.norm, mtp.final_mixer.down, mtp.final_mixer.up});
     return out;
 }
 
@@ -286,14 +312,23 @@ ops::WeightInput Model::input(WeightId id) const {
     if (parameter.uses.size() != 1) {
         throw std::invalid_argument(parameter.name + ": a weight input needs exactly one use");
     }
-    const auto& use = parameter.uses.front();
-    if (use.hadamard_signs) {
+    return input(id, parameter.uses.front().input);
+}
+
+ops::WeightInput Model::input(WeightId id, std::string_view use_name) const {
+    const auto& parameter = weight(id);
+    const auto use        = std::find_if(parameter.uses.begin(), parameter.uses.end(),
+                                         [&](const auto& u) { return u.input == use_name; });
+    if (use == parameter.uses.end()) {
+        throw std::invalid_argument(parameter.name + ": no use " + std::string(use_name));
+    }
+    if (use->hadamard_signs) {
         throw std::invalid_argument(parameter.name +
                                     ": Hadamard-rotated matrices are not supported");
     }
-    ops::WeightInput result{parameter.view, use.policy, use.activation_input_divisor};
-    if (use.input_columns) {
-        result.input_columns = replicas_.on_rank(bound_, *use.input_columns, parameter.rank);
+    ops::WeightInput result{parameter.view, use->policy, use->activation_input_divisor};
+    if (use->input_columns) {
+        result.input_columns = replicas_.on_rank(bound_, *use->input_columns, parameter.rank);
     }
     return result;
 }
@@ -327,14 +362,25 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         }
         vision_config = qwen3_5::parse_vision_config(reader.directory());
     }
+    std::optional<MtpConfig> mtp_config;
+    if (options.mtp) {
+        const auto& components = reader.directory().components;
+        if (!components.contains("mtp")) {
+            throw std::invalid_argument("MTP needs an artifact converted with its MTP block "
+                                        "(--components text,mtp)");
+        }
+        mtp_config = parse_mtp_config(reader.directory().component("mtp").config, config);
+    }
     FrontendResources resources = bind_resources(binder, config, options.vision);
     Bindings b(binder);
 
     TextWeights weights;
     weights.token_embedding =
         b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size});
+    std::vector<std::string> head_uses{"text/final_hidden"};
+    if (mtp_config) { head_uses.emplace_back("mtp/final_hidden"); }
     weights.output_head = b.parameter("text/output_head", {config.vocab_size, config.hidden_size},
-                                      {"text/final_hidden"});
+                                      std::move(head_uses));
     weights.final_mixer = bind_hc(b, config, "text/final_mixer/", false);
     for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
         const std::string p = "text/layers/" + std::to_string(i) + "/";
@@ -355,6 +401,8 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
         }
         weights.layers.push_back(std::move(layer));
     }
+    std::optional<MtpWeights> mtp_weights;
+    if (mtp_config) { mtp_weights = bind_mtp(b, config, *mtp_config, options.experts); }
     // The tower stays on rank 0, with the token embedding its output joins.
     std::optional<qwen3_5::VisionWeights> vision_weights;
     if (vision_config) {
@@ -379,8 +427,12 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
                 layer_bytes.push_back(stored_bytes(b, ids, seen));
             }
             const std::vector<WeightId> first{weights.token_embedding};
-            const std::vector<WeightId> last{weights.output_head, weights.final_mixer.norm,
-                                             weights.final_mixer.down, weights.final_mixer.up};
+            std::vector<WeightId> last{weights.output_head, weights.final_mixer.norm,
+                                       weights.final_mixer.down, weights.final_mixer.up};
+            if (mtp_weights) {
+                const auto mtp = mtp_parameters(*mtp_weights, device_experts);
+                last.insert(last.end(), mtp.begin(), mtp.end());
+            }
             stages = balanced_stages(layer_bytes, stored_bytes(b, first, seen),
                                      stored_bytes(b, last, seen), options.ranks);
         }
@@ -391,10 +443,13 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
             }
         }
         b.place(weights.token_embedding, 0);
-        for (const WeightId id : {weights.output_head, weights.final_mixer.norm,
-                                  weights.final_mixer.down, weights.final_mixer.up}) {
-            b.place(id, stages.stages() - 1);
+        std::vector<WeightId> head{weights.output_head, weights.final_mixer.norm,
+                                   weights.final_mixer.down, weights.final_mixer.up};
+        if (mtp_weights) {
+            const auto mtp = mtp_parameters(*mtp_weights, device_experts);
+            head.insert(head.end(), mtp.begin(), mtp.end());
         }
+        for (const WeightId id : head) { b.place(id, stages.stages() - 1); }
     } else if (!options.stage_layers.empty()) {
         throw std::invalid_argument("--stage-layers needs --devices naming more than one device");
     }
@@ -420,6 +475,8 @@ std::unique_ptr<Model> load_model(const artifact::Reader& reader, const LoadOpti
     model->replicas_       = qwen3_5::AuxiliaryReplicas(model->bound_, device);
     model->vision_config_  = std::move(vision_config);
     model->vision_weights_ = std::move(vision_weights);
+    model->mtp_config_     = std::move(mtp_config);
+    model->mtp_weights_    = std::move(mtp_weights);
     return model;
 }
 

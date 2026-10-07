@@ -6,6 +6,16 @@
 // stage boundary. The executor owns every sequence's mutable state (recurrent and convolution
 // states, paged KV, the indexer's pooled keys, the PLE history and n-gram context) and the
 // workspace; the model stays immutable.
+//
+// MTP speculative decoding (a model loaded with its MTP block and ExecutorOptions::draft_tokens):
+// the MTP block drafts from the stack the target left at a sequence's last position and the token
+// that follows (vLLM's cells: cell i pairs the target's pre-mixer stack of position i with token
+// i + 1 and rotates at i), verify() runs a sequence's anchor and drafts without committing them,
+// and commit() keeps a prefix: the Gated DeltaNet layers replay their recorded transitions over it
+// (gdn_replay_fold), the sparse-attention indexer tails and the PLE history advance over it from
+// what the verification recorded, and the MTP block catches up over the committed cells. Every
+// other pass (a prompt chunk, a plain decode step) advances the MTP block too, so a sequence can
+// draft whenever it decodes.
 
 #include "core/arena.h"
 #include "core/device.h"
@@ -33,7 +43,7 @@ struct ExecutorOptions {
     // The n-gram table of the PLE layer. Empty runs the model without it: the PLE injection is
     // skipped, which is what an all-zero table would give.
     std::optional<NgramTableSource> ngram;
-    NgramResidency ngram_residency = NgramResidency::Disk;
+    NgramReadOptions ngram_read;
     // Host-resident experts only: device memory lent to the expert cache, split evenly over the
     // ranks; kAutoExpertCache takes what each device has free less a margin, 0 none.
     static constexpr std::uint64_t kAutoExpertCache = ~std::uint64_t{0};
@@ -47,6 +57,9 @@ struct ExecutorOptions {
     // How the sparse-attention layers store their paged KV: any storage kv_cache_append writes
     // for two heads of 256.
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    // MTP drafts per speculative round (1..15), for a model loaded with its MTP block; 0 runs
+    // without speculation.
+    std::uint32_t draft_tokens = 0;
 };
 
 // One media item of a prompt for the Vision tower: its patches and the frontend's control.
@@ -79,8 +92,21 @@ struct SequenceSnapshot {
         std::vector<DeviceBuffer> buffers; // ssm, conv, tail, history; empty where absent
     };
     std::vector<Layer> layers;
+    // The MTP block: its indexer tail and the stack its next cell starts from.
+    std::vector<DeviceBuffer> mtp;
+    bool mtp_follows       = false;
     std::uint32_t position = 0;
     NgramContext context;
+};
+
+// A sequence's whole state at a position, in host memory: the paged KV and the indexer's pooled
+// keys of the positions before it, the recurrent state there, and the MTP block's, in the byte
+// layout image_bytes() sizes. The context cache keeps prefixes this way beyond the device's
+// sequences. The header travels beside the bytes.
+struct SequenceImage {
+    std::uint32_t position = 0;
+    NgramContext context;
+    bool mtp_follows = false;
 };
 
 class Executor {
@@ -92,9 +118,17 @@ public:
 
     [[nodiscard]] const ExecutorOptions& options() const noexcept;
     [[nodiscard]] ExecutorMemory memory() const noexcept;
+    // The n-gram table's reads since startup, and the RAM its resident rows take.
+    [[nodiscard]] NgramTableStats ngram_stats();
+    [[nodiscard]] std::uint64_t ngram_resident_bytes() const noexcept;
 
     // Empties the sequence: position zero, zero states, a fresh n-gram context.
     void reset(std::uint32_t sequence);
+    // Runs the routes requests take on sequence 0 once and resets it, so the first request does
+    // not pay for loading their kernels (CUDA loads each at its first launch): one token, a
+    // verification's width, a full prefill chunk (16 tokens with host or disk experts, which a
+    // chunk would copy or read whole), a decode step and, with drafts, a draft and a commit.
+    void warm_up();
     [[nodiscard]] std::uint32_t position(std::uint32_t sequence) const;
 
     // Runs `tokens` (at most prefill_chunk) at the sequence's next positions and leaves the logits
@@ -109,6 +143,16 @@ public:
     // Copies the sequence's recurrent state into `out`, and back; both wait for the copies.
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out);
     void restore(std::uint32_t sequence, const SequenceSnapshot& from);
+    // Bytes of an image at `position`.
+    [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const;
+    // Copies the sequence's state into `out` (image_bytes() of its position, pinned host memory):
+    // its live state, or the state at `at`, a snapshot it took whose positions it has not written
+    // since. Returns the image's header once the copies are done.
+    SequenceImage save_image(std::uint32_t sequence, const SequenceSnapshot* at,
+                             std::span<std::byte> out);
+    // Makes the sequence hold the image's state; returns once the copies are done.
+    void load_image(std::uint32_t sequence, const SequenceImage& image,
+                    std::span<const std::byte> bytes);
     // Vision: encodes the media of the prompt the (just reset) sequence prefills next, whose image
     // and video tokens then take the items' merged embeddings in place of the token embedding.
     // `rope_positions` holds the prompt's three RoPE position axes, axis-major [3, tokens]; every
@@ -118,6 +162,27 @@ public:
     void set_media(std::uint32_t sequence, std::span<const MediaItem> items,
                    std::vector<std::int32_t> rope_positions, std::int32_t rope_delta);
     [[nodiscard]] bool vision() const noexcept;
+
+    // MTP speculative decoding; every call needs an executor with drafts.
+    [[nodiscard]] std::uint32_t draft_tokens() const noexcept;
+    // Whether the sequence's MTP state follows its tokens, which a media prompt breaks until the
+    // sequence is reset; a sequence drafts only from a position past its first.
+    [[nodiscard]] bool can_draft(std::uint32_t sequence) const;
+    // Drafts draft_tokens() tokens for each of `sequences` (distinct) from its next position: the
+    // MTP block runs its anchor (the token it sampled last and has not fed) and then its own
+    // drafts, greedily. `out` receives them sequence-major; returns once they are on the host.
+    void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
+               std::span<std::int32_t> out);
+    // Runs draft_tokens() + 1 tokens of each sequence (its anchor, then its drafts) at its next
+    // positions without committing them, and leaves the logits of every token in logits(), one
+    // column per token, sequence after sequence. The sequences' positions and states stay where
+    // they were until commit().
+    void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens);
+    // Keeps the first `columns[i]` (1..draft_tokens() + 1) tokens of the last verify() of
+    // `sequences[i]`, which lists the verified sequences in their order: each sequence's state is
+    // then what feeding those tokens would have left, and its MTP block has run their cells.
+    void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> columns);
+
     [[nodiscard]] Tensor logits(std::uint32_t rows) const;
     [[nodiscard]] std::size_t head_rank() const noexcept;
     [[nodiscard]] ExpertCacheStats expert_cache_stats() const noexcept;

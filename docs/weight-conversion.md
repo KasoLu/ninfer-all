@@ -65,7 +65,7 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_8_27b_nvfp4_orcarouter` | orcarouter/Qwen3.8-27B-Uncensored-NVFP4 (GPTQ compressed-tensors): imported NVFP4 MLP projections in layers 0-55, per-row FP8 everywhere else; FP8 embedding and output head from BF16 | `quantized` |
 | `bonsai2_27b_ternary` | Imported ternary T2 text tower with Hadamard-rotated Uses, Q8 primal embedding | `ternary` (GGUF) |
 | `qwen3_8_27b_gguf` | Every text, embedding, head and MTP tensor in its GGUF block format, byte for byte | `gguf` (GGUF), `vision` (mmproj GGUF) |
-| `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL rows in the same artifact or in a table artifact of their own | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF) |
+| `qwen3_8_flash_next_gguf` | Qwen3.8-Flash-Next: every text tensor in its GGUF block format, byte for byte, expert banks expert-major, and the n-gram table's IQ4_NL rows in the same artifact or in a table artifact of their own; the MTP block from an MTP GGUF, its matrices in their blocks and its hyper-connections in BF16 | `gguf` (the release's first shard), `ngram` (its second shard), `vision` (mmproj GGUF), `mtp` (an MTP GGUF) |
 
 The QUASAR Qwen3.8-27B NVFP4 checkpoint, which quantizes every Linear layer to NVFP4, has a driver
 of its own, `python3 -m tools.convert.quasar_nvfp4 --model DIR --dflash2 REFERENCE.ninfer --out
@@ -238,7 +238,11 @@ shard, the n-gram table, is the `ngram` component: the model always records the 
 constants, row format and SHA-256, and `--components` decides where the rows go -- `text,ngram`
 (the default) into the model's artifact, `text` nowhere (the model reads a table artifact at run
 time), `ngram` into a table artifact without a model. The runtime reads only the rows each token
-addresses. Commands, runtime options and measurements: [Qwen3.8-Flash-Next](qwen3-8-flash-next.md).
+addresses. `mtp` beside `text` adds the MTP block from one of Unsloth's MTP GGUFs
+(`--source mtp=...shared-Q8_0.gguf`, block 48 with `nextn.*` tensors): its fused input projection
+`eh_proj` splits between blocks into `fc_embedding` and `fc_hidden`, its norms drop their `1 + w`,
+and its hyper-connection matrices are decoded to BF16. Commands, runtime options and measurements:
+[Qwen3.8-Flash-Next](qwen3-8-flash-next.md).
 
 ## Change part of a recipe
 

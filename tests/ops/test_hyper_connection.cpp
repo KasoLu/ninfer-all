@@ -1,7 +1,8 @@
 // hyper_connection_read/write against an FP64 oracle of the Qwen3.8-Flash-Next gated residual, at
 // the model's shapes (4 streams, hidden 2560, lowrank 320) and decode, verify and prefill widths,
 // with and without the inject rows (the final mixer has none), eagerly and under graph replay; and
-// hyper_connection_expand, which must widen the embedding into every stream exactly.
+// hyper_connection_expand, which must widen the embedding into every stream exactly, and its MTP
+// form, which adds each stream's own term.
 #include "core/arena.h"
 #include "core/device.h"
 #include "ninfer/ops/hyper_connection.h"
@@ -202,30 +203,64 @@ int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed) {
     return failures;
 }
 
-int run_expand(int tokens, std::uint32_t seed) {
-    std::vector<float> x(static_cast<std::size_t>(kHidden) * tokens);
+std::vector<float> bf16_values(std::size_t count, std::uint32_t seed, float scale) {
+    std::vector<float> out(count);
     std::uint32_t state = seed;
-    for (auto& v : x) {
+    for (auto& v : out) {
         state = state * 1664525u + 1013904223u;
-        v = bf16_to_f32(f32_to_bf16(static_cast<float>(static_cast<std::int32_t>(state)) * 1e-9f));
+        v = bf16_to_f32(f32_to_bf16(static_cast<float>(static_cast<std::int32_t>(state)) * scale));
     }
-    const auto bits = encode_bf16(x);
-    GuardedDeviceBuffer d_x(bits.size() * 2), d_stack(x.size() * kStreams * 4);
+    return out;
+}
+
+// Without `streams` every stream must be the embedding exactly; with them (the MTP layer's start)
+// each stream is its own term plus the shared one, against the FP64 sum.
+int run_expand(int tokens, bool with_streams, std::uint32_t seed) {
+    const auto x       = bf16_values(static_cast<std::size_t>(kHidden) * tokens, seed, 1e-9f);
+    const auto streams = bf16_values(static_cast<std::size_t>(kWidth) * tokens, seed + 1, 3e-9f);
+    const auto bits    = encode_bf16(x);
+    const auto stream_bits = encode_bf16(streams);
+    GuardedDeviceBuffer d_x(bits.size() * 2), d_streams(stream_bits.size() * 2),
+        d_stack(x.size() * kStreams * 4);
     d_x.copy_from_host(bits.data(), bits.size() * 2);
+    d_streams.copy_from_host(stream_bits.data(), stream_bits.size() * 2);
     Tensor t_x(d_x.data(), DType::BF16, {kHidden, tokens});
+    Tensor t_streams(d_streams.data(), DType::BF16, {kHidden, kStreams, tokens});
     Tensor t_stack(d_stack.data(), DType::FP32, {kHidden, kStreams, tokens});
-    ops::hyper_connection_expand(t_x, t_stack, nullptr);
+    if (with_streams) {
+        ops::hyper_connection_expand(t_x, t_streams, t_stack, nullptr);
+    } else {
+        ops::hyper_connection_expand(t_x, t_stack, nullptr);
+    }
     cuda_synchronize();
     const auto got = from_device<float>(d_stack.data(), x.size() * kStreams);
-    std::vector<float> want(got.size());
+    std::vector<double> want(got.size());
     for (int t = 0; t < tokens; ++t)
         for (int c = 0; c < kStreams; ++c)
-            for (int d = 0; d < kHidden; ++d)
-                want[(static_cast<std::size_t>(t) * kStreams + c) * kHidden + d] =
-                    x[static_cast<std::size_t>(t) * kHidden + d];
-    const std::string label = "expand T=" + std::to_string(tokens);
-    int failures            = verify_exact(label.c_str(), got, want);
+            for (int d = 0; d < kHidden; ++d) {
+                const std::size_t i = (static_cast<std::size_t>(t) * kStreams + c) * kHidden + d;
+                want[i]             = double(x[static_cast<std::size_t>(t) * kHidden + d]) +
+                                      (with_streams ? double(streams[i]) : 0.0);
+            }
+    const std::string label =
+        std::string(with_streams ? "expand+streams" : "expand") + " T=" + std::to_string(tokens);
+    int failures = 0;
+    if (with_streams) {
+        // One FP32 rounding of an exact sum of two widened BF16 values.
+        for (std::size_t i = 0; i < got.size(); ++i) {
+            const double error = std::abs(double(got[i]) - want[i]);
+            if (error > std::abs(want[i]) * 6.0e-8 + 1e-30) {
+                std::cerr << label << ": element " << i << " got " << got[i] << " want " << want[i]
+                          << "\n";
+                ++failures;
+                break;
+            }
+        }
+    } else {
+        failures += verify_exact(label.c_str(), got, std::vector<float>(want.begin(), want.end()));
+    }
     failures += d_x.verify_guards("expand input");
+    failures += d_streams.verify_guards("expand streams");
     failures += d_stack.verify_guards("expand stack");
     return failures;
 }
@@ -245,8 +280,10 @@ int main() {
     failures += run_case(1, false, false, 4200u);
     failures += run_case(5, false, false, 4201u);
     failures += run_case(4, true, true, 4300u);
-    failures += run_expand(1, 4400u);
-    failures += run_expand(7, 4401u);
+    failures += run_expand(1, false, 4400u);
+    failures += run_expand(7, false, 4401u);
+    failures += run_expand(1, true, 4402u);
+    failures += run_expand(9, true, 4403u);
     // Refusals: an unsupported geometry and an inject output without inject rows.
     bool refused = false;
     try {

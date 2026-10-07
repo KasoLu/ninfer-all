@@ -1,6 +1,6 @@
 // parse_text_config on the text config the converter writes for the Qwen3.8-Flash-Next
 // checkpoint (tests/fixtures/qwen4_exp/text_config.json, which tests/convert/test_qwen4_exp.py
-// holds to tools/convert/qwen4_exp.py), and its refusals.
+// holds to tools/convert/qwen4_exp.py), parse_mtp_config on the MTP block's, and their refusals.
 #include "models/qwen4_exp/config.h"
 
 #include <fstream>
@@ -66,6 +66,28 @@ int run() {
     expect_refusal([](Json& c) { c["eos_token_id"] = 248320; }, "EOS past the vocabulary");
     expect_refusal([](Json& c) { c["rope_parameters"]["mrope_section"] = Json::array({11, 11, 11}); },
                    "MRoPE sections past the rotary width");
+
+    // The MTP block: the full model's 512 experts beside an expert-pruned text model, the text
+    // model's theta, and nothing else.
+    const Json mtp         = {{"architectures", Json::array({"Qwen4ExpMTP"})},
+                              {"rope_theta", 10000000.0},
+                              {"num_experts", 512}};
+    const TextConfig coder = parse_text_config(pruned);
+    require(parse_mtp_config(mtp, coder).num_experts == 512, "the MTP block keeps its experts");
+    const auto refuses_mtp = [&](const std::function<void(Json&)>& edit, const std::string& label) {
+        Json c = mtp;
+        edit(c);
+        bool refused = false;
+        try {
+            (void)parse_mtp_config(c, config);
+        } catch (const ninfer::artifact::ArtifactError&) { refused = true; }
+        require(refused, "not refused: " + label);
+    };
+    refuses_mtp([](Json& c) { c["rope_theta"] = 1000000.0; }, "another MTP theta");
+    refuses_mtp([](Json& c) { c["num_experts"] = 9; }, "an MTP block with too few experts");
+    refuses_mtp([](Json& c) { c["architectures"] = Json::array({"Qwen3_5MTP"}); },
+                "another MTP architecture");
+    refuses_mtp([](Json& c) { c["hidden"] = 1; }, "an unknown MTP field");
     return 0;
 }
 

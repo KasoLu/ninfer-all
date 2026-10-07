@@ -7,6 +7,7 @@
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
+#include "product/ngram_table_options.h"
 #include "product/rope_yarn_options.h"
 
 #include <nlohmann/json.hpp>
@@ -88,7 +89,9 @@ std::string usage_text() {
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N | --disjoint] [--device N | --devices A,B,...]\n"
            "       [--expert-residency device|host|disk] [--expert-cache-mib N|auto]\n"
-           "       [--ngram-table PATH] [--ngram-ram] [--no-ngram-table]   (Qwen3.8-Flash-Next)\n"
+           "       [--ngram-table PATH] [--ngram-residency disk|ram|ram-hot] [--ngram-lock]\n"
+           "       [--ngram-io buffered|direct|mmap] [--ngram-io-depth N] [--ngram-ram-mib N]\n"
+           "       [--ngram-hot-profile PATH] [--no-ngram-table]   (Qwen3.8-Flash-Next)\n"
            "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4] [--output "
            "<directory>]\n"
            "       [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -217,12 +220,8 @@ Options parse_options(int argc, char** argv) {
                 out.expert_cache_bytes =
                     std::uint64_t(parse_integer<std::uint32_t>(mib, "expert-cache-mib")) << 20;
             }
-        } else if (option == "--ngram-table") {
-            out.ngram_table.path = value("--ngram-table");
-        } else if (option == "--ngram-ram") {
-            out.ngram_table.ram = true;
-        } else if (option == "--no-ngram-table") {
-            out.ngram_table.disabled = true;
+        } else if (ninfer::product::parse_ngram_table_option(
+                       option, out.ngram_table, [&] { return value(option.data()); })) {
         } else if (option == "--rope-yarn") {
             out.rope_yarn = true;
         } else if (option == "--rope-yarn-factor") {

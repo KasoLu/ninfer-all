@@ -382,15 +382,17 @@ __global__ void __launch_bounds__(256)
     stack[i] = fmaf(to_float(y[t * kHidden + d]), inject_weights[column], stack[i]);
 }
 
+// `streams`, when given, holds each stream's own term in the stack's layout.
 __global__ void __launch_bounds__(256)
-    hc_expand_kernel(const __nv_bfloat16* __restrict__ x, float* __restrict__ stack,
-                     std::int64_t elements) {
+    hc_expand_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ streams,
+                     float* __restrict__ stack, std::int64_t elements) {
     const std::int64_t i = std::int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= elements) return;
     // stack element i is stream (i / hidden) % streams of token i / width.
     const std::int64_t token = i / kWidth;
     const std::int64_t d     = i % kHidden;
-    stack[i]                 = __bfloat162float(x[token * kHidden + d]);
+    const float shared       = __bfloat162float(x[token * kHidden + d]);
+    stack[i]                 = streams == nullptr ? shared : __bfloat162float(streams[i]) + shared;
 }
 
 void require(bool condition, const char* message) {
@@ -554,7 +556,9 @@ void hyper_connection_write(Tensor& stack, const Tensor& y, const Tensor& inject
     CUDA_CHECK(cudaGetLastError());
 }
 
-void hyper_connection_expand(const Tensor& x, Tensor& stack, cudaStream_t stream) {
+namespace {
+
+void expand(const Tensor& x, const Tensor* streams, Tensor& stack, cudaStream_t stream) {
     require(stack.dtype == DType::FP32 && stack.is_contiguous() && stack.data != nullptr &&
                 stack.ne[0] == kHidden && stack.ne[1] == kStreams && stack.ne[3] == 1,
             "stack must be contiguous FP32 [2560, 4, tokens]");
@@ -563,11 +567,30 @@ void hyper_connection_expand(const Tensor& x, Tensor& stack, cudaStream_t stream
     require(x.dtype == DType::BF16 && x.is_contiguous() && x.data != nullptr &&
                 x.ne[0] == kHidden && x.ne[1] == tokens,
             "x must be contiguous BF16 [2560, tokens]");
+    if (streams != nullptr) {
+        require(streams->dtype == DType::BF16 && streams->is_contiguous() &&
+                    streams->data != nullptr && streams->ne[0] == kHidden &&
+                    streams->ne[1] == kStreams && streams->ne[2] == tokens && streams->ne[3] == 1,
+                "streams must be contiguous BF16 [2560, 4, tokens]");
+    }
     const std::int64_t elements = static_cast<std::int64_t>(kWidth) * tokens;
     hc_expand_kernel<<<static_cast<unsigned>(div_up(elements, std::int64_t{256})), 256, 0,
-                       stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                                 static_cast<float*>(stack.data), elements);
+                       stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        streams != nullptr ? static_cast<const __nv_bfloat16*>(streams->data) : nullptr,
+        static_cast<float*>(stack.data), elements);
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+void hyper_connection_expand(const Tensor& x, Tensor& stack, cudaStream_t stream) {
+    expand(x, nullptr, stack, stream);
+}
+
+void hyper_connection_expand(const Tensor& x, const Tensor& streams, Tensor& stack,
+                             cudaStream_t stream) {
+    expand(x, &streams, stack, stream);
 }
 
 } // namespace ninfer::ops

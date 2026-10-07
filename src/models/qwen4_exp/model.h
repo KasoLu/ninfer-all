@@ -26,6 +26,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -97,6 +98,15 @@ struct TextWeights {
     std::vector<LayerWeights> layers;
 };
 
+// The MTP block (vLLM Qwen4ExpMultiTokenPredictor): the two input norms and projections, one
+// sparse-attention layer with its own MoE, and its final mixer. The token embedding and the head
+// are the text model's.
+struct MtpWeights {
+    WeightId embedding_norm, hidden_norm, fc_embedding, fc_hidden;
+    LayerWeights layer;
+    HyperConnectionWeights final_mixer;
+};
+
 
 struct LoadOptions {
     // The artifact's entry file; its part files sit next to it.
@@ -109,6 +119,9 @@ struct LoadOptions {
     // Loads the Vision tower the artifact carries (its `vision` component, the Qwen3.5 tower) onto
     // the first stage's device, beside the token embedding its output joins.
     bool vision = false;
+    // Loads the MTP block the artifact carries (its `mtp` component) onto the last stage's device,
+    // beside the head it shares; its experts take the text layers' residency.
+    bool mtp = false;
 };
 
 class Model {
@@ -136,6 +149,17 @@ public:
     // The weight's one mathematical use, as a projection operand, its auxiliaries on the weight's
     // device.
     [[nodiscard]] ops::WeightInput input(WeightId id) const;
+    // The use of a weight read by several inputs (the head, which the MTP block reads too).
+    [[nodiscard]] ops::WeightInput input(WeightId id, std::string_view use) const;
+
+    // The MTP block when the model was loaded with it.
+    [[nodiscard]] const std::optional<MtpConfig>& mtp_config() const noexcept {
+        return mtp_config_;
+    }
+
+    [[nodiscard]] const std::optional<MtpWeights>& mtp_weights() const noexcept {
+        return mtp_weights_;
+    }
 
     [[nodiscard]] const FrontendResources& resources() const noexcept { return resources_; }
 
@@ -178,6 +202,8 @@ private:
     qwen3_5::AuxiliaryReplicas replicas_;
     std::optional<qwen3_5::VisionConfig> vision_config_;
     std::optional<qwen3_5::VisionWeights> vision_weights_;
+    std::optional<MtpConfig> mtp_config_;
+    std::optional<MtpWeights> mtp_weights_;
 };
 
 // Whether the artifact's text component is this family.

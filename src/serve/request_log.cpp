@@ -8,7 +8,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
@@ -1195,6 +1197,37 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"host_snapshot_evictions", delta(&RuntimeStats::hybrid_host_snapshot_evictions)},
                  {"host_dead_reclaims", delta(&RuntimeStats::hybrid_host_dead_reclaims)},
                  {"unbacked_node_losses", delta(&RuntimeStats::hybrid_unbacked_node_losses)}};
+    }
+    // Qwen3.8-Flash-Next's n-gram table reads: the interval's rows and passes, the latency
+    // quantiles as the upper bound of the histogram bucket that holds them, and the device time the
+    // PLE layer waited for its rows.
+    const NgramTableStats& rows_now  = current.ngram_table;
+    const NgramTableStats& rows_then = previous.ngram_table;
+    if (rows_now.rows != 0) {
+        std::array<std::uint64_t, NgramTableStats::kLatencyBuckets> latency{};
+        std::uint64_t batches = 0;
+        for (std::size_t b = 0; b < latency.size(); ++b) {
+            latency[b] =
+                monotonic_delta(rows_then.latency_histogram[b], rows_now.latency_histogram[b]);
+            batches += latency[b];
+        }
+        const auto quantile = [&](double q) -> Json {
+            const auto rank    = static_cast<std::uint64_t>(std::ceil(q * double(batches)));
+            std::uint64_t seen = 0;
+            for (std::size_t b = 0; b < latency.size() && batches != 0; ++b) {
+                seen += latency[b];
+                if (seen >= rank) { return std::uint64_t{1} << b; }
+            }
+            return nullptr;
+        };
+        record["ngram_table"] = Json{
+            {"rows", monotonic_delta(rows_then.rows, rows_now.rows)},
+            {"resident_rows", monotonic_delta(rows_then.resident_rows, rows_now.resident_rows)},
+            {"batches", batches},
+            {"read_seconds", monotonic_delta(rows_then.read_seconds, rows_now.read_seconds)},
+            {"read_latency_us", Json{{"p50", quantile(0.5)}, {"p99", quantile(0.99)}}},
+            {"stalls", monotonic_delta(rows_then.stalls, rows_now.stalls)},
+            {"stall_seconds", monotonic_delta(rows_then.stall_seconds, rows_now.stall_seconds)}};
     }
     record["engine_recoveries"] =
         monotonic_delta(previous.engine_recoveries, current.engine_recoveries);

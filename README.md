@@ -185,8 +185,9 @@ of the file.
   - in pinned host memory with a GPU cache (`--expert-residency host`);
   - in the file, read into a GPU cache (`--expert-residency disk`, under 1 GB of RAM).
 
-  It serves up to eight requests with prefix reuse, structured output, images and video; no release
-  carries an MTP layer, so there is no MTP. On two RTX 5090s the Q2_0 release scores 93.3% on AIME
+  It serves up to eight requests with prefix reuse, structured output, images and video, and
+  decodes speculatively (`--spec mtp`) with the MTP block Unsloth publishes separately, converted
+  beside the model. On two RTX 5090s the Q2_0 release scores 93.3% on AIME
   2025 and 86.4% on GPQA-Diamond (84.3% within 106,000 output tokens; its card, from llama.cpp:
   96.67 and 89.39). [Qwen3.8-Flash-Next](docs/qwen3-8-flash-next.md).
 - **Ternary Bonsai 2 27B.** PrismML's [ternary Qwen3.8-27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
@@ -470,9 +471,11 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
 - **Memory.** Host experts pin 34 GB of RAM for Q2_0, 50 GB for IQ3_S and 25 GB for the Coder
   build. Disk experts need under 1 GB of RAM; the page cache does the rest. The GPU expert cache
   takes what is free after startup, or `--expert-cache-mib`.
-- **The n-gram table.** Its rows are read from the file, 16 per token, unless `--ngram-ram` loads
-  all 28.8 GB. A model started without its table is refused; `--no-ngram-table` overrides that, an
-  experimental mode with no practical use.
+- **The n-gram table.** Its rows are read from the file, 16 per token, unless
+  `--ngram-residency ram` loads all 28.8 GB or `ram-hot` keeps the rows a profile ranks first in a
+  RAM budget ([the n-gram rows](docs/qwen3-8-flash-next.md#the-n-gram-rows)). A model started
+  without its table is refused; `--no-ngram-table` overrides that, an experimental mode with no
+  practical use.
 - **Images and video.** `--vision` adds the Vision tower (0.9 GB on the GPU).
 
 </details>

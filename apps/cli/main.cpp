@@ -183,7 +183,8 @@ private:
 
 void print_generation_summary(const ninfer::GenerationResult& result,
                               const ninfer::ResolvedSamplingParameters& sampling,
-                              const ninfer::MemorySummary& memory) {
+                              const ninfer::MemorySummary& memory,
+                              const ninfer::RuntimeStats& stats) {
     print_stage("prepare", "render/preprocess", result.timings.prepare_seconds);
     print_stage("generate", "vision", result.timings.vision_seconds);
     print_stage("generate", "text prefill", result.timings.prefill_seconds);
@@ -280,6 +281,22 @@ void print_generation_summary(const ninfer::GenerationResult& result,
             }
             print_metric(backend + " accepted by pos", positions.str());
         }
+    }
+
+    // Qwen3.8-Flash-Next's n-gram table reads since startup (warm-up included).
+    const ninfer::NgramTableStats& rows = stats.ngram_table;
+    if (rows.rows != 0) {
+        std::ostringstream pass, stall;
+        pass << std::fixed << std::setprecision(1)
+             << 1e6 * rows.read_seconds /
+                    static_cast<double>(std::max<std::uint64_t>(rows.batches, 1))
+             << " us over " << rows.batches << " passes";
+        stall << rows.stalls << " (" << std::fixed << std::setprecision(2)
+              << 1e3 * rows.stall_seconds << " ms)";
+        print_metric("ngram rows read", std::to_string(rows.rows));
+        print_metric("ngram rows from RAM", format_percent(rows.resident_rows, rows.rows));
+        print_metric("ngram read per pass", pass.str());
+        print_metric("ngram stalls", stall.str());
     }
 }
 
@@ -398,7 +415,7 @@ int main(int argc, char** argv) {
             }
             std::cerr << '\n';
         }
-        print_generation_summary(result, sampling, engine.memory_summary());
+        print_generation_summary(result, sampling, engine.memory_summary(), engine.runtime_stats());
         return 0;
     } catch (const std::exception& error) {
         logger->error("{}", ninfer::product::format_pretty_text(error.what()));

@@ -179,4 +179,26 @@ TextConfig parse_text_config(const Json& value) {
     return out;
 }
 
+MtpConfig parse_mtp_config(const Json& value, const TextConfig& text) {
+    artifact::require_members(value, {"architectures", "rope_theta", "num_experts"}, {},
+                              "Qwen4Exp MTP config");
+    const auto& architectures = value.at("architectures");
+    if (!architectures.is_array() || architectures.size() != 1 ||
+        architectures[0] != "Qwen4ExpMTP") {
+        throw ArtifactError("Qwen4Exp MTP config: architecture mismatch");
+    }
+    MtpConfig out;
+    out.rope_theta  = positive_float(value, "rope_theta");
+    out.num_experts = integer(value, "num_experts");
+    // The sparse-attention kernels rotate at the text model's theta.
+    if (out.rope_theta != text.rope_theta) {
+        throw ArtifactError("the MTP block's rope_theta differs from the text model's");
+    }
+    if (out.num_experts < text.num_experts_per_tok || out.num_experts > 512) {
+        throw ArtifactError("the MTP block keeps " + std::to_string(out.num_experts) +
+                            " experts; this engine implements 10 to 512");
+    }
+    return out;
+}
+
 } // namespace ninfer::models::qwen4_exp

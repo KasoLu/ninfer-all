@@ -1,10 +1,10 @@
 # syntax=docker/dockerfile:1.7
 #
-# NInfer server image. ninfer, ninfer-serve, ninfer-perplexity and ninfer-calibrate are built once
-# per architecture -- sm_86 (Ampere; the same cubins run on Ada sm_89) and sm_120a (consumer
-# Blackwell), since a NInfer build targets exactly one -- as one multi-call executable each
-# (NINFER_MULTICALL), next to the launcher and the downloader. The entrypoint runs the build that
-# matches the GPU it is given (docker/entrypoint.sh).
+# NInfer server image. ninfer, ninfer-serve, ninfer-perplexity, ninfer-calibrate and
+# ninfer-ngram-profile are built once per architecture -- sm_86 (Ampere; the same cubins run on Ada
+# sm_89) and sm_120a (consumer Blackwell), since a NInfer build targets exactly one -- as one
+# multi-call executable each (NINFER_MULTICALL), next to the launcher and the downloader. The
+# entrypoint runs the build that matches the GPU it is given (docker/entrypoint.sh).
 #
 #   docker build -t ninfer .                               both architectures, from source
 #   docker build --build-arg ARCHS=86 -t ninfer .          one architecture
@@ -97,7 +97,7 @@ RUN apt-get update \
 # later layer would store every binary a second time.
 COPY --from=dist --chmod=0755 /bin/ /opt/ninfer/
 RUN for arch in /opt/ninfer/sm*; do \
-      for name in ninfer ninfer-serve ninfer-calibrate ninfer-perplexity; do \
+      for name in ninfer ninfer-serve ninfer-calibrate ninfer-perplexity ninfer-ngram-profile; do \
         ln -s ninfer-multicall "$arch/$name"; \
       done; \
     done

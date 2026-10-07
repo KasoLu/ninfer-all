@@ -7,8 +7,11 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/vision_control.h"
 #include "models/qwen4_exp/ngram_component.h"
+#include "models/qwen4_exp/ngram_profile.h"
+#include "ninfer/ops/argmax.h"
 #include "ninfer/ops/logprob_topk.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/effective_thinking_budget.h"
@@ -22,7 +25,10 @@
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
+#include <cstring>
 #include <deque>
+#include <fstream>
 #include <iterator>
 #include <mutex>
 #include <set>
@@ -82,28 +88,77 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument(
             "Qwen3.8-Flash-Next runs its Vision tower resident on the device only");
     }
-    if (options.speculative.backend != SpeculativeBackend::None ||
-        options.speculative.ngram_draft_tokens != 0) {
-        throw std::invalid_argument("speculative decoding is not available for Qwen3.8-Flash-Next");
-    }
-    if (options.context_cache.enabled && !options.context_cache.disk_kv_path.empty()) {
+    const SpeculativeOptions& speculative = options.speculative;
+    if (speculative.backend == SpeculativeBackend::DFlash ||
+        speculative.backend == SpeculativeBackend::DFlash2) {
         throw std::invalid_argument(
-            "the context cache's disk KV tier is not available for Qwen3.8-Flash-Next");
+            "Qwen3.8-Flash-Next drafts with its MTP block only (--spec mtp)");
+    }
+    const bool mtp = speculative.backend == SpeculativeBackend::Mtp;
+    if (mtp && (speculative.draft_tokens == 0 || speculative.draft_tokens > 15)) {
+        throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,15]");
+    }
+    if (!mtp && speculative.ngram_draft_tokens != 0) {
+        throw std::invalid_argument("n-gram copy proposals are not available for "
+                                    "Qwen3.8-Flash-Next");
+    }
+    if (speculative.lookup_ngram != 0 || speculative.mtp_attention_window != 0 ||
+        speculative.mtp_policy != MtpDraftPolicy::Fixed ||
+        speculative.proposal_head != ProposalHead::Full || speculative.ngram_archive_bytes != 0) {
+        throw std::invalid_argument(
+            "Qwen3.8-Flash-Next's MTP drafting takes --draft-tokens only: no --lookup-ngram, "
+            "--mtp-attention-window, --adaptive-mtp, --lm-head-draft or n-gram archive");
+    }
+    if (options.context_cache.disk_kv_directstorage) {
+        throw std::invalid_argument(
+            "Qwen3.8-Flash-Next's context cache reads its disk tier without DirectStorage");
     }
     const NgramTableOptions& table = options.ngram_table;
-    if (table.disabled && (!table.path.empty() || table.ram)) {
-        throw std::invalid_argument("--no-ngram-table excludes --ngram-table and --ngram-ram");
+    const NgramTableOptions defaults;
+    if (table.disabled &&
+        (!table.path.empty() || table.residency != defaults.residency || table.io != defaults.io ||
+         table.ram_budget_bytes || !table.hot_profile.empty() || table.lock ||
+         table.io_depth != defaults.io_depth)) {
+        throw std::invalid_argument("--no-ngram-table excludes the other n-gram table options");
+    }
+    if (table.residency != NgramResidency::RamHot &&
+        (table.ram_budget_bytes || !table.hot_profile.empty())) {
+        throw std::invalid_argument(
+            "--ngram-ram-budget and --ngram-hot-profile belong to --ngram-residency ram-hot");
+    }
+    if (table.residency == NgramResidency::RamHot && table.hot_profile.empty()) {
+        throw std::invalid_argument("--ngram-residency ram-hot needs a hot-row profile, "
+                                    "--ngram-hot-profile PATH (ninfer-ngram-profile makes one)");
+    }
+    if (table.lock && table.residency == NgramResidency::Disk) {
+        throw std::invalid_argument("--ngram-lock needs --ngram-residency ram or ram-hot");
+    }
+    if (table.io_depth == 0 || table.io_depth > 1024) {
+        throw std::invalid_argument("--ngram-io-depth takes 1..1024 reads");
     }
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     const artifact::Reader reader(options.artifact_path);
-    // The n-gram table is located before anything else starts, so a model without one fails at
-    // once.
+    // The n-gram table, and the hot-row profile of a ram-hot table, are located before anything
+    // else starts, so a model without them fails at once.
     std::optional<models::qwen4_exp::NgramTableSource> ngram;
+    models::qwen4_exp::NgramReadOptions ngram_read{
+        .residency    = table.residency,
+        .io           = table.io,
+        .budget_bytes = table.ram_budget_bytes.value_or(std::uint64_t{4} << 30U),
+        .lock         = table.lock,
+        .depth        = table.io_depth};
     if (!table.disabled) {
-        ngram = models::qwen4_exp::ngram_table_source(
-            reader, options.artifact_path,
-            models::qwen4_exp::parse_text_config(reader.directory().component("text").config),
-            table.path);
+        const auto text =
+            models::qwen4_exp::parse_text_config(reader.directory().component("text").config);
+        ngram =
+            models::qwen4_exp::ngram_table_source(reader, options.artifact_path, text, table.path);
+        if (table.residency == NgramResidency::RamHot) {
+            auto profile = models::qwen4_exp::read_ngram_profile(table.hot_profile);
+            models::qwen4_exp::check_ngram_profile(
+                profile, models::qwen4_exp::derive_ngram_hash_constants(text.ngram),
+                table.hot_profile);
+            ngram_read.hot_rows = std::move(profile.rows);
+        }
     }
     inspect.complete();
     install_device_route_profile_for(options, device);
@@ -113,6 +168,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     load.stage_layers = options.stage_layers;
     load.experts      = options.expert_residency;
     load.vision       = options.enable_vision;
+    load.mtp          = mtp;
     StartupPhaseScope materialize(options.startup_observer, StartupPhase::TargetPlan);
     auto model = models::qwen4_exp::load_model(reader, load, device, &options.startup_observer);
     device.synchronize();
@@ -142,11 +198,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     models::qwen4_exp::ExecutorOptions executor;
     executor.max_context     = options.max_context;
-    executor.prefill_chunk   = std::clamp<std::uint32_t>(options.prefill_chunk, 64, 4096);
     executor.sequences       = options.max_concurrency;
+    executor.draft_tokens    = mtp ? speculative.draft_tokens : 0;
+    // A chunk also holds a verification of every sequence at once.
+    executor.prefill_chunk   = std::max(std::clamp<std::uint32_t>(options.prefill_chunk, 64, 4096),
+                                        (executor.draft_tokens + 1) * executor.sequences);
     executor.ngram           = std::move(ngram);
-    executor.ngram_residency = table.ram ? models::qwen4_exp::NgramResidency::Ram
-                                         : models::qwen4_exp::NgramResidency::Disk;
+    executor.ngram_read      = std::move(ngram_read);
     executor.expert_cache_bytes =
         options.expert_cache_bytes.value_or(models::qwen4_exp::ExecutorOptions::kAutoExpertCache);
     executor.cuda_graphs = options.use_cuda_graph;
@@ -155,8 +213,28 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     instance->executor = std::make_unique<models::qwen4_exp::Executor>(*model, device, executor);
     device.synchronize();
     program.complete();
+    {
+        // The first request would otherwise load every kernel it reaches.
+        StartupPhaseScope warm(options.startup_observer, StartupPhase::CudaGraphPrepare);
+        instance->executor->warm_up();
+        warm.complete();
+    }
     instance->free_after_weights = free_after_weights;
     instance->free_after_startup = free_bytes();
+    std::string table_place      = "off";
+    if (!table.disabled) {
+        const std::string file = table.path.empty() ? "the artifact" : "its table artifact";
+        const std::string io   = table.io == NgramIo::Direct   ? " (direct I/O)"
+                                 : table.io == NgramIo::Mapped ? " (mapped)"
+                                                               : "";
+        const std::string resident =
+            std::to_string(instance->executor->ngram_resident_bytes() >> 20U) + " MiB" +
+            (table.lock ? ", locked" : "");
+        table_place = table.residency == NgramResidency::Ram ? "in RAM (" + resident + ")"
+                      : table.residency == NgramResidency::RamHot
+                          ? "hot rows in RAM (" + resident + "), the rest read from " + file + io
+                          : "read from " + file + io;
+    }
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                        "Qwen3.8-Flash-Next: %zu stage(s), experts in %s memory, n-gram table "
                        "%s, state %.0f MiB, workspace %.0f MiB, expert cache %.0f MiB",
@@ -164,13 +242,20 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                        options.expert_residency == ExpertResidency::Host   ? "pinned host"
                        : options.expert_residency == ExpertResidency::Disk ? "the artifact's files"
                                                                            : "device",
-                       table.disabled      ? "off"
-                       : table.ram         ? "in RAM"
-                       : table.path.empty() ? "read from the artifact"
-                                            : "read from its table artifact",
+                       table_place.c_str(),
                        double(instance->executor->memory().state_bytes) / 1048576.0,
                        double(instance->executor->memory().workspace_bytes) / 1048576.0,
                        double(instance->executor->memory().expert_cache_bytes) / 1048576.0);
+    if (mtp) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Qwen3.8-Flash-Next: MTP speculative decoding, %u drafts a round",
+                           speculative.draft_tokens);
+        if (speculative.ngram_draft_tokens != 0) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "Qwen3.8-Flash-Next drafts with its MTP block only; n-gram copy "
+                               "proposals (--ngram-draft-tokens) are not available for it");
+        }
+    }
     if (table.disabled) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
                            "Qwen3.8-Flash-Next runs WITHOUT its n-gram table (--no-ngram-table): "
@@ -269,6 +354,7 @@ struct Qwen4ExpCore::Request {
     std::vector<TokenId> generated;
     std::optional<GenerationBudget> budget;
     Clock::time_point admitted, prefill_start, prefill_end, first_token, last_token;
+    SpeculativeStats speculative; // MTP rounds, an Engine with drafts only
 };
 
 struct Qwen4ExpCore::Impl {
@@ -301,6 +387,7 @@ struct Qwen4ExpCore::Impl {
     const std::uint32_t domain;
     const bool structured_output;
     const bool reuse_prefixes;
+    const std::uint32_t drafts; // MTP drafts a speculative round proposes; 0 without speculation
 
     mutable std::mutex queue_mutex;
     std::condition_variable queue_cv;
@@ -327,6 +414,37 @@ struct Qwen4ExpCore::Impl {
     DeviceBuffer logprob_ids, logprob_values, logprob_lse, logprob_flag;
     std::unique_ptr<PinnedHostBuffer> host_mask, host_sample, host_logprobs;
     std::unique_ptr<WorkspaceArena> sample_workspace;
+    // A speculative round's acceptance on the head device, a row per verified sequence: its
+    // drafts, the verification's greedy targets, the live draft count and the tokens fed before
+    // the round, and the licensed run (tokens, count, accepted drafts, last token); and every
+    // slot's token counts before the round, which a round that keeps fewer tokens than it
+    // licensed restores.
+    DeviceBuffer spec_drafts, spec_targets, spec_extents, spec_lengths, spec_licensed, spec_counts,
+        spec_accepted, spec_anchors, counts_backup;
+    std::unique_ptr<PinnedHostBuffer> host_spec;
+
+    // The context cache past the sequences: images of the prefixes they give up (the state a
+    // turn closed at, and where a sequence ended), in pinned host memory up to a budget; the least
+    // recently used go to files under the disk path when it is set (where a restart finds them)
+    // or are dropped. A prompt resumes from the longest stored prefix when no free sequence
+    // serves more of it.
+    struct Stored {
+        std::vector<TokenId> tokens;
+        models::qwen4_exp::SequenceImage header;
+        PrefixReusePath path = PrefixReusePath::PrivateEndpoint;
+        std::unique_ptr<PinnedHostBuffer> host; // null while only on disk
+        std::filesystem::path file;             // empty unless on disk
+        std::uint64_t bytes     = 0;
+        std::uint64_t last_used = 0;
+    };
+
+    // Shorter prefixes prefill faster than their recurrent state (about 114 MB) copies back.
+    static constexpr std::size_t kMinStoredTokens = 128;
+    std::vector<Stored> stored;
+    std::uint64_t host_budget = 0, host_used = 0;
+    std::filesystem::path disk_dir;
+    std::uint64_t disk_budget = 0, disk_used = 0;
+    bool disk_restore = false;
 
     std::thread worker;
 
@@ -336,13 +454,16 @@ struct Qwen4ExpCore::Impl {
           pending_timeout(options.pending_timeout_ms),
           domain(i.model->resources().public_token_count),
           structured_output(options.structured_output),
-          reuse_prefixes(options.context_cache.enabled), slots(i.executor->options().sequences) {
+          reuse_prefixes(options.context_cache.enabled), drafts(i.executor->draft_tokens()),
+          slots(i.executor->options().sequences) {
         RankBinding bind(device, i.executor->head_rank());
         const std::size_t rows = slots.size();
+        // A sampling call's columns per row: one, or a verification's drafts and bonus.
+        const std::size_t width = std::size_t(drafts) + 1;
         if (structured_output) {
-            token_mask = DeviceBuffer(rows * mask_words() * sizeof(std::uint32_t));
-            host_mask =
-                std::make_unique<PinnedHostBuffer>(rows * mask_words() * sizeof(std::uint32_t));
+            token_mask = DeviceBuffer(rows * width * mask_words() * sizeof(std::uint32_t));
+            host_mask  = std::make_unique<PinnedHostBuffer>(rows * width * mask_words() *
+                                                            sizeof(std::uint32_t));
         }
         sample_config   = DeviceBuffer(rows * sizeof(ops::SamplingConfig));
         sample_position = DeviceBuffer(rows * sizeof(std::int32_t));
@@ -352,21 +473,55 @@ struct Qwen4ExpCore::Impl {
         token_counts     = DeviceBuffer(rows * domain * sizeof(std::int32_t));
         score_targets    = DeviceBuffer(4096 * sizeof(std::int32_t));
         score_out        = DeviceBuffer(4096 * sizeof(float));
-        const std::size_t top = rows * kMaximumTokenLogprobs;
+        const std::size_t top = rows * width * kMaximumTokenLogprobs;
         logprob_ids           = DeviceBuffer(top * sizeof(std::int32_t));
         logprob_values        = DeviceBuffer(top * sizeof(float));
-        logprob_lse           = DeviceBuffer(rows * sizeof(float));
+        logprob_lse           = DeviceBuffer(rows * width * sizeof(float));
         logprob_flag          = DeviceBuffer(sizeof(std::int32_t));
         host_logprobs =
             std::make_unique<PinnedHostBuffer>(top * (sizeof(std::int32_t) + sizeof(float)));
         const std::int32_t enabled = 1;
         CUDA_CHECK(cudaMemcpy(logprob_flag.p, &enabled, sizeof(enabled), cudaMemcpyHostToDevice));
-        sample_workspace = std::make_unique<WorkspaceArena>(std::max<std::size_t>(
+        std::size_t workspace = std::max<std::size_t>(
             {ops::sampling_workspace_capacity_bytes(static_cast<std::int32_t>(domain), 1,
                                                     static_cast<std::int32_t>(rows)),
              ops::logprob_topk_workspace_capacity_bytes(static_cast<std::int32_t>(domain),
-                                                        static_cast<std::int32_t>(rows)),
-             std::size_t{256}}));
+                                                        static_cast<std::int32_t>(rows * width)),
+             std::size_t{256}});
+        if (drafts > 0) {
+            workspace =
+                std::max(workspace, ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                                        static_cast<std::int32_t>(domain), 1,
+                                        static_cast<std::int32_t>(drafts), 1,
+                                        static_cast<std::int32_t>(rows)));
+            const auto plane = [&](std::size_t count) {
+                return DeviceBuffer(rows * count * sizeof(std::int32_t));
+            };
+            spec_drafts   = plane(drafts);
+            spec_targets  = plane(width);
+            spec_licensed = plane(width);
+            spec_extents  = plane(1);
+            spec_lengths  = plane(1);
+            spec_counts   = plane(1);
+            spec_accepted = plane(1);
+            spec_anchors  = plane(1);
+            counts_backup = DeviceBuffer(rows * domain * sizeof(std::int32_t));
+            host_spec     = std::make_unique<PinnedHostBuffer>(rows * (drafts + width + 4) *
+                                                               sizeof(std::int32_t));
+        }
+        sample_workspace                 = std::make_unique<WorkspaceArena>(workspace);
+        const ContextCacheOptions& cache = options.context_cache;
+        if (reuse_prefixes) {
+            host_budget = cache.host_cache_budget_bytes.value_or(cache.host_kv_capacity_bytes);
+            if (!cache.disk_kv_path.empty()) {
+                disk_dir     = cache.disk_kv_path / profile_name(options);
+                disk_budget  = cache.disk_kv_capacity_bytes != 0 ? cache.disk_kv_capacity_bytes
+                                                                 : (64ULL << 30);
+                disk_restore = cache.disk_kv_restore;
+                std::filesystem::create_directories(disk_dir);
+                if (disk_restore) { scan_disk(); }
+            }
+        }
         worker = std::thread([this] {
             device.bind_to_current_thread();
             loop();
@@ -464,8 +619,9 @@ struct Qwen4ExpCore::Impl {
         stats.waiting_requests = static_cast<std::uint32_t>(pending.size());
     }
 
-    // Every request gauge, from the worker, which owns the slots.
+    // Every request gauge, from the worker, which owns the slots and the executor.
     void publish_stats() {
+        const NgramTableStats ngram = instance.executor->ngram_stats();
         std::uint32_t running = 0, prefilling = 0, decoding = 0;
         for (const Slot& slot : slots) {
             if (!slot.request) { continue; }
@@ -478,6 +634,7 @@ struct Qwen4ExpCore::Impl {
         stats.running_requests      = running;
         stats.prefilling_requests   = prefilling;
         stats.decode_ready_requests = decoding;
+        stats.ngram_table           = ngram;
     }
 
     // A request failed on its own: it completes with the error, and its sequence keeps nothing
@@ -506,6 +663,256 @@ struct Qwen4ExpCore::Impl {
     [[nodiscard]] std::uint32_t reuse(const Slot& slot, const std::vector<TokenId>& prompt) const {
         if (!reuse_prefixes) { return 0; }
         return std::max(prefix_reuse(slot.fed, prompt), prefix_reuse(slot.anchor, prompt));
+    }
+
+    // ---- The context cache's store ------------------------------------------------------------
+
+    // The disk tier's directory for this model and execution profile: an image holds the KV in its
+    // storage format and the MTP block's state only when the block runs.
+    [[nodiscard]] std::string profile_name(const EngineOptions& options) const {
+        std::string id;
+        for (const std::byte b : instance.model->info().artifact_id) {
+            char hex[3];
+            std::snprintf(hex, sizeof(hex), "%02x", std::to_integer<unsigned>(b));
+            id += hex;
+        }
+        return "qwen4_exp-image1-" + id + "-kv" +
+               std::to_string(static_cast<int>(options.kv_cache)) + "-mtp" +
+               std::to_string(drafts > 0 ? 1 : 0);
+    }
+
+    struct FileHeader {
+        char magic[8]                = {'N', 'F', 'N', 'X', 'I', 'M', 'G', '1'};
+        std::uint32_t position       = 0;
+        std::uint32_t mtp_follows    = 0;
+        std::uint32_t context_tokens = 0;
+        std::uint32_t prompt_tokens  = 0;
+        std::uint32_t path           = 0;
+        std::uint32_t reserved       = 0;
+        std::uint64_t bytes          = 0;
+    };
+
+    static std::string file_name(const std::vector<TokenId>& tokens) {
+        std::uint64_t hash = 1469598103934665603ULL; // FNV-1a over the token ids
+        for (const TokenId token : tokens) {
+            for (int i = 0; i < 4; ++i) {
+                hash ^= (std::uint32_t(token) >> (8 * i)) & 0xffU;
+                hash *= 1099511628211ULL;
+            }
+        }
+        char name[40];
+        std::snprintf(name, sizeof(name), "%016llx-%u.img", static_cast<unsigned long long>(hash),
+                      static_cast<unsigned>(tokens.size()));
+        return name;
+    }
+
+    // Reads the headers of the images a previous run left in the disk tier.
+    void scan_disk() {
+        std::uint64_t order = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(disk_dir)) {
+            if (entry.path().extension() != ".img") { continue; }
+            std::ifstream file(entry.path(), std::ios::binary);
+            FileHeader header;
+            if (!file.read(reinterpret_cast<char*>(&header), sizeof(header)) ||
+                std::memcmp(header.magic, FileHeader{}.magic, 8) != 0 ||
+                header.bytes != instance.executor->image_bytes(header.position)) {
+                continue;
+            }
+            Stored image;
+            image.header.position    = header.position;
+            image.header.mtp_follows = header.mtp_follows != 0;
+            image.header.context.previous.resize(header.context_tokens);
+            image.tokens.resize(header.prompt_tokens);
+            if (!file.read(reinterpret_cast<char*>(image.header.context.previous.data()),
+                           std::streamsize(header.context_tokens) * 4) ||
+                !file.read(reinterpret_cast<char*>(image.tokens.data()),
+                           std::streamsize(header.prompt_tokens) * 4)) {
+                continue;
+            }
+            image.path      = static_cast<PrefixReusePath>(header.path);
+            image.file      = entry.path();
+            image.bytes     = header.bytes;
+            image.last_used = ++order;
+            disk_used += entry.file_size();
+            stored.push_back(std::move(image));
+        }
+    }
+
+    // The stored prefix that serves the most of `prompt`: its index and length.
+    [[nodiscard]] std::pair<std::size_t, std::uint32_t>
+    find_stored(const std::vector<TokenId>& prompt) const {
+        std::pair<std::size_t, std::uint32_t> best{0, 0};
+        for (std::size_t i = 0; i < stored.size(); ++i) {
+            if (stored[i].host == nullptr && !disk_restore) { continue; }
+            const std::uint32_t length = prefix_reuse(stored[i].tokens, prompt);
+            if (length > best.second) { best = {i, length}; }
+        }
+        return best;
+    }
+
+    void drop_dead() {
+        std::erase_if(stored, [](const Stored& image) {
+            return image.host == nullptr && image.file.empty();
+        });
+    }
+
+    // Writes an image held in host memory to the disk tier, making room by deleting the least
+    // recently used files; entries left with neither copy are dropped by the caller.
+    void write_file(Stored& image) {
+        if (disk_dir.empty() || !image.file.empty() || image.host == nullptr) { return; }
+        const std::uint64_t size =
+            sizeof(FileHeader) + 4 * (image.header.context.previous.size() + image.tokens.size()) +
+            image.bytes;
+        if (size > disk_budget) { return; }
+        while (disk_used + size > disk_budget) {
+            Stored* oldest = nullptr;
+            for (Stored& other : stored) {
+                if (!other.file.empty() &&
+                    (oldest == nullptr || other.last_used < oldest->last_used)) {
+                    oldest = &other;
+                }
+            }
+            if (oldest == nullptr) { return; }
+            std::error_code ignored;
+            const auto bytes = std::filesystem::file_size(oldest->file, ignored);
+            disk_used -= std::min<std::uint64_t>(disk_used, ignored ? 0 : bytes);
+            std::filesystem::remove(oldest->file, ignored);
+            oldest->file.clear();
+        }
+        FileHeader header;
+        header.position       = image.header.position;
+        header.mtp_follows    = image.header.mtp_follows ? 1 : 0;
+        header.context_tokens = static_cast<std::uint32_t>(image.header.context.previous.size());
+        header.prompt_tokens  = static_cast<std::uint32_t>(image.tokens.size());
+        header.path           = static_cast<std::uint32_t>(image.path);
+        header.bytes          = image.bytes;
+        const auto path       = disk_dir / file_name(image.tokens);
+        const auto temporary  = std::filesystem::path(path).concat(".tmp");
+        {
+            std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+            file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+            file.write(reinterpret_cast<const char*>(image.header.context.previous.data()),
+                       std::streamsize(header.context_tokens) * 4);
+            file.write(reinterpret_cast<const char*>(image.tokens.data()),
+                       std::streamsize(header.prompt_tokens) * 4);
+            file.write(static_cast<const char*>(image.host->data()), std::streamsize(image.bytes));
+            if (!file) {
+                std::error_code ignored;
+                std::filesystem::remove(temporary, ignored);
+                return;
+            }
+        }
+        std::error_code failed;
+        std::filesystem::rename(temporary, path, failed);
+        if (failed) { return; }
+        image.file = path;
+        disk_used += size;
+    }
+
+    // Brings the images in pinned host memory within the budget with `bytes` more: the least
+    // recently used go to the disk tier, or are dropped without one. False when the budget
+    // cannot hold `bytes` at all.
+    bool make_host_room(std::uint64_t bytes) {
+        if (bytes > host_budget) { return false; }
+        while (host_used + bytes > host_budget) {
+            std::optional<std::size_t> oldest;
+            for (std::size_t i = 0; i < stored.size(); ++i) {
+                if (stored[i].host != nullptr &&
+                    (!oldest || stored[i].last_used < stored[*oldest].last_used)) {
+                    oldest = i;
+                }
+            }
+            if (!oldest) { return false; }
+            write_file(stored[*oldest]);
+            stored[*oldest].host.reset();
+            host_used -= stored[*oldest].bytes;
+            drop_dead();
+        }
+        drop_dead();
+        return true;
+    }
+
+    [[nodiscard]] std::optional<std::size_t>
+    stored_index(const std::vector<TokenId>& tokens) const {
+        for (std::size_t i = 0; i < stored.size(); ++i) {
+            if (stored[i].tokens == tokens) { return i; }
+        }
+        return std::nullopt;
+    }
+
+    // Keeps the state of sequence `s` up to `tokens` (its live state, or the snapshot `at`) in
+    // the store, unless the store already holds that prefix or it is too short to be worth it.
+    void store_image(std::uint32_t s, const std::vector<TokenId>& tokens,
+                     const models::qwen4_exp::SequenceSnapshot* at, PrefixReusePath path) {
+        if (tokens.size() < kMinStoredTokens || host_budget == 0) { return; }
+        if (const auto known = stored_index(tokens)) {
+            stored[*known].last_used = ++use_clock;
+            return;
+        }
+        auto& executor      = *instance.executor;
+        const auto position = at != nullptr ? at->position : executor.position(s);
+        if (position != tokens.size()) { return; } // the state holds other tokens
+        const std::uint64_t bytes = executor.image_bytes(position);
+        if (!make_host_room(bytes)) { return; }
+        Stored image;
+        image.tokens = tokens;
+        image.path   = path;
+        image.bytes  = bytes;
+        image.host   = std::make_unique<PinnedHostBuffer>(bytes);
+        image.header = executor.save_image(
+            s, at, std::span(static_cast<std::byte*>(image.host->data()), bytes));
+        image.last_used = ++use_clock;
+        host_used += bytes;
+        stored.push_back(std::move(image));
+        std::lock_guard lock(stats_mutex);
+        stats.state_d2h_count += 1;
+        stats.state_d2h_bytes += bytes;
+        stats.host_kv_occupied_bytes = host_used;
+    }
+
+    // Keeps what sequence `s` holds before its state goes: the prefix its last prompt's turn
+    // closed at, and where it ended.
+    void retire(std::uint32_t s) {
+        Slot& slot          = slots[s];
+        const bool anchored = !slot.anchor.empty() && slot.anchor.size() <= slot.fed.size() &&
+                              std::equal(slot.anchor.begin(), slot.anchor.end(), slot.fed.begin());
+        if (anchored) {
+            store_image(s, slot.anchor, &slot.snapshot, PrefixReusePath::PrivateTurnClosure);
+        }
+        if (slot.fed != slot.anchor) {
+            store_image(s, slot.fed, nullptr, PrefixReusePath::PrivateEndpoint);
+        }
+    }
+
+    // Loads the stored image of `tokens` into sequence `s`, reading it from the disk tier when it
+    // is only there; false when the store no longer holds it.
+    bool restore_stored(std::uint32_t s, const std::vector<TokenId>& tokens) {
+        const auto index = stored_index(tokens);
+        if (!index) { return false; }
+        Stored& image = stored[*index];
+        if (image.host == nullptr) {
+            image.host = std::make_unique<PinnedHostBuffer>(image.bytes);
+            std::ifstream in(image.file, std::ios::binary);
+            in.seekg(std::streamoff(sizeof(FileHeader) +
+                                    4 * (image.header.context.previous.size() + tokens.size())));
+            if (!in.read(static_cast<char*>(image.host->data()), std::streamsize(image.bytes))) {
+                image.host.reset();
+                return false;
+            }
+            host_used += image.bytes;
+        }
+        instance.executor->load_image(
+            s, image.header,
+            std::span(static_cast<const std::byte*>(image.host->data()), image.bytes));
+        image.last_used           = ++use_clock;
+        const std::uint64_t bytes = image.bytes;
+        // Within the budget again, the image just read in being the most recently used.
+        (void)make_host_room(0);
+        std::lock_guard lock(stats_mutex);
+        stats.state_h2d_count += 1;
+        stats.state_h2d_bytes += bytes;
+        stats.host_kv_occupied_bytes = host_used;
+        return true;
     }
 
     // Moves queued requests into free sequences, oldest first: each into the free sequence whose
@@ -559,12 +966,25 @@ struct Qwen4ExpCore::Impl {
         }
         r.admitted = Clock::now();
         // Resume from the sequence's live state when the prompt continues it, else from the
-        // snapshot at the end of its last prompt when the prompt continues that.
+        // snapshot at the end of its last prompt when the prompt continues that, else from the
+        // longest prefix the store keeps; what the sequence held goes to the store first.
         std::uint32_t reused = 0;
         if (reuse_prefixes && r.reusable) {
-            const std::uint32_t live     = prefix_reuse(slot.fed, r.prompt_tokens);
-            const std::uint32_t anchored = prefix_reuse(slot.anchor, r.prompt_tokens);
-            if (anchored > live) {
+            const std::uint32_t live       = prefix_reuse(slot.fed, r.prompt_tokens);
+            const std::uint32_t anchored   = prefix_reuse(slot.anchor, r.prompt_tokens);
+            const auto [image, from_store] = find_stored(r.prompt_tokens);
+            if (from_store > std::max(live, anchored)) {
+                const std::vector<TokenId> tokens = stored[image].tokens;
+                const PrefixReusePath path        = stored[image].path;
+                retire(s);
+                if (restore_stored(s, tokens)) {
+                    slot.fed = tokens;
+                    slot.anchor.clear();
+                    reused       = from_store;
+                    r.reuse_path = path;
+                }
+            } else if (anchored > live) {
+                retire(s);
                 executor.restore(s, slot.snapshot);
                 slot.fed     = slot.anchor;
                 reused       = anchored;
@@ -575,12 +995,21 @@ struct Qwen4ExpCore::Impl {
             }
         }
         if (reused == 0) {
+            if (reuse_prefixes) { retire(s); }
             executor.reset(s);
             slot.fed.clear();
+            // The snapshot's prefix is about to be overwritten.
+            slot.anchor.clear();
         }
         slot.request   = request;
         slot.last_used = ++use_clock;
         r.reused = r.prefilled = reused;
+        if (drafts > 0) {
+            r.speculative.backend      = SpeculativeBackend::Mtp;
+            r.speculative.enabled      = true;
+            r.speculative.draft_window = drafts;
+            r.speculative.accepted_per_position.assign(drafts, 0);
+        }
         r.prefill_start        = Clock::now();
         {
             std::lock_guard lock(stats_mutex);
@@ -784,6 +1213,7 @@ struct Qwen4ExpCore::Impl {
         result.thinking.post_thinking_sampling = r.post_thinking;
         result.reused_prompt_tokens            = r.reused;
         result.prefix_reuse_path               = r.reuse_path;
+        if (drafts > 0) { result.speculative = r.speculative; }
         result.timings.prepare_seconds         = r.prepare_seconds;
         result.timings.vision_seconds          = r.vision_seconds;
         result.timings.prefill_seconds = seconds(r.prefill_start, r.prefill_end) - r.vision_seconds;
@@ -899,21 +1329,44 @@ struct Qwen4ExpCore::Impl {
     // record when the request asked for logprobs.
     void accept(const std::shared_ptr<Request>& request, TokenId token,
                 const runtime::RawTokenLogprob* logprob) {
+        (void)accept(request, std::span<const TokenId>(&token, 1),
+                     logprob != nullptr ? std::span<const runtime::RawTokenLogprob>(logprob, 1)
+                                        : std::span<const runtime::RawTokenLogprob>{});
+        check_capacity(request);
+    }
+
+    [[nodiscard]] bool active(const std::shared_ptr<Request>& request) const {
+        return slots.at(request->slot).request == request;
+    }
+
+    // A request whose next feed would pass the context finishes.
+    void check_capacity(const std::shared_ptr<Request>& request) {
+        if (active(request) && request->position + request->feed.size() > max_context) {
+            finish_now(request, FinishReason::ContextCapacity);
+        }
+    }
+
+    // The same for a run of sampled tokens (a speculative round's licensed tokens), without the
+    // capacity check, which the caller makes once the round's position is known: returns how many
+    // of them the policy accepted. The next step feeds the last accepted one (the first when none
+    // was, as a single sampled token is fed whatever the policy decides).
+    std::uint32_t accept(const std::shared_ptr<Request>& request, std::span<const TokenId> tokens,
+                         std::span<const runtime::RawTokenLogprob> logprobs) {
         Request& r                    = *request;
-        const OutputDecision decision = r.output.preview_model(
-            std::span<const TokenId>(&token, 1), r.budget->remaining(), r.budget->limit_reason(),
-            logprob != nullptr ? std::span<const runtime::RawTokenLogprob>(logprob, 1)
-                               : std::span<const runtime::RawTokenLogprob>{});
+        const OutputDecision decision = r.output.preview_model(tokens, r.budget->remaining(),
+                                                               r.budget->limit_reason(), logprobs);
         const auto now = Clock::now();
         if (r.first_token == Clock::time_point{}) { r.first_token = now; }
         r.last_token = now;
-        if (decision.accepted_tokens > 1) {
-            throw std::logic_error("output policy accepted more than the sampled token");
+        if (decision.accepted_tokens > tokens.size()) {
+            throw std::logic_error("output policy accepted more than the sampled tokens");
         }
-        if (decision.accepted_tokens == 1) {
-            r.generated.push_back(token);
-            r.budget->commit(1);
+        const std::uint32_t accepted = decision.accepted_tokens;
+        if (accepted > 0) {
+            r.generated.insert(r.generated.end(), tokens.begin(), tokens.begin() + accepted);
+            r.budget->commit(accepted);
         }
+        const TokenId token = tokens[accepted > 0 ? accepted - 1 : 0];
         std::optional<GenerationTimingObservation> timing;
         if (r.observation.live_timings) {
             timing = GenerationTimingObservation{
@@ -928,7 +1381,7 @@ struct Qwen4ExpCore::Impl {
         }
         if (decision.finished()) {
             finish(request, decision.finish_reason);
-            return;
+            return accepted;
         }
         r.feed.assign(1, token);
         if (decision.continuation == ContinuationAction::ApplyTargetControl) {
@@ -945,21 +1398,33 @@ struct Qwen4ExpCore::Impl {
         }
         if (r.cancelled.load(std::memory_order_acquire)) {
             finish_now(request, FinishReason::Cancelled);
-            return;
         }
-        if (r.position + r.feed.size() > max_context) {
-            finish_now(request, FinishReason::ContextCapacity);
-        }
+        return accepted;
     }
 
-    // One step of every decoding request: those that feed one token run as one batch, whose
-    // experts read their weights once; one feeding a thinking-control suffix runs alone.
+    // Whether the request's next step can be a speculative round: an Engine with drafts, one token
+    // to feed, an MTP state that follows the sequence, room for the round in the context, and no
+    // switch of sampling parameters pending (a reasoning block that has not closed yet when the
+    // request samples its answer differently).
+    [[nodiscard]] bool speculates(const Request& r) const {
+        return drafts > 0 && r.feed.size() == 1 && instance.executor->can_draft(r.slot) &&
+               r.position + drafts + 1 <= max_context &&
+               !(r.options.execution.post_thinking_sampling && !r.post_thinking);
+    }
+
+    // One step of every decoding request: those that speculate run one MTP round together, those
+    // that feed one token otherwise run as one batch, whose experts read their weights once; one
+    // feeding a thinking-control suffix runs alone.
     void decode_step() {
         auto& executor = *instance.executor;
-        std::vector<std::shared_ptr<Request>> batch, alone;
+        std::vector<std::shared_ptr<Request>> batch, alone, speculative;
         for (const Slot& slot : slots) {
             if (!slot.request || !slot.request->decoding) { continue; }
-            (slot.request->feed.size() == 1 ? batch : alone).push_back(slot.request);
+            if (speculates(*slot.request)) {
+                speculative.push_back(slot.request);
+            } else {
+                (slot.request->feed.size() == 1 ? batch : alone).push_back(slot.request);
+            }
         }
         const auto start = Clock::now();
         for (const auto& request : alone) {
@@ -995,15 +1460,232 @@ struct Qwen4ExpCore::Impl {
             std::vector<runtime::RawTokenLogprob> logprobs(batch.size());
             sample(rows, ops::kSamplePurposeDecode, sampled, logprobs);
             for (std::size_t b = 0; b < batch.size(); ++b) {
+                if (drafts > 0) { ++batch[b]->speculative.fallback_steps; }
                 try {
                     accept(batch[b], sampled[b], rows[b].logprobs ? &logprobs[b] : nullptr);
                 } catch (...) { fail(batch[b], std::current_exception()); }
             }
         }
+        if (!speculative.empty()) { speculative_round(speculative); }
         std::lock_guard lock(stats_mutex);
         stats.decode_rounds += 1;
-        stats.decode_row_rounds += batch.size() + alone.size();
+        stats.decode_row_rounds += batch.size() + alone.size() + speculative.size();
         stats.decode_seconds_total += seconds(start, Clock::now());
+    }
+
+    // One MTP round of each request: the MTP block drafts from its anchor, the target verifies the
+    // anchor and the drafts at once, the acceptance licenses a run of tokens on the device (the
+    // accepted drafts and a correction or bonus, sampled as the request samples, so the output
+    // follows the target's distribution), the output policy takes what it accepts of the run, and
+    // the executor commits the tokens fed up to the last of them.
+    void speculative_round(const std::vector<std::shared_ptr<Request>>& batch) {
+        auto& executor      = *instance.executor;
+        const std::size_t b = batch.size();
+        const std::size_t k = drafts;
+        const std::size_t w = k + 1;
+        const auto columns  = static_cast<std::int32_t>(w);
+        std::vector<std::uint32_t> sequences;
+        std::vector<TokenId> anchors;
+        for (const auto& request : batch) {
+            sequences.push_back(request->slot);
+            anchors.push_back(request->feed.front());
+        }
+        std::vector<TokenId> proposed(b * k);
+        executor.draft(sequences, anchors, proposed);
+        std::vector<TokenId> tokens;
+        for (std::size_t j = 0; j < b; ++j) {
+            tokens.push_back(anchors[j]);
+            tokens.insert(tokens.end(), proposed.begin() + std::ptrdiff_t(j * k),
+                          proposed.begin() + std::ptrdiff_t((j + 1) * k));
+        }
+        executor.verify(sequences, tokens);
+
+        RankBinding bind(device, executor.head_rank());
+        const cudaStream_t stream = executor.head_stream();
+        std::vector<SampleRow> rows;
+        for (const auto& request : batch) { rows.push_back(sample_row(*request)); }
+        // The rows' sampling, each column of a grammar's row masked as the drafts before it leave
+        // the grammar.
+        auto* configs = static_cast<ops::SamplingConfig*>(host_sample->data());
+        bool masked   = false;
+        for (std::size_t j = 0; j < b; ++j) {
+            const SampleRow& row = rows[j];
+            ops::SamplingConfig config;
+            config.temperature       = row.params->temperature;
+            config.top_k             = row.params->top_k;
+            config.top_p             = row.params->top_p;
+            config.min_p             = row.params->min_p;
+            config.presence_penalty  = row.params->presence_penalty;
+            config.frequency_penalty = row.params->frequency_penalty;
+            config.seed              = row.params->seed;
+            config.token_counts      = row.counts ? static_cast<std::int32_t*>(token_counts.p) +
+                                                        std::size_t(row.slot) * domain
+                                                  : nullptr;
+            if (row.grammar != nullptr) {
+                auto* words = static_cast<std::uint32_t*>(host_mask->data()) + j * w * mask_words();
+                row.grammar->fill_masks(std::span(words, w * mask_words()),
+                                        std::span<const TokenId>(proposed).subspan(j * k, k));
+                config.token_mask =
+                    static_cast<const std::uint32_t*>(token_mask.p) + j * w * mask_words();
+                config.token_mask_stride = static_cast<std::int32_t>(mask_words());
+                masked                   = true;
+            }
+            configs[j] = config;
+        }
+        if (masked) {
+            CUDA_CHECK(cudaMemcpyAsync(token_mask.p, host_mask->data(),
+                                       b * w * mask_words() * sizeof(std::uint32_t),
+                                       cudaMemcpyHostToDevice, stream));
+        }
+        CUDA_CHECK(cudaMemcpyAsync(sample_config.p, configs, b * sizeof(ops::SamplingConfig),
+                                   cudaMemcpyHostToDevice, stream));
+        // Drafts, live draft counts and the tokens each request fed before the round.
+        auto* staged = static_cast<std::int32_t*>(host_spec->data());
+        std::copy(proposed.begin(), proposed.end(), staged);
+        for (std::size_t j = 0; j < b; ++j) {
+            staged[b * k + j]     = static_cast<std::int32_t>(k);
+            staged[b * k + b + j] = static_cast<std::int32_t>(batch[j]->position);
+        }
+        CUDA_CHECK(
+            cudaMemcpyAsync(spec_drafts.p, staged, b * k * 4, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(spec_extents.p, staged + b * k, b * 4, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(spec_lengths.p, staged + b * k + b, b * 4,
+                                   cudaMemcpyHostToDevice, stream));
+        const auto rows_n         = static_cast<std::int32_t>(b);
+        const Tensor logits       = executor.logits(static_cast<std::uint32_t>(b * w));
+        const auto* device_config = static_cast<const ops::SamplingConfig*>(sample_config.p);
+        const Tensor drafted(spec_drafts.p, DType::I32, {static_cast<std::int32_t>(k), rows_n});
+        // The tokens' logprob records, from the distributions their columns are drawn from,
+        // before the acceptance adds the round's tokens to the penalty counts.
+        const bool gather     = std::any_of(rows.begin(), rows.end(),
+                                            [](const SampleRow& row) { return row.logprobs; });
+        const std::size_t top = b * w * kMaximumTokenLogprobs;
+        auto* host_ids        = static_cast<std::int32_t*>(host_logprobs->data());
+        auto* host_values =
+            reinterpret_cast<float*>(host_ids + slots.size() * w * kMaximumTokenLogprobs);
+        if (gather) {
+            Tensor ids(logprob_ids.p, DType::I32, {ops::kLogprobTopK, columns, rows_n});
+            Tensor values(logprob_values.p, DType::FP32, {ops::kLogprobTopK, columns, rows_n});
+            Tensor lse(logprob_lse.p, DType::FP32, {columns, rows_n});
+            const Tensor flag(logprob_flag.p, DType::I32, {1});
+            ops::logprob_topk(logits.view({logits.ne[0], columns, rows_n}), device_config, &drafted,
+                              static_cast<std::int32_t>(domain), ids, values, lse, flag,
+                              *sample_workspace, stream);
+            CUDA_CHECK(cudaMemcpyAsync(host_ids, logprob_ids.p, top * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(host_values, logprob_values.p, top * sizeof(float),
+                                       cudaMemcpyDeviceToHost, stream));
+        }
+        for (std::size_t j = 0; j < b; ++j) {
+            if (!rows[j].counts) { continue; }
+            const std::size_t at = std::size_t(rows[j].slot) * domain * sizeof(std::int32_t);
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(counts_backup.p) + at,
+                                       static_cast<const std::byte*>(token_counts.p) + at,
+                                       std::size_t(domain) * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+        Tensor targets(spec_targets.p, DType::I32, {columns * rows_n});
+        ops::argmax(logits, targets, static_cast<std::int32_t>(domain), stream);
+        Tensor extents(spec_extents.p, DType::I32, {rows_n});
+        Tensor lengths(spec_lengths.p, DType::I32, {rows_n});
+        Tensor round_anchors(spec_anchors.p, DType::I32, {rows_n});
+        Tensor licensed(spec_licensed.p, DType::I32, {columns, rows_n});
+        Tensor counts(spec_counts.p, DType::I32, {rows_n});
+        Tensor accepted(spec_accepted.p, DType::I32, {rows_n});
+        {
+            auto scope = sample_workspace->scope();
+            ops::speculative_accept_greedy_drafts(
+                targets.view({columns, rows_n}), logits.view({logits.ne[0], columns, rows_n}),
+                drafted, extents, lengths, round_anchors, licensed, counts, accepted,
+                static_cast<std::int32_t>(domain), device_config, *sample_workspace, stream);
+        }
+        auto* host = staged + b * (k + 2);
+        CUDA_CHECK(
+            cudaMemcpyAsync(host, spec_licensed.p, b * w * 4, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(host + b * w, spec_counts.p, b * 4, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(host + b * w + b, spec_accepted.p, b * 4, cudaMemcpyDeviceToHost,
+                                   stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // The output policy takes its part of each licensed run; the executor then keeps the tokens
+        // fed up to the last one taken.
+        std::vector<std::uint32_t> kept(b, 1);
+        std::vector<char> failed(b, 0);
+        for (std::size_t j = 0; j < b; ++j) {
+            const auto& request           = batch[j];
+            Request& r                    = *request;
+            const std::int32_t licensed_n = host[b * w + j];
+            const std::int32_t drafts_n   = host[b * w + b + j];
+            const std::int32_t* run       = host + j * w;
+            if (licensed_n < 1 || licensed_n > columns || run[0] == ops::kSamplerNonFiniteToken) {
+                throw std::runtime_error("Qwen3.8-Flash-Next produced non-finite logits");
+            }
+            for (std::int32_t i = 0; i < licensed_n; ++i) {
+                if (run[i] < 0 || std::uint32_t(run[i]) >= domain) {
+                    throw std::runtime_error("Qwen3.8-Flash-Next licensed a token outside the "
+                                             "vocabulary");
+                }
+            }
+            std::vector<runtime::RawTokenLogprob> records;
+            if (rows[j].logprobs) {
+                for (std::int32_t i = 0; i < licensed_n; ++i) {
+                    runtime::RawTokenLogprob record{.id = run[i], .logprob = kLogprobSentinel};
+                    for (std::size_t t = 0; t < kMaximumTokenLogprobs; ++t) {
+                        const std::size_t at = (j * w + std::size_t(i)) * kMaximumTokenLogprobs + t;
+                        record.top_ids[t]    = host_ids[at];
+                        record.top_values[t] = host_values[at];
+                        if (host_ids[at] == run[i]) { record.logprob = host_values[at]; }
+                    }
+                    records.push_back(record);
+                }
+            }
+            r.speculative.rounds += 1;
+            r.speculative.drafted_tokens += k;
+            r.speculative.accepted_tokens += std::uint32_t(drafts_n);
+            for (std::int32_t i = 0; i < drafts_n; ++i) {
+                ++r.speculative.accepted_per_position[i];
+            }
+            const std::span<const TokenId> run_tokens(run, std::size_t(licensed_n));
+            std::uint32_t taken = 0;
+            try {
+                taken = accept(request, run_tokens, records);
+            } catch (...) {
+                fail(request, std::current_exception());
+                failed[j] = 1;
+            }
+            // The tokens counted as sampled: those taken, or the first when none was.
+            kept[j] = std::max<std::uint32_t>(taken, 1);
+            if (kept[j] < std::uint32_t(licensed_n) && active(request) && rows[j].counts) {
+                // The acceptance counted the whole run; the request keeps only its prefix.
+                const std::size_t at = std::size_t(r.slot) * domain * sizeof(std::int32_t);
+                CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(token_counts.p) + at,
+                                           static_cast<const std::byte*>(counts_backup.p) + at,
+                                           std::size_t(domain) * sizeof(std::int32_t),
+                                           cudaMemcpyDeviceToDevice, stream));
+                // The run's tokens are still in the licensed plane, at the row's offset.
+                const Tensor ids(static_cast<std::int32_t*>(spec_licensed.p) + j * w, DType::I32,
+                                 {static_cast<std::int32_t>(kept[j])});
+                Tensor row_counts(static_cast<std::int32_t*>(token_counts.p) +
+                                      std::size_t(r.slot) * domain,
+                                  DType::I32, {static_cast<std::int32_t>(domain)});
+                ops::increment_token_counts(ids, row_counts, stream);
+            }
+        }
+        executor.commit(sequences, kept);
+        for (std::size_t j = 0; j < b; ++j) {
+            Request& r = *batch[j];
+            if (failed[j]) { continue; } // its sequence keeps nothing for the context cache
+            Slot& slot = slots[r.slot];
+            // The verification fed the anchor and the drafts; the sequence keeps the first ones.
+            slot.fed.insert(slot.fed.end(), tokens.begin() + std::ptrdiff_t(j * w),
+                            tokens.begin() + std::ptrdiff_t(j * w + kept[j]));
+            r.position += kept[j];
+            try {
+                check_capacity(batch[j]);
+            } catch (...) { fail(batch[j], std::current_exception()); }
+        }
     }
 
     std::vector<float> score(const std::vector<TokenId>& tokens, std::uint32_t first_target) {

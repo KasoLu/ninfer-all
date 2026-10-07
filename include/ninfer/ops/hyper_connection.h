@@ -57,4 +57,12 @@ void hyper_connection_write(Tensor& stack, const Tensor& y, const Tensor& inject
 // each stream c, x BF16 [hidden, tokens] widened exactly to FP32.
 void hyper_connection_expand(const Tensor& x, Tensor& stack, cudaStream_t stream);
 
+// The MTP layer's start (vLLM Qwen4ExpMultiTokenPredictor, whose fused input joins the token's
+// projection to every stream's with unit weight): stack[c, d] = streams[d, c] + x[d], with
+// `streams` BF16 [hidden, streams, tokens] (each stream's own projection) and x BF16
+// [hidden, tokens] (the token's, shared by the streams), both widened exactly to FP32 and summed in
+// FP32. The oracle is the FP64 sum; the stack is compared as FP32.
+void hyper_connection_expand(const Tensor& x, const Tensor& streams, Tensor& stack,
+                             cudaStream_t stream);
+
 } // namespace ninfer::ops
