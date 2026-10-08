@@ -7,8 +7,8 @@ using ninfer::runtime::PressureCheckpointRecoveryImpact;
 
 constexpr bool recovery_impacts_compare_values() {
     const std::array alternatives{
-        CheckpointRecoveryAlternativeWork{.prefill = {.tokens = 10}},
-        CheckpointRecoveryAlternativeWork{.prefill = {.tokens = 20}},
+        CheckpointRecoveryAlternativeWork{.transfers = {}, .prefill = {.tokens = 10}},
+        CheckpointRecoveryAlternativeWork{.transfers = {}, .prefill = {.tokens = 20}},
     };
     auto independent = alternatives;
     const PressureCheckpointRecoveryImpact left{
