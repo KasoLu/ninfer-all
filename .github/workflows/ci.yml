@@ -64,6 +64,26 @@ jobs:
               -o test_host_kv_clamp
           ./test_host_kv_clamp
 
+  cxx20-libcxx:
+    name: C++20 text and resource contracts (libc++)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install libc++
+        run: sudo apt-get update && sudo apt-get install -y clang libc++-dev libc++abi-dev
+      - name: Compile text sources and test copy-on-write state
+        run: |
+          clang++ -std=c++20 -stdlib=libc++ -fsyntax-only -DUTF8PROC_STATIC \
+            -Isrc -Iinclude -Ithird_party -Ithird_party/llama-jinja \
+            -Ithird_party/xgrammar/include -Ithird_party/xgrammar/3rdparty/dlpack/include \
+            src/text/*.cpp
+          clang++ -std=c++20 -stdlib=libc++ -O2 -Isrc -Ithird_party \
+            src/text/unique_strings.cpp tests/text/test_unique_strings.cpp -o unique_strings_test
+          ./unique_strings_test
+          clang++ -std=c++20 -stdlib=libc++ -Wall -Wextra -Werror -Isrc -Iinclude \
+            tests/host/test_checkpoint_recovery_impact.cpp -o checkpoint_recovery_impact_test
+          ./checkpoint_recovery_impact_test
+
   linux-scripts:
     name: Linux launcher and downloader guard
     runs-on: ubuntu-latest

@@ -4,6 +4,9 @@ ninfer_add_test(ninfer_admission_policy_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/
 ninfer_add_test(ninfer_context_cost_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_context_cost.cpp"
   LIBRARIES ninfer_runtime_support ninfer::json)
 
+ninfer_add_test(ninfer_checkpoint_recovery_impact_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../host/test_checkpoint_recovery_impact.cpp")
+
 ninfer_add_test(ninfer_slot_spill_guard_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_slot_spill_guard.cpp")
 
