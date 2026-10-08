@@ -7,7 +7,14 @@ from pathlib import Path
 import statistics
 
 
-def compare(single, split):
+def compare(single, split, eos_tokens=()):
+    eos_tokens = frozenset(eos_tokens)
+    if any(type(token) is not int or token < 0 for token in eos_tokens):
+        raise ValueError("EOS token IDs must be nonnegative integers")
+
+    def through_eos(tokens):
+        return tokens[:next((i + 1 for i, token in enumerate(tokens) if token in eos_tokens), len(tokens))]
+
     for field in ("schema", "artifact_id", "source", "drafts", "kv", "prefill_chunk", "max_context"):
         if single[field] != split[field]:
             raise ValueError(f"pipeline reports differ in {field}")
@@ -30,6 +37,7 @@ def compare(single, split):
                 raise ValueError("an Engine sample failed or reused prompt state")
     rows = []
     equal = True
+    qualified = True
     for one, two in zip(single["cases"], split["cases"], strict=True):
         for field in ("input_tokens", "needle_position", "expected"):
             if one[field] != two[field]:
@@ -40,9 +48,16 @@ def compare(single, split):
                    for report in (one, two) for sample in report["samples"]]
         matching = [all(sample[field] == reference[field] for field in fields)
                     for sample in two["samples"]]
+        visible_matching = [through_eos(sample["output_tokens"]) == through_eos(reference["output_tokens"])
+                            for sample in two["samples"]]
+        # Without a configured EOS in the reference, keep the original complete-output contract.
+        if not eos_tokens.intersection(reference["output_tokens"]):
+            visible_matching = matching
         equal = equal and all(repeats) and all(matching)
+        qualified = qualified and all(repeats) and all(visible_matching)
         row = {"prompt_tokens": one["prompt_tokens"], "fixed_mode_equal": all(repeats),
-               "matching_split_samples": sum(matching), "samples_per_device_count": 3}
+               "matching_split_samples": sum(matching), "samples_per_device_count": 3,
+               "matching_through_eos_samples": sum(visible_matching)}
         differences = [[index for index, (a, b) in enumerate(zip(reference["output_tokens"],
                          sample["output_tokens"], strict=True)) if a != b]
                        for sample in two["samples"]]
@@ -61,7 +76,8 @@ def compare(single, split):
         row["decode_tokens_per_second"] = [
             63 / row["decode_seconds"][key] for key in ("single_median", "split_median")]
         rows.append(row)
-    return {"byte_identity": equal, "artifact_id": single["artifact_id"],
+    return {"byte_identity": equal, "qualification_pass": qualified,
+            "eos_token_ids": sorted(eos_tokens), "artifact_id": single["artifact_id"],
             "hardware": [single["hardware"], split["hardware"]], "contexts": rows,
             "measurement": "three requests per context; no discarded warmup; Engine cache disabled"}
 
@@ -70,10 +86,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("single", type=Path)
     parser.add_argument("split", type=Path)
+    parser.add_argument("--eos-token", type=int, action="append", default=[],
+                        help="accept cross-host differences after this configured EOS token; repeat for multiple IDs")
     args = parser.parse_args()
-    result = compare(json.loads(args.single.read_text()), json.loads(args.split.read_text()))
+    result = compare(json.loads(args.single.read_text()), json.loads(args.split.read_text()), args.eos_token)
     print(json.dumps(result, indent=2))
-    raise SystemExit(0 if result["byte_identity"] else 1)
+    raise SystemExit(0 if result["qualification_pass"] else 1)
 
 
 if __name__ == "__main__":

@@ -634,7 +634,9 @@ largest selected prefix, with acceptance bounded separately for each request. Th
 from the sampling `--min-p` filter. The full captured draft chain still runs, and `drafted_tokens`
 counts that work. Only verification shrinks; a throughput gain is not established. The floor is
 part of the disk context-cache profile, and each verification width has its own CUDA Graph.
-GPU qualification of this option is in progress.
+GPU qualification passed K=1/4, floors 0/0.3/1, fixed-mode repetition, cancellation/recovery and
+three concurrent sequences. Floor 1 agrees with K=1. The release checks below establish no gain
+from floor 0.3, so zero remains the default.
 
 The verification leaves the sequence's state where it was: each Gated DeltaNet layer records its
 transitions and the commit replays the kept ones into the state (the Qwen3.5 family's ReplaySSM
@@ -994,7 +996,10 @@ output difference remains visible; its cause is not established by these timings
 agreement. A completed diagnostic applied the A6000 route choices to the two RTX 3090s, using
 Op defaults for additional 3090 profile keys. Its outputs are identical to the original split
 run at every context and repeat; this route change did not remove the cross-host difference.
-It is not a calibration of those routes for the 3090. The raw 64-token identity gate stays open.
+It is not a calibration of those routes for the 3090. On October 9, the user accepted differences
+after EOS and closed M7. All nine cross-host comparisons match through the first EOS, and all
+fixed-mode repeats remain exact. The full-output differences and unresolved cause remain recorded.
+The comparison tool's `--eos-token 248046` option applies this accepted boundary without hiding raw differences.
 
 **MTP.** The Q2_0 release with Unsloth's `shared-Q8_0` MTP block, converted into one file with its
 table, on two RTX 3090s (350 W, PCIe 4.0 x16, one GPU per socket of an EPYC 7663 host with 629 GB

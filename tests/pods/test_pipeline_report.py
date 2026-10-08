@@ -44,6 +44,46 @@ def test_report_does_not_hide_a_cross_device_or_repeat_difference():
     assert result["contexts"][1]["matching_split_samples"] == 2
 
 
+def test_post_eos_differences_are_accepted_and_remain_visible():
+    single, split = reports()
+    for report in (single, split):
+        for case in report["cases"]:
+            for sample in case["samples"]:
+                sample["output_tokens"][4] = 248046
+    for case in split["cases"]:
+        for sample in case["samples"]:
+            sample["output_tokens"][9:] = [9] * 55
+            sample["content"] += " trailing continuation"
+    result = compare(single, split, [248046])
+    assert result["qualification_pass"]
+    assert not result["byte_identity"]
+    assert result["contexts"][0]["matching_through_eos_samples"] == 3
+    assert result["contexts"][0]["different_tokens"] == [55] * 3
+    assert not compare(single, split)["qualification_pass"]
+
+
+@pytest.mark.parametrize("position", [0, 4])
+def test_difference_before_or_at_eos_is_rejected(position):
+    single, split = reports()
+    for report in (single, split):
+        for sample in report["cases"][0]["samples"]:
+            sample["output_tokens"][4] = 248046
+    for sample in split["cases"][0]["samples"]:
+        sample["output_tokens"][position] = 9
+    assert not compare(single, split, [248046])["qualification_pass"]
+
+
+def test_post_eos_repeat_difference_is_still_rejected():
+    single, split = reports()
+    for report in (single, split):
+        for sample in report["cases"][0]["samples"]:
+            sample["output_tokens"][4] = 248046
+    split["cases"][0]["samples"][2]["output_tokens"][9] = 9
+    result = compare(single, split, [248046])
+    assert result["contexts"][0]["matching_through_eos_samples"] == 3
+    assert not result["qualification_pass"]
+
+
 @pytest.mark.parametrize("change", ["artifact", "missing_repeat", "failed", "truncated", "infinite"])
 def test_report_refuses_incomparable_or_incomplete_evidence(change):
     single, split = reports()

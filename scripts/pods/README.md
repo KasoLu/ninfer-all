@@ -153,9 +153,12 @@ two devices, with the same native-Q2 artifact and standalone IQ4 table companion
 input tokens, 64 generated tokens, int8 KV, no prefix reuse and no discarded warmup. It retains
 exact input/output tokens, content, finish reason and per-phase times in `pipeline.json`.
 `compare_pipeline.py SINGLE SPLIT` rejects incomplete or incomparable runs, reports every timing
-sample and its median, and fails on any fixed-mode or cross-device output difference. Decode rate
-uses the 63 intervals after the first generated token. These routines are not measurement evidence
-until both reports have completed.
+sample and its median, and fails on any fixed-mode or cross-device output difference. Optional
+`--eos-token 248046` applies the accepted M7 boundary: cross-device tokens must match through the
+first EOS, while every fixed-mode repeat must still match in full. Raw full-output differences
+remain in the report separately from acceptance. Without a configured EOS in the output, the
+complete-output comparison applies. Decode rate uses the 63 intervals after the first generated
+token. These routines are not measurement evidence until both reports have completed.
 
 For the same Linux/CUDA image, `runtime_package.sh` packages the already-built test executable,
 its SHA-256 and source identity. `bootstrap_runtime.sh` installs only runtime dependencies and
