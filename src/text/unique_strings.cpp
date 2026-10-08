@@ -495,7 +495,9 @@ struct Parser {
                            std::find(r.domain.values.begin(), r.domain.values.end(), *string_value) == r.domain.values.end();
                 });
                 if (parent.rules.empty()) return false;
-                if (!parent.seen.unique()) parent.seen = std::make_shared<std::unordered_set<std::string>>(*parent.seen);
+                if (parent.seen.use_count() != 1) {
+                    parent.seen = std::make_shared<std::unordered_set<std::string>>(*parent.seen);
+                }
                 parent.seen->insert(*string_value);
             }
             ++parent.count;
