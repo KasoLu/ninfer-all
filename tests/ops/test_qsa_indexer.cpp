@@ -65,8 +65,8 @@ std::vector<double> pooled_oracle(const Sequence& seq, int block) {
 }
 
 int check_selection(const std::string& label, const Sequence& seq, const std::vector<std::vector<double>>& pooled,
-                    int position, const int* got, int got_count) {
-    const int blocks = (position + 1) / 4;
+                    int position, const int* got, int got_count, int column = -1) {
+    const int blocks = std::min((position + 1) / 4, static_cast<int>(pooled.size()));
     std::vector<int> expected;
     std::vector<double> score(blocks);
     if (blocks <= kTop) {
@@ -76,7 +76,8 @@ int check_selection(const std::string& label, const Sequence& seq, const std::ve
         std::vector<std::vector<double>> q(kHeads);
         for (int h = 0; h < kHeads; ++h) {
             std::vector<double> raw(kDim);
-            for (int d = 0; d < kDim; ++d) raw[d] = seq.projection[static_cast<std::size_t>(position) * kProjection + h * kDim + d];
+            for (int d = 0; d < kDim; ++d) raw[d] = seq.projection[
+                static_cast<std::size_t>(column < 0 ? position : column) * kProjection + h * kDim + d];
             q[h] = norm_rope(raw, seq.query_norm, position);
         }
         for (int b = 0; b < blocks; ++b) {
@@ -94,13 +95,15 @@ int check_selection(const std::string& label, const Sequence& seq, const std::ve
         expected.assign(order.begin(), order.begin() + kTop);
         std::sort(expected.begin(), expected.end());
     }
-    std::vector<int> actual(got, got + got_count);
-    if (!std::is_sorted(actual.begin(), actual.end())) {
-        std::cerr << label << ": selection not in increasing block order\n";
+    if (got_count != static_cast<int>(expected.size())) {
+        std::cerr << label << ": selected " << got_count << " blocks, expected " << expected.size() << '\n';
         return 1;
     }
-    if (static_cast<int>(actual.size()) != static_cast<int>(expected.size())) {
-        std::cerr << label << ": selected " << actual.size() << " blocks, expected " << expected.size() << '\n';
+    std::vector<int> actual(got, got + got_count);
+    if (!std::is_sorted(actual.begin(), actual.end()) ||
+        std::adjacent_find(actual.begin(), actual.end()) != actual.end() ||
+        (!actual.empty() && (actual.front() < 0 || actual.back() >= blocks))) {
+        std::cerr << label << ": selection not in increasing block order\n";
         return 1;
     }
     if (actual == expected) return 0;
@@ -214,6 +217,106 @@ int run(std::uint32_t seed) {
     return failures;
 }
 
+int selection_case(int tokens, int capacity, int first, bool ties = false) {
+    Sequence seq{tokens, std::vector<float>(std::size_t(tokens) * kProjection),
+                 std::vector<float>(kDim), std::vector<float>(kDim)};
+    fill_uniform(seq.projection, 9100 + tokens, -2.0f, 2.0f);
+    fill_uniform(seq.query_norm, 9110, -0.5f, 0.5f);
+    round_to_bf16(seq.projection);
+    round_to_bf16(seq.query_norm);
+    if (ties) { std::fill(seq.projection.begin(), seq.projection.end(), 0.0f); }
+    std::vector<float> keys(std::size_t(capacity) * kDim);
+    fill_uniform(keys, 9111, -2.0f, 2.0f);
+    // Public pooled keys are FP32 inputs to select; the oracle uses those exact values.
+    std::vector<std::vector<double>> pooled(capacity, std::vector<double>(kDim));
+    for (int b = 0; b < capacity; ++b) {
+        std::copy_n(keys.data() + std::size_t(b) * kDim, kDim, pooled[b].begin());
+    }
+    GuardedDeviceBuffer d_projection(seq.projection.size() * 2), d_qn(kDim * 2),
+        d_pooled(keys.size() * 4), d_first(4), d_selected(std::size_t(tokens) * kTop * 4),
+        d_counts(tokens * 4);
+    const auto bits = encode_bf16(seq.projection), norms = encode_bf16(seq.query_norm);
+    d_projection.copy_from_host(bits.data(), d_projection.bytes());
+    d_qn.copy_from_host(norms.data(), d_qn.bytes());
+    d_pooled.copy_from_host(keys.data(), d_pooled.bytes());
+    Tensor projection(d_projection.data(), DType::BF16, {kProjection, tokens});
+    Tensor norm(d_qn.data(), DType::BF16, {kDim});
+    Tensor positions(d_first.data(), DType::I32, {1});
+    Tensor pool(d_pooled.data(), DType::FP32, {kDim, capacity});
+    Tensor selected(d_selected.data(), DType::I32, {kTop, tokens});
+    Tensor counts(d_counts.data(), DType::I32, {tokens});
+    const ops::QsaIndexerWeights weights{&norm, nullptr};
+    WorkspaceArena workspace(ops::qsa_indexer_select_workspace_bytes(tokens, capacity));
+    cudaStream_t stream = nullptr;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    int failures = 0;
+    {
+        const auto step = [&] {
+            ops::qsa_indexer_select(projection, positions, weights, kEps, pool, workspace,
+                                   selected, counts, stream);
+        };
+        cudaGraphExec_t graph = nullptr;
+        for (int replay = 0; replay < 2; ++replay) {
+            const int position = first + replay * 3;
+            d_first.copy_from_host(&position, 4);
+            if (replay == 0) {
+                step();
+            } else {
+                cudaGraph_t captured = nullptr;
+                CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+                step();
+                CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
+                CUDA_CHECK(cudaGraphInstantiate(&graph, captured, 0));
+                CUDA_CHECK(cudaGraphDestroy(captured));
+                CUDA_CHECK(cudaGraphLaunch(graph, stream));
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            const auto got = from_device<int>(d_selected.data(), std::size_t(tokens) * kTop);
+            const auto sizes = from_device<int>(d_counts.data(), tokens);
+            for (int t = 0; t < tokens; ++t) {
+                failures += check_selection("qsa T=" + std::to_string(tokens) +
+                    " p=" + std::to_string(position + t),
+                    seq, pooled, position + t, got.data() + std::size_t(t) * kTop, sizes[t], t);
+                if (ties) {
+                    for (int i = 0; i < sizes[t]; ++i) {
+                        if (got[std::size_t(t) * kTop + i] != i) { ++failures; break; }
+                    }
+                }
+            }
+            if (replay == 1) {
+                CUDA_CHECK(cudaGraphLaunch(graph, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                const auto same = from_device<int>(d_selected.data(), std::size_t(tokens) * kTop);
+                const auto same_sizes = from_device<int>(d_counts.data(), tokens);
+                if (same_sizes != sizes) { ++failures; }
+                for (int t = 0; t < tokens; ++t) {
+                    if (sizes[t] >= 0 && sizes[t] <= kTop &&
+                        !std::equal(got.begin() + std::size_t(t) * kTop,
+                                    got.begin() + std::size_t(t) * kTop + sizes[t],
+                                    same.begin() + std::size_t(t) * kTop)) { ++failures; }
+                }
+                // Changed device position after capture must change causal visibility and RoPE.
+                const int next = position + 2;
+                d_first.copy_from_host(&next, 4);
+                CUDA_CHECK(cudaGraphLaunch(graph, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                const auto repeated = from_device<int>(d_selected.data(), std::size_t(tokens) * kTop);
+                const auto repeated_sizes = from_device<int>(d_counts.data(), tokens);
+                for (int t = 0; t < tokens; ++t) {
+                    failures += check_selection("qsa changed-position graph", seq, pooled, next + t,
+                        repeated.data() + std::size_t(t) * kTop, repeated_sizes[t], t);
+                }
+            }
+        }
+        CUDA_CHECK(cudaGraphExecDestroy(graph));
+    }
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    for (auto* buffer : {&d_projection, &d_qn, &d_pooled, &d_first, &d_selected, &d_counts}) {
+        failures += buffer->verify_guards("qsa selection routes");
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -221,7 +324,17 @@ int main() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
-    const int failures = run(8100u);
+    int failures = run(8100u);
+    for (int tokens : {1, 3, 4, 5, 8, 9, 15, 16, 17, 37, 127, 128, 129, 512}) {
+        failures += selection_case(tokens, 700, 2050);
+    }
+    failures += selection_case(5, 512, 2047);
+    failures += selection_case(5, 700, 2400, true);
+    failures += selection_case(128, 700, 2400, true);
+    failures += selection_case(128, 8192, 32700);
+    failures += selection_case(129, 32768, 130970);
+    failures += selection_case(512, 32768, 0);
+    failures += selection_case(512, 32768, 1800);
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " qsa_indexer\n";
     return failures == 0 ? 0 : 1;
 }

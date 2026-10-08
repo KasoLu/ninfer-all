@@ -146,9 +146,6 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
     MoeWeights out;
     out.router       = b.parameter(m + "router", {c.num_experts, h}, {input});
     out.shared_score = b.parameter(m + "shared_score", {1, h}, {input});
-    const artifact::Residency experts = residency == ExpertResidency::Host
-                                            ? artifact::Residency::Pinned
-                                            : artifact::Residency::Device;
     for (std::uint32_t e = 0; e < c.num_experts; ++e) {
         const std::string x = m + "experts/" + std::to_string(e) + "/";
         if (residency == ExpertResidency::Disk) {
@@ -158,9 +155,29 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
             out.located_down.push_back(locate(reader, x + "down", h, w));
             continue;
         }
-        out.gate.push_back(b.parameter(x + "gate", {w, h}, {input}, {}, experts));
-        out.up.push_back(b.parameter(x + "up", {w, h}, {input}, {}, experts));
-        out.down.push_back(b.parameter(x + "down", {h, w}, {x + "product"}, {}, experts));
+        const auto storage = [&](const char* role) {
+            if (residency != ExpertResidency::Host) { return artifact::Residency::Device; }
+            const auto& reader = b.binder.reader();
+            const auto found = reader.directory().bindings.find(x + role);
+            if (found == reader.directory().bindings.end()) {
+                throw artifact::ArtifactError("missing logical parameter " + x + role);
+            }
+            const auto& parts = found->second.parts;
+            const bool blocks = std::all_of(parts.begin(), parts.end(), [&](const auto& part) {
+                return is_gguf(reader.geometry(part.object).format);
+            });
+            if (blocks) { return artifact::Residency::Pinned; }
+            // Native banks are registered independently, so each layer's objects stay within
+            // one registration. Windows keeps pageable banks and uses bounded copy staging.
+#if defined(__linux__)
+            return artifact::Residency::Registered;
+#else
+            return artifact::Residency::Host;
+#endif
+        };
+        out.gate.push_back(b.parameter(x + "gate", {w, h}, {input}, {}, storage("gate")));
+        out.up.push_back(b.parameter(x + "up", {w, h}, {input}, {}, storage("up")));
+        out.down.push_back(b.parameter(x + "down", {h, w}, {x + "product"}, {}, storage("down")));
     }
     const std::uint64_t s = c.shared_expert_intermediate_size;
     out.shared_gate       = b.parameter(m + "shared/gate", {s, h}, {input});
@@ -174,7 +191,9 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& c, const std::string& p,
     }
     for (const WeightId id : downs) {
         for (const auto& part : b.at(id).reference.binding.parts) {
-            b.binder.device_tail(part.object, kExpertTail);
+            if (is_gguf(b.binder.reader().geometry(part.object).format)) {
+                b.binder.device_tail(part.object, kExpertTail);
+            }
         }
     }
     return out;

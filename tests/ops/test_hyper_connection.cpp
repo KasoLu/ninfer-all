@@ -81,9 +81,11 @@ Oracle oracle(const std::vector<float>& stack, const std::vector<float>& norm,
     return out;
 }
 
-int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed) {
+int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed,
+             bool fused = false, bool fp32_y = false) {
     const std::string label = "hyper_connection T=" + std::to_string(tokens) +
-                              (with_inject ? "" : " mixer") + (graph ? " graph" : "");
+                              (with_inject ? "" : " mixer") + (graph ? " graph" : "") +
+                              (fused ? (fp32_y ? " write_read FP32" : " write_read BF16") : "");
     std::vector<float> stack(static_cast<std::size_t>(kWidth) * tokens), norm(kWidth),
         down(static_cast<std::size_t>(kLowrank) * kWidth), up(static_cast<std::size_t>(kWidth) * kLowrank),
         inject(static_cast<std::size_t>(kStreams) * kWidth), y(static_cast<std::size_t>(kHidden) * tokens);
@@ -97,13 +99,17 @@ int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed) {
     fill_uniform(up, seed + 3, -0.1f, 0.1f);
     fill_uniform(inject, seed + 4, -0.03f, 0.03f);
     fill_uniform(y, seed + 5, -4.0f, 4.0f);
-    for (auto* v : {&norm, &down, &up, &inject, &y}) round_to_bf16(*v);
-
-    const Oracle expected = oracle(stack, norm, down, up, with_inject ? &inject : nullptr, tokens);
+    for (auto* v : {&norm, &down, &up, &inject}) round_to_bf16(*v);
+    if (!fp32_y) { round_to_bf16(y); }
+    std::vector<float> input_stack = stack;
+    std::vector<float> previous(static_cast<std::size_t>(kStreams) * tokens);
+    fill_uniform(previous, seed + 7, -0.5f, 2.0f);
+    previous[0] = 0.0f;
 
     GuardedDeviceBuffer d_stack(stack.size() * 4), d_norm(norm.size() * 2), d_down(down.size() * 2),
         d_up(up.size() * 2), d_inject(inject.size() * 2), d_mixed(static_cast<std::size_t>(kHidden) * tokens * 2),
-        d_weights(static_cast<std::size_t>(kStreams) * tokens * 4), d_y(y.size() * 2);
+        d_weights(static_cast<std::size_t>(kStreams) * tokens * 4),
+        d_y(y.size() * (fp32_y ? 4 : 2));
     d_stack.copy_from_host(stack.data(), d_stack.bytes());
     const auto copy_bf16 = [](GuardedDeviceBuffer& buffer, const std::vector<float>& values) {
         const auto bits = encode_bf16(values);
@@ -113,7 +119,9 @@ int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed) {
     copy_bf16(d_down, down);
     copy_bf16(d_up, up);
     copy_bf16(d_inject, inject);
-    copy_bf16(d_y, y);
+    if (fp32_y) { d_y.copy_from_host(y.data(), d_y.bytes()); }
+    else { copy_bf16(d_y, y); }
+    if (fused) { d_weights.copy_from_host(previous.data(), d_weights.bytes()); }
 
     Tensor t_stack(d_stack.data(), DType::FP32, {kHidden, kStreams, tokens});
     Tensor t_norm(d_norm.data(), DType::BF16, {kWidth});
@@ -122,14 +130,20 @@ int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed) {
     Tensor t_inject(d_inject.data(), DType::BF16, {kWidth, kStreams});
     Tensor t_mixed(d_mixed.data(), DType::BF16, {kHidden, tokens});
     Tensor t_weights(d_weights.data(), DType::FP32, {kStreams, tokens});
-    Tensor t_y(d_y.data(), DType::BF16, {kHidden, tokens});
+    Tensor t_y(d_y.data(), fp32_y ? DType::FP32 : DType::BF16, {kHidden, tokens});
     const ops::HyperConnectionWeights weights{&t_norm, &t_down, &t_up, with_inject ? &t_inject : nullptr};
     WorkspaceArena workspace(
         ops::hyper_connection_read_workspace_bytes(kStreams, kHidden, kLowrank, tokens));
 
     const auto run = [&](cudaStream_t stream) {
-        ops::hyper_connection_read(t_stack, weights, kEps, workspace, t_mixed,
-                                   with_inject ? &t_weights : nullptr, stream);
+        if (fused) {
+            // Reuse the previous inject plane as the next read's output, as the Engine does.
+            ops::hyper_connection_write_read(t_stack, t_y, t_weights, weights, kEps, workspace,
+                                             t_mixed, with_inject ? &t_weights : nullptr, stream);
+        } else {
+            ops::hyper_connection_read(t_stack, weights, kEps, workspace, t_mixed,
+                                       with_inject ? &t_weights : nullptr, stream);
+        }
     };
     if (graph) {
         cudaStream_t stream;
@@ -141,8 +155,20 @@ int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed) {
         CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
         CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
         for (int replay = 0; replay < 2; ++replay) {
+            if (fused) {
+                // Change graph inputs between replays; a captured old value must not survive.
+                if (replay == 1) {
+                    for (auto& value : input_stack) { value *= -0.5f; }
+                    for (auto& value : previous) { value += 0.125f; }
+                }
+                CUDA_CHECK(cudaMemcpyAsync(d_stack.data(), input_stack.data(), d_stack.bytes(),
+                                            cudaMemcpyHostToDevice, stream));
+                CUDA_CHECK(cudaMemcpyAsync(d_weights.data(), previous.data(), d_weights.bytes(),
+                                            cudaMemcpyHostToDevice, stream));
+            }
             CUDA_CHECK(cudaMemsetAsync(d_mixed.data(), 0xff, d_mixed.bytes(), stream));
             CUDA_CHECK(cudaGraphLaunch(executable, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
         }
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGraphExecDestroy(executable));
@@ -153,7 +179,27 @@ int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed) {
     }
     cuda_synchronize();
 
-    int failures = verify_reduction(label + " mixed",
+    int failures = 0;
+    if (fused) {
+        // The write's FP32 store is observable. Evaluate it independently in FP64, round once,
+        // then evaluate the whole read in FP64 from those represented stack values.
+        std::vector<double> written(stack.size());
+        for (std::size_t i = 0; i < stack.size(); ++i) {
+            const std::size_t column = i / kHidden, t = column / kStreams;
+            written[i] = double(input_stack[i]) + double(y[t * kHidden + i % kHidden]) * previous[column];
+            stack[i] = static_cast<float>(written[i]);
+        }
+        const auto got = from_device<float>(d_stack.data(), stack.size());
+        failures += verify_pointwise(label + " written stack",
+                                     std::vector<double>(got.begin(), got.end()), written,
+                                     {1.0e-6, 1.2e-7});
+        if (!with_inject) {
+            failures += verify_exact((label + " preserved previous inject").c_str(),
+                                      from_device<float>(d_weights.data(), previous.size()), previous);
+        }
+    }
+    const Oracle expected = oracle(stack, norm, down, up, with_inject ? &inject : nullptr, tokens);
+    failures += verify_reduction(label + " mixed",
                                     from_device_bf16(d_mixed.data(), expected.mixed.size()),
                                     expected.mixed, {4.0e-3, 1.0e-6, 2.0 * 3.90625e-3});
     if (with_inject) {
@@ -199,6 +245,19 @@ int run_case(int tokens, bool with_inject, bool graph, std::uint32_t seed) {
     }
     for (auto* buffer : {&d_stack, &d_norm, &d_down, &d_up, &d_inject, &d_mixed, &d_weights, &d_y}) {
         failures += buffer->verify_guards(label.c_str());
+    }
+    if (fused && tokens == 1) {
+        for (int invalid = 0; invalid < 2; ++invalid) {
+            Tensor bad_y = t_y, bad_inject = t_weights;
+            if (invalid == 0) { bad_y.ne[1] = tokens + 1; }
+            else { bad_inject.ne[2] = 2; }
+            bool refused = false;
+            try {
+                ops::hyper_connection_write_read(t_stack, bad_y, bad_inject, weights, kEps,
+                                                 workspace, t_mixed, &t_weights, nullptr);
+            } catch (const std::invalid_argument&) { refused = true; }
+            failures += refused ? 0 : 1;
+        }
     }
     return failures;
 }
@@ -280,6 +339,16 @@ int main() {
     failures += run_case(1, false, false, 4200u);
     failures += run_case(5, false, false, 4201u);
     failures += run_case(4, true, true, 4300u);
+    // Fused write/read: both block-output dtypes, every narrow specialization, the GEMM seam,
+    // a prefill interior, the final mixer, and graph replays with changed stack/inject inputs.
+    for (const int tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 37}) {
+        failures += run_case(tokens, true, false, 4500u + tokens, true, tokens % 2 == 0);
+    }
+    failures += run_case(1, true, false, 4550u, true, true);
+    failures += run_case(8, true, false, 4551u, true, false);
+    failures += run_case(9, true, true, 4552u, true, true);
+    failures += run_case(5, false, false, 4553u, true, false);
+    failures += run_case(4, true, true, 4554u, true, false);
     failures += run_expand(1, false, 4400u);
     failures += run_expand(7, false, 4401u);
     failures += run_expand(1, true, 4402u);

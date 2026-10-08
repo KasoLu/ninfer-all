@@ -12,7 +12,8 @@ namespace ninfer::artifact {
 
 // Pinned: the object lives only in one page-locked Host block laid out by the plan (for weights
 // streamed to the device on demand); it never receives a device placement.
-enum class Residency { Device, Host, Values, Pinned };
+// Registered: Host bytes registered separately for DMA, with the same object/view lifetime.
+enum class Residency { Device, Host, Values, Pinned, Registered };
 
 struct ParameterReference {
     std::string name;
@@ -82,6 +83,7 @@ private:
     struct Demand {
         bool device             = false;
         bool host               = false;
+        bool registered         = false;
         std::uint64_t alignment = 256;
         std::optional<QType> transcode;
         std::uint32_t evict_rank = 0;

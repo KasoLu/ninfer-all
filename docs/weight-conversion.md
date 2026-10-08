@@ -45,6 +45,15 @@ python3 -m tools.convert \
 
 `--components` defaults to `text` (`text,ngram` for Qwen3.8-Flash-Next). Include only the optional
 components you want to distribute.
+Flash-Next also accepts `--layers A..B` for a zero-based, half-open source layer slice with its
+embedding and head. Source indices survive in provenance; runtime blocks are renumbered from
+zero. A slice without PLE needs no n-gram table. These are qualification models, not full-model
+quality candidates; see [Flash-Next conversion](qwen3-8-flash-next.md#convert).
+Flash-Next conversions storing the n-gram table also embed `ngram.hot` from the checkpoint
+directory when present. `--resource ngram.hot=PATH` selects a different profile made by
+`ninfer-ngram-profile`. The converter checks its hash constants and row IDs before writing it
+as `ngram.resources.hot_profile`; standalone table artifacts need no frontend resources.
+The profile changes residency selection, not table bytes or the table digest.
 `--proposal` adds the indexed proposal head used by speculative decoding; it uses the repository's
 token ranking and defaults to 131,072 rows. The ordinary full-vocabulary output head is retained.
 

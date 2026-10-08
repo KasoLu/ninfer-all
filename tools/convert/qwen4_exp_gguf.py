@@ -29,7 +29,9 @@ import torch
 
 from tools.artifact.formats import GGUF_FORMATS_BY_TYPE
 
-from .gguf_blocks import _dequantize, _vision_source, block_format, block_source
+from .gguf_blocks import (
+    _dequantize, _vision_source, block_format, block_source, q2_native_source, q8_native_source,
+)
 from .methods import AuxiliaryValue, cast_direct, import_encoded
 from .sources.gguf import TYPE_BF16, TYPE_F16, TYPE_F32, GGUFFile
 from .sources.logical import EncodedRows, LogicalSource, array_source
@@ -271,7 +273,7 @@ def _stored(info, kind: str) -> bool:
     return info.type_id in DIRECT
 
 
-def validate(gguf: GGUFFile, config: dict) -> None:
+def validate(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None = None) -> None:
     """Refuse any GGUF that is not the Flash-Next text model this config describes."""
 
     for key, expected in EXPECTED_HEADER.items():
@@ -284,12 +286,16 @@ def validate(gguf: GGUFFile, config: dict) -> None:
         )
     if gguf.kv.get("qwen4exp.ple.eos_token_id") != config["eos_token_id"]:
         raise ValueError(f"{gguf.path}: the PLE EOS differs from the model's")
-    if config["ple_layers"] != [1] or config["num_hidden_layers"] != LAYERS:
-        raise ValueError("the qwen4exp GGUF recipe implements PLE on block 1 of 48")
-    for layer, kind in enumerate(config["layer_types"]):
+    indices = tuple(range(LAYERS)) if source_layers is None else source_layers
+    if (not indices or any(not 0 <= i < LAYERS for i in indices)
+            or indices != tuple(range(indices[0], indices[-1] + 1))
+            or config["num_hidden_layers"] != len(indices)
+            or config["ple_layers"] != [i for i, source in enumerate(indices) if source == 1]):
+        raise ValueError("the qwen4exp GGUF recipe implements slices of 48 blocks with PLE on block 1")
+    for layer, kind in zip(indices, config["layer_types"], strict=True):
         if (kind == "full_attention") != full_attention(layer):
             raise ValueError("the qwen4exp GGUF recipe needs QSA on every fourth block")
-    expected = expected_tensors(tuple(config["ple_layers"]), config["num_experts"])
+    expected = expected_tensors((1,), config["num_experts"])
     model = {name for name in gguf.tensors if name != NGRAM_TENSOR}
     if model != set(expected):
         missing = sorted(set(expected) - model)[:5]
@@ -495,7 +501,8 @@ def _moe_sources(out: dict, gguf: GGUFFile, g: str, m: str, experts: int) -> Non
                                            (HIDDEN, SHARED_WIDTH), rows())
 
 
-def text_sources(gguf: GGUFFile, config: dict) -> dict[str, tuple[LogicalSource, bool]]:
+def text_sources(gguf: GGUFFile, config: dict, source_layers: tuple[int, ...] | None = None
+                 ) -> dict[str, tuple[LogicalSource, bool]]:
     """Every text parameter's GGUF source; True marks encoded block rows."""
 
     out: dict[str, tuple[LogicalSource, bool]] = {}
@@ -516,11 +523,12 @@ def text_sources(gguf: GGUFFile, config: dict) -> dict[str, tuple[LogicalSource,
     matrix("text/token_embedding", "token_embd.weight", (VOCABULARY, HIDDEN))
     matrix("text/output_head", "output.weight", (VOCABULARY, HIDDEN))
     hc("text/final_mixer/", "output_hc_", inject=False)
-    for layer in range(LAYERS):
-        g, p = f"blk.{layer}.", f"text/layers/{layer}/"
+    indices = range(config["num_hidden_layers"]) if source_layers is None else source_layers
+    for layer, source_layer in enumerate(indices):
+        g, p = f"blk.{source_layer}.", f"text/layers/{layer}/"
         hc(p + "attn_hc/", g + "hc_attn_", inject=True)
         hc(p + "mlp_hc/", g + "hc_ffn_", inject=True)
-        if full_attention(layer):
+        if config["layer_types"][layer] == "full_attention":
             a = p + "attention/"
             matrix(a + "query", g + "attn_q.weight", (QUERY_ROWS, HIDDEN), attention_rows(False))
             matrix(a + "gate", g + "attn_q.weight", (QUERY_ROWS, HIDDEN), attention_rows(True))
@@ -609,6 +617,23 @@ def _group_moe(recipe, m: str, experts: int, formats: dict[str, str]) -> None:
     _group_same_format(recipe, [m + "shared/gate", m + "shared/up"], formats)
 
 
+def configure_ngram_gguf(model, recipe, table):
+    """Bind IQ4_NL table rows and record the digest of their stored bytes."""
+    if not isinstance(table, GGUFFile):
+        raise ValueError("--source ngram must name the release's n-gram table shard (.gguf)")
+    descriptor = model.components["ngram"]["config"]
+    source = ngram_source(table, descriptor["rows"])
+    descriptor["format"] = source.read_encoded(0, 1).format
+    if descriptor["format"] != "gguf_iq4_nl":
+        raise ValueError("the n-gram GGUF table must contain IQ4_NL rows")
+    size = table.info(NGRAM_TENSOR).nbytes
+    print(f"hashing the n-gram table ({size / 1e9:.1f} GB)", flush=True)
+    descriptor["table_sha256"] = table_digest(table)
+    if "ngram/table" in model.parameters:
+        recipe.assign("ngram/table", format=descriptor["format"], method=import_encoded,
+                      source=source)
+
+
 def qwen3_8_flash_next_gguf(model, recipe, sources):
     """A Qwen3.8-Flash-Next GSQ-RCO GGUF release in its own block formats: the model shard as
     `--source gguf=SHARD1.gguf` (for the text component) and the n-gram table shard as
@@ -618,18 +643,10 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
     MTP block from an MTP GGUF (`--source mtp=mtp-*.gguf`), whose matrices keep their blocks but
     whose hyper-connections become BF16, which their kernels read."""
 
-    table = sources["ngram"]
-    if not isinstance(table, GGUFFile):
-        raise ValueError("--source ngram must name the release's n-gram table shard (.gguf)")
-    descriptor = model.components["ngram"]["config"]
-    source = ngram_source(table, descriptor["rows"])
-    descriptor["format"] = source.read_encoded(0, 1).format
-    size = table.info(NGRAM_TENSOR).nbytes
-    print(f"hashing the n-gram table ({size / 1e9:.1f} GB)", flush=True)
-    descriptor["table_sha256"] = table_digest(table)
+    from .qwen4_exp_ngram import configure_ngram
+
     if "text" not in model.components:
-        recipe.assign("ngram/table", format=descriptor["format"], method=import_encoded,
-                      source=source)
+        configure_ngram(model, recipe, sources["ngram"])
         return
     config = model.config
     if config.get("architectures") != ["Qwen4ExpForCausalLM"]:
@@ -637,22 +654,24 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
     gguf = sources["gguf"]
     if not isinstance(gguf, GGUFFile):
         raise ValueError("--source gguf must name the model's first .gguf shard")
-    validate(gguf, config)
+    validate(gguf, config, model.source_layers)
     formats: dict[str, str] = {}
-    for name, (text_source, encoded) in text_sources(gguf, config).items():
+    for name, (text_source, encoded) in text_sources(gguf, config, model.source_layers).items():
         formats[name] = _assign(recipe, name, text_source, encoded, model)
-    if "ngram/table" in model.parameters:
-        formats["ngram/table"] = descriptor["format"]
-        recipe.assign("ngram/table", format=descriptor["format"], method=import_encoded,
-                      source=source)
     if "mtp" in model.components:
+        from .official_recipes import flash_next_mtp_formats
+        from .sources.safetensors import SafetensorsSource
+
         mtp = sources["mtp"]
-        if not isinstance(mtp, GGUFFile):
-            raise ValueError("--source mtp must name the model's MTP GGUF (block 48, nextn.*)")
         experts = model.components["mtp"]["config"]["num_experts"]
-        validate_mtp(mtp, experts)
-        for name, (mtp_source, encoded) in mtp_sources(mtp, experts).items():
-            formats[name] = _assign(recipe, name, mtp_source, encoded, model)
+        if isinstance(mtp, SafetensorsSource):
+            formats.update(flash_next_mtp_formats(model, recipe))
+        elif isinstance(mtp, GGUFFile):
+            validate_mtp(mtp, experts)
+            for name, (mtp_source, encoded) in mtp_sources(mtp, experts).items():
+                formats[name] = _assign(recipe, name, mtp_source, encoded, model)
+        else:
+            raise ValueError("--source mtp must name an MTP GGUF or HF safetensors subset")
     if "vision" in model.components:
         vision = _vision_source(model, sources)
         for name, parameter in model.parameters.items():
@@ -660,12 +679,15 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
                 formats[name] = parameter.direct_format
                 recipe.assign(name, format=parameter.direct_format, method=cast_direct,
                               source=model.source(name, vision))
-    if set(formats) != set(model.parameters):
-        missing = sorted(set(model.parameters) - set(formats))[:5]
+    if set(formats) != set(model.parameters) - {"ngram/table"}:
+        missing = sorted(set(model.parameters) - set(formats) - {"ngram/table"})[:5]
         raise ValueError(f"the GGUF leaves logical parameters without a source: {missing}")
-    for layer in range(LAYERS):
+    # A malformed model, missing component or invalid source must fail before the large scan.
+    if "ngram" in model.components:
+        configure_ngram(model, recipe, sources["ngram"])
+    for layer in range(config["num_hidden_layers"]):
         p = f"text/layers/{layer}/"
-        if full_attention(layer):
+        if config["layer_types"][layer] == "full_attention":
             _group_attention(recipe, p, formats)
         else:
             n = p + "gdn/"
@@ -682,12 +704,64 @@ def qwen3_8_flash_next_gguf(model, recipe, sources):
     columns = AuxiliaryValue(
         "int32", (GDN_VALUE_DIM,), tiled_input_columns().astype("<i4").tobytes()
     )
-    for layer in range(LAYERS):
-        if full_attention(layer):
+    for layer in range(config["num_hidden_layers"]):
+        if config["layer_types"][layer] == "full_attention":
             continue
         name = f"text/layers/{layer}/gdn/output"
         for input_name in model.parameters[name].inputs:
             recipe.use(name, input_name, auxiliaries={"input_columns": columns})
+
+
+def qwen3_8_flash_next_gsq_q2(model, recipe, sources):
+    """Preserve GSQ Q2_0 routed grids in native planes. Preserve shared Q2_0/Q8_0/BF16 operands;
+    other shared block formats decode to BF16. Other projections, MTP and the table retain
+    their GGUF recipe contracts."""
+    if "text" in model.components:
+        gguf = sources["gguf"]
+        if not isinstance(gguf, GGUFFile):
+            raise ValueError("--source gguf must name the model's first .gguf shard")
+        # Check the trained grids before hashing a 28.8 GB companion or reading other weights.
+        for layer in model.source_layers or range(LAYERS):
+            for role in ("gate", "up", "down"):
+                tensor = f"blk.{layer}.ffn_{role}_exps.weight"
+                if gguf.info(tensor).type_id != 42:
+                    raise ValueError(f"{tensor}: native GSQ Q2 requires stored Q2_0 experts")
+    qwen3_8_flash_next_gguf(model, recipe, sources)
+    if "text" not in model.components:
+        return
+    gguf = sources["gguf"]
+    for layer, source_layer in enumerate(model.source_layers or range(LAYERS)):
+        g, m = f"blk.{source_layer}.", f"text/layers/{layer}/moe/"
+        for expert in range(model.config["num_experts"]):
+            for role, shape in (("gate", (EXPERT_WIDTH, HIDDEN)),
+                                ("up", (EXPERT_WIDTH, HIDDEN)),
+                                ("down", (HIDDEN, EXPERT_WIDTH))):
+                source = q2_native_source(gguf, g + f"ffn_{role}_exps.weight", shape,
+                                          rows(expert * shape[0]))
+                recipe.assign(m + f"experts/{expert}/{role}", format="q2_g64_fp16",
+                              method=import_encoded, source=source, activation_policy="AllowA8")
+        for role, shape in (("gate", (SHARED_WIDTH, HIDDEN)),
+                            ("up", (SHARED_WIDTH, HIDDEN)),
+                            ("down", (HIDDEN, SHARED_WIDTH))):
+            tensor = g + f"ffn_{role}_shexp.weight"
+            if gguf.info(tensor).type_id == TYPE_BF16:
+                # The base recipe already supplies the exact BF16 rows and A16 permission.
+                continue
+            if gguf.info(tensor).type_id == 42:
+                source = q2_native_source(gguf, tensor, shape, rows())
+                recipe.assign(m + f"shared/{role}", format="q2_g64_fp16", method=import_encoded,
+                              source=source, activation_policy="AllowA8")
+                continue
+            if gguf.info(tensor).type_id == 8:
+                source = q8_native_source(gguf, tensor, shape, rows())
+                recipe.assign(m + f"shared/{role}", format="q8_g32_fp16", method=import_encoded,
+                              source=source, activation_policy="AllowA8")
+            else:
+                source, _ = bf16_matrix_source(gguf, tensor, shape)
+                recipe.assign(m + f"shared/{role}", format="bf16", method=cast_direct,
+                              source=source, activation_policy="A16Only")
+                print(f"{tensor}: {gguf.info(tensor).type_name} shared rows decoded to BF16",
+                      flush=True)
 
 
 def with_mtp_expert_count(config: dict, path) -> dict:
@@ -746,6 +820,7 @@ def table_digest(gguf: GGUFFile) -> str:
 
 RECIPES = {
     "qwen3_8_flash_next_gguf": qwen3_8_flash_next_gguf,
+    "qwen3_8_flash_next_gsq_q2": qwen3_8_flash_next_gsq_q2,
 }
 
 __all__ = [
@@ -762,6 +837,7 @@ __all__ = [
     "with_mtp_expert_count",
     "ngram_source",
     "qwen3_8_flash_next_gguf",
+    "qwen3_8_flash_next_gsq_q2",
     "table_digest",
     "text_sources",
     "validate",

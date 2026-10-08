@@ -10,6 +10,9 @@
 #include <string>
 
 #ifdef _WIN32
+#    ifndef _WIN32_WINNT
+#        define _WIN32_WINNT 0x0602
+#    endif
 #    ifndef NOMINMAX
 #        define NOMINMAX
 #    endif
@@ -224,16 +227,31 @@ struct NgramTableReader::File {
             read_cached(offset, destination, bytes);
         }
     }
+
+    void prefetch(std::uint64_t offset, std::uint64_t count) const noexcept {
+        if (io == NgramIo::Direct) { return; }
+#ifdef _WIN32
+        if (view != nullptr) {
+            WIN32_MEMORY_RANGE_ENTRY range{const_cast<std::uint8_t*>(view + offset),
+                                          static_cast<SIZE_T>(count)};
+            (void)PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
+        }
+#elif defined(POSIX_FADV_WILLNEED)
+        (void)::posix_fadvise(descriptor, static_cast<off_t>(offset),
+                             static_cast<off_t>(count), POSIX_FADV_WILLNEED);
+#endif
+    }
 };
 
 // Anonymous memory for the resident rows: 2 MiB pages where Linux offers them, and lockable.
 class NgramTableReader::Memory {
 public:
-    explicit Memory(std::uint64_t bytes) : bytes_(bytes) {
+    explicit Memory(std::uint64_t bytes, bool huge_pages = true) : bytes_(bytes) {
         if (bytes > std::numeric_limits<std::size_t>::max()) {
             throw std::runtime_error("n-gram table: " + mib(bytes) + " exceed the address space");
         }
 #ifdef _WIN32
+        (void)huge_pages;
         data_ = static_cast<std::uint8_t*>(
             VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
         if (data_ == nullptr) {
@@ -248,7 +266,7 @@ public:
                                      " of RAM: " + error_text(errno));
         }
 #    if defined(MADV_HUGEPAGE)
-        (void)::madvise(p, bytes, MADV_HUGEPAGE);
+        (void)::madvise(p, bytes, huge_pages ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
 #    endif
         data_ = static_cast<std::uint8_t*>(p);
 #endif
@@ -298,6 +316,180 @@ private:
     bool locked_ = false;
 };
 
+// Four-way CLOCK sets. The allocation includes tags, reference bits, hands, and row bytes;
+// unlike a table-sized index its size depends only on the budget. Only the owner accesses it.
+class NgramTableReader::RowCache {
+public:
+    RowCache(std::uint64_t rows, std::uint32_t row_bytes, std::uint64_t budget)
+        : row_bytes_(row_bytes) {
+        constexpr std::uint64_t ways = 4;
+        const std::uint64_t per_set = ways * (std::uint64_t(row_bytes) + sizeof(std::uint64_t)) + 1;
+        sets_ = std::min(budget / per_set, (rows - 1) / ways + 1);
+        if (sets_ == 0) { return; }
+        // Sparse row admission should not fault a 2 MiB page for one short row.
+        memory_ = std::make_unique<Memory>(sets_ * per_set, false);
+        tags_ = reinterpret_cast<std::uint64_t*>(memory_->data());
+        clocks_ = memory_->data() + sets_ * ways * sizeof(std::uint64_t);
+        payload_ = clocks_ + sets_;
+        // Tags hold row + 1, so the anonymous memory's initial zeros mean empty. Neither the
+        // index nor the payload needs touching before a lookup/admission reaches its page.
+    }
+
+    [[nodiscard]] std::uint64_t bytes() const noexcept { return memory_ ? memory_->bytes() : 0; }
+    [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+
+    [[nodiscard]] bool contains(std::uint64_t row) const noexcept {
+        if (sets_ == 0) { return false; }
+        const std::uint64_t first = set(row) * 4;
+        for (std::uint64_t i = 0; i < 4; ++i) {
+            if (tags_[first + i] == row + 1) { return true; }
+        }
+        return false;
+    }
+
+    bool copy(std::uint64_t row, std::uint8_t* out) noexcept {
+        if (sets_ == 0) { return false; }
+        const std::uint64_t group = set(row);
+        for (unsigned i = 0; i < 4; ++i) {
+            const std::uint64_t slot = group * 4 + i;
+            if (tags_[slot] != row + 1) { continue; }
+            clocks_[group] |= static_cast<std::uint8_t>(1U << i);
+            std::memcpy(out, payload_ + slot * row_bytes_, row_bytes_);
+            return true;
+        }
+        return false;
+    }
+
+    void insert(std::uint64_t row, const std::uint8_t* data) noexcept {
+        if (sets_ == 0) { return; }
+        const std::uint64_t group = set(row);
+        auto& clock = clocks_[group];
+        for (unsigned i = 0; i < 4; ++i) {
+            if (tags_[group * 4 + i] == row + 1) {
+                clock |= static_cast<std::uint8_t>(1U << i);
+                return;
+            }
+        }
+        unsigned hand = (clock >> 4U) & 3U;
+        while (tags_[group * 4 + hand] != kEmpty && (clock & (1U << hand)) != 0) {
+            clock &= static_cast<std::uint8_t>(~(1U << hand));
+            hand = (hand + 1) & 3U;
+        }
+        const std::uint64_t slot = group * 4 + hand;
+        size_ += tags_[slot] == kEmpty;
+        std::memcpy(payload_ + slot * row_bytes_, data, row_bytes_);
+        tags_[slot] = row + 1;
+        clock = static_cast<std::uint8_t>((clock & 15U) | (1U << hand) | (((hand + 1) & 3U) << 4U));
+    }
+
+private:
+    [[nodiscard]] std::uint64_t set(std::uint64_t row) const noexcept {
+        row ^= row >> 30U;
+        row *= 0xbf58476d1ce4e5b9ULL;
+        row ^= row >> 27U;
+        row *= 0x94d049bb133111ebULL;
+        return (row ^ (row >> 31U)) % sets_;
+    }
+    static constexpr std::uint64_t kEmpty = 0;
+    std::uint64_t sets_ = 0, size_ = 0;
+    std::uint32_t row_bytes_;
+    std::unique_ptr<Memory> memory_;
+    std::uint64_t* tags_ = nullptr;
+    std::uint8_t* clocks_ = nullptr;
+    std::uint8_t* payload_ = nullptr;
+};
+
+// Direct I/O cannot warm the OS page cache; Windows buffered reads have no file-offset hint.
+// Keep one bounded speculative batch separately from
+// demand reads; only a completely successful batch may supply bytes to a later request. The
+// owner never waits for speculative work in prefetch() or submit(). Failed hints are discarded:
+// a demand read still reports the underlying failure through its ordinary path.
+class NgramTableReader::Lookahead {
+public:
+    explicit Lookahead(NgramTableReader& owner)
+        : owner_(owner), payload_(std::size_t(owner.options_.depth) * owner.layout_.row_bytes),
+          pool_(1) {
+        std::vector<std::filesystem::path> paths;
+        for (const auto& segment : owner.layout_.segments) { paths.push_back(segment.path); }
+        queue_ = FileReadQueue::open(paths, owner.options_.io == NgramIo::Direct,
+                                    owner.options_.depth);
+        ids_.reserve(owner.options_.depth);
+    }
+
+    ~Lookahead() {
+        try { pool_.finish(); } catch (...) {}
+    }
+
+    void discard() {
+        if (active_) { pool_.finish(); }
+        active_ = false;
+    }
+
+    void submit(std::span<const std::uint64_t> rows) {
+        if (rows.empty() || (active_ && !complete_.load(std::memory_order_acquire))) { return; }
+        if (active_) { pool_.finish(); }
+        const auto count = std::min<std::size_t>(rows.size(), owner_.options_.depth);
+        ids_.assign(rows.begin(), rows.begin() + static_cast<std::ptrdiff_t>(count));
+        reads_.clear();
+        const auto rb = owner_.layout_.row_bytes;
+        if (queue_) {
+            for (std::size_t i = 0; i < count; ++i) {
+                std::uint64_t offset = ids_[i] * rb;
+                std::size_t remaining = rb;
+                auto* destination = payload_.data() + i * rb;
+                auto segment = static_cast<std::size_t>(
+                    std::upper_bound(owner_.starts_.begin(), owner_.starts_.end(), offset) -
+                    owner_.starts_.begin() - 1);
+                while (remaining != 0) {
+                    const auto& part = owner_.layout_.segments[segment];
+                    const auto local = offset - owner_.starts_[segment];
+                    const auto bytes = static_cast<std::size_t>(
+                        std::min<std::uint64_t>(remaining, part.bytes - local));
+                    reads_.push_back({segment, part.file_offset + local, {destination, bytes}});
+                    offset += bytes;
+                    destination += bytes;
+                    remaining -= bytes;
+                    ++segment;
+                }
+            }
+        }
+        succeeded_ = false;
+        complete_.store(false, std::memory_order_relaxed);
+        active_ = true;
+        pool_.start(1, [this, rb](std::size_t) {
+            try {
+                if (queue_) { queue_->read(reads_); }
+                else {
+                    for (std::size_t i = 0; i < ids_.size(); ++i) {
+                        owner_.read(ids_[i] * rb, payload_.data() + i * rb, rb);
+                    }
+                }
+                succeeded_ = true;
+            } catch (...) {}
+            complete_.store(true, std::memory_order_release);
+        });
+    }
+
+    bool copy(std::uint64_t row, std::uint8_t* destination) const {
+        if (!active_ || !complete_.load(std::memory_order_acquire) || !succeeded_) { return false; }
+        const auto found = std::lower_bound(ids_.begin(), ids_.end(), row);
+        if (found == ids_.end() || *found != row) { return false; }
+        const auto rb = owner_.layout_.row_bytes;
+        std::memcpy(destination, payload_.data() + std::size_t(found - ids_.begin()) * rb, rb);
+        return true;
+    }
+
+private:
+    NgramTableReader& owner_;
+    std::vector<std::uint8_t> payload_;
+    std::vector<std::uint64_t> ids_;
+    std::vector<QueuedFileRead> reads_;
+    std::unique_ptr<FileReadQueue> queue_;
+    bool active_ = false, succeeded_ = false;
+    std::atomic<bool> complete_{false};
+    ReadPool pool_;
+};
+
 NgramTableReader::NgramTableReader(NgramTableLayout layout, const NgramReadOptions& options)
     : layout_(std::move(layout)), options_(options) {
     if (layout_.row_bytes == 0 || layout_.rows == 0 || layout_.segments.empty()) {
@@ -310,7 +502,7 @@ NgramTableReader::NgramTableReader(NgramTableLayout layout, const NgramReadOptio
         throw std::invalid_argument("n-gram table: 1..1024 reads in flight");
     }
     if (options_.lock && options_.residency == NgramResidency::Disk) {
-        throw std::invalid_argument("n-gram table: the disk residency keeps no rows to lock");
+        throw std::invalid_argument("n-gram table: locking needs ram or ram-hot residency");
     }
     const std::uint64_t table_bytes = layout_.rows * layout_.row_bytes;
     std::uint64_t covered           = 0;
@@ -335,6 +527,26 @@ NgramTableReader::NgramTableReader(NgramTableLayout layout, const NgramReadOptio
         load_resident();
     } else if (options_.residency == NgramResidency::RamHot) {
         load_hot();
+    } else if (options_.budget_bytes != 0) {
+        cache_ = std::make_unique<RowCache>(layout_.rows, layout_.row_bytes, options_.budget_bytes);
+    }
+    if (options_.residency != NgramResidency::Ram && options_.io != NgramIo::Mapped) {
+        std::vector<std::filesystem::path> paths;
+        for (const auto& segment : layout_.segments) { paths.push_back(segment.path); }
+        queue_ = FileReadQueue::open(paths, options_.io == NgramIo::Direct, options_.depth);
+        if (queue_) {
+            // Startup's parallel bulk loads are finished. One worker now drives the OS queue;
+            // its depth bounds native reads instead of allocating a thread for every read.
+            pool_ = std::make_unique<ReadPool>(1);
+        }
+    }
+    const bool staged_hints = options_.io == NgramIo::Direct
+#ifdef _WIN32
+                              || options_.io == NgramIo::Buffered
+#endif
+        ;
+    if (options_.residency != NgramResidency::Ram && staged_hints) {
+        lookahead_ = std::make_unique<Lookahead>(*this);
     }
     // The profile has served its purpose.
     options_.hot_rows = {};
@@ -348,7 +560,14 @@ NgramTableReader::~NgramTableReader() {
 }
 
 std::uint64_t NgramTableReader::resident_bytes() const noexcept {
-    return (resident_ ? resident_->bytes() : 0) + hot_bits_.size() * 8 + hot_blocks_.size() * 4;
+    return (resident_ ? resident_->bytes() : 0) + hot_bits_.size() * 8 + hot_blocks_.size() * 4 +
+           (cache_ ? cache_->bytes() : 0);
+}
+
+const char* NgramTableReader::io_backend() const noexcept {
+    if (options_.residency == NgramResidency::Ram) { return "ram"; }
+    if (options_.io == NgramIo::Mapped) { return "mapped"; }
+    return queue_ ? queue_->backend() : "positioned-threads";
 }
 
 void NgramTableReader::read(std::uint64_t offset, std::uint8_t* destination,
@@ -490,8 +709,18 @@ void NgramTableReader::submit(std::span<const std::uint64_t> row_ids, std::span<
     }
     batch_start_ = std::chrono::steady_clock::now();
     misses_.clear();
+    admissions_.clear();
     std::uint64_t hits = 0;
     for (std::size_t i = 0; i < row_ids.size(); ++i) {
+        if (cache_ && cache_->copy(row_ids[i], out.data() + i * rb)) {
+            ++hits;
+            continue;
+        }
+        if (lookahead_ && lookahead_->copy(row_ids[i], out.data() + i * rb)) {
+            ++hits;
+            if (cache_) { admissions_.push_back(static_cast<std::uint32_t>(i)); }
+            continue;
+        }
         std::int64_t slot = -1;
         if (options_.residency == NgramResidency::Ram) {
             slot = static_cast<std::int64_t>(row_ids[i]);
@@ -500,10 +729,32 @@ void NgramTableReader::submit(std::span<const std::uint64_t> row_ids, std::span<
         }
         if (slot < 0) {
             misses_.push_back(static_cast<std::uint32_t>(i));
+            if (cache_) { admissions_.push_back(static_cast<std::uint32_t>(i)); }
             continue;
         }
         std::memcpy(out.data() + i * rb, resident_->data() + std::uint64_t(slot) * rb, rb);
         ++hits;
+    }
+    if (queue_) {
+        reads_.clear();
+        for (const auto i : misses_) {
+            std::uint64_t offset = row_ids[i] * rb;
+            std::size_t remaining = rb;
+            auto* destination = out.data() + i * rb;
+            auto segment = static_cast<std::size_t>(
+                std::upper_bound(starts_.begin(), starts_.end(), offset) - starts_.begin() - 1);
+            while (remaining != 0) {
+                const auto& part = layout_.segments[segment];
+                const auto local = offset - starts_[segment];
+                const auto count = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(remaining, part.bytes - local));
+                reads_.push_back({segment, part.file_offset + local, {destination, count}});
+                destination += count;
+                offset += count;
+                remaining -= count;
+                ++segment;
+            }
+        }
     }
     rows_.fetch_add(row_ids.size(), std::memory_order_relaxed);
     resident_hits_.fetch_add(hits, std::memory_order_relaxed);
@@ -511,6 +762,10 @@ void NgramTableReader::submit(std::span<const std::uint64_t> row_ids, std::span<
     batch_out_ = out;
     pending_   = true;
     if (misses_.empty()) { return; }
+    if (queue_) {
+        pool_->start(1, [this](std::size_t) { queue_->read(reads_); });
+        return;
+    }
     // Groups of rows, a few per thread, so a prompt chunk's thousands of rows share the threads
     // without a hand-off per row.
     const std::size_t groups = std::min<std::size_t>(misses_.size(), 4 * options_.depth);
@@ -532,6 +787,12 @@ void NgramTableReader::wait() {
     try {
         pool_->finish();
     } catch (...) { failure = std::current_exception(); }
+    if (!failure && cache_) {
+        for (const std::size_t i : admissions_) {
+            cache_->insert(batch_ids_[i], batch_out_.data() + i * layout_.row_bytes);
+        }
+        resident_rows_.store(cache_->size(), std::memory_order_relaxed);
+    }
     const auto nanoseconds =
         static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                        std::chrono::steady_clock::now() - batch_start_)
@@ -539,13 +800,63 @@ void NgramTableReader::wait() {
     batches_.fetch_add(1, std::memory_order_relaxed);
     latency_ns_.fetch_add(nanoseconds, std::memory_order_relaxed);
     histogram_[latency_bucket(nanoseconds)].fetch_add(1, std::memory_order_relaxed);
-    if (failure) { std::rethrow_exception(failure); }
+    if (failure) {
+        if (lookahead_) { lookahead_->discard(); }
+        std::rethrow_exception(failure);
+    }
 }
 
 void NgramTableReader::read_rows(std::span<const std::uint64_t> row_ids,
                                  std::span<std::uint8_t> out) {
     submit(row_ids, out);
     wait();
+}
+
+void NgramTableReader::prefetch(std::span<const std::uint64_t> row_ids) {
+    for (const auto row : row_ids) {
+        if (row >= layout_.rows) { throw std::out_of_range("n-gram prefetch: row past the table"); }
+    }
+    if (options_.residency == NgramResidency::Ram) { return; }
+    std::vector<std::uint64_t> rows;
+    rows.reserve(row_ids.size());
+    for (const auto row : row_ids) {
+        if (cache_ && cache_->contains(row)) { continue; }
+        if (options_.residency == NgramResidency::RamHot && hot_slot(row) >= 0) { continue; }
+        rows.push_back(row);
+    }
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    if (lookahead_) {
+        lookahead_->submit(rows);
+        return;
+    }
+    // Coalesce ranges that touch the same page, including rows split between artifact parts.
+    std::size_t previous = files_.size();
+    std::uint64_t begin = 0, end = 0;
+    for (const auto row : rows) {
+        std::uint64_t offset = row * layout_.row_bytes;
+        std::uint64_t remaining = layout_.row_bytes;
+        auto segment = static_cast<std::size_t>(
+            std::upper_bound(starts_.begin(), starts_.end(), offset) - starts_.begin() - 1);
+        while (remaining != 0) {
+            const auto& part = layout_.segments[segment];
+            const std::uint64_t local = offset - starts_[segment];
+            const std::uint64_t count = std::min(remaining, part.bytes - local);
+            const std::uint64_t first = part.file_offset + local;
+            if (segment == previous && first / kAlign <= end / kAlign) {
+                end = std::max(end, first + count);
+            } else {
+                if (previous != files_.size()) { files_[previous]->prefetch(begin, end - begin); }
+                previous = segment;
+                begin = first;
+                end = first + count;
+            }
+            offset += count;
+            remaining -= count;
+            ++segment;
+        }
+    }
+    if (previous != files_.size()) { files_[previous]->prefetch(begin, end - begin); }
 }
 
 NgramTableStats NgramTableReader::counters() const {

@@ -45,7 +45,7 @@ ninfer_app(ninfer-perplexity ninfer_app_perplexity BUILD_ID
   LIBRARIES ninfer_engine ninfer_product_logging ninfer::json)
 ninfer_app(ninfer-ngram-profile ninfer_app_ngram_profile
   SOURCES ngram_profile/main.cpp
-  LIBRARIES ninfer_model_loading ninfer::json)
+  LIBRARIES ninfer_model_runtime ninfer_product_prompt_input ninfer::json)
 
 if(NINFER_MULTICALL)
   ninfer_finalize_bundle(ninfer-multicall)

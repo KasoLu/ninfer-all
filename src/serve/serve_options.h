@@ -66,6 +66,7 @@ struct ServeOptions {
     // Qwen3.8-Flash-Next: where the expert banks live, and where its n-gram table comes from.
     ExpertResidency expert_residency = ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
+    HybridExpertOptions hybrid_experts;
     NgramTableOptions ngram_table;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;

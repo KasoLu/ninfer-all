@@ -53,6 +53,15 @@ void hyper_connection_read(const Tensor& stack, const HyperConnectionWeights& we
 void hyper_connection_write(Tensor& stack, const Tensor& y, const Tensor& inject_weights,
                             cudaStream_t stream);
 
+// Write y with previous_inject, then read the updated stack with weights. The written FP32
+// stack is an observable rounding boundary before the read. Uses the read workspace query.
+// previous_inject may be the same tensor as inject_weights: the read consumes its old values
+// before publishing the new ones. All other inputs/outputs and workspace must not overlap.
+void hyper_connection_write_read(Tensor& stack, const Tensor& y, const Tensor& previous_inject,
+                                 const HyperConnectionWeights& weights, float eps,
+                                 WorkspaceArena& workspace, Tensor& mixed, Tensor* inject_weights,
+                                 cudaStream_t stream);
+
 // The stack's start (transformers repeats the embedding into every stream): stack[c, d] = x[d] for
 // each stream c, x BF16 [hidden, tokens] widened exactly to FP32.
 void hyper_connection_expand(const Tensor& x, Tensor& stack, cudaStream_t stream);

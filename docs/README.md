@@ -64,7 +64,7 @@ other references own narrower contracts:
 | [Numeric formats](maintainer/tensor-formats.md) | represented values, codes/scales, conversion arithmetic and numerical interpretation |
 | [Storage layouts](maintainer/storage-layouts.md) | packing, plane offsets, padding, encoded sizes and view addressing |
 | [Qwen3.5 model](maintainer/qwen3_5-model.md) | Dense/MoE mathematics, instance config, logical parameters, MTP, Vision and state semantics |
-| [Qwen3.8-Flash-Next plan](maintainer/qwen3-8-flash-next-plan.md) | the `Qwen4ExpForConditionalGeneration` family: its mathematics, byte census, mapping onto the engine, the milestones done and the work not started |
+| [Qwen4Exp model](maintainer/qwen4-exp-model.md) | Flash-Next mathematics, byte census, completed milestone evidence and measured limitations |
 | [Pipeline stages](maintainer/pipeline-parallel-plan.md) | `--devices`: whole-layer stages over several GPUs, what they cover, verification and measurements |
 | [Quality trades](maintainer/quality-trade-experiments.md) | the precision flags (`--lm-head-q4/q6`, `--embedding-q4/q6`, `--mtp-experts-q4`, `--gdn-state-fp16`, `--mlp-a8-decode`) and what each costs |
 | [DFlash and DFlash2](maintainer/dflash.md) | conditioning, masked draft computation, proposal distributions and backend state |

@@ -13,6 +13,7 @@ set(ninfer_op_tests
   moe_route
   moe_experts
   moe_experts_gguf
+  moe_experts_native
   rmsnorm
   rmsnorm_pack_tail
   gated_rmsnorm
@@ -294,3 +295,6 @@ foreach(table IN ITEMS legacy unified)
     ninfer_linear_add_bf16_a16_${table}_routes_test
     PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 ENVIRONMENT NINFER_LINEAR_ROUTES=${table})
 endforeach()
+ninfer_add_test(ninfer_moe_expert_cpu_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_expert_cpu.cpp"
+  LIBRARIES ninfer_ops)

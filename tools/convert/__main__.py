@@ -6,6 +6,7 @@ import argparse
 from contextlib import ExitStack
 import importlib.util
 from pathlib import Path
+import re
 import sys
 from collections.abc import Mapping
 
@@ -89,6 +90,15 @@ def _recipe_parts(value: str):
     return filename, function
 
 
+def _layers(value: str):
+    match = re.fullmatch(r"([0-9]+)\.\.([0-9]+)", value)
+    if match is not None:
+        begin, end = map(int, match.groups())
+        if begin < end:
+            return begin, end
+    raise argparse.ArgumentTypeError("expected a zero-based range a..b with a < b; b is excluded")
+
+
 def _function(value: str):
     recipes = {**RECIPES, **TERNARY_RECIPES, **GGUF_RECIPES, **QWEN4_EXP_GGUF_RECIPES}
     if value in recipes:
@@ -140,14 +150,20 @@ def main(argv=None):
         help="comma-separated text,vision,mtp,dflash,dflash2 (default text); for "
         "Qwen3.8-Flash-Next text,ngram (the default: the model with its n-gram table), text (the "
         "model alone, its table read from a table artifact at run time) or ngram (that table "
-        "artifact), and vision or mtp (from --source mtp=MTP.gguf) beside text",
+        "artifact), and vision or mtp (from --source mtp=MTP.gguf or an HF safetensors subset) beside text",
     )
     parser.add_argument(
         "--resource",
         action="append",
         default=[],
         metavar="ROLE=PATH",
-        help="override a final frontend resource",
+        help="override a final frontend resource; Flash-Next also accepts ngram.hot=PROFILE "
+        "to embed a hot-row profile with the stored n-gram table",
+    )
+    parser.add_argument(
+        "--layers", type=_layers, metavar="A..B",
+        help="Flash-Next qualification slice: source layers A through B-1, rebased to zero; "
+        "retains embedding and head, omits the table when the slice has no PLE",
     )
     parser.add_argument(
         "--proposal",
@@ -175,6 +191,8 @@ def main(argv=None):
         base = stack.enter_context(SafetensorsSource(args.model))
         architectures = base.config.get("architectures") or [None]
         flash_next = architectures[0] in QWEN4_EXP_ARCHITECTURES
+        if args.layers is not None and not flash_next:
+            raise ValueError("--layers is implemented for Qwen3.8-Flash-Next")
         # Flash-Next's MTP GGUF is read block by block, as its model shard is.
         block_sources = frozenset(("ternary", "gguf", "ngram") + (("mtp",) if flash_next else ()))
         sources = SourceInputs(base, paths, stack, block_sources)
@@ -193,7 +211,9 @@ def main(argv=None):
         if build_model is build_qwen4_exp and "gguf" in paths:
             # An expert-pruned release takes the model's config with its own expert count.
             base.config = with_gguf_expert_count(base.config, paths["gguf"])
-        if build_model is build_qwen4_exp and "mtp" in components and "mtp" in paths:
+        if build_model is build_qwen4_exp and "mtp" in components and isinstance(
+            companions.get("mtp"), GGUFFile
+        ):
             # The MTP block keeps the experts its GGUF holds, whatever the model kept.
             base.config = with_mtp_expert_count(base.config, paths["mtp"])
         model = build_model(
@@ -201,6 +221,7 @@ def main(argv=None):
             components=components,
             companions=companions,
             resource_overrides=overrides,
+            **({"layers": args.layers} if flash_next else {}),
         )
         recipe = Recipe(model)
         _function(args.recipe)(model, recipe, sources)
@@ -225,6 +246,8 @@ def main(argv=None):
         }
         if args.override:
             provenance["override"] = args.override
+        if args.layers is not None:
+            provenance["source_layers"] = list(model.source_layers)
         if args.proposal:
             provenance["ranking"] = str(args.ranking)
         report = convert(

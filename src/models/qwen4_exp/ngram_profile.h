@@ -10,7 +10,10 @@
 #include "models/qwen4_exp/ngram_hash.h"
 
 #include <cstdint>
+#include <cstddef>
 #include <filesystem>
+#include <span>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::models::qwen4_exp {
@@ -24,6 +27,8 @@ struct NgramProfile {
 
 // Throws std::runtime_error for a file that is not a whole profile.
 [[nodiscard]] NgramProfile read_ngram_profile(const std::filesystem::path& path);
+[[nodiscard]] NgramProfile decode_ngram_profile(std::span<const std::byte> bytes,
+                                                std::string_view label);
 void write_ngram_profile(const std::filesystem::path& path, const NgramProfile& profile);
 
 // Refuses (std::invalid_argument) a profile counted for other hash constants than `constants`.

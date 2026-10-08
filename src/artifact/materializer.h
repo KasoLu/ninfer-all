@@ -44,6 +44,7 @@ struct HostPlacement {
     ObjectHandle object;
     // Already-read resources move into final storage without invalidating their byte views.
     std::vector<std::byte> data;
+    bool registered = false;
 };
 
 struct MaterializationPlan {
@@ -82,7 +83,7 @@ struct MaterializationStats {
     std::vector<std::uint64_t> device_capacity_by_rank;
     std::uint64_t retained_host_bytes   = 0;
     std::uint64_t owned_value_bytes     = 0;
-    std::uint64_t pinned_bytes          = 0; // page-locked Host block (Residency::Pinned)
+    std::uint64_t pinned_bytes          = 0; // pinned block plus separately registered Host objects
     std::uint64_t peak_staging_bytes    = 0;
     std::size_t device_object_count     = 0;
     std::size_t pinned_object_count     = 0;
@@ -153,6 +154,8 @@ private:
         std::optional<WeightParent> pinned;
         std::optional<WeightParent> host;
         std::vector<std::byte> host_data;
+        // Unregister before freeing host_data. Moving ObjectStorage keeps the vector's address.
+        std::unique_ptr<HostMemoryRegistration> registration;
     };
 
     // The pool owns the physical memory behind a pool-backed arena; destroy the arena first.

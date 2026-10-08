@@ -1,5 +1,6 @@
 #include "serve/serve_options.h"
 #include "product/ngram_table_options.h"
+#include "product/hybrid_expert_options.h"
 #include "product/post_thinking_options.h"
 #include "product/rope_yarn_options.h"
 #include "product/speculative_options.h"
@@ -110,6 +111,7 @@ std::string serve_usage_text(const char* argv0) {
            "  --expert-cache-mib N|auto     with host or disk experts: device memory for the\n"
            "                                most used experts (default auto: what is free;\n"
            "                                0 turns the host cache off; disk needs one)\n" +
+           std::string(ninfer::product::kHybridExpertHelp) +
            std::string(ninfer::product::kNgramTableHelp) +
            "  --no-cuda-graph               decode without CUDA Graphs (on by default)\n"
            "  --cuda-graph-allowance-mib N  CUDA Graph driver-state allowance taken from the\n"
@@ -312,6 +314,7 @@ std::string serve_usage_text(const char* argv0) {
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2     speculative decoding backend\n"
            "  --draft-tokens N              drafts per round, 1..15\n"
+           "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0)\n"
            "  --lm-head-draft               draft with the optimized proposal head\n"
            "  --adaptive-mtp                each MTP round verifies 3..--draft-tokens\n"
            "                                drafts, the width the drafts' measured survival\n"
@@ -988,6 +991,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             continue;
         }
+        if (product::parse_hybrid_expert_option(arg, options.hybrid_experts,
+                                               [&] { return require_value(arg.c_str()); })) {
+            continue;
+        }
         if (product::parse_ngram_table_option(arg, options.ngram_table,
                                               [&] { return require_value(arg.c_str()); })) {
             continue;
@@ -1008,6 +1015,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+            continue;
+        }
+        if (arg == "--draft-min-p") {
+            options.speculative.draft_min_p =
+                parse_float_in(require_value("--draft-min-p"), "draft-min-p", 0.0F, 1.0F);
             continue;
         }
         if (arg == "--ngram-draft-tokens") {

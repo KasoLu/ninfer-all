@@ -538,7 +538,7 @@ most requests admitted at once since startup, and the Engine's counters since st
 the request log's `throughput` record (see [Structured request log](#structured-request-log)):
 `tokens`, `throughput_tokens_per_second` averaged over the uptime, `scheduler`, `decode_batch`,
 `host_work` and the `context_cache` counters and gauges, and for Qwen3.8-Flash-Next the
-`ngram_table` reads. `queue` holds `depth`, the number of
+`ngram_table` reads (the block appears after the first row read). `queue` holds `depth`, the number of
 requests waiting for admission, and `entries`: the first 16 of them in submission order, each with
 its Engine `request_id`, `position` and `wait_seconds`, refreshed at least once a second while
 requests wait. It needs the API key like `/v1/load` and, like it, reads only published snapshots.
@@ -1744,12 +1744,17 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--stage-layers A,B,...` | layers per stage, in `--devices` order; omitted means a split chosen from each device's free memory | memory-balanced |
 | `--expert-residency device\|host\|disk` | Qwen3.8-Flash-Next: routed expert banks in GPU memory, in pinned host memory read across the bus, or left in the artifact's files and streamed into the device expert cache (see [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#run)) | `device` |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; `0` turns the host-mode cache off, and disk mode needs one | `auto` (what is free after startup) |
+| `--expert-dma-share F` | native host experts: fraction of distinct decode/verify cache misses copied to the GPU, `0..1`; values below `1` enable experimental CPU mixing; prefill uses the GPU | `1` |
+| `--expert-cpu-threads N` | native host experts: `1..256` CPU workers | logical thread count capped at 16 |
+| `--expert-cache-adaptive` | replace cold native experts between calls; changes the CPU/GPU arithmetic partition | off |
+| `--expert-profile PATH` | fill the native expert cache from counts for the same artifact and bank geometry | none |
+| `--expert-profile-out PATH` | record native expert counts after requests | none |
 | `--ngram-table PATH` | Qwen3.8-Flash-Next: the n-gram table artifact of a model published without its table | the model's own table |
 | `--ngram-residency disk\|ram\|ram-hot` | Qwen3.8-Flash-Next: where the n-gram rows come from: the table's file, 16 rows per token; all of the table in RAM; or the rows a hot-row profile ranks first in RAM and the rest from the file (see [the n-gram rows](qwen3-8-flash-next.md#the-n-gram-rows)) | `disk` |
 | `--ngram-io buffered\|direct\|mmap` | Qwen3.8-Flash-Next: how rows are read from the file: through the OS page cache, past it, or out of a mapping | `buffered` |
 | `--ngram-io-depth N` | Qwen3.8-Flash-Next: row reads in flight, `1..1024` | `64` |
-| `--ngram-hot-profile PATH` | `ram-hot`: the profile `ninfer-ngram-profile` writes | none |
-| `--ngram-ram-mib N` | `ram-hot`: RAM for the hot rows and their index | `4096` |
+| `--ngram-hot-profile PATH` | `ram-hot`: override the selected table's embedded profile with a `ninfer-ngram-profile` file | selected table's embedded profile |
+| `--ngram-ram-mib N` | `disk`: budget for cached rows and their index (`0` disables); `ram-hot`: budget for the profile's resident rows and index | `0` for disk; `4096` for ram-hot |
 | `--ngram-lock` | `ram`, `ram-hot`: lock the resident rows in physical memory (`mlock`, `VirtualLock`) | off |
 | `--no-ngram-table` | Qwen3.8-Flash-Next: run without the n-gram table, a non-standard experimental mode (the Q2_0 release's WikiText-2 perplexity rises from 2.66 to 5.01) | off |
 | `--device-profile auto\|off\|calibrate` | the per-GPU [route profile](device-profiles.md): `auto` uses the stored or built-in one and calibrates a device that has none, `off` keeps the compiled routes, `calibrate` measures anew | `auto` |
@@ -1767,6 +1772,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys and `rk2v4-e8` opt-in E8 root-code keys; all nine are accepted on every build target (see [Context and memory](cli.md#context-and-memory)); for Qwen3.8-Flash-Next it is the storage of the sparse-attention layers' KV | `bf16` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)) | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
+| `--draft-min-p P` | Flash-Next MTP only: verify through the first draft at or below this absolute probability; the full draft chain still runs; see [MTP](qwen3-8-flash-next.md#mtp-speculative-decoding) | `0` (off) |
 | `--lm-head-draft` | optimized proposal head | off |
 | `--adaptive-mtp` | MTP only: each round verifies 3..`--draft-tokens` drafts, the width favored by the drafts' measured survival and the measured round cost; see [Adaptive MTP](#adaptive-mtp) | off |
 | `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query; verification keeps full attention; see [MTP attention window](#mtp-attention-window) | `0` (whole history) |
@@ -2108,7 +2114,7 @@ blocks after them from the cache.
 
 With Qwen3.8-Flash-Next and its n-gram table, `ngram_table` reports the interval's row reads:
 `rows` the rows the passes addressed (16 a token), `resident_rows` those RAM served
-(`--ngram-residency ram` or `ram-hot`), `batches` the passes and `read_seconds` their read time
+(`ram`, `ram-hot`, or the `disk` row cache), `batches` the passes and `read_seconds` their read time
 summed, `read_latency_us` the `p50` and `p99` of a pass's read as the upper bound of its
 power-of-two histogram bucket, and `stalls` and `stall_seconds` the passes whose PLE layer waited
 for its rows after the layers before it and the device time it waited.

@@ -12,6 +12,7 @@
 
 #include <cub/block/block_scan.cuh>
 #include <cuda_bf16.h>
+#include <mma.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -28,6 +29,7 @@ constexpr int kTopBlocks   = 512;
 constexpr int kProjection  = kHeads * kHeadDim + kHeadDim;
 constexpr int kThreads     = 512;
 constexpr int kScoreBlocks = 64; // blocks one scoring CTA covers
+constexpr int kMmaTokens   = 128;
 
 // fl32(1e7^(-2i/64)) for i < 32: the text RoPE frequencies of theta 1e7 over 64 rotary dims.
 __device__ __forceinline__ float rope_frequency(int pair) {
@@ -112,6 +114,90 @@ __global__ void qsa_tail_kernel(const __nv_bfloat16* __restrict__ projection,
 __device__ __forceinline__ unsigned order_key(float value) {
     const unsigned bits = __float_as_uint(value);
     return bits & 0x80000000u ? ~bits : bits | 0x80000000u;
+}
+
+// One query preparation per token, shared by every block tile. Keep the original FP32
+// normalization/reduction and angle boundaries; only its materialization location changes.
+__global__ void __launch_bounds__(kThreads)
+    qsa_query_kernel(const __nv_bfloat16* projection, const int* first,
+                     const __nv_bfloat16* query_norm, float eps, float* queries) {
+    __shared__ float row[kHeads * kHeadDim];
+    __shared__ float reduce[kHeads][4];
+    const int tid = threadIdx.x, head = tid / kHeadDim, lane = tid % kHeadDim;
+    const int t = blockIdx.x, position = *first + t;
+    if ((position + 1) / kBlock <= kTopBlocks) { return; }
+    row[tid] = __bfloat162float(projection[static_cast<std::int64_t>(t) * kProjection + tid]);
+    __syncthreads();
+    norm_rope_row(row + head * kHeadDim, query_norm, eps, position, lane, reduce[head]);
+    queries[static_cast<std::int64_t>(t) * kHeads * kHeadDim + tid] = row[tid];
+}
+
+// Four queries (sixteen heads) share each key tile. FP32 operands remain public; TF32 high
+// and residual components are private. Three products omit low*low; qualification checks
+// the resulting selection against the FP64 oracle without reducing stored pooled-key precision.
+__global__ void __launch_bounds__(128)
+    qsa_mma_score_kernel(const float* __restrict__ queries, const int* __restrict__ first,
+                        const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
+                        int tokens, int capacity) {
+    namespace wmma = nvcuda::wmma;
+    __shared__ __align__(32) float q_hi[16 * 8], q_lo[16 * 8];
+    __shared__ __align__(32) float k_hi[4][16 * 8], k_lo[4][16 * 8];
+    __shared__ __align__(32) float dots[4][16 * 16];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int t0 = blockIdx.y * 4, b0 = blockIdx.x * 64;
+    const int start = *first;
+    const int blocks = min((start + min(t0 + 4, tokens)) / kBlock, capacity);
+    if (blocks <= kTopBlocks || b0 >= blocks) { return; }
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> sum;
+    wmma::fill_fragment(sum, 0.0f);
+#pragma unroll
+    for (int base = 0; base < kHeadDim; base += 8) {
+        const int row = tid / 8, d = tid % 8;
+        const int t = t0 + row / kHeads;
+        const bool scored = t < tokens && (start + t + 1) / kBlock > kTopBlocks;
+        const float q = scored ? queries[(static_cast<std::int64_t>(t) * kHeads +
+                                         row % kHeads) * kHeadDim + base + d] : 0.0f;
+        const float high = wmma::__float_to_tf32(q);
+        q_hi[tid] = high;
+        q_lo[tid] = wmma::__float_to_tf32(q - high);
+#pragma unroll
+        for (int i = lane; i < 16 * 8; i += 32) {
+            const int b = b0 + warp * 16 + i / 8;
+            const float k = b < blocks ? pooled[static_cast<std::int64_t>(b) * kHeadDim +
+                                                 base + i % 8] : 0.0f;
+            const float kh = wmma::__float_to_tf32(k);
+            k_hi[warp][i] = kh;
+            k_lo[warp][i] = wmma::__float_to_tf32(k - kh);
+        }
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> ah, al;
+        wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> bh, bl;
+        wmma::load_matrix_sync(ah, q_hi, 8);
+        wmma::load_matrix_sync(al, q_lo, 8);
+        wmma::load_matrix_sync(bh, k_hi[warp], 8);
+        wmma::load_matrix_sync(bl, k_lo[warp], 8);
+        wmma::mma_sync(sum, ah, bh, sum);
+        wmma::mma_sync(sum, ah, bl, sum);
+        wmma::mma_sync(sum, al, bh, sum);
+        __syncthreads();
+    }
+    wmma::store_matrix_sync(dots[warp], sum, 16, wmma::mem_row_major);
+    __syncwarp();
+    const int column = lane % 16;
+    const int b = b0 + warp * 16 + column;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int local_t = lane / 16 + 2 * i, t = t0 + local_t;
+        const int visible = min((start + t + 1) / kBlock, capacity);
+        if (t < tokens && visible > kTopBlocks && b < visible) {
+            float score = 0.0f;
+#pragma unroll
+            for (int h = 0; h < kHeads; ++h) {
+                score += fmaxf(dots[warp][(local_t * kHeads + h) * 16 + column], 0.0f);
+            }
+            keys_workspace[static_cast<std::int64_t>(t) * capacity + b] = order_key(score);
+        }
+    }
 }
 
 // The scores of blocks [64 x, 64 x + 64) for query y (the 1/sqrt(128) scale does not change the
@@ -318,6 +404,9 @@ std::size_t qsa_indexer_select_workspace_bytes(std::int32_t tokens, std::int32_t
     require(tokens > 0 && capacity > 0, "tokens and capacity must be positive");
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::I32, {capacity, tokens});
+    if (tokens >= kMmaTokens && capacity > kTopBlocks) {
+        (void)layout.alloc(DType::FP32, {kHeads * kHeadDim, tokens});
+    }
     return layout.peak_bytes(1);
 }
 
@@ -342,11 +431,25 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
     Tensor keys                 = workspace.alloc(DType::I32, {capacity, tokens});
     const dim3 score_grid(static_cast<unsigned>((capacity + kScoreBlocks - 1) / kScoreBlocks),
                           static_cast<unsigned>(tokens));
-    qsa_score_kernel<<<score_grid, kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(projection.data), first,
-        static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
-        static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), capacity);
-    CUDA_CHECK(cudaGetLastError());
+    if (capacity > kTopBlocks) {
+        if (tokens < kMmaTokens) {
+            qsa_score_kernel<<<score_grid, kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(projection.data), first,
+                static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
+                static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), capacity);
+        } else {
+            Tensor queries = workspace.alloc(DType::FP32, {kHeads * kHeadDim, tokens});
+            qsa_query_kernel<<<tokens, kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(projection.data), first,
+                static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
+                static_cast<float*>(queries.data));
+            CUDA_CHECK(cudaGetLastError());
+            qsa_mma_score_kernel<<<dim3((capacity + 63) / 64, (tokens + 3) / 4), 128, 0, stream>>>(
+                static_cast<const float*>(queries.data), first, static_cast<const float*>(pooled.data),
+                static_cast<unsigned*>(keys.data), tokens, capacity);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
     qsa_select_kernel<<<tokens, kThreads, 0, stream>>>(
         first, static_cast<const unsigned*>(keys.data), capacity, static_cast<int*>(selected.data),
         static_cast<int*>(counts.data));

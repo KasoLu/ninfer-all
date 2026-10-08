@@ -59,8 +59,9 @@ ParameterReference Binder::binding(std::string name, const Binding& binding, Sha
             require_device(part.object);
         } else if (residency == Residency::Pinned) {
             require_pinned(part.object);
-        } else if (residency == Residency::Host) {
+        } else if (residency == Residency::Host || residency == Residency::Registered) {
             (void)host_object(part.object);
+            if (residency == Residency::Registered) { demands_[part.object.index].registered = true; }
         }
     }
     return {std::move(name), std::move(shape), binding, residency};
@@ -303,7 +304,7 @@ MaterializationPlan Binder::finish(std::uint64_t evictable_alignment) && {
     }
     for (std::size_t i = 0; i < demands_.size(); ++i) {
         if (demands_[i].host) {
-            plan.host_objects.push_back({ObjectHandle{i}, std::move(demands_[i].host_data)});
+            plan.host_objects.push_back({ObjectHandle{i}, std::move(demands_[i].host_data), demands_[i].registered});
         }
     }
     return plan;

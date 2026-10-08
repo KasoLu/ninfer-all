@@ -278,6 +278,15 @@ public:
             finalize_phase.complete();
             return;
         }
+        if (options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share ||
+            options.hybrid_experts.cpu_threads != 0 ||
+            options.hybrid_experts.adaptive_cache || !options.hybrid_experts.routing_profile.empty() ||
+            !options.hybrid_experts.record_profile.empty()) {
+            throw std::invalid_argument("hybrid expert options require native Qwen3.8-Flash-Next host experts");
+        }
+        if (options.speculative.draft_min_p != 0) {
+            throw std::invalid_argument("--draft-min-p requires Qwen3.8-Flash-Next MTP");
+        }
         auto constructed  = runtime::construct_model(options, device);
         // construct_model returns the resolved options for this instance. Anything the model had
         // to derive (the single host RAM budget's Host split and long-anchor count) is only known

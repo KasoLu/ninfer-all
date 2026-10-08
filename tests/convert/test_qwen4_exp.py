@@ -252,3 +252,20 @@ def test_build_model_adds_the_mtp_block(tmp_path):
         # The head serves the MTP block's final mixer too.
         assert model.parameters["text/output_head"].inputs == ("text/final_hidden",
                                                                "mtp/final_hidden")
+
+    # A range-fetched companion supplies actual MTP bytes; the base has no MTP weights.
+    companion = tmp_path / "mtp"
+    companion.mkdir()
+    (companion / "config.json").write_text(json.dumps(config))
+    hidden = torch.arange(64, dtype=torch.bfloat16).reshape(8, 8)
+    norm = torch.arange(8, dtype=torch.bfloat16)
+    save_file({"mtp.fc_hidden.weight": hidden, "mtp.pre_fc_norm_embedding.weight": norm},
+              companion / "model.safetensors")
+    with SafetensorsSource(root) as source, SafetensorsSource(companion) as mtp:
+        model = build_model(source, components=("text", "mtp"), companions={"mtp": mtp})
+        assert torch.equal(model.parameters["mtp/fc_hidden"].source.rows(2, 5), hidden[2:5])
+        assert torch.equal(model.parameters["mtp/embedding_norm"].source.values(), norm)
+        assert model.components["mtp"]["config"]["num_experts"] == 5
+        mtp.config["text_config"]["hc_lowrank"] += 1
+        with pytest.raises(ValueError, match="MTP companion hc_lowrank"):
+            build_model(source, components=("text", "mtp"), companions={"mtp": mtp})

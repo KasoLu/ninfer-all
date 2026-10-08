@@ -75,7 +75,7 @@ ExpertCache::ExpertCache(DeviceContext& device, std::vector<ExpertCacheLayer> la
         if (layer.slots != 0) {
             RankBinding bind(device_, layer.banks.rank);
             layer.storage = DeviceBuffer(std::size_t(layer.slots) * layer.slot_bytes);
-            CUDA_CHECK(cudaMemset(layer.storage.p, 0, layer.storage.bytes));
+            layer.storage.fill(0);
         }
         layer.staging = staging_bytes;
         staging_bytes += 3 * experts * sizeof(void*);

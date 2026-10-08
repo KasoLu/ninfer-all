@@ -5,6 +5,9 @@
 
 #include "artifact/reader.h"
 #include "models/qwen3_5/frontend/tokenizer.h"
+#include "models/qwen3_5/frontend/frontend.h"
+#include "models/qwen3_5/frontend/resources.h"
+#include "product/prompt_input/prompt_input.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/ngram_hash.h"
 #include "models/qwen4_exp/ngram_profile.h"
@@ -21,6 +24,9 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -41,7 +47,8 @@ constexpr const char* kUsage =
     "Counts the n-gram table rows a corpus addresses, from its tokens alone (no model runs), and\n"
     "writes them, the most frequent first, as a hot-row profile for --ngram-residency ram-hot.\n"
     "A TEXT file is one document, or a .jsonl file one document per line: its \"text\", or its\n"
-    "\"messages\" rendered as the chat template's <|im_start|>role ... <|im_end|> turns.\n"
+    "\"messages\" rendered by the model's Frontend, including tools and the generation prompt.\n"
+    "Message documents may set \"enable_thinking\"; absent uses the template's default.\n"
     "\n"
     "  --out PROFILE        write the profile\n"
     "  --max-rows N         keep the N most frequent rows (default: every row the corpus reads)\n"
@@ -105,8 +112,9 @@ Options parse(int argc, char** argv) {
 
 // The model's tokenizer and n-gram hash, read from its artifact without its weights.
 struct Hash {
-    std::vector<std::byte> tokenizer_json, tokenizer_config, generation_config;
-    std::unique_ptr<models::qwen3_5::frontend::Tokenizer> tokenizer;
+    std::vector<std::byte> tokenizer_json, tokenizer_config, generation_config, chat_template;
+    std::shared_ptr<const models::qwen3_5::frontend::Tokenizer> tokenizer;
+    std::optional<models::qwen3_5::Frontend> frontend;
     NgramHashConstants constants;
     std::int32_t eos    = 0;
     std::uint32_t vocab = 0;
@@ -125,12 +133,23 @@ struct Hash {
         tokenizer_json    = object("tokenizer.json");
         tokenizer_config  = object("tokenizer_config.json");
         generation_config = object("generation_config.json");
+        chat_template     = object("chat_template.jinja");
         const auto view   = [](const std::vector<std::byte>& bytes) {
             return std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size());
         };
-        tokenizer = std::make_unique<models::qwen3_5::frontend::Tokenizer>(
+        tokenizer = std::make_shared<const models::qwen3_5::frontend::Tokenizer>(
             models::qwen3_5::frontend::TokenizerResources{
                 view(tokenizer_json), view(tokenizer_config), view(generation_config)});
+        models::qwen3_5::FrontendResources resources{
+            .tokenizer_json = view(tokenizer_json),
+            .tokenizer_config_json = view(tokenizer_config),
+            .chat_template_jinja = view(chat_template),
+            .generation_config_json = view(generation_config),
+            .tokenizer = tokenizer,
+            .public_token_count = static_cast<std::uint32_t>(tokenizer->vocab_size())};
+        frontend.emplace(models::qwen3_5::make_frontend(resources,
+            {.architecture = models::Architecture::Qwen4Exp, .vision_enabled = false,
+             .max_context = std::numeric_limits<std::uint32_t>::max()}));
         constants = models::qwen4_exp::derive_ngram_hash_constants(config.ngram);
         eos       = config.eos_token_id;
         vocab     = config.vocab_size;
@@ -140,8 +159,7 @@ struct Hash {
     }
 
     // The rows each token of `text` addresses, document start to end, in order.
-    void rows(std::string_view text, std::vector<std::uint64_t>& out) const {
-        const auto ids = tokenizer->encode(text);
+    void rows(std::span<const TokenId> ids, std::vector<std::uint64_t>& out) const {
         std::vector<std::int32_t> tokens(ids.begin(), ids.end());
         NgramContext context = NgramContext::sequence_start(constants, eos);
         out.resize(tokens.size() * constants.heads());
@@ -151,14 +169,15 @@ struct Hash {
 
 // Every document of the corpus, in file order.
 void for_each_document(const std::vector<std::filesystem::path>& texts,
-                       const std::function<void(std::string_view)>& visit) {
+                       const Hash& hash,
+                       const std::function<void(std::span<const TokenId>)>& visit) {
     for (const auto& path : texts) {
         std::ifstream file(path, std::ios::binary);
         if (!file) { throw std::runtime_error("cannot open " + path.string()); }
         if (path.extension() != ".jsonl") {
             std::ostringstream all;
             all << file.rdbuf();
-            visit(all.str());
+            visit(hash.frontend->tokenize_text(all.str()));
             continue;
         }
         std::string line;
@@ -172,26 +191,24 @@ void for_each_document(const std::vector<std::filesystem::path>& texts,
                                          " is not a JSON object");
             }
             if (json.contains("text") && json["text"].is_string()) {
-                visit(json["text"].get<std::string>());
+                visit(hash.frontend->tokenize_text(json["text"].get<std::string>()));
                 continue;
             }
             if (!json.contains("messages") || !json["messages"].is_array()) {
                 throw std::runtime_error(path.string() + ":" + std::to_string(number) +
                                          " has neither text nor messages");
             }
-            std::string chat;
-            for (const auto& message : json["messages"]) {
-                if (!message.is_object() || !message.contains("content") ||
-                    !message["content"].is_string()) {
-                    continue;
+            std::optional<bool> thinking;
+            if (json.contains("enable_thinking")) {
+                if (!json["enable_thinking"].is_boolean()) {
+                    throw std::runtime_error(path.string() + ":" + std::to_string(number) +
+                                             " enable_thinking must be boolean");
                 }
-                const std::string role = message.contains("role") && message["role"].is_string()
-                                             ? message["role"].get<std::string>()
-                                             : std::string("user");
-                chat += "<|im_start|>" + role + "\n" + message["content"].get<std::string>() +
-                        "<|im_end|>\n";
+                thinking = json["enable_thinking"].get<bool>();
             }
-            visit(chat);
+            const auto prepared = hash.frontend->prepare(
+                product::prompt_from_messages_json(line, thinking, false));
+            visit(prepared.token_ids());
         }
     }
 }
@@ -200,8 +217,8 @@ int profile(const Options& options, const Hash& hash) {
     std::vector<std::uint32_t> counts(static_cast<std::size_t>(hash.constants.rows), 0);
     std::vector<std::uint64_t> rows;
     std::uint64_t documents = 0, tokens = 0;
-    for_each_document(options.texts, [&](std::string_view text) {
-        hash.rows(text, rows);
+    for_each_document(options.texts, hash, [&](std::span<const TokenId> ids) {
+        hash.rows(ids, rows);
         for (const auto row : rows) {
             if (counts[row] != std::numeric_limits<std::uint32_t>::max()) { ++counts[row]; }
         }
@@ -261,8 +278,8 @@ int evaluate(const Options& options, const Hash& hash) {
         static_cast<std::size_t>((hash.constants.rows * options.row_bytes + 4095) / 4096), 0);
     std::vector<std::uint64_t> rows;
     std::uint64_t documents = 0, reads = 0, repeats = 0, in_profile = 0;
-    for_each_document(options.texts, [&](std::string_view text) {
-        hash.rows(text, rows);
+    for_each_document(options.texts, hash, [&](std::span<const TokenId> ids) {
+        hash.rows(ids, rows);
         ++documents;
         const auto document = static_cast<std::uint32_t>(documents);
         for (const auto row : rows) {

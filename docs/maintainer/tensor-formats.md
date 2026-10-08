@@ -1,6 +1,6 @@
 # NInfer Persistent Tensor Numeric Formats
 
-This reference defines the nine persistent numeric tensor formats accepted by current `.ninfer`
+This reference defines the persistent numeric tensor formats accepted by current `.ninfer`
 artifacts: their logical words, quantization semantics, canonical reference encoders where
 applicable, and conformance boundaries. [Container framing](artifact-container.md),
 [physical layouts](storage-layouts.md), weight recipes and runtime-state codecs are defined
@@ -8,7 +8,7 @@ separately.
 
 ## 1. Registered formats
 
-NInfer has exactly twenty-four persistent numeric tensor formats in five categories.
+NInfer's closed registry has the following persistent numeric formats in five categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -22,6 +22,7 @@ Grouped quantized-weight formats preserve signed codes plus one scale per logica
 
 | Canonical name | Code width | Group size | Legal signed codes | Scale | Full-group logical bits/weight |
 |---|---:|---:|---:|---|---:|
+| `q2_g64_fp16` | 2 | 64 | `[-1, 2]`, stored as offset codes `0..3` | one binary16 scale/group | 2.25 |
 | `q4_g64_fp16` | 4 | 64 | `[-8, 7]` | one binary16 scale/group | 4.25 |
 | `q5_g64_fp16` | 5 | 64 | `[-16, 15]` | one binary16 scale/group | 5.25 |
 | `q6_g64_fp16` | 6 | 64 | `[-32, 31]` | one binary16 scale/group | 6.25 |
@@ -34,11 +35,12 @@ The block-scaled floating-point weight format is:
 |---|---|---:|---|---|
 | `nvfp4` | E2M1, 4 bits/weight | 16 | one E4M3FN word/group | one positive FP32 weight divisor per stacked source matrix |
 
-The row-scaled floating-point weight format is:
+The row-scaled floating-point weight formats are:
 
 | Canonical name | Code | Scale granularity | Scale |
 |---|---|---|---|
 | `fp8_e4m3fn_row_bf16` | E4M3FN, 8 bits/weight | one multiplier per logical row | BF16 |
+| `fp8_e4m3fn_row_fp16` | E4M3FN, 8 bits/weight | one multiplier per logical row | IEEE binary16 |
 
 GGUF block formats keep ggml's quantized blocks byte for byte, so a GGUF tensor imports without
 decoding or requantizing:
@@ -46,6 +48,9 @@ decoding or requantizing:
 | Canonical name | ggml type | Block values | Block bytes | Bits/weight |
 |---|---:|---:|---:|---:|
 | `gguf_q8_0` | 8 | 32 | 34 | 8.50 |
+| `gguf_q4_0` | 2 | 32 | 18 | 4.50 |
+| `gguf_q5_0` | 6 | 32 | 22 | 5.50 |
+| `gguf_q2_0` | 42 | 64 | 18 | 2.25 |
 | `gguf_q2_k` | 10 | 256 | 84 | 2.625 |
 | `gguf_q3_k` | 11 | 256 | 110 | 3.4375 |
 | `gguf_q4_k` | 12 | 256 | 144 | 4.50 |
@@ -98,7 +103,7 @@ A **quantization scheme** defines only the persistent logical representation of 
 - the validity rules for codes and scales;
 - the mathematical reconstruction of each represented weight.
 
-The six quantized names above identify schemes in this sense. Their meanings are immutable: a
+The quantized names above identify schemes in this sense. Their meanings are immutable: a
 consumer must not infer a different zero point, scale geometry, code range, or reconstruction rule
 from context.
 
@@ -110,8 +115,10 @@ may preserve an already encoded source or quantize floating-point values.
 
 The built-in `grouped_absmax` method implements the reference encoder in Section 7 for all four
 grouped integer formats. `fp8_row_maxabs` rounds source values to BF16 and quantizes each row to
-E4M3FN codes with a BF16 multiplier. `import_encoded` preserves compatible FP8 or NVFP4 codes,
-scales, and, for NVFP4, the weight divisor of the row's own source matrix. NInfer currently provides no built-in
+E4M3FN codes with a BF16 multiplier. `import_encoded` preserves compatible FP8, NVFP4, T2, native Q2
+or GGUF codes and scales and, for NVFP4, the weight divisor of the row's own source matrix.
+Native `q2_g64_fp16` imports trained GSQ Q2_0 codes; `grouped_absmax` and `grouped_search` refuse
+that target. NInfer currently provides no built-in
 floating-point-to-NVFP4 quantizer.
 
 A recipe can supply a Python callable as its method. Different methods can produce different
@@ -289,7 +296,7 @@ calibration is not part of this weight format. In particular, a
 site-level input divisor used by an NVFP4 execution path is a separate model-role tensor and cannot
 be inferred from `nvfp4`, its block scales, or `d_w`.
 
-### 3.4 `fp8_e4m3fn_row_bf16`
+### 3.4 Row-scaled FP8
 
 `fp8_e4m3fn_row_bf16` is a rank-two weight matrix `[N,K]` with positive dimensions. Every logical
 weight owns one E4M3FN code word, and every logical row owns one BF16 dequantization multiplier. The
@@ -322,6 +329,19 @@ The format does not define how a floating-point source is assigned a scale or ro
 A recipe either preserves already selected code and scale words exactly or names its
 conversion method. Activation quantization and activation scales are separate compute or runtime-state
 concerns and are not persistent fields of this format.
+
+`fp8_e4m3fn_row_fp16` has the same E4M3FN code rules and multiplier semantics, with an IEEE
+binary16 row scale instead of BF16. Scale sign must be positive, including positive zero;
+subnormals are admitted, negative zero and non-finite scales are refused. A zero scale requires
+only signed-zero codes. Its exact reconstruction uses `exact_binary16_to_binary32(s[n])` in the
+equation above. The supported layout is `row_interleaved_v1`, used for Flash-Next n-gram rows.
+
+The `fp8_row_maxabs` producer first represents inputs as BF16. For FP16 scales it computes
+`binary32(max(abs(row)) / 448)`, rounds to binary16 with ties to even, and rescues a positive
+scale rounded to zero as the smallest binary16 subnormal. An overflowing scale is refused.
+It rounds the reciprocal of the stored scale to FP32, multiplies each BF16 input by that
+reciprocal with an FP32 result, clamps to `[-448,448]`, then rounds to E4M3FN with ties to even.
+All-zero rows use positive-zero codes and scale. Each row is independent of chunk boundaries.
 
 ### 3.5 GGUF block formats
 
@@ -440,6 +460,20 @@ This restriction is part of the scheme, not an encoder preference. A kernel may 
 signed-byte load because the registered conversion path establishes the code invariant; that
 implementation convenience does not make `-128` legal. The trusted local runtime does not rescan
 the complete Q8 payload solely to prove an invariant already established by its producer.
+
+### 5.4 Q2
+
+`q2_g64_fp16` preserves the GSQ Q2_0 grid: each unsigned stored two-bit word `u` in `0..3`
+represents integer `q = u - 1` in `[-1, 2]`, and each group of 64 values owns one binary16 scale.
+Its exact weight is `(u - 1) * scale`. This offset encoding differs from T2's two's complement;
+all four Q2 words are valid. An encoded import preserves the original code and scale bits while
+moving them from interleaved GGUF blocks into the native row-split planes.
+
+Q2 accepts every finite binary16 scale word, including both signed zeros and subnormals. When
+the scale is zero, any code remains valid and preserves the source representation. These Q2
+rules override the zero-scale restrictions below; infinity and NaN remain invalid. The producer
+does not round, negate or canonicalize imported scales. Floating-point-to-Q2 quantization is
+outside the current conversion contract.
 
 ## 6. Grouped signed-integer scale and reconstruction semantics
 
