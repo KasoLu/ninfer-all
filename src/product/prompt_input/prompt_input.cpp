@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -239,10 +240,16 @@ PromptInput prompt_from_messages(const std::filesystem::path& path,
                                  std::optional<bool> enable_thinking, bool vision_enabled) {
     std::ifstream stream(path);
     if (!stream) { throw std::runtime_error("failed to open messages JSON: " + path.string()); }
+    const std::string json{std::istreambuf_iterator<char>(stream),
+                           std::istreambuf_iterator<char>()};
+    return prompt_from_messages_json(json, enable_thinking, vision_enabled);
+}
 
+PromptInput prompt_from_messages_json(std::string_view json,
+                                     std::optional<bool> enable_thinking, bool vision_enabled) {
     Json root;
     try {
-        stream >> root;
+        root = Json::parse(json);
     } catch (const nlohmann::json::exception& error) {
         throw std::invalid_argument(std::string("failed to parse messages JSON: ") + error.what());
     }

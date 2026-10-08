@@ -22,6 +22,64 @@ HF repository, and Strata is github.com/Niko1221/Strata (MIT).
 
 ## Progress
 
+**Current delivery decision (October 8, 2026).** All model and expert arithmetic runs on the GPU.
+The completed native/CPU experiments are retained without further development. The working
+artifact family is the published GGUF representation with the existing external IQ4_NL table.
+Add missing MTP to the existing artifacts while preserving their text weights, Vision, tokenizer
+and table descriptor; inspect actual artifact directories before rebuilding. Existing MTP must
+not be duplicated. The private IQ4 table has the same row digest and configuration as the public
+table and provides no new representation.
+
+The October 8 header audit confirmed that the public Q2_0, IQ3_S and Coder IQ1_M NInfer models
+have no MTP bindings. The private GGUF MTP artifact supplies 28 existing physical objects
+(2,791,415,296 bytes) and 1,567 logical bindings; the three target configurations are compatible,
+including the Coder target's independently pruned expert bank. Prepare candidates and qualify them,
+then update the same public repositories as authorized by the user; do not create new repositories.
+Large downloads, remaining artifact assembly and GPU qualification run on the RTX 3090 pod,
+never on the local Mac; MLX repositories are out of scope. The CPU pod archived
+the n-gram corpus and was deleted with its volume. Temporary transfers use the
+existing private `WaveCut/ninfer-cache` bucket. After verified public updates,
+remove temporary copies, preserve source and measurement receipts, and delete the disposable Pod
+and its volume.
+
+Q2, IQ3 and Coder passed host/disk MTP qualification on RTX 3090, including exact fixed-mode
+repetition, and replaced the files in their existing public repositories. Their new sizes are
+41,327,319,040, 58,521,103,360 and 33,303,628,800 bytes. Readback verified every previous object
+and each added MTP object; publication verified remote sizes, SHA-256 and metadata.
+Their Vision checks preserve the existing plain-decoding fallback, and subsequent text requests resume MTP.
+The first media check incorrectly demanded MTP for media; source inspection identified the
+existing restriction and the qualification now reports it explicitly. Q2 MTP was slower than
+plain decoding in the short measured workload; the product guide retains every range and the
+overlapping-transfer limitation. No MTP speedup is claimed.
+The CPU pod and its 160 GB volume were deleted after the completed corpus and Q2 candidate
+were archived and their receipts collected. The corpus archive passed a full SHA-256 readback.
+After verifying the public Q2 replacement, five temporary Bucket files, including a failed
+assembly copy, were deleted (82,654,771,724 bytes). Their metadata and deletion receipt remain local.
+
+The initial broad n-gram corpus contains 3,711,509 training tokens and 1,103,918 held-out
+tokens, sampled deterministically from four pinned Common Corpus shards and one pinned
+github-code-clean shard. It spans the observed language/domain labels with equal per-group
+token ceilings, retaining provenance, sparse groups and an explicit document/repository split.
+This is a coverage sample, not a claim to cover every language or represent user traffic.
+Source labels remain automatically assigned, and exact snippet deduplication does not remove
+every near-duplicate. Python and the native C++ profiler produced byte-identical 104,893,176-byte
+profiles containing 26,223,284 ranked rows. Held-out hit rates are 33.79% at 256 MiB and 49.64%
+at 4 GiB. Across groups with at least 2,048 held-out tokens, minima are 6.04% and 20.54%; the
+aggregate does not establish uniform language coverage. Embedded and explicit profiles passed
+the full-model Engine comparison against uncached reads, with actual RAM hits and exact tokens.
+The existing public table repository now includes the embedded resource, an explicit profile
+sidecar and all qualification reports. Remote sizes, SHA-256 and metadata were verified.
+The private bucket retains the corpus and profile with full SHA-256 readbacks. Cache residency stays opt-in.
+
+The two offload paths are host RAM to GPU and disk to GPU. Host mode keeps the expert banks in
+RAM and caches frequently used experts on the GPU. Disk mode retains the OS page cache and its
+bounded pinned transfer buffer. The user excluded an additional application-managed RAM cache
+of experts on October 8. Do not implement or benchmark that extra tier. Retain the existing
+device expert cache and both offload paths. This decision concerns expert weights. It does not
+resolve the separate M6 proposal for a shipped n-gram row profile.
+No CPU arithmetic fallback or automatic CPU/DMA split is part of this delivery. These decisions
+supersede the earlier hybrid-platform proposal below; its completed evidence remains recorded.
+
 | milestone | done | where |
 |---|---|---|
 | M0 | the text config normalised by the converter and parsed strictly in C++, one shared fixture | `tools/convert/qwen4_exp.py`, `src/models/qwen4_exp/config.*`, `tests/fixtures/qwen4_exp/` |
@@ -37,23 +95,355 @@ HF repository, and Strata is github.com/Niko1221/Strata (MIT).
 | M5 | the n-gram table described by every model and stored inside it or in a table artifact of its own, refused when missing or different; up to eight concurrent requests with batched decode (the experts read once per batch), FIFO admission between prefill chunks; the context cache's live and turn-closure reuse of a sequence's recurrent state; structured output through the grammar's token masks; the Qwen3.5 Vision tower from the release's mmproj with three-axis RoPE for media prompts | `src/models/qwen4_exp/ngram_component.*`, `executor.*`, `src/runtime/engine/qwen4_exp_core.*`, `tools/convert/qwen4_exp_gguf.py` |
 
 | M5 | MTP speculative decoding (October 2026): the `mtp` component from Unsloth's MTP GGUFs (`eh_proj` split between blocks into `fc_embedding` and `fc_hidden`, hyper-connections decoded to BF16); the MTP block's own sparse-attention KV, pooled keys and indexer tail, its catch-up over every token the model commits; verification of every decoding request's anchor and drafts in one pass, Gated DeltaNet replay records and their fold, the indexer tails and the PLE history advanced over the kept positions (`ple_inject_record`, `ple_history_advance`); the Qwen3.5 family's acceptance (`speculative_accept_greedy_drafts`) with penalties, grammar masks and logprobs; the context cache's sequence images (KV, pooled keys, recurrent and MTP state) in pinned host memory and in disk files | `tools/convert/qwen4_exp*.py`, `src/models/qwen4_exp/{model,executor}.*`, `src/runtime/engine/qwen4_exp_core.*`, `src/ops/{hyper_connection,ple_inject}/` |
+| M5 | 32K/128K public Engine needle checks on two RTX 3090s: 33,024/131,008 input tokens, facts at positions 32,768/98,304, different four-digit facts, plain and MTP K=4, int8 KV, prefix reuse off | `tests/models/qwen4_exp/test_long_context_real.cpp`; October 8, 2026 |
 
-Not started: NInfer's own quantized expert formats and the RadixArk NVFP4 checkpoint. The sparse-attention layers'
-KV takes every `--kv-dtype` format since October 2026.
+Native Q2 storage/import, vector expert Ops and grouped integer tensor-core prefill are qualified
+against independent oracles on October 8. Full-model quality and scoring time were measured;
+native does not attain GGUF quality/performance parity. Keep the optimized GGUF artifact route
+for workloads where these costs matter; native support remains an explicit artifact choice.
+The RadixArk NVFP4 checkpoint remains open.
+The sparse-attention layers' KV takes every `--kv-dtype` format since October 2026.
 
 ### What the milestones left (October 2026)
 
 | milestone | not done | instead or note |
 |---|---|---|
-| M2 | the quality recipe from the BF16 checkpoint (`qwen3_8_flash_next`, Q4/Q5 experts), the FP8 row-scale n-gram table writer from the BF16 row shards, the `q2_g64_fp16` format, the MTP range-fetch helper, `--layers a..b` slice artifacts | Q2_0 experts run as the stored `gguf_q2_0` blocks; the slice test fetches its tensors with `tools/reference/fetch_slice.py` |
-| M3 | NInfer's own expert formats and their A8 routes | the expert banks keep the releases' GGUF blocks. Done since: the QSA layers' KV in all nine `--kv-dtype` formats (`sparse_softmax_attention` decodes them, October 2026) |
-| M5 | a needle past 32K positions (the generate test's needle sits at 4,463) | done: MTP with its own KV and catch-up, multi-column verification with ReplaySSM records and their fold, verification and draft graphs, the indexer tail and PLE history advanced over the kept positions, the Host and disk tiers of the context cache (sequence images with the pooled keys), decode graphs, prefix reuse with live and turn-closure states, structured output, Vision, up to eight requests; long-context perplexity over 65,536-position windows agrees with llama.cpp |
-| M6 | io_uring/IOCP (threads issue the reads), reads started from the drafts or one prompt chunk ahead, `WILLNEED` hints for draft candidates, a user-space row cache for `disk`, a profile shipped in the table artifact | shipped: `--ngram-residency disk\|ram\|ram-hot`, `--ngram-io buffered\|direct\|mmap`, `--ngram-io-depth`, `--ngram-ram-mib`, `--ngram-lock`, the hot-row profile tool (`ninfer-ngram-profile`), rows read while the layers before the PLE layer run, `/stats` row counters with the PLE layer's stall time |
-| M7 | a recorded byte-identity check of a split against one card | the generate test and perplexity ran on two RTX 3090 Ti, two RTX 4090 and two RTX 5090 |
-| M8 | the hybrid MoE with CPU expert compute (doorbell, CPU kernels, DMA share) | shipped instead: host experts with a device expert cache and disk experts streamed into it, every expert computed on the GPU |
-| M9 | A8 int8 MoE prefill, the fused HC write and read, multi-column verify forms, BF16 pooled keys, indexer prefill MMA, expert-cache tuning options | done: wide MoE calls through ggml's matrix kernel, wide HC reads as cuBLAS GEMMs, decode-width GEMVs, spread sparse attention and block scoring, parallel disk reads, host-expert prefill from device slots |
+| M2 | complete within the agreed scope | IQ4_NL is the selected table; native-Q2 slices, exact Q2/Q8 import, materialization, packing and companion binding qualified; full HF-to-Q4/Q5 artifacts excluded; the completed FP8-table experiment was rejected by the user because of its 80% larger table; redundant private artifacts were deleted and measured results retained |
+| M3 | Op qualification complete; native quality/performance limitations remain | measured full native-Q2 quality: 391,000 targets, overall PPL +0.2594%, worst window +4.2972%, one scoring pair +14.83% time; BF16/Q2/Q4/Q5/Q6/Q8, grouped A8/A16 MMA, mixed projections and both layouts pass independent FP64 oracles, repeats, graph replay and route boundaries; QSA covers nine KV formats; native does not replace the optimized GGUF artifact route |
+| M6 | complete within the agreed scope | the qualified broad profile is published in the existing IQ4 table repository; Linux buffered/direct I/O measured with verified cold first request and two warm repeats: 0–4.096 microseconds of PLE stall per request; NumPy/C++ profile bytes match; embedded/explicit profiles pass full-model Engine token and RAM-hit checks; draft/verify top-2 hints pass B=1/8, K=15 eager/graph checks; cache stays opt-in after first-request regressions; Windows execution excluded by the user |
+| M7 | explain the cross-host output differences and qualify the required pipeline identity | October 8: all nine requests repeat within each configuration; A6000 versus two RTX 3090s matches all 64 tokens at 128K, but differs after EOS at 4K/32K; full timing distributions recorded; the completed A6000-route diagnostic leaves all split outputs unchanged |
+| M8 | completed experiment retained; further native/CPU development excluded | DMA=1 evidence remains: native-Q2 logits equal the two-3090 resident run at 32 teacher-forced positions; 31.38 tok/s at K=4 versus 23.98 plain and 35.19 GiB peak RSS on a 256 GB host; CPU mixing 3.11–5.26 tok/s and maximum relative logit L2 0.60 remain disclosed; ongoing delivery uses GPU arithmetic with GGUF RAM/disk offload |
+| M9 | complete controls and measured selection; no confidence-floor speed gain established | native grouped A8/A16 MMA improves the prior native routes but retains reported GGUF regressions; fused HC write/read, multi-column HC/GDN/QSA verify and QSA indexer MMA at T>=128 are qualified; BF16 pooled keys rejected by the independent selection oracle; DMA=1 remains selected and draft minimum probability remains zero; HC and QSA gains are measured at Op scope only |
 
 M0, M1, M4 and M10 are complete.
+
+**Scope change (October 8, 2026).** Full HF-to-Q4/Q5 model conversion and its full-model
+quality/performance campaign are removed from delivery, including the M8 full-Q4 benchmark.
+Existing Q4/Q5 format support and affected Op oracles remain. After reviewing the completed
+comparison, the user rejected the FP8 n-gram table because it increases table storage from
+28.80 GB to 51.84 GB. IQ4_NL remains the release choice. Further FP8-table work and publication
+of its two experimental repositories are excluded. At the user's cleanup request, both rejected
+FP8 repositories and the redundant private IQ4 table were deleted from HF; their reports and
+prior measurements remain locally. Together their model files totalled 121,291,481,344 bytes.
+Retained companion links now point to the identical public IQ4 table. Existing format support
+does not add a native FP8 expert mode.
+Windows execution is excluded because the user has no Windows test host. DMA=1 is the delivered
+native-host mode and default; CPU mixing below one remains explicitly experimental, with further
+full-model numerical qualification outside this delivery. Existing CPU Op oracles and reported
+full-model deviations remain part of the evidence.
+
+**State after the final October 8 campaign.** Conversion, independent oracles, cache/MTP,
+long-context, native-host logits/throughput, Linux I/O and FP8/IQ4 quality evidence are retained.
+DMA=1 is now the default; CLI and serving option tests pass locally, and both affected Engine
+validation files pass strict Linux/GCC syntax checks. GPU results used explicit DMA=1 before
+that default change; arithmetic is unchanged. The `/stats` counter repair also passed its
+contract test and six public requests. All five NInfer rentals are confirmed exited with
+stopped desired state at that point. On October 8 the five superseded rentals and their
+970 GB of allocated disks were deleted after verifying local results and the four retained
+private model archives. The native and FP8 private HF model cards were
+updated and read back, with unchanged payload sizes/digests and private visibility.
+
+The remaining delivery work is PR delivery and resolution of the cross-host pipeline identity gate.
+Public MTP replacements and the qualified hot profile are complete.
+Automatic CPU/DMA split calibration is excluded
+by the GPU-only arithmetic decision. The other decisions remain open until resolved with the
+user; the Windows and CPU-mixing exclusions above are already authorized. Keep all
+native scoring/kernel regressions visible. Reuse completed evidence and the frozen pod harness;
+rerun only checks invalidated by a change. Optional router lookahead remains outside delivery.
+An October 8 inventory found a retained two-3090 rental running again after a reported stop.
+The harness had accepted `actual_status=exited` without canceling `intended_status=running`;
+explicit stop and the guard now require both terminal compute and a stopped desired state.
+The queued-start regression suite passes (22 tests). The instance is confirmed exited/stopped,
+with files retained. The provider reports 112.4 minutes of uptime, about $1.52 at its $0.81/h
+rate; this is an estimate, not a billing receipt or an exact restart timestamp. All its harness
+jobs were terminal. A redundant collection was interrupted by shutdown; earlier completed
+receipts and the remote files remain available.
+The numerical, cancellation and fixed-mode repetition contracts remain in force. Earlier
+scoring regressions and post-EOS pipeline differences remain disclosed beside later results.
+
+**Subsequent M9 work.** `--draft-min-p` passed the affected GPU qualification on October 8.
+It computes draft confidence through the existing `target_logprobs` Op, retains the full captured
+draft chain and shortens verification through the first draft at or below the absolute floor.
+The batch uses its largest selected prefix and individual acceptance extents. Replay records
+separate allocation capacity from active width, CUDA Graphs are keyed by width, and the floor is
+part of disk-cache identity. Zero preserves the fixed-window behavior. Local CLI/server option
+tests and strict Linux/GCC syntax checks pass; no throughput improvement is claimed. Real-model
+checks passed K=1 and K=4, floors 0/0.3/1, exact fixed-mode repeats, cancellation/recovery and
+three concurrent sequences on two GPUs. Floor 1 agrees with K=1. The retained
+single-3090 build pod and older two-3090 pod could not resume because provider resources were
+unavailable. Pod 54851854 resumed with a 30-minute guard, installed missing build tools, and is
+built the affected checks in its 62 GiB tmpfs. The first test launch failed because that mount is
+noexec; copying the completed executables to disk fixed the launch, and the checks passed at
+20:35:47 UTC. The routine is `scripts/pods/draft_confidence_checks.sh`; draft-confidence calibration
+uses the conservative zero default. On the published Q2 representation on one RTX 3090,
+floors 0 and 0.3 produced the same tokens, draft counts and acceptance for two short prompts,
+with three repetitions each. This limited sweep establishes no benefit for 0.3. Keep zero rather
+than claiming calibrated acceleration. No further native-format performance campaign is scheduled.
+
+**M6 corpus decision (October 8, 2026).** The user retained the representative n-gram profile
+and requested broad coverage of languages, prose and code, without preferred languages.
+Use pinned public sources and deterministic samples across language, collection and programming
+language groups. Bound each site's, author's or repository's contribution. Separate profile
+construction and held-out evaluation by source document or repository. Record the resulting
+mixture, missing groups and per-group hit rates at the same RAM budgets. This measures row reuse,
+not model quality. A favorable aggregate must not conceal poor coverage in individual groups.
+The corpus was built on the CPU Pod; the profile was built on the RTX 3090 host after the CPU
+Pod was deleted. Reuse the existing profiler and keep caching opt-in
+until the measured Engine benefit supports another choice.
+
+The five-stratum raw frequency corpus could not be recovered from this checkout, its two Claude
+worktrees, the neighboring NInfer checkouts or `/home/wavecut/services/ninfer-3090/tools/freq_corpus`
+on aifarm. Commit `eea471ce5600402914091ee4f0aa8d859a459966` explicitly leaves the raw corpora ignored;
+the retained ranking counts cannot reconstruct token order for n-gram profiling. The broad
+replacement corpus above supersedes the proposed scope exclusion.
+
+The following records the completed, subsequently rejected FP8-table experiment. The full FP8
+table was built from the pinned BF16 source's 128 n-gram tensors on October 8.
+It has 320,001,536 rows of 162 bytes and occupies 51,840,252,928 bytes as a v3 artifact,
+80% more row storage than the 90-byte IQ4_NL representation. Its native-Q2/MTP companion
+copies the existing weights and resources unchanged and replaces the table descriptor.
+Both private HF uploads passed privacy, size, SHA-256 and metadata readback checks.
+The full FP8 table then passed the public Engine hybrid test with direct I/O: three exact
+fixed-mode repeats each for plain and MTP K=4, active cancellation/recovery, routing-profile
+recording and nonzero table reads. The RTX 3090 / EPYC 7302P workload used 128 input tokens,
+16 generated tokens, int8 KV, a 4 GiB expert cache, DMA share 0.5 and eight CPU workers.
+Plain request times were 9.34945/11.7956/11.0541 s; K=4 times were
+8.3734/8.46306/8.37219 s. This is functional evidence, not a comparable FP8 quality or
+throughput advantage over IQ4.
+
+The final FP8/IQ4 comparison used the same executable and native weights on two RTX 3090s,
+BF16 KV, context 32,768, stride 16,384 and the held-out corpus's 391,000 targets, six streams
+and 18 windows. IQ4 PPL is 5.04508077; FP8 is 4.98215281 (-1.2473%). Fourteen windows improve
+and four worsen, with worst +0.2624% (first GitHub-code window) and best -13.2749% (last arXiv
+window). Both code-domain aggregates worsen about 0.105%. Scoring is 443.49/446.33 seconds
+(FP8 +0.6419%); one sequential pair cannot establish a stable speed difference. The current
+IQ4 baseline differs from the earlier A6000 native result (5.00450069); changed hardware and
+source snapshot prevent attributing that difference to any one optimization. The FP8 quality
+gain does not remove the earlier native-versus-GGUF regressions. Full domain results are in
+the product guide.
+
+The M8 integration registers native host weight objects separately on Linux and copies their
+planes directly; other platforms use pageable weights and bounded pinned copy staging.
+Routing profiles select the initial cached experts, bind counts to the artifact and layer shapes,
+and can record updated counts at request boundaries. A mapped 32-bit release/acquire handshake
+connects the CPU supervisor to eager and captured decode/verify/MTP execution. Preparation,
+CPU completion and retirement keep the shared staging buffers live through their last GPU
+consumer. The public options select DMA share, CPU workers and adaptive caching; defaults
+keep the cache and decode split fixed. The context-image directory includes the CPU backend
+and resolved cache placement. A cancellation drains CPU work, transfers and n-gram reads,
+then discards the incomplete sequence rather than caching it. The whole-expert FP64 test covers
+Q2/Q4/Q5, CPU-only and DMA-only misses, mixed hits, adaptive swaps and T=1/3/16/17; it now
+also captures repeated exchanges and cancellation/recovery with a deliberately delayed worker.
+The CUDA integration passed on an RTX 3090 with CUDA 13.1 and an EPYC 7302P host (256 GB RAM).
+The first build exposed an undefined error-check macro in host registration; that was fixed.
+The first mixed CPU/DMA test timed out: first-use kernel loading held the CUDA driver lock
+while the GPU waited for preparation and the supervisor tried to submit a copy. Eager exchanges
+now wait on the host and retire before returning; captured exchanges retain GPU waits.
+The affected hybrid oracle/graph/cancellation test then passed in 2.86 seconds with lazy loading
+enabled. Registered materialization, masked native GPU routes, scalar/AVX2 CPU experts and the
+FP32 residual merge also passed. EPYC 9354 / GCC 13.3 later passed 33 AVX-512 VNNI oracle cases.
+The final BF16 full-model comparison at prefixes 128/2,112, 16 teacher-forced positions each,
+found all logit words identical between host DMA=1 on one RTX 3090 and resident execution on
+two RTX 3090s. DMA=0/0.5 repeated exactly and retained top-1 at all positions, but maximum
+relative L2 was 0.324/0.604, with maximum KL 0.00761/0.00194. Those CPU modes remain experimental.
+The final public serving grid uses 219 input and 64 output tokens, int8 KV, a 4 GiB cache,
+eight CPU workers and three requests per mode. DMA=1/K=4 achieves 31.38 tok/s median versus
+23.98 plain; CPU DMA=0/0.5 achieves 3.11/5.26. All generated tokens match across this grid.
+Peak RSS is 35.19 GiB for K=4 and 32.68 GiB plain; the tested 256 GB host exceeds the 64 GB
+Plan B target. The GGUF baseline failed at startup, so these rates do not establish a gain
+over optimized GGUF. Full distributions and measurement conditions are in the product guide.
+The full-model test then exposed an unnecessary requirement that the GGUF MTP companion also
+use native weights. Native banks now map to the hybrid scheduler independently, and GGUF banks
+retain their mapped-host GPU route. After that fix, public Engine plain/K=4 runs passed three
+fixed-mode repeats each, cancellation after generated tokens, recovery and routing-profile
+recording. The workload was 128 input and 16 output tokens, int8 KV, a 4 GiB cache, DMA share
+0.5 and eight CPU workers. FP8 source downloads ran concurrently, so these request times are
+not an isolated throughput comparison.
+
+Per-step n-gram lookahead copies the draft winner and runner-up to distinct pinned slots on an
+auxiliary stream and hashes private contexts while later draft steps run. Verification also
+hints the two candidates after each actual verified prefix; predicted tokens never advance the
+next column's context. The GPU test covers eager execution, graph replay, B=1/8, every candidate
+at each of 15 steps and 16 verify columns, EOS, error propagation and recovery. An initial host
+synchronization of a captured CUDA event failed with `cudaErrorInvalidValue`; completion now
+uses the joined compute stream, and the affected test passes in 0.73 s. Exact BF16 top-2
+selection retains its separate independent oracle at the real vocabulary width.
+
+Direct I/O uses one bounded speculative batch with separate staging and a separate read queue.
+Only complete successful batches become visible; hints never admit rows into the persistent
+cache. Linux native-queue and positioned-read fallback tests cover exact rows, failure/retry,
+bounded depth, eviction and destruction during pending reads. The updated reader test passes
+on the RTX 3090 host too (0.28 s), and the full FP8-table Engine check passes. Buffered/mapped
+OS hints remain advisory. The final public Engine I/O run verifies table-page eviction before
+the first request and two warm repeats, with DMA=1/K=4 and no persistent row cache. Buffered
+and direct reads incur 0–4.096 microseconds of PLE stall per request on the rental's Samsung SSD;
+the product guide retains all three decode rates and counters for each mode. `/stats` initially
+omitted n-gram counters; the omission and report contract were fixed before remeasuring those
+two modes. This qualifies the measured row-read stall, not an isolated speedup from lookahead.
+Shipping the representative hot profile remains open; Windows execution is excluded.
+
+Embedded hot profiles now use the existing raw-resource framing. Conversion accepts a default
+`ngram.hot` beside the checkpoint or `--resource ngram.hot=PATH` and stores it only with table
+rows. `ram-hot` reads the selected table's profile unless an explicit profile overrides it;
+other modes leave the resource unread. Hash mismatch, duplicate/out-of-range rows and malformed
+framing are refused. Python conversion tests pass (49 affected cases; 36 rechecked after the
+no-PLE default-profile fix), as do the Linux CPU reader/profile checks and strict host syntax
+checks of the loader, Engine construction and component tests. Two test-run failures, a local
+variable collision and a read-only working directory, were fixed before the CPU pass.
+The C++ component/resource tests and Python-writer/C++-reader/GPU interop pass on RTX 3090;
+the interop check took 3.02 seconds. Its initial failure was a missing pytest dependency,
+now included in bootstrap. Public Engine use of the embedded profile remains unqualified.
+The five-stratum frequency corpus is not present in
+this checkout; the retained technical-text profile's 25.5% held-out hit rate is not evidence for
+a representative default. Existing full private table archives do not yet contain that resource.
+
+Fused HC write/read preserves the public FP32 stack rounding, supports BF16/FP32 branch output,
+and allows the previous and next injection planes to share storage. The text and MTP executors
+use it between attention and MLP. Its independent FP64 oracle covers T=1..9 and 37, both output
+dtypes, aliasing, guards and changed-input graph replay; the GPU test passes in 3.04 s.
+Against separate public write/read calls on RTX 3090 / CUDA 13.1, 61 paired graph samples per
+cell cover T=1/4/8/9/16/128/512, both dtypes, and reused/64 MiB-evicted L2 inputs. Medians fall
+2.0–6.6% in 26 of 28 cells; two T=1 cells tie and none regress. Each graph loses one node.
+The full FP8-table Engine check also passes; no whole-model speedup has been measured.
+
+The QSA indexer keeps its original SIMT scoring below 128 columns. At T>=128 it prepares
+the query once and scores four queries against 64 pooled keys per CTA using three TF32
+high/residual products. Public pooled keys remain FP32. The independent FP64 selection
+oracle passes in 10.67 seconds, including T=127/128/129, capacities 512/700/8192/32768,
+dense-to-sparse transitions, exact ties, guards and changed-position graph replay.
+On RTX 3090 / CUDA 13.1, 33 rotated samples for each of the original, staged-SIMT and MMA
+candidates cover reused and 64 MiB-evicted L2. MMA lowers all 12 T=128/512 medians by
+30.8–65.0%; short calls regress by up to 40%, so their original route is retained.
+The final public Op check confirms 30.8–66.2% lower wide medians against the retained original
+measurements. Workspace grows by 2048 bytes per token and the wide graph gains one node.
+The staged-SIMT alternative was removed. No whole-model or other-GPU gain is claimed.
+
+The BF16 pooled-key experiment is closed without changing the stored state. Across three
+seeds and 32 queries each at 4K/32K/128K, 167/288 selections change and 166 changes exceed
+the existing near-threshold tolerance. The largest changed score distance is 0.004997
+relative to the threshold. These synthetic represented-input results reject that candidate;
+they are not a model-quality measurement. Existing HC/GDN/QSA verify paths already process
+multiple columns, with independent Op checks and the completed K=1/4/8/15 Engine suite.
+
+**Qualification contract (October 8, 2026).** The agreed contract is numerical correctness against
+independent mathematical oracles and exact repetition with the execution configuration fixed.
+Changing verification width, prefill partition or batch composition can change reductions and a near-tie argmax;
+plain-versus-MTP token differences must be reported, but are not a byte-identity requirement.
+Sampling RNG purposes also differ between plain and speculative decoding. Exact context-image
+restore remains required for the same prefix computation history and execution profile, including
+n-gram enablement. The native Q2 cache check initially compared cold 512+218 prefill against a
+512+188 prefix followed by 30 tokens: their eight-token answers differ. Live-prefix and disk-prefix
+continuations agree exactly; the test now checks that required identity and records the cold
+difference separately, rather than treating a change in prefill partition as a restore failure.
+The complete native Q2 Engine suite then passed with `target_differences=0`,
+`batch_differences=5`, `failures=0`: K=1/4/8/15, output/thinking budgets, seeded repeats,
+cancellation, logprobs, disk restore and cache-profile isolation. This does not establish
+full-model quality or throughput. The converter/MTP/FP8 source/table suite has 131 passing tests;
+the live range-fetch check retrieved one 5,120-byte HF MTP norm and verified its file hash,
+not the entire MTP block.
+
+The October 8 disk-cache qualification passed exact row checks (including split rows, eviction
+and failed-batch admission) and 12 public Engine comparisons: plain/MTP K=4, buffered reads with
+no cache or a 4 GiB cache, direct reads with a 4 GiB cache, and two requests per mode. Repeated
+cached requests hit every row. The first buffered requests were 9.55%/11.40% slower with the cache;
+repeat generation times differed by less than 0.4%. A separate old/new CLI pair took
+0.795/0.810 seconds with identical answers. These are single samples, not a timing distribution.
+The disk cache therefore defaults to zero; `ram-hot` retains its 4096 MiB default. Capacity includes
+the cache index and is not RSS. Windows remains untested. Full results and measurement boundaries
+are in the product guide; the later Linux queue/lookahead qualification is described above.
+The rebuilt CLI passes its option tests and a public Engine request confirms zero disk-cache
+capacity and zero rows served from the row cache when no budget is specified.
+
+The first build exhausted the 180 GiB volume after 14m24s; logs contain ENOSPC and NVCC crashes,
+with no cgroup OOM event. Model files were retained. Removing download caches, compressing the
+previous benchmark executable and moving compiler scratch to tmpfs allowed the retry to finish
+in 13m01s. Fatbinary compression now uses `balance`; the failed attempt is not a valid speed
+baseline. The subsequent test wrapper lacked GNU `time` after its Engine checks had passed;
+only the comparison was resumed, without a peak-RSS measurement.
+
+The next A16 pass replaces wide scalar expert dots with grouped BF16 tensor-core dots,
+keeping integer weight codes exact and carrying the down input in high/residual components.
+The unchanged independent oracle, layout/mixed-bank and graph/repeat checks passed (12.22 s).
+Against a retained vector executable on RTX 3090, 13/14 wide real-Q2 cells improved by
+41.2–89.5%; T=16/cyclic regressed 2.2%. T=512 changed from 30.9/31.9 ms to 3.27/3.35 ms,
+but A16 is still 50.9–120.3% slower than GGUF across the wide cells. Its relative L2 increased
+from about 1.6e-7 to 2.4e-6, within the same bounds. Small-width timing differences are
+unattributed. The current public Engine run passed with 3 target-mode differences, 7 batch
+differences and no failures, compared with 0/5/0 above; no full-model A16 speed or quality
+claim follows. Full workload tables and remaining costs are in the product guide.
+
+The FP8 n-gram writer is qualified on October 8 with real row width 160, uneven HF shard
+boundaries, multiple writer chunk sizes, and single-file/multipart `.ninfer` artifacts.
+The quantizer matches an independent scalar codebook oracle at rounding and FP16 scale
+boundaries; the Python-writer/C++-reader/GPU chain matches independent FP64 row products
+rounded to BF16, including reordered and repeated row reads. Six affected C++/GPU checks
+pass on RTX 3090 with CUDA 13.1. Initial reader-call and test-dispatch mistakes were corrected
+before that passing run. This does not measure conversion of the full 102 GB HF table or
+its effect on model quality. Hashing and writing make two bounded passes through the source.
+
+The official FP8 source was checked at revision `236dfdf285828023ca3bcd3f37366c58a3469b13`:
+its index names individual `experts.<e>.gate_proj/up_proj/down_proj.weight` tensors and
+`weight_scale_inv` companions; its config declares 128x128 weight blocks. The six fetched
+tensors show BF16 scales, not the FP32 scale storage initially assumed. The earlier wording
+"fused FP8 expert sources" assumed the BF16 checkpoint's fused layout and is not the actual
+official FP8 layout. The converter now decodes these matrices using their stored multipliers
+and preserves FP32 products until the selected encoding's next cast. It also resolves split
+versus fused experts against recipe-selected sources. The first check exposed an existing
+Qwen3.5-only config validator in the shared builder; Flash-Next source validation now uses
+its own parser, including MTP's expert count.
+The corrected suite passed 131 tests in 3.07 s, including source overrides and unequal
+text/MTP expert counts. Three real matrices (4,915,200 values, 640×2560 gate/up and 2560×640
+down) match an independent FP64 E4M3FN codebook/block-product oracle exactly after FP32
+rounding, at two read chunk sizes. BF16/F32 scale boundaries, partial blocks, non-finite
+values and invalid metadata are covered synthetically. This qualifies source interpretation;
+full-model FP8 conversion, throughput and quality remain unmeasured. The FP8 checkpoint's
+own n-gram encoding still requires a separate IQ4_NL or BF16 table source.
+
+Intermediate generated models are retained in private Hugging Face model repositories with
+conversion reports, source revisions, table dependencies and qualification limits. The pod
+harness archives explicit paths, verifies visibility and uploaded bytes, and retains sources;
+production promotion and later deletion are separate decisions (`scripts/pods/README.md`).
+The initial archives completed on October 8: [GGUF Q2_0 + MTP](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-GGUF-Q2_0-MTP-NInfer-exp-20261008)
+(69,229,477,120 bytes) and [native Q2 + MTP](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-native-Q2-MTP-NInfer-exp-20261008)
+(40,651,086,080 bytes). Private visibility, SHA-256, sizes and all three metadata files were
+verified against the uploaded revisions. The native artifact's card names the first artifact
+as its external n-gram companion. Full-model production qualification is still incomplete.
+
+The native-Q2 `3..5` and `1..4` slices passed public Engine qualification on RTX A6000 with
+CUDA 13.1 and int8 KV: 32/700 input tokens, 16 outputs and exact fixed-mode repeats. The
+converter preserved 3,125/4,691 selected bindings and every selected physical object, activation
+use and frontend resource relative to the full native artifact. The no-PLE slice reads no table
+rows and rejects unused table options; the PLE slice reads the standalone table and refuses a
+missing companion. The standalone IQ4 table preserves all source table bytes, verified by digest.
+Both slices and the table are private HF archives with verified file sizes, SHA-256 and metadata;
+the slices are debug artifacts, not complete models. The first PLE test used a stale binary:
+deploying source with its local timestamp let Ninja skip a changed test. The harness now updates
+timestamps only when file contents change. A missing JSON include dependency in the M7 test was
+also fixed; the rebuilt slice tests pass. These fixes do not qualify full-model HF/FP8 quality.
+
+The October 8 M7 run uses the same native-Q2 artifact and executable on RTX A6000 and two RTX
+3090s, with int8 KV, 512-token prefill chunks, no prefix reuse and plain decoding. Three requests
+per context generate 64 tokens with model stops disabled. Both configurations repeat exactly;
+the 128K outputs also match across hosts. At 4K and 32K, each of the three split samples differs
+in 53/64 tokens, starting at zero-based output index 9. All prefixes through the first configured
+EOS (token 248046 at index 4) match. This does not pass the raw 64-token identity gate. The hosts
+use different default route profiles and drivers; the completed diagnostic reusing A6000 route
+choices on the 3090s leaves every split output unchanged. Those choices are not a 3090 calibration.
+Timing and comparison limits are in
+the product guide.
+
+October 8 qualification found and fixed premature reuse of the first stage's MTP embedding
+buffer during peer copies. The traced 24 repeats per graph mode now have identical valid KV,
+MTP intermediates and logits, including alternating delayed copies. Public Engine qualification
+without the trace passes too, including 48 delayed-copy repeats and the logprobs/cache checks.
+The greedy suite still reports six plain/MTP differences and seven batch-composition differences;
+those are recorded under the agreed numerical contract, not hidden by the ordering fix.
+Output/thinking budgets and context-image profile
+isolation have regression coverage. Plain and MTP K=4 passed the 32K/128K needle checks with
+different facts and normal model stops. These are behavioral checks, not long-context throughput
+comparisons: the MTP run overlapped CPU conversion and plane verification. The n-gram
+cold/warm mode and held-out profile measurements, and the independent CPU/GPU expert comparison,
+are recorded in `docs/qwen3-8-flash-next.md`; they do not complete M6 or integrate M8.
 
 ### Speculative decoding: what exists (October 2026)
 
@@ -517,7 +907,7 @@ Assumptions: RTX 3090 24 GB, ~22.5 GB usable after the CUDA context and display;
 dual channel ~40 GB/s effective for streaming CPU kernels (DDR5-6000 ~65 GB/s); NVMe random 4 KiB read ~80-120 us
 QD1, >300K IOPS at depth.
 
-**Plan A - 1x 3090 + 128 GB RAM, Q4-class experts (best quality that runs).**
+**Plan A - 1x 3090 + 128 GB RAM, Q4-class experts (capacity reference, outside this delivery).**
 - VRAM: dense ~3.4 GB (W4 g64 GDN/QSA/shared/head, BF16 HC + router) or ~5.2 GB (int8 dense); MTP 1.4 GB (Q4 experts
   in VRAM, dense BF16); KV+state at 128K rk8v4 1.5 GB; prefill workspace 1.5 GB; **expert cache ~13 GB ≈ 4,700 Q4
   experts (19%)**.
@@ -568,10 +958,10 @@ lookahead prefetch); an option loads it, or a profile-selected hot part of it, i
   `row * row_bytes` (a 4 KiB page holds 25.6 FP8 rows; ~4% of reads straddle two pages, accepted rather than padding
   rows to 256 B, which would cost +60%);
 - formats, chosen by the converter recipe:
-  - `fp8_e4m3_rowscale` - 160 B + 2 B FP16 scale per row = 162 B/row, 51.8 GB. Default; near-lossless (BF16 rows have
-    a small dynamic range per row);
+  - `fp8_e4m3_rowscale` - 160 B + 2 B FP16 scale per row = 162 B/row, 51.8 GB. The completed experiment
+    was rejected because of its larger table; retained format support is not a release recommendation;
   - `int4_g32_iq4nl` - 5 x (FP16 scale + 16 B codes, IQ4_NL codebook, split-half nibbles) = 90 B/row, 28.8 GB. Bit-exact
-    import of GGUF `per_layer_token_embd` (IQ4_NL) and the GSQ evaluations were done with it;
+    import of GGUF `per_layer_token_embd` (IQ4_NL) and the GSQ evaluations were done with it. Selected release format;
   - `bf16` - 320 B/row, 102.4 GB. Reference/oracle only.
   Sources: the HF BF16 shards (the checkpoint stores the table in BF16, 128 row shards), the GSQ GGUF shard 2
   (IQ4_NL), or an existing FP8 table (`nvidia/Qwen3.8-Flash-Next-NVFP4` ships `model-fp8-mtp-ple.safetensors`,
@@ -591,18 +981,30 @@ lookahead prefetch); an option loads it, or a profile-selected hot part of it, i
   per model replaced it, and the hybrid replaced that so that several published checkpoints share one table.
 
 **Runtime option surface** (CLI and serve config; names follow our `--kebab` convention). **Status (October
-2026):** built as planned below, with the budget as `--ngram-ram-mib N` (default 4096) and no built-in profile:
-`ram-hot` takes the file `ninfer-ngram-profile` writes. Reads go through a pool of `--ngram-io-depth` threads, not
-io_uring or IOCP; a pass starts its reads when it hashes its tokens and uploads the rows just before the PLE layer, so
-the embedding and block 0 run meanwhile (no reads from the drafts or a chunk ahead, no `WILLNEED` hints); `disk` has
-no user-space row cache, the page cache serving repeats; `ram-hot` keeps its rows in row order behind a bit per table
-row (40 MiB) instead of an open-addressing table, and admits nothing online. The table as planned:
+2026):** built as planned below, with the budget as `--ngram-ram-mib N` (default 0 for `disk`, 4096 for
+`ram-hot`). `ram-hot` takes the selected table's embedded profile or the explicit file
+`ninfer-ngram-profile` writes. Conversion embeds `ngram.hot` when supplied; shipping a
+representative default and its full-model qualification remain open. Buffered/direct misses use a core-owned bounded
+io_uring/IOCP queue driven by one worker; Linux hosts that disable io_uring retain positioned-read workers.
+The Linux queue, reader and direct-I/O public Engine checks pass; the final buffered/direct
+serving run measures near-zero PLE stalls with cold and warm table pages. IOCP remains untested;
+Windows qualification is excluded. A pass starts its reads when it hashes its tokens and uploads the rows just before the PLE layer, so
+the embedding and block 0 run meanwhile. The October 8 implementation adds a budgeted four-way CLOCK row cache
+for `disk` (opt-in, including the index; zero disables it) and advisory lookahead for the next prompt
+chunk and the top two tokens of each MTP draft step and actual verify prefix. Linux buffered/mapped reads use `WILLNEED`;
+Windows mapped reads use `PrefetchVirtualMemory`. Linux row/Engine qualification passes; Windows is untested.
+First-request regressions keep the disk cache disabled by default. Direct I/O has bounded
+speculative staging; Windows buffered I/O uses the same bounded staging with buffered reads,
+untested on Windows. Draft/verify hints pass GPU ordering
+and graph checks; the serving run does not isolate their speedup. `ram-hot` keeps its rows in
+row order behind a bit per table row (40 MiB) instead of an open-addressing table, and admits nothing online.
+The table as planned:
 
 | option | values | default | meaning |
 |---|---|---|---|
 | `--ngram-residency` | `disk`, `ram`, `ram-hot` | `disk` | where rows come from |
 | `--ngram-io` | `buffered`, `direct`, `mmap` | `buffered` | disk mode: `pread` into a bounded row cache through the OS page cache (`posix_fadvise(RANDOM)`; Windows `FILE_FLAG_RANDOM_ACCESS`); `direct` = O_DIRECT / `FILE_FLAG_NO_BUFFERING` 4 KiB-aligned reads that bypass the page cache (Strata's default on Windows: keeps RAM for the expert arena); `mmap` = map + `madvise(MADV_RANDOM)`, prefetch via `madvise(WILLNEED)` / `PrefetchVirtualMemory` |
-| `--ngram-ram-mib N` | number | 4096 (ram-hot) | resident budget for `ram-hot` (planned as `--ngram-ram-budget GiB`, also capping a `disk` row cache that was not built) |
+| `--ngram-ram-mib N` | number | `disk`: 0; `ram-hot`: 4096 | rows plus index: CLOCK cache in `disk` (zero disables), profile-selected resident rows in `ram-hot` |
 | `--ngram-hot-profile PATH` | file | built-in profile shipped in the artifact | row-frequency profile for `ram-hot` |
 | `--ngram-lock` | flag | off | `mlock`/`VirtualLock` the resident rows (`ram`, `ram-hot`) |
 | `--ngram-io-depth N` | int | 64 | outstanding reads (io_uring on Linux, overlapped I/O / IOCP on Windows) |
@@ -649,9 +1051,9 @@ prefill is eager, decode rounds are captured per (family, B, frontier envelope, 
 
 1. **New mathematical architecture** `Qwen4ExpForConditionalGeneration` (README/AGENTS "Product and architecture"
    must name it).
-2. **New execution platform: hybrid CPU/GPU MoE with host-resident experts** (Plans A/B). Without it the model needs
-   ≥ 2x 24 GB at ≤ 2.5 bpw (Plan C). The plan stages it so that Plan C (GPU-resident, Linux pipeline) is complete
-   and useful before the hybrid mode exists.
+2. **GPU expert execution with host-RAM or disk weights.** The existing GGUF paths support both offload
+   placements on one GPU. The earlier CPU/GPU hybrid proposal was implemented as an experiment;
+   further CPU expert work is excluded by the current delivery decision.
 3. **Host/disk-resident model data on the token path** (the n-gram table), required by the product statement in
    2.5.
 4. Concurrency: hybrid mode starts at C = 1 (each extra row multiplies distinct experts and CPU work); GPU-resident
@@ -741,8 +1143,9 @@ oracle tests in `tests/ops/`, and a `bench/ops` microbenchmark):
   `gate_up_proj[e]` rows 0..639 gate / 640..1279 up, `down_proj[e]`; zero-centred norms kept as `w` (the Ops take
   `unit_offset`); `linear_attn.norm` plain; `A_log`/`dt_bias` -> fp32; conv squeezed to [4, C].
 - Recipes in `official_recipes.py`:
-  - `qwen3_8_flash_next` (Plan A/B quality): experts Q4 g64 gate/up + Q5 g64 down (Q6 on sensitive layers,
-    chosen by measured KL as in the 35B recipe), GDN/QSA projections Q8 (A8-int prefill permission) or Q4, HC
+  - `qwen3_8_flash_next` (format support; full-model conversion excluded): experts Q4 g64 gate/up +
+    Q5 g64 down; no sensitive-layer Q6 mask or KL sweep is part of this delivery. GDN/QSA projections
+    use Q8 (A8-int prefill permission) or Q4, HC
     BF16, router + shared score BF16, shared experts Q8, head Q6, embed Q8 (host gather), PLE projections BF16, MTP
     dense BF16 + MTP experts Q4, vision BF16. Source: HF BF16 (`--model`), or the official FP8 checkpoint via
     `sources/compressed_tensors.py`.
@@ -755,8 +1158,10 @@ oracle tests in `tests/ops/`, and a `bench/ops` microbenchmark):
     `nextn_eh_proj [fc_embedding | fc_hidden]` split back.
   - the n-gram table, the same artifact's `ngram` component: from the GGUF shard 2 (`--source ngram=`,
     `per_layer_token_embd`, IQ4_NL, imported byte-exactly - note GGUF's split-half nibble order); the 128 HF BF16 row
-    shards (streamed shard by shard, never materialised; FP8 E4M3 per-row scale = max|row|/448) are not a source
-    yet.
+    shards now stream to `fp8_e4m3fn_row_fp16` / `row_interleaved_v1`: 160 E4M3FN codes and one
+    FP16 row multiplier, 162 bytes per row. `fp8_row_maxabs` rounds max|row|/448 to the stored
+    scale before normalizing and rounding codes. The descriptor hashes the quantized row bytes;
+    the writer rereads the BF16 source in bounded chunks, without a table-sized temporary file.
 - Expert banks: one parent object per (layer, projection) holding 512 experts contiguously, expert-major, each
   expert's rows contiguous, so an expert is one contiguous byte range (cache slot copy = one DMA, CPU kernel = one
   stream). 73,728 logical expert parameters are grouped by `recipe.group`.
@@ -764,8 +1169,9 @@ oracle tests in `tests/ops/`, and a `bench/ops` microbenchmark):
   n-gram table, in one file (the writer splits into parts only when `--max-file-bytes` asks). Tensor axes must stay < 2^31 elements: the expert bank
   [512*1280, 2560] = 1.68e9 elements is fine; the n-gram table [320,001,446, 160] is fine per axis.
 
-### 3.4 Hybrid execution (host experts + VRAM expert cache + CPU expert compute)
+### 3.4 Retained hybrid experiment (frozen; current delivery uses GPU arithmetic)
 
+The following records the implemented experiment, not additional delivery requirements.
 Program-owned machinery (Ops stay closed: they receive an expert pointer table and a "parts" input):
 
 1. **Host expert arena.** All experts of all layers in host RAM in their artifact encoding. Linux: `cudaHostRegister`
@@ -791,9 +1197,12 @@ Program-owned machinery (Ops stay closed: they receive an expert pointer table a
 6. **Lookahead router prefetch** (optional, measured): apply layer l+1's router to layer l's input to start copies
    early (Strata uses it in the low-RAM mode).
 
-Determinism: CPU and GPU expert arithmetic round differently; byte-identical repeats need a fixed split
-(`--expert-dma-share 0`, no adaptive swaps), as Strata documents. The verification contract is numerical (KL/top-1
-against the oracle), not bitwise across splits.
+Determinism: CPU and GPU expert arithmetic round differently. Qualification uses a fixed split
+and no adaptive swaps. The delivered default is `--expert-dma-share 1`, which matched every
+resident logit word in the final dense/sparse-prefix comparison. CPU mixes below one repeat
+within a fixed mode but have not passed full-model numerical qualification; their further
+refinement is excluded by the user's October 8 decision. CPU Op qualification retains its
+independent FP64 oracle.
 
 ### 3.5 Residual stack, HC and the pipeline stages
 
@@ -859,7 +1268,8 @@ Do **not** adopt the "experimental speed projection" (an abliteration vector, `r
 ## 4. Staged implementation plan
 
 Each milestone ends in something independently checkable. Efforts are engineer-weeks for one engineer familiar with
-the tree (est., ±50%). Verification hardware: the Windows 3090 host builds everything; correctness runs of the full
+the tree (est., ±50%). Verification hardware: Linux CUDA 13.1 rentals; Windows execution is excluded
+by the user's October 8 decision. Correctness runs of the full
 model need either one 48 GB sm_86 card (RTX A6000, rentable) or 2x 3090 on Linux; the BF16 reference needs a
 CPU box with ≥ 400 GB RAM or a rented multi-GPU vLLM node for one-off logit dumps.
 
@@ -867,14 +1277,14 @@ CPU box with ≥ 400 GB RAM or a rented multi-GPU vLLM node for one-off logit du
 |---|---|---|---|---|
 | M0 | Product decision + family scaffold | AGENTS/README name the architecture and (later) the hybrid mode; `src/models/qwen4_exp/config`; `registry` entry; `ModelInstance` two-member variant; ResourceManager/RequestRecord instantiated for both contracts; refusal paths for unsupported shapes | config round-trip on the real `config.json`; refusal tests for each validated invariant; qwen3_5 test suite unchanged (`ctest`) | 1-2 |
 | M1 | Reference harness (CPU, Python 3.11) | `tools/reference/qwen4_exp/`: an FP32/FP64 transcription of the modular code that loads tensors **lazily by range** from the HF safetensors (one expert at a time), runs any layer slice, and dumps golden tensors: hash rows (incl. EOS cuts, BOS context, image ids), PLE block, HC read/write, GDN layer (prefill + step), QSA layer at n ≤ 2051 and n > 2051 (selection sets included), MoE, final mixer + head, MTP step | cross-check the hash against the checkpoint's I64 buffers and Strata's `ple_parity` vectors (exact); cross-check one full forward of layers 0-3 against transformers itself on the same slice (FP32, ≤ 1e-5 rel) | 1-2 |
-| M2 | Converter, artifact, loader | `tools/convert/qwen4_exp.py`, recipes (BF16-debug, Q8, Q4/Q5 experts, GSQ-Q2 import), n-gram table writer (FP8-rowscale, IQ4_NL import), `--layers a..b` slice artifacts for tests, MTP range-fetch helper; C++ bindings/load for all roles, `q2_g64_fp16` format registration (artifact + python) | byte-exact import of encoded GGUF rows (Q2_0 experts, IQ4_NL table rows) vs the GGUF file; independent decode of every stored format vs source within the format's error bound; loader binding/shape tests; companion digest/constant refusal tests | 2-3 |
+| M2 | Converter, artifact, loader | `tools/convert/qwen4_exp.py`, recipes (BF16-debug, Q8, Q4/Q5 format support, GSQ-Q2 import; full HF-to-Q4/Q5 artifacts excluded), IQ4_NL table import, `--layers a..b` slice artifacts for tests, MTP range-fetch helper; C++ bindings/load for all roles, `q2_g64_fp16` format registration (artifact + python); FP8-table experiment completed and rejected | byte-exact import of encoded GGUF rows (Q2_0 experts, IQ4_NL table rows) vs the GGUF file; independent decode of every stored format vs source within the format's error bound; loader binding/shape tests; companion digest/constant refusal tests | 2-3 |
 | M3 | New Ops at H 2560 (parallelisable) | `hyper_connection`, `ple_inject` + `ngram_dequant_rows`, GDN shape registrations + sigmoid gated norm, attention [256,24,2] dense, rope D128/R64 MRoPE, `qsa_indexer`, `sparse_softmax_attention` (BF16, int8, rk8v4 KV), `sparse_moe_512` (resident; Q4/Q5, Q8, q2_g64), head/embedding shapes | per op-development.md: naive FP32/FP64 oracle at T = 1, route boundaries and interior, real shapes; selection = exact set equality modulo documented near-ties; sparse attention with an identity selection must equal dense causal attention; microbenchmarks in `bench/ops` | 6-10 |
 | M4 | Full forward, GPU-resident, single device | `execution/` + minimal `program/` (prefill eager, decode ungraphed), n-gram rows via a simple `ram`/`pread` path; first on slice artifacts (layers 0-3 + head), then the full GSQ-Q2 artifact on one 48 GB card | slice: per-layer `R` and logits vs M1 dumps (FP32 criteria); full model: next-token KL and top-1 agreement vs a reference engine's logits (vLLM BF16 or llama.cpp on the same GSQ file) over a fixed 32K-token corpus incl. one > 8K prompt (sparse path engaged); perplexity within the GSQ README's reported recovery | 2-3 |
-| M5 | Decode product path | CUDA graphs (dense/sparse topology classes), MTP with step-0 selection reuse, verify + ReplaySSM + indexer-tail/PLE snapshots, commit/abort, StateImage extensions, pooled-key KV plane in host/disk tiers, prefix cache, serving `reasoning_effort` | greedy MTP output byte-identical to greedy non-speculative output, incl. forced-wrong drafts; checkpoint save/restore/fork equivalence (byte-identical continuation); needle-in-haystack at 32K/128K; serving schema tests | 3-4 |
+| M5 | Decode product path | CUDA graphs (dense/sparse topology classes), MTP with step-0 selection reuse, verify + ReplaySSM + indexer-tail/PLE snapshots, commit/abort, StateImage extensions, pooled-key KV plane in host/disk tiers, prefix cache, serving `reasoning_effort` | independent numerical/state oracles, incl. forced-wrong drafts; exact repetition for a fixed execution configuration and reported plain/MTP differences; checkpoint save/restore/fork equivalence (byte-identical continuation); needle-in-haystack at 32K/128K; serving schema tests | 3-4 |
 | M6 | n-gram residency surface | `--ngram-residency` (disk / ram / ram-hot), `--ngram-io`, budget, hot-profile tool (tokenize corpus -> row counts, no model), I/O thread + io_uring/IOCP, lookahead issue from drafts, speculative WILLNEED, `/stats` counters | rows bit-identical across all modes; layer-1 stall time ≈ 0 at decode with a warm and a cold page cache (measured, NVMe); hot-set hit rate on held-out text reported per budget (decides whether `ram-hot` stays) | 1-2 |
 | M7 | Plan C: 2x 3090 pipeline (Linux) | stage solver with expert banks, `R` over `StageLink`, MTP/head on rank 0 | output byte-identical to the single-48 GB-card run; decode/prefill measured at 4K/32K/128K (median of 3) and compared with the 2.4 estimates | 1-2 |
-| M8 | Hybrid MoE (Plans A/B) | host arena (Linux pinned ranges; Windows pageable + pinned staging ring), byte-sized VRAM cache + residency table + profile fill + adaptive swaps, doorbell + in-graph wait, CPU kernels (q2_g64, Q4/Q5 g64; AVX-512 VNNI and AVX2), DMA share, prefill expert streaming, concurrency 1 | CPU expert kernels vs FP64 oracle (same criteria as GPU routes); hybrid logits vs the resident run of the same artifact within the resident-vs-oracle bound; byte-identical repeats with a fixed split; no deadlock under abort/cancel (fault-injection test with a stalled CPU worker); measured tok/s on 3090 + 64 GB (GSQ-Q2) and + 128 GB (Q4) | 6-10 |
-| M9 | Performance pass | A8 int8 MoE prefill, fused HC write+read, multi-column HC/GDN/QSA for verify, pooled keys BF16 (only if the measured selection-flip rate is negligible), indexer prefill MMA, expert-cache tuning, `--calibrate` knobs (DMA share, draft min-p) | each change measured at its claimed scope; end-to-end only for end-to-end claims | 3-6 |
+| M8 | Hybrid MoE (Plan B; Q4/Q5 Ops retained) | host arena, byte-sized VRAM cache + residency table + profile fill + adaptive swaps, doorbell + in-graph wait, CPU kernels (q2_g64, Q4/Q5 g64; AVX-512 VNNI and AVX2), DMA share, prefill expert streaming, concurrency 1; delivered default DMA=1, CPU mixing experimental, Windows execution excluded | CPU expert kernels vs FP64 oracle; delivered DMA=1 logits vs resident; exact fixed-mode repeats; no deadlock under abort/cancel with a stalled CPU worker; measured GSQ-Q2 tok/s on RTX 3090 with host RAM reported (64 GB target); further CPU full-model refinement and full-Q4 benchmark excluded | 6-10 |
+| M9 | Performance pass | retain measured A8 int8 MoE prefill, fused HC write/read, multi-column HC/GDN/QSA verify and indexer MMA; expert-cache tuning on the existing GGUF RAM/disk paths and draft min-p calibration; automatic CPU/DMA split calibration excluded | each change measured at its claimed scope and RAM/VRAM budget; end-to-end only for end-to-end claims | 3-6 |
 | M10 | Vision | Qwen3.5 tower reuse, merger to 2560, placeholder ids into the PLE hash, 3-D positions into QSA pooled-key rotation | image prompts: logits vs reference engine; PLE rows for image positions match the oracle | 1-2 |
 
 Ordering: M0 -> M1 ∥ M2 -> M3 -> M4 -> {M5, M6, M7} -> M8 -> M9; M10 any time after M5. Total ≈ 27-46
@@ -899,7 +1309,7 @@ engineer-weeks; the GPU-resident product (through M7) is ≈ 17-28.
    attention, set the long-context decode slope (Strata: 94 -> 56 tok/s from 4K to 262K).
 4. **R4 Quantization quality.** Our groupwise 4-bit experts come from RTN/MSE; GSQ-RCO's 2-3 bpw are trained and
    evaluated (Q2_0 89.07 task average vs BF16 93.12). Below 4 bits import GSQ rather than quantize ourselves; the
-   Q4 recipe needs a KL sweep per layer like the 35B recipe.
+   full HF-to-Q4/Q5 conversion and its per-layer KL sweep are excluded from this delivery.
 5. **R5 Reference availability.** The full BF16 model is 360 GB; a full-model oracle run needs rented hardware. The
    plan uses lazily-loaded slices (M1) for numerical work and a one-off logit dump from a reference engine for
    end-to-end KL.

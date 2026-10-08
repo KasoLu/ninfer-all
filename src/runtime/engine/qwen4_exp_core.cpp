@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <bit>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -95,6 +96,10 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
             "Qwen3.8-Flash-Next drafts with its MTP block only (--spec mtp)");
     }
     const bool mtp = speculative.backend == SpeculativeBackend::Mtp;
+    if (!std::isfinite(speculative.draft_min_p) || speculative.draft_min_p < 0 ||
+        speculative.draft_min_p > 1 || (!mtp && speculative.draft_min_p != 0)) {
+        throw std::invalid_argument("--draft-min-p requires --spec mtp and a finite value in [0,1]");
+    }
     if (mtp && (speculative.draft_tokens == 0 || speculative.draft_tokens > 15)) {
         throw std::invalid_argument("--spec mtp requires --draft-tokens in [1,15]");
     }
@@ -106,7 +111,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         speculative.mtp_policy != MtpDraftPolicy::Fixed ||
         speculative.proposal_head != ProposalHead::Full || speculative.ngram_archive_bytes != 0) {
         throw std::invalid_argument(
-            "Qwen3.8-Flash-Next's MTP drafting takes --draft-tokens only: no --lookup-ngram, "
+            "Qwen3.8-Flash-Next's MTP drafting has no --lookup-ngram, "
             "--mtp-attention-window, --adaptive-mtp, --lm-head-draft or n-gram archive");
     }
     if (options.context_cache.disk_kv_directstorage) {
@@ -121,14 +126,12 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
          table.io_depth != defaults.io_depth)) {
         throw std::invalid_argument("--no-ngram-table excludes the other n-gram table options");
     }
-    if (table.residency != NgramResidency::RamHot &&
-        (table.ram_budget_bytes || !table.hot_profile.empty())) {
+    if (table.residency != NgramResidency::RamHot && !table.hot_profile.empty()) {
         throw std::invalid_argument(
-            "--ngram-ram-budget and --ngram-hot-profile belong to --ngram-residency ram-hot");
+            "--ngram-hot-profile belongs to --ngram-residency ram-hot");
     }
-    if (table.residency == NgramResidency::RamHot && table.hot_profile.empty()) {
-        throw std::invalid_argument("--ngram-residency ram-hot needs a hot-row profile, "
-                                    "--ngram-hot-profile PATH (ninfer-ngram-profile makes one)");
+    if (table.residency == NgramResidency::Ram && table.ram_budget_bytes) {
+        throw std::invalid_argument("--ngram-ram-mib needs --ngram-residency disk or ram-hot");
     }
     if (table.lock && table.residency == NgramResidency::Disk) {
         throw std::invalid_argument("--ngram-lock needs --ngram-residency ram or ram-hot");
@@ -138,26 +141,43 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     const artifact::Reader reader(options.artifact_path);
+    const auto text =
+        models::qwen4_exp::parse_text_config(reader.directory().component("text").config);
+    const bool has_ple = !text.ple_layers.empty();
+    if (!has_ple &&
+        (!table.path.empty() || table.residency != defaults.residency || table.io != defaults.io ||
+         table.ram_budget_bytes || !table.hot_profile.empty() || table.lock ||
+         table.io_depth != defaults.io_depth)) {
+        throw std::invalid_argument("n-gram table options do not apply to a slice without PLE layers");
+    }
     // The n-gram table, and the hot-row profile of a ram-hot table, are located before anything
     // else starts, so a model without them fails at once.
     std::optional<models::qwen4_exp::NgramTableSource> ngram;
     models::qwen4_exp::NgramReadOptions ngram_read{
         .residency    = table.residency,
         .io           = table.io,
-        .budget_bytes = table.ram_budget_bytes.value_or(std::uint64_t{4} << 30U),
+        .budget_bytes = table.ram_budget_bytes.value_or(
+            table.residency == NgramResidency::RamHot ? std::uint64_t{4} << 30U : 0),
         .lock         = table.lock,
         .depth        = table.io_depth};
-    if (!table.disabled) {
-        const auto text =
-            models::qwen4_exp::parse_text_config(reader.directory().component("text").config);
-        ngram =
-            models::qwen4_exp::ngram_table_source(reader, options.artifact_path, text, table.path);
+    if (!table.disabled && has_ple) {
+        ngram = models::qwen4_exp::ngram_table_source(
+            reader, options.artifact_path, text, table.path,
+            table.residency == NgramResidency::RamHot && table.hot_profile.empty());
         if (table.residency == NgramResidency::RamHot) {
-            auto profile = models::qwen4_exp::read_ngram_profile(table.hot_profile);
-            models::qwen4_exp::check_ngram_profile(
-                profile, models::qwen4_exp::derive_ngram_hash_constants(text.ngram),
-                table.hot_profile);
-            ngram_read.hot_rows = std::move(profile.rows);
+            if (!table.hot_profile.empty()) {
+                auto profile = models::qwen4_exp::read_ngram_profile(table.hot_profile);
+                models::qwen4_exp::check_ngram_profile(
+                    profile, models::qwen4_exp::derive_ngram_hash_constants(text.ngram),
+                    table.hot_profile);
+                ngram_read.hot_rows = std::move(profile.rows);
+            } else if (ngram->hot_profile) {
+                ngram_read.hot_rows = std::move(ngram->hot_profile->rows);
+                ngram->hot_profile.reset();
+            } else {
+                throw std::invalid_argument("--ngram-residency ram-hot needs a profile in the "
+                    "table artifact or --ngram-hot-profile PATH (ninfer-ngram-profile makes one)");
+            }
         }
     }
     inspect.complete();
@@ -200,6 +220,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     executor.max_context     = options.max_context;
     executor.sequences       = options.max_concurrency;
     executor.draft_tokens    = mtp ? speculative.draft_tokens : 0;
+    executor.draft_min_p     = speculative.draft_min_p;
     // A chunk also holds a verification of every sequence at once.
     executor.prefill_chunk   = std::max(std::clamp<std::uint32_t>(options.prefill_chunk, 64, 4096),
                                         (executor.draft_tokens + 1) * executor.sequences);
@@ -208,6 +229,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     executor.expert_cache_bytes =
         options.expert_cache_bytes.value_or(models::qwen4_exp::ExecutorOptions::kAutoExpertCache);
     executor.cuda_graphs = options.use_cuda_graph;
+    executor.hybrid_experts = options.hybrid_experts;
     executor.vision_max_merged_tokens = options.vision_max_merged_tokens;
     executor.kv_cache                 = options.kv_cache;
     instance->executor = std::make_unique<models::qwen4_exp::Executor>(*model, device, executor);
@@ -221,8 +243,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     }
     instance->free_after_weights = free_after_weights;
     instance->free_after_startup = free_bytes();
-    std::string table_place      = "off";
-    if (!table.disabled) {
+    std::string table_place      = has_ple ? "off" : "not used (no PLE layers)";
+    if (!table.disabled && has_ple) {
         const std::string file = table.path.empty() ? "the artifact" : "its table artifact";
         const std::string io   = table.io == NgramIo::Direct   ? " (direct I/O)"
                                  : table.io == NgramIo::Mapped ? " (mapped)"
@@ -233,13 +255,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         table_place = table.residency == NgramResidency::Ram ? "in RAM (" + resident + ")"
                       : table.residency == NgramResidency::RamHot
                           ? "hot rows in RAM (" + resident + "), the rest read from " + file + io
-                          : "read from " + file + io;
+                          : "read from " + file + io + ", row cache capacity " + resident;
     }
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                        "Qwen3.8-Flash-Next: %zu stage(s), experts in %s memory, n-gram table "
                        "%s, state %.0f MiB, workspace %.0f MiB, expert cache %.0f MiB",
                        model->stages().stages(),
-                       options.expert_residency == ExpertResidency::Host   ? "pinned host"
+                       options.expert_residency == ExpertResidency::Host   ? "host"
                        : options.expert_residency == ExpertResidency::Disk ? "the artifact's files"
                                                                            : "device",
                        table_place.c_str(),
@@ -256,7 +278,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                "proposals (--ngram-draft-tokens) are not available for it");
         }
     }
-    if (table.disabled) {
+    if (table.disabled && has_ple) {
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
                            "Qwen3.8-Flash-Next runs WITHOUT its n-gram table (--no-ngram-table): "
                            "a non-standard experimental mode. The model was trained with the "
@@ -572,6 +594,18 @@ struct Qwen4ExpCore::Impl {
                            [](const Slot& slot) { return slot.request != nullptr; });
     }
 
+    void fail_engine(std::exception_ptr error) {
+        {
+            std::lock_guard lock(queue_mutex);
+            failed = true;
+            stopping = true;
+        }
+        for (auto& slot : slots) {
+            if (slot.request) { complete(std::exchange(slot.request, {}), error); }
+        }
+        queue_cv.notify_all();
+    }
+
     void loop() {
         for (;;) {
             {
@@ -594,19 +628,22 @@ struct Qwen4ExpCore::Impl {
             try {
                 admit();
                 step();
+            } catch (const ops::CpuExpertCancelled&) {
+                // Native hybrid execution is C1 and has drained every CPU task before throwing.
+                // A partially advanced layer stack is discarded; it must never enter the prefix cache.
+                try {
+                    auto request = slots.front().request;
+                    slots.front().fed.clear();
+                    slots.front().anchor.clear();
+                    instance.executor->abort(0);
+                    // MTP can finish the response before its catch-up observes cancellation.
+                    // The sequence still needs cleanup, but no second terminal.
+                    if (request) { finish_now(request, FinishReason::Cancelled); }
+                } catch (...) { fail_engine(std::current_exception()); }
             } catch (...) {
                 // Not a request's own error: the device may be in an unknown state, so the Engine
                 // fails with every request it holds.
-                const auto error = std::current_exception();
-                {
-                    std::lock_guard lock(queue_mutex);
-                    failed   = true;
-                    stopping = true;
-                }
-                for (auto& slot : slots) {
-                    if (slot.request) { complete(std::exchange(slot.request, {}), error); }
-                }
-                queue_cv.notify_all();
+                fail_engine(std::current_exception());
             }
             publish_stats();
         }
@@ -668,7 +705,8 @@ struct Qwen4ExpCore::Impl {
     // ---- The context cache's store ------------------------------------------------------------
 
     // The disk tier's directory for this model and execution profile: an image holds the KV in its
-    // storage format and the MTP block's state only when the block runs.
+    // storage format and the MTP block's state only when the block runs. Verify width changes
+    // reductions; disabling PLE changes every layer's recurrent/KV state. Each needs its own store.
     [[nodiscard]] std::string profile_name(const EngineOptions& options) const {
         std::string id;
         for (const std::byte b : instance.model->info().artifact_id) {
@@ -677,8 +715,11 @@ struct Qwen4ExpCore::Impl {
             id += hex;
         }
         return "qwen4_exp-image1-" + id + "-kv" +
-               std::to_string(static_cast<int>(options.kv_cache)) + "-mtp" +
-               std::to_string(drafts > 0 ? 1 : 0);
+               std::to_string(static_cast<int>(options.kv_cache)) + "-drafts" +
+               std::to_string(drafts) + "-draft-min-p" +
+               std::to_string(std::bit_cast<std::uint32_t>(options.speculative.draft_min_p)) + "-ngram" +
+               std::to_string(options.ngram_table.disabled ? 0 : 1) + "-experts-" +
+               instance.executor->expert_execution_profile();
     }
 
     struct FileHeader {
@@ -1026,6 +1067,13 @@ struct Qwen4ExpCore::Impl {
     }
 
     void step() {
+        auto& executor = *instance.executor;
+        const auto cancellation_owner = executor.hybrid_experts() ? slots.front().request : nullptr;
+        struct CancellationBorrow {
+            models::qwen4_exp::Executor& executor;
+            ~CancellationBorrow() { executor.bind_cancellation(nullptr); }
+        } cancellation_borrow{executor};
+        executor.bind_cancellation(cancellation_owner ? &cancellation_owner->cancelled : nullptr);
         std::shared_ptr<Request> prefilling;
         bool decoding = false;
         for (const Slot& slot : slots) {
@@ -1191,6 +1239,7 @@ struct Qwen4ExpCore::Impl {
 
     // Frees the request's sequence (keeping its state for the context cache) and completes it.
     void finish(const std::shared_ptr<Request>& request, FinishReason reason) {
+        instance.executor->save_expert_profile();
         Request& r = *request;
         GenerationResult result;
         result.prompt              = r.prompt_summary;
@@ -1273,6 +1322,11 @@ struct Qwen4ExpCore::Impl {
         executor.forward(r.slot, chunk, 1);
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
         r.prefilled += n;
+        if (r.prefilled < prompt_n) {
+            const auto next = std::span<const TokenId>(r.prompt_tokens).subspan(
+                r.prefilled, std::min(executor.options().prefill_chunk, prompt_n - r.prefilled));
+            executor.prefetch_ngram(r.slot, next);
+        }
         if (reuse_prefixes && r.reusable && r.prefilled == r.anchor_at) {
             executor.snapshot(r.slot, slot.snapshot);
             slot.anchor = slot.fed;
@@ -1409,6 +1463,7 @@ struct Qwen4ExpCore::Impl {
     [[nodiscard]] bool speculates(const Request& r) const {
         return drafts > 0 && r.feed.size() == 1 && instance.executor->can_draft(r.slot) &&
                r.position + drafts + 1 <= max_context &&
+               r.output.model_token_budget_remaining(r.budget->remaining()) > 1 &&
                !(r.options.execution.post_thinking_sampling && !r.post_thinking);
     }
 
@@ -1481,17 +1536,24 @@ struct Qwen4ExpCore::Impl {
     void speculative_round(const std::vector<std::shared_ptr<Request>>& batch) {
         auto& executor      = *instance.executor;
         const std::size_t b = batch.size();
-        const std::size_t k = drafts;
-        const std::size_t w = k + 1;
-        const auto columns  = static_cast<std::int32_t>(w);
         std::vector<std::uint32_t> sequences;
         std::vector<TokenId> anchors;
         for (const auto& request : batch) {
             sequences.push_back(request->slot);
             anchors.push_back(request->feed.front());
         }
-        std::vector<TokenId> proposed(b * k);
-        executor.draft(sequences, anchors, proposed);
+        std::vector<TokenId> all_drafts(b * drafts);
+        std::vector<std::uint32_t> draft_extents(b, drafts);
+        executor.draft(sequences, anchors, all_drafts, draft_extents);
+        const std::size_t k = *std::max_element(draft_extents.begin(), draft_extents.end());
+        const std::size_t w = k + 1;
+        const auto columns = static_cast<std::int32_t>(w);
+        std::vector<TokenId> proposed;
+        proposed.reserve(b * k);
+        for (std::size_t j = 0; j < b; ++j) {
+            proposed.insert(proposed.end(), all_drafts.begin() + std::ptrdiff_t(j * drafts),
+                            all_drafts.begin() + std::ptrdiff_t(j * drafts + k));
+        }
         std::vector<TokenId> tokens;
         for (std::size_t j = 0; j < b; ++j) {
             tokens.push_back(anchors[j]);
@@ -1543,7 +1605,12 @@ struct Qwen4ExpCore::Impl {
         auto* staged = static_cast<std::int32_t*>(host_spec->data());
         std::copy(proposed.begin(), proposed.end(), staged);
         for (std::size_t j = 0; j < b; ++j) {
-            staged[b * k + j]     = static_cast<std::int32_t>(k);
+            // The batch uses its largest confidence prefix. Acceptance also respects each
+            // sequence's shorter prefix and its output/thinking budget, including correction.
+            const auto remaining = batch[j]->output.model_token_budget_remaining(
+                batch[j]->budget->remaining());
+            staged[b * k + j] = static_cast<std::int32_t>(
+                std::min<std::size_t>(draft_extents[j], remaining - 1));
             staged[b * k + b + j] = static_cast<std::int32_t>(batch[j]->position);
         }
         CUDA_CHECK(
@@ -1642,7 +1709,7 @@ struct Qwen4ExpCore::Impl {
                 }
             }
             r.speculative.rounds += 1;
-            r.speculative.drafted_tokens += k;
+            r.speculative.drafted_tokens += drafts; // the captured draft chain still runs in full
             r.speculative.accepted_tokens += std::uint32_t(drafts_n);
             for (std::int32_t i = 0; i < drafts_n; ++i) {
                 ++r.speculative.accepted_per_position[i];
@@ -1730,6 +1797,7 @@ struct Qwen4ExpCore::Impl {
             CUDA_CHECK(cudaStreamSynchronize(stream));
             out.insert(out.end(), host.begin(), host.end());
         }
+        executor.save_expert_profile();
         return out;
     }
 };

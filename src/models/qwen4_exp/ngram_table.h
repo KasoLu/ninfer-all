@@ -3,10 +3,12 @@
 // Row reads from the Qwen3.8-Flash-Next n-gram table. By default the table stays in its files and
 // the rows each pass addresses are read from there, `depth` at once: positioned reads through the
 // OS page cache (NgramIo::Buffered), aligned reads past it (Direct), or copies out of a read-only
-// mapping (Mapped). The Ram residency reads the whole table into RAM at startup; RamHot reads the
+// mapping (Mapped). Disk caches recently read rows within its RAM budget. The Ram residency reads
+// the whole table into RAM at startup; RamHot reads the
 // rows a hot-row profile ranks most frequent, as many as a budget holds, and reads the rest from
 // the files. Every mode returns the files' bytes.
 
+#include "core/file_read_queue.h"
 #include "models/qwen4_exp/read_pool.h"
 #include "ninfer/types.h"
 
@@ -38,9 +40,9 @@ struct NgramTableLayout {
 struct NgramReadOptions {
     NgramResidency residency = NgramResidency::Disk;
     NgramIo io               = NgramIo::Buffered;
-    // RamHot: the RAM the resident rows and their index take at most, and the profile's rows, the
-    // most frequent first; the leading rows that fit become resident.
+    // Disk: cached rows and their index, zero disables caching. RamHot: resident rows and index.
     std::uint64_t budget_bytes = 0;
+    // RamHot: most frequent first; the leading rows that fit become resident.
     std::vector<std::uint32_t> hot_rows;
     bool lock           = false; // keep the resident rows in physical memory
     std::uint32_t depth = 64;    // reads in flight
@@ -58,10 +60,15 @@ public:
 
     [[nodiscard]] const NgramReadOptions& options() const noexcept { return options_; }
 
-    // Rows and bytes held in RAM (the RamHot index included).
-    [[nodiscard]] std::uint64_t resident_rows() const noexcept { return resident_rows_; }
+    // Rows held in RAM and allocated capacity including the index; Disk fills on demand.
+    [[nodiscard]] std::uint64_t resident_rows() const noexcept {
+        return resident_rows_.load(std::memory_order_relaxed);
+    }
 
     [[nodiscard]] std::uint64_t resident_bytes() const noexcept;
+
+    // Physical reader selected on this OS; a restricted Linux host may disable io_uring.
+    [[nodiscard]] const char* io_backend() const noexcept;
 
     // Starts copying the rows `row_ids` addresses, in order, into `out` (row_ids.size() *
     // row_bytes); the resident rows are copied before it returns. Both spans stay untouched by
@@ -74,12 +81,20 @@ public:
     // submit() and wait().
     void read_rows(std::span<const std::uint64_t> row_ids, std::span<std::uint8_t> out);
 
+    // Advisory lookahead: OS hints for Linux buffered/mapped and Windows mapped reads;
+    // up to depth direct reads (also Windows buffered reads) into
+    // bounded staging. Hints do not change demand counters or admit rows to the resident cache.
+    // Like submit/wait, called by the reader's owner, never concurrently with them.
+    void prefetch(std::span<const std::uint64_t> row_ids);
+
     // The counters of every finished batch; any thread may read them.
     [[nodiscard]] NgramTableStats counters() const;
 
 private:
     struct File;
     class Memory;
+    class RowCache;
+    class Lookahead;
 
     // Reads `bytes` of the table at table offset `offset`, across segments, from the files.
     void read(std::uint64_t offset, std::uint8_t* destination, std::size_t bytes) const;
@@ -94,14 +109,19 @@ private:
     std::vector<std::unique_ptr<File>> files_; // one per segment
     std::vector<std::uint64_t> starts_;        // table offset of each segment
     std::unique_ptr<Memory> resident_;         // Ram: the table; RamHot: the hot rows by row id
-    std::uint64_t resident_rows_ = 0;
+    std::unique_ptr<RowCache> cache_;          // Disk: bounded rows, populated after successful reads
+    std::atomic<std::uint64_t> resident_rows_{0};
     // RamHot: bit per table row, and the hot rows before each 512-row block.
     std::vector<std::uint64_t> hot_bits_;
     std::vector<std::uint32_t> hot_blocks_;
     std::unique_ptr<ReadPool> pool_;
+    std::unique_ptr<FileReadQueue> queue_;
+    std::vector<QueuedFileRead> reads_;
+    std::unique_ptr<Lookahead> lookahead_;
 
     // The batch in flight: the rows the files serve (index into the batch), and its start.
     std::vector<std::uint32_t> misses_;
+    std::vector<std::uint32_t> admissions_;
     std::span<const std::uint64_t> batch_ids_;
     std::span<std::uint8_t> batch_out_;
     std::chrono::steady_clock::time_point batch_start_;

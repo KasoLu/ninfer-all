@@ -20,4 +20,10 @@ namespace ninfer::ops {
  */
 void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStream_t stream);
 
+// The two highest finite BF16 vocabulary logits per column, ordered by descending value then
+// ascending token id. Both outputs are contiguous I32 [T]; second excludes the token in first.
+// Requires 2 <= valid_rows <= physical_rows. Inputs and outputs must not overlap. No workspace.
+void argmax_top2(const Tensor& logits, Tensor& first, Tensor& second,
+                 std::int32_t valid_rows, cudaStream_t stream);
+
 } // namespace ninfer::ops

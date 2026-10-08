@@ -11,6 +11,7 @@ benchmark-report, and external protocol behavior. Repository verification princi
   materialization and Python-writer/C++-reader interoperability;
 - `convert/` — source interpretation, Qwen logical mapping, recipe overrides/sharing, optional
   components, resources, proposals and numerical conversion methods;
+- `reference/` — bounded checkpoint range fetch, exact subset bytes and hash manifests;
 - `models/qwen3_5/` — config/binding, frontend, state/context stores, workspace, MTP alignment and
   opt-in real Engine integration;
 - `ops/` — semantic Op qualification with independent mathematical or state-transition oracles;
@@ -201,6 +202,29 @@ NINFER_QWEN4_EXP_EXPERTS=host \
 ```
 
 Its Ops are also composed over a slice of the BF16 checkpoint against an FP64 golden.
+The public Engine regression requires a text+ngram+MTP artifact and, by default, two 24 GiB GPUs.
+It qualifies K=1/4/8/15 for output and thinking budgets, post-thinking sampling, penalties, seeded
+repetition, JSON grammar and stop tokens, including three concurrent requests and cancellation.
+It reports token differences from plain decode and serial batches; exact repetition holds the
+execution configuration fixed. Independent Op suites qualify the arithmetic, including the
+vector/matrix MoE boundary at T=8/9 and the wider verification batches.
+It forces host images to spill, restarts the Engine, and verifies both restored continuation and
+isolation between verify widths and table-enabled versus `--no-ngram-table` state:
+
+```bash
+NINFER_FLASH_NEXT_ARTIFACT=$PWD/models/flash-next-q2_0-mtp.ninfer \
+NINFER_FLASH_NEXT_DEVICES=0,1 \
+  ctest --test-dir build -R '^ninfer_qwen4_exp_engine_real$' --output-on-failure
+```
+
+`NINFER_FLASH_NEXT_CACHE_ONLY=1` runs the image spill/restore/isolation regression alone.
+`NINFER_FLASH_NEXT_SAMPLING_ONLY=1` repeats the seeded K=1 request over three sequence slots,
+with and without CUDA graphs, and reports the first differing token's top-logprob records.
+On Linux, `ninfer_qwen4_exp_peer_copy_order_test` repeats that workload while delaying alternate
+copies of the first prompt chunk's MTP embeddings from GPU 0 to GPU 1. It checks that the next
+chunk cannot overwrite the source before the peer copy consumes it. The delay fixture assumes
+this prompt's seven MTP cells and device order `0,1`; use that order for this test.
+
 `tools/reference/fetch_slice.py` range-fetches the first blocks, embedding, final mixer, head and
 the needed n-gram rows (`--exclude ngram_embedding` keeps the 102 GB table out), and
 `tools/reference/qwen4_exp.py --layers 4 --head --out DIR/golden` writes the golden:
@@ -210,13 +234,28 @@ NINFER_QWEN4_EXP_SLICE=$PWD/fn_slice \
   ctest --test-dir build -R ninfer_qwen4_exp_slice_real --output-on-failure
 ```
 
+`ninfer_qwen4_exp_ngram_writer_interop_test` converts a small sharded BF16 table with the
+production Python writer, reads single-file and multipart artifacts through `NgramTableReader`,
+and checks reordered and repeated GPU-decoded rows exactly against independently decoded
+FP64 products rounded to BF16. `tests/convert/test_qwen4_exp_ngram.py` separately checks the
+quantizer against a scalar codebook oracle, source-shard boundaries, digest stability and
+invalid source metadata. It does not require the full 102 GB HF table.
+
+`tests/convert/test_block_fp8.py` checks HF 128×128 E4M3FN expert matrices against an
+independent FP64 codebook/block-product oracle with BF16 or FP32 scales, partial reads and
+invalid representations. It also covers fused/split source selection for Qwen3.5 and
+Flash-Next text/MTP. Running the file with a range-fetched checkpoint directory qualifies
+its actual matrix values at two chunk sizes; `scripts/pods/fp8_source_checks.sh` combines
+that real-source check with the affected converter suite.
+
 Token log probabilities run through the public Engine on either family. The test checks that each
 record spells its token's text and that the drawn token tops its distribution under greedy
 decoding, that gathering them changes no generated token, that streaming, a stop string, three
 requests decoded as one batch and a JSON grammar's mask all reach the records, and that a request
 without them gathers none. `NINFER_LOGPROBS_ARTIFACT` names the artifact, and the test is skipped
 without it; `NINFER_LOGPROBS_NGRAM_TABLE` names a Qwen3.8-Flash-Next table artifact, and
-`NINFER_LOGPROBS_SPECULATIVE=mtp` or `dflash2` verifies the tokens in speculative rounds:
+`NINFER_LOGPROBS_SPECULATIVE=mtp` or `dflash2` verifies the tokens in speculative rounds.
+`NINFER_LOGPROBS_DEVICES=0,1` selects a two-GPU layer pipeline:
 
 ```bash
 NINFER_LOGPROBS_ARTIFACT=$PWD/out/qwen3_8_27b.ninfer NINFER_LOGPROBS_SPECULATIVE=dflash2 \

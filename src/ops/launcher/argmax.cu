@@ -58,6 +58,25 @@ void argmax_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,
                                tiled_block_for(physical_rows, valid_rows, t_count), stream);
 }
 
+void argmax_second_launch(const Tensor& logits, const Tensor& first, Tensor& second,
+                          std::int32_t valid_rows, cudaStream_t stream) {
+    for_each_token_slice(logits.ne[1], 1, [&](int offset, int count) {
+        const auto input = logits.slice(1, offset, count);
+        const auto winner = first.slice(0, offset, count);
+        auto runner = second.slice(0, offset, count);
+        argmax_second_init<<<div_up(count, 256), 256, 0, stream>>>(
+            static_cast<const std::int32_t*>(winner.data),
+            static_cast<std::int32_t*>(runner.data), count);
+        CUDA_CHECK(cudaGetLastError());
+        const dim3 grid(div_up(valid_rows, kArgmaxBlock), count);
+        argmax_second_kernel<<<grid, kArgmaxBlock, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(input.data),
+            static_cast<const std::int32_t*>(winner.data),
+            static_cast<std::int32_t*>(runner.data), valid_rows, logits.ne[0]);
+        CUDA_CHECK(cudaGetLastError());
+    });
+}
+
 namespace {
 
 void argmax_tiled_atomic_launch(const Tensor& logits, Tensor& out, std::int32_t valid_rows,

@@ -8,6 +8,7 @@
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
 #include "product/ngram_table_options.h"
+#include "product/hybrid_expert_options.h"
 #include "product/rope_yarn_options.h"
 
 #include <nlohmann/json.hpp>
@@ -57,6 +58,7 @@ struct Options {
     std::vector<int> devices;
     ninfer::ExpertResidency expert_residency = ninfer::ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
+    ninfer::HybridExpertOptions hybrid_experts;
     ninfer::NgramTableOptions ngram_table;
 #if defined(NINFER_SM8X_COMPAT)
     // FP8 E4M3 KV attention has no SM86 implementation, so the upstream default would fail at
@@ -89,6 +91,7 @@ std::string usage_text() {
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N | --disjoint] [--device N | --devices A,B,...]\n"
            "       [--expert-residency device|host|disk] [--expert-cache-mib N|auto]\n"
+           "       [--expert-dma-share F] [--expert-cpu-threads N] [--expert-cache-adaptive]\n"
            "       [--ngram-table PATH] [--ngram-residency disk|ram|ram-hot] [--ngram-lock]\n"
            "       [--ngram-io buffered|direct|mmap] [--ngram-io-depth N] [--ngram-ram-mib N]\n"
            "       [--ngram-hot-profile PATH] [--no-ngram-table]   (Qwen3.8-Flash-Next)\n"
@@ -220,6 +223,8 @@ Options parse_options(int argc, char** argv) {
                 out.expert_cache_bytes =
                     std::uint64_t(parse_integer<std::uint32_t>(mib, "expert-cache-mib")) << 20;
             }
+        } else if (ninfer::product::parse_hybrid_expert_option(
+                       option, out.hybrid_experts, [&] { return value(option.data()); })) {
         } else if (ninfer::product::parse_ngram_table_option(
                        option, out.ngram_table, [&] { return value(option.data()); })) {
         } else if (option == "--rope-yarn") {
@@ -360,6 +365,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.devices                       = options.devices;
     engine_options.expert_residency              = options.expert_residency;
     engine_options.expert_cache_bytes            = options.expert_cache_bytes;
+    engine_options.hybrid_experts                = options.hybrid_experts;
     engine_options.ngram_table                   = options.ngram_table;
     engine_options.max_context      = options.context;
     engine_options.kv_cache         = options.kv;

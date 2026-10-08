@@ -231,6 +231,78 @@ def block_source(
     )
 
 
+def q2_native_source(
+    gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowMap
+) -> LogicalSource:
+    """Import GSQ Q2_0 as native offset codes and the exact signed binary16 scale words.
+
+    The row map selects rows within a tensor or flattened expert bank. The physical K padding
+    holds logical integer zero (stored code 1); wholly padding groups have positive-zero scales.
+    No floating-point dequantization or quantizer participates in the encoded import.
+    """
+    if gguf.info(tensor).type_id != GGML_Q2_0:
+        raise ValueError(f"{tensor}: native Q2 import requires stored Q2_0 blocks")
+    if len(shape) != 2 or shape[1] != gguf.info(tensor).shape[-1] or shape[1] % 64:
+        raise ValueError(f"{tensor}: native Q2 import requires complete 64-value blocks")
+    raw_source = block_source(gguf, tensor, shape, select)
+    k = shape[1]
+    groups, padded_groups = k // 64, ((k + 127) // 128) * 2
+
+    def encoded(begin: int, end: int) -> EncodedRows:
+        index = select(begin, end)
+        low, high = int(index.min()), int(index.max()) + 1
+        blocks = gguf.read_blocks(tensor, low, high)[index - low].reshape(end - begin, groups, 18)
+        scale_words = np.zeros((end - begin, padded_groups), dtype="<u2")
+        scale_words[:, :groups] = np.ascontiguousarray(blocks[..., :2]).view("<u2").squeeze(-1)
+        scales = scale_words.view("<f2")
+        if not np.isfinite(scales).all():
+            raise ValueError(f"{tensor}: Q2 scales must be finite binary16 words")
+        codes = np.full((end - begin, padded_groups, 16), 0x55, dtype=np.uint8)
+        codes[:, :groups] = blocks[..., 2:]
+        return EncodedRows("q2_g64_fp16", torch.from_numpy(codes.reshape(end - begin, -1)),
+                           torch.from_numpy(scales), packed=True)
+
+    return LogicalSource(shape, f"{tensor}[q2_g64_fp16]{list(shape)}",
+                         raw_source.read_values, encoded)
+
+
+def q8_native_source(
+    gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowMap
+) -> LogicalSource:
+    """Preserve compatible Q8_0 integer codes and binary16 scales as native Q8 planes.
+
+    Native Q8 excludes -128 and negative-zero scales, and requires zero codes for zero-scale
+    groups. Refuse an incompatible source instead of silently changing its representation.
+    """
+    if gguf.info(tensor).type_id != 8:
+        raise ValueError(f"{tensor}: native Q8 import requires stored Q8_0 blocks")
+    if len(shape) != 2 or shape[1] != gguf.info(tensor).shape[-1] or shape[1] % 32:
+        raise ValueError(f"{tensor}: native Q8 import requires complete 32-value blocks")
+    raw_source = block_source(gguf, tensor, shape, select)
+    groups, padded_groups = shape[1] // 32, ((shape[1] + 127) // 128) * 4
+
+    def encoded(begin: int, end: int) -> EncodedRows:
+        index = select(begin, end)
+        low, high = int(index.min()), int(index.max()) + 1
+        blocks = gguf.read_blocks(tensor, low, high)[index - low].reshape(end - begin, groups, 34)
+        raw_words = np.ascontiguousarray(blocks[..., :2]).view("<u2").squeeze(-1)
+        raw_scales = raw_words.view("<f2")
+        raw_codes = blocks[..., 2:]
+        if (not np.isfinite(raw_scales).all() or (raw_words == 0x8000).any() or
+                (raw_codes == 0x80).any() or
+                ((raw_scales == 0)[..., None] & (raw_codes != 0)).any()):
+            raise ValueError(f"{tensor}: Q8_0 source is outside the native Q8 code/scale contract")
+        scales = np.zeros((end - begin, padded_groups), dtype="<f2")
+        scales[:, :groups] = raw_scales
+        codes = np.zeros((end - begin, padded_groups, 32), dtype=np.uint8)
+        codes[:, :groups] = raw_codes
+        return EncodedRows("q8_g32_fp16", torch.from_numpy(codes.reshape(end - begin, -1)),
+                           torch.from_numpy(scales), packed=True)
+
+    return LogicalSource(shape, f"{tensor}[q8_g32_fp16]{list(shape)}",
+                         raw_source.read_values, encoded)
+
+
 def tiled_input_columns() -> np.ndarray:
     """For each stored ``ssm_out`` column (tiled value heads), its grouped activation element."""
 
@@ -500,6 +572,8 @@ __all__ = [
     "expected_tensors",
     "has_mtp",
     "qwen3_8_27b_gguf",
+    "q2_native_source",
+    "q8_native_source",
     "text_sources",
     "tiled_input_columns",
     "validate",

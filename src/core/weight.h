@@ -40,6 +40,11 @@ enum class QType : std::uint16_t {
     GGUF_Q5_0    = 26,
     // Two-bit codes over {-1, 0, 1, 2} times one binary16 d per 64 columns (GSQ-RCO's Q2_0).
     GGUF_Q2_0 = 27,
+    // Four adjacent offset-binary codes per byte: (code - 1) times a signed binary16 scale
+    // per 64 columns. Row-split planes preserve the GSQ-RCO Q2_0 grid without requantization.
+    Q2_G64_FP16 = 28,
+    // E4M3FN row codes followed by one binary16 multiplier (RowInterleaved only).
+    FP8_E4M3FN_ROW_FP16 = 29,
 };
 
 [[nodiscard]] constexpr bool is_gguf(QType format) {
@@ -91,6 +96,7 @@ enum class QuantLayout : std::uint16_t {
     RowSplitPanel = 4,
     // Rows of whole ggml blocks, as a GGUF stores them.
     GgufBlocks = 5,
+    RowInterleaved = 6,
 };
 
 // Rows per stored panel. Four 32-byte records is exactly one 128-byte line, which is all the

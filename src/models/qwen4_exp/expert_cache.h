@@ -37,6 +37,8 @@ struct ExpertCacheStats {
     std::uint64_t admitted     = 0; // experts copied into slots
     std::uint64_t copied_bytes = 0;
     std::uint32_t slots        = 0;
+    std::uint64_t cpu_routes   = 0; // native hybrid: routed (token, expert) pairs computed on CPU
+    std::uint64_t dma_routes   = 0; // native hybrid: uncached pairs staged to GPU slots
 };
 
 class ExpertCache {

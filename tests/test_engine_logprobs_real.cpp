@@ -34,6 +34,15 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.max_concurrency      = 3;
     options.max_pending_requests = 3;
     options.structured_output    = true;
+    if (const char* devices = std::getenv("NINFER_LOGPROBS_DEVICES"); devices && *devices) {
+        const std::string list(devices);
+        for (std::size_t begin = 0; begin < list.size();) {
+            const auto end = list.find(',', begin);
+            options.devices.push_back(std::stoi(list.substr(begin, end - begin)));
+            if (end == std::string::npos) { break; }
+            begin = end + 1;
+        }
+    }
     if (const char* table = std::getenv("NINFER_LOGPROBS_NGRAM_TABLE"); table && *table) {
         options.ngram_table.path = table;
     }

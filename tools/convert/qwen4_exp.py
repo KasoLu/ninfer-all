@@ -278,7 +278,8 @@ def ngram_hash_constants(text: dict, ple_layer_index: int = 0) -> tuple[list[int
     return multipliers, head_vocab
 
 
-def build_model(base, *, components=("text", "ngram"), companions=None, resource_overrides=None):
+def build_model(base, *, components=("text", "ngram"), companions=None, resource_overrides=None,
+                layers=None):
     """A Qwen3.8-Flash-Next checkpoint's text component, optionally its Vision tower and its MTP
     block, and its n-gram table.
 
@@ -286,10 +287,23 @@ def build_model(base, *, components=("text", "ngram"), companions=None, resource
     stores the table's rows. `text,ngram` is the self-contained model, `text` the model alone (its
     rows come from a table artifact at run time), and `ngram` alone that table artifact; `vision`
     adds the tower to a model and `mtp` the MTP block that drafts for speculative decoding.
+    `layers=(begin, end)` selects a zero-based, half-open source layer range for qualification.
+    The slice retains the embedding, final mixer and head. A slice without PLE has no table.
     """
     from .model import Model
     from .qwen3_5 import _Builder, vision_config
     from .resources import load_resources
+    from .qwen4_exp_ngram import attach_hot_profile
+    from pathlib import Path
+
+    resource_overrides = dict(resource_overrides or {})
+    explicit_profile = resource_overrides.pop("ngram.hot", None)
+
+    def add_profile(model):
+        path = Path(explicit_profile) if explicit_profile is not None else None
+        if path is None and "ngram/table" in model.parameters and (base.root / "ngram.hot").is_file():
+            path = base.root / "ngram.hot"
+        attach_hot_profile(model, path)
 
     selected = set(components)
     if len(selected) != len(tuple(components)) or not (
@@ -301,24 +315,56 @@ def build_model(base, *, components=("text", "ngram"), companions=None, resource
             "table), text (the model alone) or ngram (the table alone), with vision and mtp "
             "optional beside text"
         )
-    descriptor = {"config": ngram_config(base.config)}
     if "text" not in selected:
-        model = Model({"ngram": descriptor})
+        if layers is not None:
+            raise ValueError("--layers requires the text component")
+        model = Model({"ngram": {"config": ngram_config(base.config)}})
         _ngram_table(model)
+        if resource_overrides:
+            raise ValueError("resource overrides have no selected frontend consumer")
+        add_profile(model)
         return model
     config = text_config(base.config)
-    records = {"text": {"config": config}, "ngram": descriptor}
+    begin, end = 0, config["num_hidden_layers"]
+    if layers is not None:
+        if (not isinstance(layers, (tuple, list)) or len(layers) != 2
+                or any(type(v) is not int for v in layers)
+                or not 0 <= layers[0] < layers[1] <= end):
+            raise ValueError(f"--layers requires 0 <= begin < end <= {end} (end excluded)")
+        begin, end = layers
+    source_layers = tuple(range(begin, end))
+    config["num_hidden_layers"] = len(source_layers)
+    config["layer_types"] = config["layer_types"][begin:end]
+    config["ple_layers"] = [i - begin for i in config["ple_layers"] if begin <= i < end]
+    records = {"text": {"config": config}}
+    if config["ple_layers"]:
+        records["ngram"] = {"config": ngram_config(base.config)}
     if "vision" in selected:
         records["vision"] = {"config": vision_config(base.config, config), "target": "text"}
     if "mtp" in selected:
-        records["mtp"] = {"config": mtp_config(base.config), "target": "text"}
+        from .sources.safetensors import SafetensorsSource
+
+        mtp_source = (companions or {}).get("mtp", base)
+        # GGUF recipes replace these lazy logical sources after building the model.
+        # A safetensors subset already has the HF names and supplies them directly.
+        mtp_store = mtp_source if isinstance(mtp_source, SafetensorsSource) else base
+        mtp_description = mtp_store.config or base.config
+        if mtp_store is not base:
+            actual = text_config(mtp_description)
+            for key in ("hidden_size", "hc_count", "hc_lowrank", "num_attention_heads",
+                        "num_key_value_heads", "head_dim", "indexer_n_heads", "indexer_head_dim",
+                        "moe_intermediate_size", "shared_expert_intermediate_size"):
+                if actual[key] != config[key]:
+                    raise ValueError(f"MTP companion {key} differs from the target model")
+        records["mtp"] = {"config": mtp_config(mtp_description), "target": "text"}
     refs, resources, count, special = load_resources(
         base.root, vocab_size=config["vocab_size"],
         vision_config=records["vision"]["config"] if "vision" in selected else None,
         overrides=resource_overrides)
     for component, resource_refs in refs.items():
         records[component]["resources"] = resource_refs
-    model = Model(records, resources=resources, token_count=count, special_token_ids=special)
+    model = Model(records, resources=resources, token_count=count, special_token_ids=special,
+                  source_layers=source_layers)
     builder = _Builder(model)
     h, vocab = config["hidden_size"], config["vocab_size"]
     prefix = "model.language_model."
@@ -330,7 +376,7 @@ def build_model(base, *, components=("text", "ngram"), companions=None, resource
     _hyper_connection(builder, "text/final_mixer/", prefix + "hyper_connection_mixer.", base,
                       config, inject=False)
     for i, kind in enumerate(config["layer_types"]):
-        p, sp = f"text/layers/{i}/", prefix + f"layers.{i}."
+        p, sp = f"text/layers/{i}/", prefix + f"layers.{source_layers[i]}."
         _hyper_connection(builder, p + "attn_hc/", sp + "attn_hyper_connection.", base, config,
                           inject=True)
         _hyper_connection(builder, p + "mlp_hc/", sp + "mlp_hyper_connection.", base, config,
@@ -346,9 +392,10 @@ def build_model(base, *, components=("text", "ngram"), companions=None, resource
     if "vision" in selected:
         builder.vision(base, records["vision"]["config"], h)
     if "mtp" in selected:
-        _mtp(builder, base, config, records["mtp"]["config"]["num_experts"])
-    if "ngram" in selected:
+        _mtp(builder, mtp_store, config, records["mtp"]["config"]["num_experts"])
+    if "ngram" in selected and "ngram" in records:
         _ngram_table(model)
+    add_profile(model)
     return model
 
 

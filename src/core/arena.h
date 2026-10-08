@@ -158,6 +158,19 @@ private:
     std::size_t size_ = 0;
 };
 
+// Registers an existing host allocation without moving its bytes. The allocation must outlive
+// the registration and every queued transfer; portable registration serves every device rank.
+class HostMemoryRegistration {
+public:
+    HostMemoryRegistration(void* data, std::size_t bytes);
+    ~HostMemoryRegistration();
+    HostMemoryRegistration(const HostMemoryRegistration&) = delete;
+    HostMemoryRegistration& operator=(const HostMemoryRegistration&) = delete;
+
+private:
+    void* data_ = nullptr;
+};
+
 using WorkspaceArena = DeviceArena;
 
 // Binds a rank for the duration of a scope and restores the previous one, so an exception thrown

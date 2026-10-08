@@ -31,6 +31,37 @@ ServeOptions parse(std::vector<std::string> arguments) {
 
 int main() {
     int failures = 0;
+    failures += check(parse({"ninfer-serve", "model.ninfer"}).speculative.draft_min_p == 0,
+                      "draft confidence must be opt-in");
+    for (const auto* floor : {"0", "0.3", "1"}) {
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
+                                "--draft-tokens", "4", "--draft-min-p", floor})
+                              .speculative.draft_min_p == std::stof(floor),
+                          "server did not preserve draft confidence");
+    }
+    for (const auto& args : std::vector<std::vector<std::string>>{
+             {"--spec", "mtp", "--draft-tokens", "4", "--draft-min-p", "-0.1"},
+             {"--spec", "mtp", "--draft-tokens", "4", "--draft-min-p", "1.1"},
+             {"--spec", "mtp", "--draft-tokens", "4", "--draft-min-p", "nan"},
+             {"--spec", "mtp", "--draft-tokens", "4", "--draft-min-p", "inf"},
+             {"--spec", "mtp", "--draft-tokens", "4", "--draft-min-p", "0.3x"},
+             {"--spec", "dflash", "--draft-tokens", "4", "--draft-min-p", "0.3"},
+             {"--spec", "dflash2", "--draft-tokens", "4", "--draft-min-p", "0.3"},
+             {"--draft-min-p", "0.3"}}) {
+        std::vector<std::string> full{"ninfer-serve", "model.ninfer"};
+        full.insert(full.end(), args.begin(), args.end());
+        bool rejected = false;
+        try { (void)parse(full); } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "server accepted invalid draft confidence");
+    }
+    failures += check(parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host"})
+                              .hybrid_experts.dma_share == 1.0F,
+                      "server must default native host expert misses to GPU execution");
+    for (const auto* share : {"0", "0.5", "1"}) {
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--expert-residency", "host",
+                                 "--expert-dma-share", share}).hybrid_experts.dma_share == std::stof(share),
+                          "server did not preserve an explicit hybrid DMA share");
+    }
     const auto archive = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                 "5", "--ngram-draft-tokens", "63", "--ngram-archive-mib", "512",
                                 "--ngram-session-mib", "128", "--ngram-native-sessions"});

@@ -1,5 +1,6 @@
 #include "options.h"
 #include "product/ngram_table_options.h"
+#include "product/hybrid_expert_options.h"
 #include "product/post_thinking_options.h"
 #include "product/rope_yarn_options.h"
 #include "product/speculative_options.h"
@@ -178,6 +179,7 @@ std::string usage_text(const char* argv0) {
            "  --expert-cache-mib N|auto     with host or disk experts: device memory for the\n"
            "                                most used experts (default auto: what is free;\n"
            "                                0 turns the host cache off; disk needs one)\n" +
+           std::string(ninfer::product::kHybridExpertHelp) +
            std::string(ninfer::product::kNgramTableHelp) +
            "  --no-cuda-graph               decode without CUDA Graphs\n"
            "\n"
@@ -194,6 +196,7 @@ std::string usage_text(const char* argv0) {
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2     speculative decoding backend\n"
            "  --draft-tokens N              drafts per round, 1..15\n"
+           "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0)\n"
            "  --lm-head-draft               draft with the optimized proposal head\n"
            "  --mtp-attention-window N      the MTP draft head attends to its first 64 keys\n"
            "                                and the newest N before its query, not the\n"
@@ -372,6 +375,8 @@ Options parse_options(int argc, char** argv) {
                 options.expert_cache_bytes =
                     std::uint64_t(parse_u32(mib.c_str(), "expert-cache-mib", true)) << 20;
             }
+        } else if (product::parse_hybrid_expert_option(arg, options.hybrid_experts,
+                                                      [&] { return value(arg); })) {
         } else if (product::parse_ngram_table_option(arg, options.ngram_table,
                                                      [&] { return value(arg); })) {
         } else if (arg == "--kv-dtype") {
@@ -380,6 +385,8 @@ Options parse_options(int argc, char** argv) {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+        } else if (arg == "--draft-min-p") {
+            options.speculative.draft_min_p = parse_float(value(arg), "draft-min-p", 0.0F, 1.0F);
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens =
                 parse_u32(value(arg), "ngram-draft-tokens", true);

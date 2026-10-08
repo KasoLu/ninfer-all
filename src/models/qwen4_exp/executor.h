@@ -22,6 +22,7 @@
 #include "core/tensor.h"
 #include "ninfer/types.h"
 #include "models/qwen4_exp/expert_cache.h"
+#include "models/qwen4_exp/hybrid_experts.h"
 #include "models/qwen4_exp/model.h"
 #include "models/qwen4_exp/ngram_component.h"
 #include "models/qwen4_exp/ngram_hash.h"
@@ -48,6 +49,7 @@ struct ExecutorOptions {
     // ranks; kAutoExpertCache takes what each device has free less a margin, 0 none.
     static constexpr std::uint64_t kAutoExpertCache = ~std::uint64_t{0};
     std::uint64_t expert_cache_bytes                = kAutoExpertCache;
+    HybridExpertOptions hybrid_experts;
     // Decode steps (one token) of device- and host-resident experts replay a CUDA graph per
     // segment of consecutive layers on one device.
     bool cuda_graphs = true;
@@ -60,6 +62,8 @@ struct ExecutorOptions {
     // MTP drafts per speculative round (1..15), for a model loaded with its MTP block; 0 runs
     // without speculation.
     std::uint32_t draft_tokens = 0;
+    // Absolute greedy-draft probability floor; zero disables confidence computation.
+    float draft_min_p = 0;
 };
 
 // One media item of a prompt for the Vision tower: its patches and the frontend's control.
@@ -124,6 +128,9 @@ public:
 
     // Empties the sequence: position zero, zero states, a fresh n-gram context.
     void reset(std::uint32_t sequence);
+    // Discards a pass interrupted inside a layer, draining its row reads and device work before
+    // releasing provisional state. The caller must discard this sequence's reusable prefix.
+    void abort(std::uint32_t sequence);
     // Runs the routes requests take on sequence 0 once and resets it, so the first request does
     // not pay for loading their kernels (CUDA loads each at its first launch): one token, a
     // verification's width, a full prefill chunk (16 tokens with host or disk experts, which a
@@ -136,6 +143,9 @@ public:
     // Work is queued on the device streams; logits() is ready on head_stream().
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows);
+    // Hints the next known tokens' table rows from a copy of the sequence's hash context. Does
+    // not advance sequence state or wait for GPU work; at most prefill_chunk tokens.
+    void prefetch_ngram(std::uint32_t sequence, std::span<const std::int32_t> tokens);
     // Runs one token of each of `sequences` (distinct) at its next position in one pass, and
     // leaves their logits in logits(), one column per sequence in that order. The experts read
     // their weights once for the whole batch; each sequence's mixers run on its own state.
@@ -171,12 +181,14 @@ public:
     // Drafts draft_tokens() tokens for each of `sequences` (distinct) from its next position: the
     // MTP block runs its anchor (the token it sampled last and has not fed) and then its own
     // drafts, greedily. `out` receives them sequence-major; returns once they are on the host.
+    // Optional `extents` receives one length per sequence, including the first draft at or below the
+    // probability floor. Drafting still executes the full captured chain.
     void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
-               std::span<std::int32_t> out);
-    // Runs draft_tokens() + 1 tokens of each sequence (its anchor, then its drafts) at its next
+               std::span<std::int32_t> out, std::span<std::uint32_t> extents = {});
+    // Runs 2..draft_tokens() + 1 tokens of each sequence (its anchor, then its drafts) at its next
     // positions without committing them, and leaves the logits of every token in logits(), one
     // column per token, sequence after sequence. The sequences' positions and states stay where
-    // they were until commit().
+    // they were until commit(). Every sequence has the same width within this call.
     void verify(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens);
     // Keeps the first `columns[i]` (1..draft_tokens() + 1) tokens of the last verify() of
     // `sequences[i]`, which lists the verified sequences in their order: each sequence's state is
@@ -186,6 +198,12 @@ public:
     [[nodiscard]] Tensor logits(std::uint32_t rows) const;
     [[nodiscard]] std::size_t head_rank() const noexcept;
     [[nodiscard]] ExpertCacheStats expert_cache_stats() const noexcept;
+    [[nodiscard]] std::string expert_execution_profile() const;
+    [[nodiscard]] bool hybrid_experts() const noexcept;
+    void save_expert_profile() const;
+    // Worker-thread scope only. The owner retains the flag until the eager call returns, then
+    // clears the borrow. No consumer thread mutates Program state through this method.
+    void bind_cancellation(const std::atomic<bool>* cancelled) noexcept;
     [[nodiscard]] cudaStream_t head_stream() const noexcept;
 
 private:

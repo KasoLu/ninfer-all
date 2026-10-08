@@ -445,6 +445,13 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             throw ArtifactError("Host placement size differs from object");
         }
         storage.host_data = std::move(placement.data);
+        if (placement.registered) {
+            storage.registration = std::make_unique<HostMemoryRegistration>(
+                storage.host_data.data(), storage.host_data.size());
+            out.stats_.pinned_bytes = checked_add(out.stats_.pinned_bytes, storage.host_data.size(),
+                                                "registered Host bytes");
+            ++out.stats_.pinned_object_count;
+        }
         out.stats_.retained_host_bytes =
             checked_add(out.stats_.retained_host_bytes, storage.host_data.size(), "retained bytes");
         if (std::holds_alternative<TensorObject>(object)) {

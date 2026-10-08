@@ -129,4 +129,36 @@ __launch_bounds__(kArgmaxBlock) __global__
     }
 }
 
+__global__ void argmax_second_init(const std::int32_t* first, std::int32_t* second,
+                                  std::int32_t tokens) {
+    const auto t = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (t < tokens) { second[t] = first[t] == 0 ? 1 : 0; }
+}
+
+__launch_bounds__(kArgmaxBlock) __global__
+void argmax_second_kernel(const __nv_bfloat16* logits, const std::int32_t* first,
+                          std::int32_t* second, std::int32_t valid_rows,
+                          std::int32_t physical_rows) {
+    const auto t = static_cast<std::int32_t>(blockIdx.y);
+    const std::int64_t base = static_cast<std::int64_t>(t) * physical_rows;
+    const auto v = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    float value = -CUDART_INF_F;
+    std::int32_t index = INT32_MAX;
+    if (v < valid_rows && v != first[t]) {
+        value = __bfloat162float(logits[base + v]);
+        index = v;
+    }
+    argmax_block_reduce(value, index);
+    if (threadIdx.x != 0 || index == INT32_MAX) { return; }
+    int current = second[t];
+    for (;;) {
+        if (!argmax_better(value, index, __bfloat162float(logits[base + current]), current)) {
+            break;
+        }
+        const int observed = atomicCAS(reinterpret_cast<int*>(second + t), current, index);
+        if (observed == current) { break; }
+        current = observed;
+    }
+}
+
 } // namespace ninfer::ops

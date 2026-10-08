@@ -51,6 +51,21 @@ int run() {
     const NgramHashConstants constants = derive_ngram_hash_constants(config.ngram);
     require(constants.rows == 320001536ULL, "n-gram table rows");
 
+    // A 3..5 source slice starts at a QSA block and contains no PLE. Local layer numbers
+    // describe this stack; they do not imply the full checkpoint's every-fourth phase.
+    Json slice = fixture();
+    slice["num_hidden_layers"] = 2;
+    slice["layer_types"] = Json::array({"full_attention", "linear_attention"});
+    slice["ple_layers"] = Json::array();
+    const auto sliced = parse_text_config(slice);
+    require(sliced.num_hidden_layers == 2 && sliced.ple_layers.empty() &&
+                sliced.layer_types.front() == MixerKind::SparseAttention,
+            "non-prefix layer slice without PLE");
+    slice["layer_types"] = Json::array({"linear_attention", "linear_attention"});
+    slice["ple_layers"] = Json::array({0});
+    require(parse_text_config(slice).ple_layers == std::vector<std::uint32_t>{0},
+            "slice retains PLE at local block zero");
+
     expect_refusal([](Json& c) { c["hidden_size"] = 2048; }, "another hidden width");
     // An expert-pruned release keeps 256 of the 512 experts; fewer than the ten a token selects,
     // or more than 512, are refused.

@@ -10,12 +10,14 @@ add_library(ninfer_core STATIC
   disk_kv_store.cpp
   disk_kv_bridge.cpp
   direct_storage_reader.cpp
+  file_read_queue.cpp
   paged_kv_cache.cpp
   linear_attention_state.cpp
   layout.cpp
   tensor.cpp
   weight_view.cpp
   decode_graph.cpp
+  cuda_host_handshake.cu
   evictable_kv_pool.cu
   evictable_weight_pool.cu
   vmm.cu

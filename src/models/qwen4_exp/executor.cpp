@@ -8,7 +8,9 @@
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
 #include "core/weight_view.h"
+#include "ninfer/ops/target_logprobs.h"
 #include "models/qwen4_exp/ngram_hash.h"
+#include "models/qwen4_exp/ngram_draft_prefetch.h"
 #include "models/qwen4_exp/expert_stream.h"
 #include "models/qwen4_exp/ngram_table.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -296,9 +298,54 @@ ExpertTable make_located_table(std::span<const ExpertLocation> locations) {
     return out;
 }
 
+// Native operands retain the artifact's planes. The Program owns only these device tables.
+struct NativeExpertTable {
+    QType format = QType::BF16;
+    bool integer_a8 = false;
+    DeviceBuffer table;
+    std::vector<Weight> operands;
+    [[nodiscard]] ops::NativeExpertTable view() const {
+        return {format, static_cast<const Weight*>(table.p), integer_a8};
+    }
+};
+
+NativeExpertTable make_native_table(const Model& model, std::span<const WeightId> ids,
+                                  std::int32_t rows, std::int32_t columns) {
+    NativeExpertTable out;
+    std::vector<Weight> operands;
+    for (const WeightId id : ids) {
+        const auto input = model.input(id);
+        const auto format = native_weight(input.weight).qtype;
+        const bool a8 = format != QType::BF16 && input.policy != ops::LinearPolicy::A16Only;
+        Weight operand = ops::prepare_native_expert(input, rows, columns, a8);
+        if (operands.empty()) {
+            out.format = operand.qtype;
+            out.integer_a8 = a8;
+        } else if (operand.qtype != out.format || a8 != out.integer_a8) {
+            throw std::invalid_argument(model.weight(id).name +
+                                        ": native expert bank has mixed formats or policies");
+        }
+        operands.push_back(operand);
+    }
+    out.table = DeviceBuffer(operands.size() * sizeof(Weight));
+    out.table.copy_from_host(operands.data(), operands.size() * sizeof(Weight));
+    out.operands = std::move(operands);
+    return out;
+}
+
+struct NativeMoePlan {
+    NativeExpertTable gate, up, down, shared_gate, shared_up, shared_down;
+    std::int32_t experts = 0;
+    [[nodiscard]] ops::NativeMoeWeights banks() const {
+        return {gate.view(), up.view(), down.view(), shared_gate.view(), shared_up.view(),
+                shared_down.view(), experts};
+    }
+};
+
 struct MoePlan {
     Tensor router, shared_gate;
     ExpertTable gate, up, down, shared_gate_table, shared_up_table, shared_down_table;
+    std::optional<NativeMoePlan> native;
     // Device banks or disk experts' device slots, with zeros after the down banks; host experts
     // are read across the bus.
     bool device_resident = false;
@@ -359,8 +406,12 @@ struct SequenceState {
     std::uint32_t decode_steps = 0;
     // The same for a verification of this sequence alone (a graph per segment) and for its draft
     // chain on one device with every expert there (one graph), captured at the second of each.
-    std::vector<DecodeGraphExecutable> verify;
-    std::uint32_t verify_runs = 0;
+    struct VerifyGraphs {
+        std::vector<DecodeGraphExecutable> segments;
+        std::uint32_t runs = 0;
+    };
+    // The captured record strides and kernels depend on the actual verification width.
+    std::array<VerifyGraphs, 17> verify;
     DecodeGraphExecutable draft;
     std::uint32_t draft_runs = 0;
 };
@@ -481,6 +532,9 @@ struct Executor::Impl {
     TextConfig config;
     NgramHashConstants ngram;
     std::unique_ptr<NgramTableReader> table;
+    std::unique_ptr<NgramDraftPrefetch> draft_prefetch;
+    // Native host banks use the CPU/GPU scheduler; GGUF banks retain their mapped-host route.
+    std::vector<std::size_t> hybrid_layers;
     // The rank of the first PLE layer, whose staging buffer the rows are read into; whether this
     // pass's stage_rows() has waited for them; the waits the stall counters have yet to measure.
     std::size_t rows_rank = 0;
@@ -502,15 +556,16 @@ struct Executor::Impl {
     // MTP speculative decoding (options.draft_tokens > 0). The MTP layer's index in the per-layer
     // route records, expert cache and expert stream is num_hidden_layers.
     std::optional<MtpPlan> mtp;
-    // The tokens a verification runs per sequence (the drafts and the anchor), and the public
-    // tokens a draft is chosen among.
+    // Maximum and current verification widths (drafts plus anchor), and the public vocabulary.
     std::uint32_t verify_width = 0;
+    std::uint32_t active_verify_width = 0;
     std::int32_t domain        = 0;
     bool verifying             = false;
     std::vector<SequenceState*> verified; // the last verify()'s sequences, in order
     // The MTP chain on the head rank: token ids and positions of a pass's cells (a draft step's at
     // step * sequences), staged from the host.
-    DeviceBuffer mtp_ids, mtp_positions;
+    DeviceBuffer mtp_ids, mtp_positions, ngram_prefetch_tokens;
+    DeviceBuffer mtp_logprobs;
     std::unique_ptr<PinnedHostBuffer> mtp_staging;
     cudaEvent_t mtp_staged       = nullptr;
     std::uint32_t mtp_routes     = 0; // MTP route pairs recorded for the expert cache
@@ -524,6 +579,8 @@ struct Executor::Impl {
     // Expert cache (host-resident experts): every layer's routes of the last pass, on its device
     // and in pinned host memory, and how many tokens they cover.
     std::unique_ptr<ExpertCache> cache;
+    std::unique_ptr<HybridExperts> hybrid;
+    const std::atomic<bool>* cancelled = nullptr;
     // Disk-resident experts: made resident before each layer's experts run.
     std::unique_ptr<ExpertStream> stream;
     std::vector<DeviceBuffer> route_records;
@@ -566,6 +623,10 @@ struct Executor::Impl {
             table = std::make_unique<NgramTableReader>(options.ngram->layout, options.ngram_read);
         }
         max_logit_rows = std::min<std::uint32_t>(options.prefill_chunk, 512);
+        if (!std::isfinite(options.draft_min_p) || options.draft_min_p < 0 ||
+            options.draft_min_p > 1 || (options.draft_min_p != 0 && options.draft_tokens == 0)) {
+            throw std::invalid_argument("qwen4_exp: draft_min_p needs MTP and a finite value in [0,1]");
+        }
         if (options.draft_tokens > 0) {
             if (!model.mtp_weights()) {
                 throw std::invalid_argument("qwen4_exp: drafts need a model loaded with its MTP "
@@ -591,6 +652,16 @@ struct Executor::Impl {
         memory.ranks.resize(device.size());
         plan_weights();
         if (verify_width > 0) { plan_mtp(); }
+        const bool native_host = model.options().experts == ExpertResidency::Host &&
+            std::any_of(layers.begin(), layers.end(), [](const auto& layer) { return layer.moe.native.has_value(); });
+        if (native_host && options.sequences != 1) {
+            throw std::invalid_argument("native host experts require concurrency 1");
+        }
+        if (!native_host && (options.hybrid_experts.dma_share != HybridExpertOptions{}.dma_share ||
+            options.hybrid_experts.cpu_threads != 0 || options.hybrid_experts.adaptive_cache ||
+            !options.hybrid_experts.routing_profile.empty() || !options.hybrid_experts.record_profile.empty())) {
+            throw std::invalid_argument("hybrid expert options require native host experts");
+        }
         plan_segments();
         allocate_ranks();
         allocate_vision();
@@ -605,6 +676,7 @@ struct Executor::Impl {
     }
 
     ~Impl() {
+        draft_prefetch.reset();
         // A pass that failed between starting the row reads and waiting for them leaves them
         // writing into a staging buffer.
         if (table) {
@@ -617,9 +689,11 @@ struct Executor::Impl {
                 RankBinding bind(device, segments[i].rank);
                 sequence.decode[i].reset();
             }
-            for (std::size_t i = 0; i < sequence.verify.size(); ++i) {
-                RankBinding bind(device, segments[i].rank);
-                sequence.verify[i].reset();
+            for (auto& width : sequence.verify) {
+                for (std::size_t i = 0; i < width.segments.size(); ++i) {
+                    RankBinding bind(device, segments[i].rank);
+                    width.segments[i].reset();
+                }
             }
             if (sequence.draft.ready()) {
                 RankBinding bind(device, model.head_rank());
@@ -734,6 +808,21 @@ struct Executor::Impl {
         const auto h    = static_cast<std::int32_t>(config.hidden_size);
         plan.moe.router = direct(model, lw.moe.router, {h, static_cast<std::int32_t>(experts)});
         plan.moe.shared_gate = direct(model, lw.moe.shared_score, {h});
+        if (!lw.moe.gate.empty() &&
+            !is_gguf(native_weight(model.weight(lw.moe.gate.front()).view).qtype)) {
+            const auto width = static_cast<std::int32_t>(config.moe_intermediate_size);
+            const auto shared_width = static_cast<std::int32_t>(config.shared_expert_intermediate_size);
+            NativeMoePlan native;
+            native.gate = make_native_table(model, lw.moe.gate, width, h);
+            native.up = make_native_table(model, lw.moe.up, width, h);
+            native.down = make_native_table(model, lw.moe.down, h, width);
+            native.shared_gate = make_native_table(model, std::span(&lw.moe.shared_gate, 1), shared_width, h);
+            native.shared_up = make_native_table(model, std::span(&lw.moe.shared_up, 1), shared_width, h);
+            native.shared_down = make_native_table(model, std::span(&lw.moe.shared_down, 1), h, shared_width);
+            native.experts = static_cast<std::int32_t>(lw.moe.gate.size());
+            plan.moe.native = std::move(native);
+            return plan;
+        }
         if (lw.moe.gate.empty()) {
             plan.moe.gate = make_located_table(lw.moe.located_gate);
             plan.moe.up   = make_located_table(lw.moe.located_up);
@@ -802,6 +891,9 @@ struct Executor::Impl {
         }
         for (const LayerPlan* layer : planned) {
             const LayerPlan& plan = *layer;
+            if (plan.moe.native) {
+                bytes = std::max(bytes, ops::moe_experts_native_workspace_bytes(t));
+            }
             if (plan.gdn) {
                 for (const Projection* p : {&plan.gdn->qkv, &plan.gdn->z, &plan.gdn->a,
                                             &plan.gdn->b, &plan.gdn->output}) {
@@ -1132,12 +1224,22 @@ struct Executor::Impl {
         mtp_ids       = DeviceBuffer(cells * 4);
         mtp_positions = DeviceBuffer(cells * 4);
         mtp_staging   = std::make_unique<PinnedHostBuffer>(cells * 8);
+        if (options.draft_min_p > 0) {
+            mtp_logprobs = DeviceBuffer(std::uint64_t(options.draft_tokens) * options.sequences * 4);
+        }
+        if (table && options.ngram_read.residency != NgramResidency::Ram) {
+            draft_prefetch = std::make_unique<NgramDraftPrefetch>(
+                device.rank(head), *table, ngram, config.eos_token_id, config.vocab_size,
+                options.sequences, options.draft_tokens);
+            ngram_prefetch_tokens = DeviceBuffer(2 * std::uint64_t(options.sequences) *
+                                                  verify_width * sizeof(std::int32_t));
+        }
         CUDA_CHECK(cudaEventCreateWithFlags(&mtp_staged, cudaEventDisableTiming));
         // Each sequence's MTP tail as the draft steps advance it (a catch-up redoes those cells).
         for (SequenceState& sequence : sequences) {
             sequence.mtp_scratch_tail = DeviceBuffer(sequence.mtp.tail.bytes);
         }
-        memory.ranks[head].workspace_bytes += mtp_ids.bytes + mtp_positions.bytes +
+        memory.ranks[head].workspace_bytes += mtp_ids.bytes + mtp_positions.bytes + mtp_logprobs.bytes + ngram_prefetch_tokens.bytes +
                                               sequences.size() * sequences.front().mtp.tail.bytes;
     }
 
@@ -1164,6 +1266,45 @@ struct Executor::Impl {
         route_host =
             std::make_unique<PinnedHostBuffer>(expert.size() * pairs * sizeof(std::int32_t));
         const ExpertResidency residency = model.options().experts;
+        const bool native_host = residency == ExpertResidency::Host &&
+            std::any_of(expert.begin(), expert.end(), [](const auto& item) { return item.first->moe.native.has_value(); });
+        if (native_host) {
+            std::vector<HybridExpertLayer> host_layers;
+            hybrid_layers.resize(expert.size());
+            for (std::size_t index = 0; index < expert.size(); ++index) {
+                const auto& [plan, moe] = expert[index];
+                if (!plan->moe.native) { continue; }
+                hybrid_layers[index] = host_layers.size();
+                const auto& native = *plan->moe.native;
+                HybridExpertLayer layer;
+                layer.rank = plan->rank;
+#if defined(__linux__)
+                layer.registered = true; // native Host bindings use Residency::Registered
+#endif
+                for (std::int32_t e = 0; e < native.experts; ++e) {
+                    layer.experts.push_back({{native.gate.operands[e], native.gate.integer_a8},
+                                             {native.up.operands[e], native.up.integer_a8},
+                                             {native.down.operands[e], native.down.integer_a8}});
+                }
+                host_layers.push_back(std::move(layer));
+            }
+            if (!options.hybrid_experts.routing_profile.empty()) {
+                std::vector<std::size_t> widths;
+                for (const auto& layer : host_layers) { widths.push_back(layer.experts.size()); }
+                auto counts = read_expert_profile(options.hybrid_experts.routing_profile,
+                                                  model.info().artifact_id, widths);
+                for (std::size_t layer = 0; layer < host_layers.size(); ++layer) {
+                    host_layers[layer].route_counts = std::move(counts[layer]);
+                }
+            }
+            hybrid = std::make_unique<HybridExperts>(device, std::move(host_layers),
+                options.prefill_chunk, options.expert_cache_bytes, options.hybrid_experts);
+            for (std::size_t r = 0; r < ranks.size(); ++r) {
+                memory.ranks[r].expert_cache_bytes += hybrid->cache_bytes(r);
+                memory.ranks[r].workspace_bytes += hybrid->working_bytes(r);
+            }
+            return;
+        }
         if (residency == ExpertResidency::Host) { allocate_slot_pools(); }
         if (residency == ExpertResidency::Device ||
             (residency == ExpertResidency::Host && options.expert_cache_bytes == 0)) {
@@ -1318,6 +1459,7 @@ struct Executor::Impl {
 
     void reset(std::uint32_t s) {
         auto& sequence    = sequences.at(s);
+        if (std::find(verified.begin(), verified.end(), &sequence) != verified.end()) { verified.clear(); }
         sequence.position = 0;
         sequence.context  = NgramContext::sequence_start(ngram, config.eos_token_id);
         sequence.media_columns.clear();
@@ -1369,6 +1511,18 @@ struct Executor::Impl {
     };
     std::vector<MediaRun> media_runs;
     bool mrope = false;
+
+    void prefetch_ngram(std::uint32_t sequence, std::span<const std::int32_t> tokens) {
+        if (!table || options.ngram_read.residency == NgramResidency::Ram ||
+            options.ngram_read.io == NgramIo::Direct) { return; }
+        if (tokens.size() > options.prefill_chunk) {
+            throw std::invalid_argument("qwen4_exp prefetch: at most prefill_chunk tokens");
+        }
+        NgramContext context = sequences.at(sequence).context;
+        std::vector<std::uint64_t> rows(tokens.size() * config.ngram_heads());
+        ngram_row_ids(ngram, tokens, config.eos_token_id, config.vocab_size, context, rows);
+        table->prefetch(rows);
+    }
 
     void stage_inputs(std::span<const Part> parts, std::span<const std::int32_t> tokens) {
         const auto t            = static_cast<std::int32_t>(tokens.size());
@@ -1546,7 +1700,7 @@ struct Executor::Impl {
 
     // A verification's record row of the part: its position among the verified sequences.
     [[nodiscard]] std::int32_t record_row(const Part& part) const {
-        return part.column / static_cast<std::int32_t>(verify_width);
+        return part.column / static_cast<std::int32_t>(active_verify_width);
     }
 
     void run_gdn(const LayerPlan& plan, std::size_t index, LayerState& state, RankState& rank,
@@ -1571,7 +1725,7 @@ struct Executor::Impl {
             const auto row = record_row(part);
             const auto all = rank.records->layer(static_cast<std::int32_t>(gdn_local[index]),
                                                  static_cast<std::int32_t>(verified.size()),
-                                                 static_cast<std::int32_t>(verify_width));
+                                                 static_cast<std::int32_t>(active_verify_width));
             record = GdnReplayRecordLayer{all.conv.slice(2, row, 1), all.key.slice(3, row, 1),
                                           all.value.slice(3, row, 1), all.gate.slice(3, row, 1)};
         }
@@ -1873,6 +2027,17 @@ struct Executor::Impl {
             auto scope = ws.scope();
             ops::moe_route(mixed, m.router, m.shared_gate, ws, ids, weights, shared, s);
         }
+        if (m.native) {
+            Tensor y(rank.y, DType::FP32, {h, t});
+            if (hybrid) {
+                hybrid->run(hybrid_layers[index], mixed, ids, weights, shared, m.native->banks(), t == 1 || verifying,
+                            ws, y);
+                return;
+            }
+            auto scope = ws.scope();
+            ops::moe_experts_native(mixed, ids, weights, shared, m.native->banks(), nullptr, ws, y, s);
+            return;
+        }
         // The slot pools are sized for the text layers' experts; the MTP block's wide calls stay
         // on the vector products over its host banks.
         if (t > kVectorTokens && !slot_pools.empty() && index < layers.size() &&
@@ -1936,12 +2101,11 @@ struct Executor::Impl {
                     run_qsa(plan, state, rank, part, target_inputs(i, state, rank, part));
                 }
             }
-            ops::hyper_connection_write(stack, Tensor(rank.y, DType::BF16, {h, t}), inject,
-                                        rank.stream);
             {
                 auto scope = rank.workspace->scope();
-                ops::hyper_connection_read(stack, plan.mlp_hc.weights(), config.rms_norm_eps,
-                                           *rank.workspace, mixed, &inject, rank.stream);
+                ops::hyper_connection_write_read(
+                    stack, Tensor(rank.y, DType::BF16, {h, t}), inject, plan.mlp_hc.weights(),
+                    config.rms_norm_eps, *rank.workspace, mixed, &inject, rank.stream);
             }
             run_moe(plan, rank, t, i);
             ops::hyper_connection_write(stack, Tensor(rank.y, DType::FP32, {h, t}), inject,
@@ -2007,18 +2171,20 @@ struct Executor::Impl {
             }
         }
         settle_routes();
+        if (hybrid) { hybrid->begin(cancelled, !warming); }
         stage_inputs(parts, tokens);
         // Disk-resident experts need the host between a layer's routing and its experts, so their
         // passes stay eager, and so does a batch of several sequences. A verification of one
-        // sequence replays its graphs while its experts take the vector products (no host between
-        // routing and experts).
+        // sequence replays its graphs while its experts take the vector products. Native host
+        // experts coordinate with their supervisor through captured handshakes.
         SequenceState& first = *parts.front().sequence;
         const bool graph     = options.cuda_graphs && t == 1 && !stream && !verifying;
         const bool verify_graph =
             options.cuda_graphs && verifying && parts.size() == 1 && !stream && t <= kVectorTokens;
         if (graph && first.decode.empty() && first.decode_steps++ > 0) { capture_decode(first); }
-        if (verify_graph && first.verify.empty() && first.verify_runs++ > 0) {
-            first.verify = capture_segments(first, t);
+        auto* verification = verify_graph ? &first.verify.at(std::size_t(t)) : nullptr;
+        if (verification && verification->segments.empty() && verification->runs++ > 0) {
+            verification->segments = capture_segments(first, t);
         }
         for (std::size_t i = 0; i < segments.size(); ++i) {
             const Segment& segment = segments[i];
@@ -2029,12 +2195,13 @@ struct Executor::Impl {
             if (segment.rows && table) { stage_rows(ranks[segment.rank]); }
             if (graph && !first.decode.empty()) {
                 first.decode[i].launch(ranks[segment.rank].stream);
-            } else if (verify_graph && !first.verify.empty()) {
-                first.verify[i].launch(ranks[segment.rank].stream);
+            } else if (verification && !verification->segments.empty()) {
+                verification->segments[i].launch(ranks[segment.rank].stream);
             } else {
                 run_segment(parts, segment, t, logit_rows);
             }
         }
+        if (hybrid) { hybrid->finish(); }
         // A verification commits its positions later (commit()).
         if (!verifying) {
             for (const Part& part : parts) {
@@ -2193,6 +2360,13 @@ struct Executor::Impl {
         CUDA_CHECK(cudaStreamWaitEvent(last.stream, first.done, 0));
         CUDA_CHECK(cudaMemcpyPeerAsync(out, device.rank(head).device, first.mixed,
                                        device.rank(0).device, std::size_t(h) * n * 2, last.stream));
+        // Catch-up returns with this copy queued. The next prompt chunk can start on rank 0
+        // before the head consumes its embeddings, so protect the source until the copy ends.
+        CUDA_CHECK(cudaEventRecord(last.done, last.stream));
+        {
+            RankBinding bind(device, 0);
+            CUDA_CHECK(cudaStreamWaitEvent(first.stream, last.done, 0));
+        }
     }
 
     // One MTP pass on the head rank over `n` cells whose starting stacks are in its input plane,
@@ -2242,10 +2416,10 @@ struct Executor::Impl {
                      .tail      = drafting ? sequence.mtp_scratch_tail.p : sequence.mtp.tail.p});
         }
         mrope = media;
-        ops::hyper_connection_write(stack, Tensor(rank.y, DType::BF16, {h, n}), inject, s);
         {
             auto scope = ws.scope();
-            ops::hyper_connection_read(stack, plan.mlp_hc.weights(), eps, ws, mixed, &inject, s);
+            ops::hyper_connection_write_read(stack, Tensor(rank.y, DType::BF16, {h, n}), inject,
+                                             plan.mlp_hc.weights(), eps, ws, mixed, &inject, s);
         }
         run_moe(plan, rank, n, layers.size());
         ops::hyper_connection_write(stack, Tensor(rank.y, DType::FP32, {h, n}), inject, s);
@@ -2270,7 +2444,8 @@ struct Executor::Impl {
     // The greedy draft of each of the `n` single-cell parts of the last MTP pass: the block's
     // final mixer, the head, and the argmax over the public tokens into `out` (device I32 [n],
     // head rank).
-    void mtp_head(std::int32_t n, std::int32_t* out) {
+    void mtp_head(std::int32_t n, std::int32_t* out, std::int32_t* second = nullptr,
+                  float* logprobs = nullptr) {
         RankState& rank      = ranks[model.head_rank()];
         const cudaStream_t s = rank.stream;
         WorkspaceArena& ws   = *rank.workspace;
@@ -2286,7 +2461,16 @@ struct Executor::Impl {
         Tensor logits(rank.logits, DType::BF16, {static_cast<std::int32_t>(config.vocab_size), n});
         project(mtp->head, mixed, logits, ws, s);
         Tensor tokens(out, DType::I32, {n});
-        ops::argmax(logits, tokens, domain, s);
+        if (second) {
+            Tensor alternative(second, DType::I32, {n});
+            ops::argmax_top2(logits, tokens, alternative, domain, s);
+        } else {
+            ops::argmax(logits, tokens, domain, s);
+        }
+        if (logprobs) {
+            Tensor probabilities(logprobs, DType::FP32, {n});
+            ops::target_logprobs(logits, tokens, domain, probabilities, s);
+        }
     }
 
     // Advances the MTP block over what a target pass committed: for each sequence the cells from
@@ -2329,17 +2513,20 @@ struct Executor::Impl {
                                        width * 4, cudaMemcpyDeviceToDevice, rank.stream));
         }
         if (n == 0) { return; }
+        if (hybrid) { hybrid->begin(cancelled, !warming); }
         stage_mtp(ids, 0, positions, 0);
         mtp_pass(parts, n, static_cast<const std::int32_t*>(mtp_ids.p),
                  static_cast<const std::int32_t*>(mtp_positions.p), false);
+        if (hybrid) { hybrid->finish(); }
     }
 
     void draft(std::span<const std::uint32_t> batch, std::span<const std::int32_t> anchors,
-               std::span<std::int32_t> out) {
+               std::span<std::int32_t> out, std::span<std::uint32_t> extents = {}) {
         require_mtp("draft");
         const std::size_t b = batch.size();
         const std::size_t k = options.draft_tokens;
-        if (b == 0 || anchors.size() != b || out.size() != b * k) {
+        if (b == 0 || b > sequences.size() || anchors.size() != b || out.size() != b * k ||
+            (!extents.empty() && extents.size() != b)) {
             throw std::invalid_argument("qwen4_exp draft: one anchor and its drafts per sequence");
         }
         std::vector<SequenceState*> drafting;
@@ -2373,7 +2560,13 @@ struct Executor::Impl {
             }
             parts.push_back({drafting[j], std::int32_t(j), 1, first});
         }
+        if (hybrid) { hybrid->begin(cancelled, !warming); }
         stage_mtp(anchors, 0, positions, 0);
+        if (draft_prefetch) {
+            std::vector<NgramContext> contexts;
+            for (const auto* sequence : drafting) { contexts.push_back(sequence->context); }
+            draft_prefetch->begin(std::move(contexts), anchors);
+        }
         auto* ids        = static_cast<std::int32_t*>(mtp_ids.p);
         const auto* at   = static_cast<const std::int32_t*>(mtp_positions.p);
         const auto n     = static_cast<std::int32_t>(b);
@@ -2387,11 +2580,18 @@ struct Executor::Impl {
             for (std::size_t i = 0; i < k; ++i) {
                 if (i > 0) { stage_hidden(rank.stack, n, 0); }
                 mtp_pass(parts, n, ids + i * b, at + i * b, true);
-                mtp_head(n, ids + (i + 1) * b);
+                auto* second = draft_prefetch ?
+                    static_cast<std::int32_t*>(ngram_prefetch_tokens.p) + i * b : nullptr;
+                auto* logprobs = mtp_logprobs.p ? static_cast<float*>(mtp_logprobs.p) + i * b : nullptr;
+                mtp_head(n, ids + (i + 1) * b, second, logprobs);
+                if (draft_prefetch) {
+                    draft_prefetch->enqueue(i, ids + (i + 1) * b, second, rank.stream);
+                }
             }
+            if (draft_prefetch) { draft_prefetch->join(rank.stream); }
         };
-        // One sequence on one device with every expert there replays the chain as a graph: its
-        // tokens and positions are read where they were staged, and nothing in it needs the host.
+        // Tokens and positions stay in the staged buffers. Native hybrid experts use the same
+        // captured exchange as text decode; the older GGUF host cache still follows eagerly.
         SequenceState& only = *drafting.front();
         const bool graph = options.cuda_graphs && b == 1 && device.size() == 1 && !stream && !cache;
         if (graph && !only.draft.ready() && only.draft_runs++ > 0) {
@@ -2406,20 +2606,41 @@ struct Executor::Impl {
         }
         auto* host = static_cast<std::int32_t*>(mtp_staging->data());
         CUDA_CHECK(cudaMemcpyAsync(host, ids + b, k * b * 4, cudaMemcpyDeviceToHost, rank.stream));
+        auto* logprobs = reinterpret_cast<float*>(host + mtp_ids.bytes / 4);
+        if (mtp_logprobs.p) {
+            CUDA_CHECK(cudaMemcpyAsync(logprobs, mtp_logprobs.p, k * b * sizeof(float),
+                                       cudaMemcpyDeviceToHost, rank.stream));
+        }
         CUDA_CHECK(cudaStreamSynchronize(rank.stream));
+        if (hybrid) { hybrid->finish(); }
+        if (draft_prefetch) { draft_prefetch->check(); }
         for (std::size_t j = 0; j < b; ++j) {
             for (std::size_t i = 0; i < k; ++i) { out[j * k + i] = host[i * b + j]; }
+            std::uint32_t extent = static_cast<std::uint32_t>(k);
+            if (mtp_logprobs.p) {
+                const float floor = std::log(options.draft_min_p);
+                for (std::size_t i = 0; i < k; ++i) {
+                    if (!std::isfinite(logprobs[i * b + j])) {
+                        throw std::runtime_error("qwen4_exp: non-finite MTP draft confidence");
+                    }
+                    if (logprobs[i * b + j] <= floor && extent == k) {
+                        extent = static_cast<std::uint32_t>(i + 1);
+                    }
+                }
+            }
+            if (!extents.empty()) { extents[j] = extent; }
         }
     }
 
     void verify(std::span<const std::uint32_t> batch, std::span<const std::int32_t> tokens) {
         require_mtp("verify");
         const std::size_t b = batch.size();
-        const std::size_t w = verify_width;
-        if (b == 0 || b > sequences.size() || tokens.size() != b * w) {
+        const std::size_t w = b == 0 ? 0 : tokens.size() / b;
+        if (b == 0 || b > sequences.size() || w < 2 || w > verify_width || tokens.size() != b * w) {
             throw std::invalid_argument("qwen4_exp verify: an anchor and its drafts per sequence");
         }
         check_tokens(tokens, static_cast<std::uint32_t>(tokens.size()));
+        active_verify_width = static_cast<std::uint32_t>(w);
         std::vector<Part> parts;
         verified.clear();
         for (std::size_t j = 0; j < b; ++j) {
@@ -2439,6 +2660,22 @@ struct Executor::Impl {
         verifying = true;
         try {
             pass(parts, tokens, static_cast<std::uint32_t>(tokens.size()));
+            if (draft_prefetch) {
+                RankBinding bind(device, model.head_rank());
+                RankState& rank = ranks[model.head_rank()];
+                std::vector<NgramContext> contexts;
+                for (const auto* sequence : verified) { contexts.push_back(sequence->context); }
+                draft_prefetch->begin_verification(std::move(contexts), tokens);
+                const auto count = static_cast<std::int32_t>(tokens.size());
+                auto* first = static_cast<std::int32_t*>(ngram_prefetch_tokens.p);
+                auto* second = first + std::size_t(options.sequences) * w;
+                Tensor logits(rank.logits, DType::BF16,
+                              {static_cast<std::int32_t>(config.vocab_size), count});
+                Tensor winners(first, DType::I32, {count}), alternatives(second, DType::I32, {count});
+                ops::argmax_top2(logits, winners, alternatives, domain, rank.stream);
+                draft_prefetch->enqueue_verification(first, second, rank.stream);
+                draft_prefetch->join(rank.stream);
+            }
         } catch (...) {
             verifying = false;
             verified.clear();
@@ -2449,7 +2686,7 @@ struct Executor::Impl {
 
     void commit(std::span<const std::uint32_t> batch, std::span<const std::uint32_t> kept) {
         require_mtp("commit");
-        const std::uint32_t w = verify_width;
+        const std::uint32_t w = active_verify_width;
         if (batch.size() != verified.size() || kept.size() != batch.size()) {
             throw std::invalid_argument("qwen4_exp commit: the last verification's sequences");
         }
@@ -2459,10 +2696,17 @@ struct Executor::Impl {
                                             "1 to draft_tokens + 1 tokens each");
             }
         }
+        if (draft_prefetch) {
+            RankBinding bind(device, model.head_rank());
+            // Captured events encode graph dependencies; wait on the joined stream before
+            // reading host callback state. Host synchronization of a captured event is invalid.
+            CUDA_CHECK(cudaStreamSynchronize(ranks[model.head_rank()].stream));
+            draft_prefetch->check();
+        }
         const auto di = static_cast<std::int32_t>(config.indexer_head_dim);
         const std::uint64_t index_rows =
             std::uint64_t(config.indexer_n_heads + 1) * config.indexer_head_dim;
-        const std::uint64_t columns = std::uint64_t(w) * options.sequences;
+        const std::uint64_t columns = std::uint64_t(verify_width) * options.sequences;
         const auto stack_width      = std::int32_t(config.hc_count * config.hidden_size);
         for (std::size_t i = 0; i < layers.size(); ++i) {
             const LayerPlan& plan = layers[i];
@@ -2735,6 +2979,10 @@ void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tok
     impl_->forward(sequence, tokens, logit_rows);
 }
 
+void Executor::prefetch_ngram(std::uint32_t sequence, std::span<const std::int32_t> tokens) {
+    impl_->prefetch_ngram(sequence, tokens);
+}
+
 void Executor::decode(std::span<const std::uint32_t> sequences,
                       std::span<const std::int32_t> tokens) {
     impl_->decode(sequences, tokens);
@@ -2776,8 +3024,9 @@ std::uint32_t Executor::draft_tokens() const noexcept {
 bool Executor::can_draft(std::uint32_t sequence) const { return impl_->can_draft(sequence); }
 
 void Executor::draft(std::span<const std::uint32_t> sequences,
-                     std::span<const std::int32_t> anchors, std::span<std::int32_t> out) {
-    impl_->draft(sequences, anchors, out);
+                     std::span<const std::int32_t> anchors, std::span<std::int32_t> out,
+                     std::span<std::uint32_t> extents) {
+    impl_->draft(sequences, anchors, out, extents);
 }
 
 void Executor::verify(std::span<const std::uint32_t> sequences,
@@ -2799,6 +3048,7 @@ Tensor Executor::logits(std::uint32_t rows) const {
 std::size_t Executor::head_rank() const noexcept { return impl_->model.head_rank(); }
 
 ExpertCacheStats Executor::expert_cache_stats() const noexcept {
+    if (impl_->hybrid) { return impl_->hybrid->stats(); }
     if (impl_->stream) {
         const auto stream = impl_->stream->stats();
         return ExpertCacheStats{.routes       = stream.routes,
@@ -2812,6 +3062,34 @@ ExpertCacheStats Executor::expert_cache_stats() const noexcept {
 
 cudaStream_t Executor::head_stream() const noexcept {
     return impl_->ranks[impl_->model.head_rank()].stream;
+}
+
+std::string Executor::expert_execution_profile() const {
+    return impl_->hybrid ? impl_->hybrid->execution_profile() : "gpu";
+}
+
+bool Executor::hybrid_experts() const noexcept { return impl_->hybrid != nullptr; }
+void Executor::save_expert_profile() const {
+    const auto& path = impl_->options.hybrid_experts.record_profile;
+    if (impl_->hybrid && !path.empty()) {
+        write_expert_profile(path, impl_->model.info().artifact_id, impl_->hybrid->route_counts());
+    }
+}
+void Executor::bind_cancellation(const std::atomic<bool>* cancelled) noexcept {
+    // Also drains partially enqueued work on exception paths before the request's borrowed flag
+    // can die. Normal pass/draft boundaries have already drained and propagated any failure.
+    if (!cancelled && impl_->hybrid) { try { impl_->hybrid->finish(); } catch (...) {} }
+    impl_->cancelled = cancelled;
+}
+void Executor::abort(std::uint32_t sequence) {
+    if (impl_->table) { impl_->table->wait(); }
+    impl_->rows_waited = true;
+    impl_->device.synchronize();
+    impl_->pending_routes = 0;
+    impl_->mtp_routes = 0;
+    impl_->verifying = false;
+    impl_->verified.clear();
+    impl_->reset(sequence);
 }
 
 } // namespace ninfer::models::qwen4_exp

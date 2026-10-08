@@ -27,9 +27,10 @@ inline constexpr const char* kNgramTableHelp =
     "  --ngram-io buffered|direct|mmap  how rows are read from the file: through the\n"
     "                                page cache (default), past it, or mapped\n"
     "  --ngram-io-depth N            row reads in flight, 1..1024 (default 64)\n"
-    "  --ngram-hot-profile PATH      ram-hot: the profile (ninfer-ngram-profile)\n"
-    "  --ngram-ram-mib N             ram-hot: RAM for the rows and their index\n"
-    "                                (default 4096)\n"
+    "  --ngram-hot-profile PATH      ram-hot: override the table's embedded profile\n"
+    "                                with a ninfer-ngram-profile file\n"
+    "  --ngram-ram-mib N             disk, ram-hot: RAM for rows and their index\n"
+    "                                (disk default 0/off; ram-hot default 4096)\n"
     "  --ngram-lock                  ram, ram-hot: lock the rows in physical memory\n"
     "  --no-ngram-table              Qwen3.8-Flash-Next: run without the n-gram table.\n"
     "                                Non-standard experimental mode: the model was\n"
@@ -88,7 +89,7 @@ bool parse_ngram_table_option(std::string_view option, NgramTableOptions& out, V
         out.hot_profile = std::string(value());
     } else if (option == "--ngram-ram-mib") {
         out.ram_budget_bytes =
-            detail::parse_ngram_count(std::string(value()), option, 1, std::uint64_t{1} << 30U)
+            detail::parse_ngram_count(std::string(value()), option, 0, std::uint64_t{1} << 30U)
             << 20U;
     } else if (option == "--ngram-lock") {
         out.lock = true;

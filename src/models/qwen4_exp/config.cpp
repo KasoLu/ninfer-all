@@ -136,7 +136,7 @@ TextConfig parse_text_config(const Json& value) {
         .seed = artifact::require_u64(value.at("ngram_seed"), "ngram_seed", false),
     };
     const auto& ple = value.at("ple_layers");
-    if (!ple.is_array() || ple.empty()) { throw ArtifactError("ple_layers must name blocks"); }
+    if (!ple.is_array()) { throw ArtifactError("ple_layers must be an array of blocks"); }
     for (const auto& block : ple) {
         const auto index = artifact::require_u64(block, "PLE block", false);
         if (index >= out.num_hidden_layers ||

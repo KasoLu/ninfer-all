@@ -38,9 +38,16 @@ experts off the GPU, in pinned host memory with a device cache of the most used
 ones (`--expert-residency host`) or in the artifact's files, read into a device cache as each layer
 routes to them (`--expert-residency disk`). Its n-gram table is stored in the model's artifact or
 in a separate table artifact the model names by digest (`--ngram-table`); it stays in that file,
-read a row at a time, unless `--ngram-ram` loads it, and a model without a table is refused unless
-`--no-ngram-table` overrides that. These are the only product modes in which model weights live off
+read a row at a time, unless `--ngram-residency ram` loads it. A model with PLE requires its table
+unless `--no-ngram-table` overrides that; a qualification layer slice without PLE needs no table.
+These are the only product modes in which model weights live off
 the GPU.
+For the current Flash-Next delivery, all model and expert arithmetic runs on the GPU. Keep the
+completed native/CPU experiments and their evidence, but do not extend CPU expert execution or
+automatically select a CPU share. Develop the existing GGUF host-RAM and disk-streaming paths;
+reuse published weights and the published IQ4 table when adding MTP. Disk residency uses the OS
+page cache. An additional application-managed RAM cache of experts is excluded from this delivery
+by the user's decision. Keep the bounded transfer buffers and the device expert cache.
 This line builds for **`sm_86`** (the RTX 30 series; that build also runs the RTX 40 series),
 `sm_89`, and `120a` (the RTX 50 series and RTX PRO 6000 Blackwell, CUDA 13.1 or newer), with
 `sm_80` as an unmeasured compatibility target; the published Docker image carries the `86` and

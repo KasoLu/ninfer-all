@@ -30,7 +30,7 @@
 
 set(NINFER_PRODUCT_ROOTS src include apps cmake third_party)
 
-if(ENV{NINFER_BUILD_ID})
+if(DEFINED ENV{NINFER_BUILD_ID} AND NOT "$ENV{NINFER_BUILD_ID}" STREQUAL "")
   set(_id "$ENV{NINFER_BUILD_ID}")
 else()
   set(_id "")

@@ -35,6 +35,19 @@ using namespace ninfer;
 
 constexpr int kHidden = 2560, kWidth = 640, kExperts = 512, kTopK = 10;
 
+// Independent stored Q2_0 decoder: binary16 multiplier and four adjacent 2-bit codes per byte.
+// Do not use the production GPU decoder to construct this format's mathematical oracle.
+float exact_q2_0(const std::uint8_t* block, int element) {
+    const std::uint16_t scale = std::uint16_t(block[0]) | (std::uint16_t(block[1]) << 8U);
+    const int exponent = (scale >> 10U) & 31, fraction = scale & 1023;
+    if (exponent == 31) { throw std::runtime_error("nonfinite Q2_0 scale in fixture"); }
+    const double magnitude = exponent ? std::ldexp(1024.0 + fraction, exponent - 25)
+                                      : std::ldexp(double(fraction), -24);
+    const double multiplier = scale & 0x8000 ? -magnitude : magnitude;
+    const int code = (block[2 + element / 4] >> (2 * (element % 4))) & 3;
+    return float(multiplier * (code - 1));
+}
+
 void check(cudaError_t status, const char* what) {
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
@@ -116,12 +129,19 @@ struct Bank {
             matrices.emplace_back(bytes.size() + kTail);
             check(cudaMemset(matrices.back().p, 0, bytes.size() + kTail), "zero a bank");
             matrices.back().copy_from_host(bytes.data(), bytes.size());
-            DeviceBuffer values(std::size_t(rows) * k * sizeof(float));
-            ops::gguf::dequantize_rows(ops::detail::gguf_type(q), matrices.back().p, row_bytes, k,
-                                       nullptr, rows, static_cast<float*>(values.p), k, nullptr);
-            check(cudaDeviceSynchronize(), "dequantize");
             exact.emplace_back(std::size_t(rows) * k);
-            values.copy_to_host(exact.back().data(), exact.back().size() * sizeof(float));
+            if (q == QType::GGUF_Q2_0) {
+                for (std::size_t element = 0; element < exact.back().size(); ++element) {
+                    exact.back()[element] = exact_q2_0(bytes.data() + (element / 64) * 18,
+                                                       int(element % 64));
+                }
+            } else {
+                DeviceBuffer values(std::size_t(rows) * k * sizeof(float));
+                ops::gguf::dequantize_rows(ops::detail::gguf_type(q), matrices.back().p, row_bytes, k,
+                                           nullptr, rows, static_cast<float*>(values.p), k, nullptr);
+                check(cudaDeviceSynchronize(), "dequantize");
+                values.copy_to_host(exact.back().data(), exact.back().size() * sizeof(float));
+            }
         }
         for (int e = 0; e < experts; ++e) { pointers[e] = matrices[e % count].p; }
         table.copy_from_host(pointers.data(), pointers.size() * sizeof(void*));
@@ -287,7 +307,7 @@ int main() {
              Q::GGUF_Q3_K,
              Q::GGUF_Q5_0,
              8,
-             {1, 2, 3, 8, 40},
+             {1, 2, 3, 8, 9, 16, 24, 40, 48},
              kExperts},
             // Experts concentrated on a few ids: several columns per pass (chunks 4 and 8).
             {"q2_0 dense routing",

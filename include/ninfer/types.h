@@ -124,6 +124,9 @@ struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP, DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
+    // Flash-Next MTP: truncate verification after the first draft whose absolute probability
+    // is at or below this floor. Zero keeps the full window; drafting still runs the captured chain.
+    float draft_min_p = 0;
     ProposalHead proposal_head = ProposalHead::Full;
     // Context-lookup drafting: match this many trailing tokens against the sequence so far and
     // propose whatever followed the last time they appeared. 0 disables it. It costs no device
@@ -464,8 +467,8 @@ struct ModelSuspendOptions {
 enum class ExpertResidency : std::uint8_t {
     // In the weight arena of each layer's stage device.
     Device,
-    // In page-locked host memory, read by the expert kernels across the bus: the model then needs
-    // only its dense weights in device memory.
+    // In host RAM: native experts copy misses into a device cache; an explicit DMA share below
+    // one enables experimental CPU compute. GGUF GPU kernels read uncached pinned bytes.
     Host,
     // Left in the artifact's files and copied into a device cache when a pass routes to them,
     // through the OS page cache: the least host memory, at the cost of a wait for every expert a
@@ -473,9 +476,19 @@ enum class ExpertResidency : std::uint8_t {
     Disk,
 };
 
+// Native Flash-Next host experts, concurrency one. By default all misses execute on the GPU.
+// Shares below one enable experimental CPU mixing with different numerical results.
+struct HybridExpertOptions {
+    float dma_share = 1; // 0..1 of distinct uncached experts per decode/verify call
+    std::uint32_t cpu_threads = 0; // automatic, or 1..256
+    bool adaptive_cache = false;
+    std::filesystem::path routing_profile; // initial per-layer expert counts for this artifact
+    std::filesystem::path record_profile; // write accumulated counts at request boundaries
+};
+
 // Qwen3.8-Flash-Next: where the n-gram table's rows come from.
 enum class NgramResidency : std::uint8_t {
-    // The table's file: each token's rows are read as the hash addresses them.
+    // The table's file, with a bounded cache of rows read as the hash addresses them.
     Disk,
     // RAM: the whole table is read at startup.
     Ram,
@@ -489,7 +502,7 @@ enum class NgramIo : std::uint8_t {
     // Positioned reads through the OS page cache.
     Buffered,
     // Reads that bypass the page cache (O_DIRECT, FILE_FLAG_NO_BUFFERING): the table takes no
-    // RAM beyond what the residency keeps, and every read reaches the drive.
+    // RAM beyond what the residency keeps, and every cache miss reaches the drive.
     Direct,
     // Copies out of a read-only mapping of the file, faulted in through the page cache.
     Mapped,
@@ -502,7 +515,8 @@ struct NgramTableOptions {
     std::filesystem::path path;
     NgramResidency residency = NgramResidency::Disk;
     NgramIo io               = NgramIo::Buffered;
-    // RamHot: the RAM its rows and their index take at most. Empty takes 4 GiB.
+    // Disk, RamHot: cached/resident rows and their index take at most this RAM. Empty takes
+    // zero for Disk and 4 GiB for RamHot. Ram always loads the whole table.
     std::optional<std::uint64_t> ram_budget_bytes;
     // RamHot: the hot-row profile (ninfer-ngram-profile) the rows are chosen by.
     std::filesystem::path hot_profile;
@@ -539,6 +553,7 @@ struct EngineOptions {
     // evenly over the devices. Empty takes what each device has free after startup less a margin;
     // zero disables the cache.
     std::optional<std::uint64_t> expert_cache_bytes;
+    HybridExpertOptions hybrid_experts;
     // Qwen3.8-Flash-Next only.
     NgramTableOptions ngram_table;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.

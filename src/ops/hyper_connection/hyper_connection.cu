@@ -1,7 +1,8 @@
 // ninfer::ops - hyper-connection read/write of Qwen3.8-Flash-Next (contract in
 // include/ninfer/ops/hyper_connection.h). Four launches: per-stream RMSNorm into FP32 workspace,
 // the down and inject GEMVs with their activations, the up GEMV with the gated stream mix, and the
-// weighted write. Every product accumulates in FP32. Up to eight tokens, the two GEMVs stream their
+// weighted write. Write/read fusion folds that write into the following norm while preserving
+// the FP32 stack store. Every product accumulates in FP32. Up to eight tokens, the two GEMVs stream their
 // 6.5 MB of weights each in 16-byte vectors, specialized for the token count: every thread issues
 // all of its weight loads before its first product, so a whole matrix is in flight at once; the
 // down rows split K over a CTA's warps, two rows a CTA sharing each activation load, and the up rows
@@ -57,6 +58,9 @@ __device__ __forceinline__ float warp_sum(float value) {
 
 __device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + __expf(-x)); }
 
+__device__ __forceinline__ float to_float(float value) { return value; }
+__device__ __forceinline__ float to_float(__nv_bfloat16 value) { return __bfloat162float(value); }
+
 __device__ __forceinline__ void unpack_bf16x8(const uint4& v, float (&out)[8]) {
     const auto* pairs = reinterpret_cast<const __nv_bfloat162*>(&v);
 #pragma unroll
@@ -76,16 +80,29 @@ __device__ __forceinline__ void load_f32x8(const float* p, float (&out)[8]) {
 }
 
 // One block per (stream, token), four values per thread: xn = x * rsqrt(mean x^2 + eps) * (1 + g),
-// and its BF16 rounding when asked for.
+// and its BF16 rounding when asked for. The fused form first writes the block output to the
+// FP32 stack; the register values have that same rounding and feed the norm without reloading.
+template <bool Write, typename Output = float>
 __global__ void __launch_bounds__(kNormThreads)
-    hc_norm_kernel(const float* __restrict__ stack, const __nv_bfloat16* __restrict__ norm,
+    hc_norm_kernel(float* __restrict__ stack, const Output* __restrict__ y,
+                   const float* __restrict__ previous_inject,
+                   const __nv_bfloat16* __restrict__ norm,
                    float eps, float* __restrict__ normalized,
                    __nv_bfloat16* __restrict__ normalized_bf16) {
     const int c             = blockIdx.x;
     const int t             = blockIdx.y;
     const std::int64_t base = (static_cast<std::int64_t>(t) * kStreams + c) * kHidden;
     __shared__ float partial[kNormThreads / 32];
-    const float4 x = reinterpret_cast<const float4*>(stack + base)[threadIdx.x];
+    float4 x = reinterpret_cast<const float4*>(stack + base)[threadIdx.x];
+    if constexpr (Write) {
+        const std::int64_t y_base = static_cast<std::int64_t>(t) * kHidden + 4 * threadIdx.x;
+        const float weight = previous_inject[t * kStreams + c];
+        x.x = fmaf(to_float(y[y_base]), weight, x.x);
+        x.y = fmaf(to_float(y[y_base + 1]), weight, x.y);
+        x.z = fmaf(to_float(y[y_base + 2]), weight, x.z);
+        x.w = fmaf(to_float(y[y_base + 3]), weight, x.w);
+        reinterpret_cast<float4*>(stack + base)[threadIdx.x] = x;
+    }
     float sum      = warp_sum(x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w);
     if ((threadIdx.x & 31) == 0) { partial[threadIdx.x >> 5] = sum; }
     __syncthreads();
@@ -367,9 +384,6 @@ void gemm_bf16(cudaStream_t stream, int m, int n, int k, const __nv_bfloat16* a,
                "GEMM");
 }
 
-__device__ __forceinline__ float to_float(float value) { return value; }
-__device__ __forceinline__ float to_float(__nv_bfloat16 value) { return __bfloat162float(value); }
-
 template <typename Output>
 __global__ void __launch_bounds__(256)
     hc_write_kernel(float* __restrict__ stack, const Output* __restrict__ y,
@@ -414,6 +428,40 @@ void require_geometry(std::int32_t streams, std::int32_t hidden, std::int32_t lo
             "unsupported geometry (streams 4, hidden 2560, lowrank 320 are implemented)");
 }
 
+void require_write_inputs(const Tensor& y, const Tensor& inject_weights, std::int32_t tokens) {
+    require((y.dtype == DType::BF16 || y.dtype == DType::FP32) && y.is_contiguous() &&
+                y.data != nullptr && y.ne[0] == kHidden && y.ne[1] == tokens &&
+                y.ne[2] == 1 && y.ne[3] == 1,
+            "y must be contiguous BF16 or FP32 [2560, tokens]");
+    require(inject_weights.dtype == DType::FP32 && inject_weights.is_contiguous() &&
+                inject_weights.data != nullptr && inject_weights.ne[0] == kStreams &&
+                inject_weights.ne[1] == tokens && inject_weights.ne[2] == 1 &&
+                inject_weights.ne[3] == 1,
+            "inject weights must be contiguous FP32 [4, tokens]");
+}
+
+void normalize(const Tensor& stack, const Tensor* y, const Tensor* previous_inject,
+               const Tensor& norm, float eps, float* normalized,
+               __nv_bfloat16* normalized_bf16, cudaStream_t stream) {
+    auto* xs = static_cast<float*>(stack.data);
+    const auto* norm_p = static_cast<const __nv_bfloat16*>(norm.data);
+    const dim3 grid(kStreams, stack.ne[2]);
+    if (y == nullptr) {
+        hc_norm_kernel<false, float><<<grid, kNormThreads, 0, stream>>>(
+            xs, nullptr, nullptr, norm_p, eps, normalized, normalized_bf16);
+    } else if (y->dtype == DType::FP32) {
+        hc_norm_kernel<true><<<grid, kNormThreads, 0, stream>>>(
+            xs, static_cast<const float*>(y->data), static_cast<const float*>(previous_inject->data),
+            norm_p, eps, normalized, normalized_bf16);
+    } else {
+        hc_norm_kernel<true><<<grid, kNormThreads, 0, stream>>>(
+            xs, static_cast<const __nv_bfloat16*>(y->data),
+            static_cast<const float*>(previous_inject->data), norm_p, eps, normalized,
+            normalized_bf16);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace
 
 std::size_t hyper_connection_read_workspace_bytes(std::int32_t streams, std::int32_t hidden,
@@ -432,15 +480,18 @@ std::size_t hyper_connection_read_workspace_bytes(std::int32_t streams, std::int
     return layout.peak_bytes(1);
 }
 
-void hyper_connection_read(const Tensor& stack, const HyperConnectionWeights& weights, float eps,
-                           WorkspaceArena& workspace, Tensor& mixed, Tensor* inject_weights,
-                           cudaStream_t stream) {
+namespace {
+
+void read(const Tensor& stack, const Tensor* y, const Tensor* previous_inject,
+          const HyperConnectionWeights& weights, float eps, WorkspaceArena& workspace,
+          Tensor& mixed, Tensor* inject_weights, cudaStream_t stream) {
     require(stack.dtype == DType::FP32 && stack.is_contiguous() && stack.data != nullptr &&
                 aligned16(stack.data) && stack.ne[0] == kHidden && stack.ne[1] == kStreams &&
                 stack.ne[3] == 1,
             "stack must be contiguous 16-byte aligned FP32 [2560, 4, tokens]");
     const std::int32_t tokens = stack.ne[2];
     require(tokens > 0, "tokens must be positive");
+    if (y != nullptr) { require_write_inputs(*y, *previous_inject, tokens); }
     require(eps > 0.0f, "eps must be positive");
     require_bf16(weights.norm, kWidth, 1, "norm must be BF16 [10240]");
     require_bf16(weights.down, kWidth, kLowrank, "down must be BF16 [10240, 320]");
@@ -478,10 +529,7 @@ void hyper_connection_read(const Tensor& stack, const HyperConnectionWeights& we
         auto* xn16             = static_cast<__nv_bfloat16*>(normalized_bf16.data);
         auto* low16            = static_cast<__nv_bfloat16*>(low_bf16.data);
         auto* products_p       = static_cast<float*>(products.data);
-        hc_norm_kernel<<<dim3(kStreams, tokens), kNormThreads, 0, stream>>>(
-            static_cast<const float*>(stack.data),
-            static_cast<const __nv_bfloat16*>(weights.norm->data), eps, normalized_p, xn16);
-        CUDA_CHECK(cudaGetLastError());
+        normalize(stack, y, previous_inject, *weights.norm, eps, normalized_p, xn16, stream);
         if (inject_w != nullptr) {
             hc_down_kernel<<<dim3(kStreams, chunks), kDownWarps * 32, 0, stream>>>(
                 normalized_p, down_w, inject_w, tokens, kLowrank, nullptr, inject_out);
@@ -503,10 +551,7 @@ void hyper_connection_read(const Tensor& stack, const HyperConnectionWeights& we
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    hc_norm_kernel<<<dim3(kStreams, tokens), kNormThreads, 0, stream>>>(
-        static_cast<const float*>(stack.data),
-        static_cast<const __nv_bfloat16*>(weights.norm->data), eps, normalized_p, nullptr);
-    CUDA_CHECK(cudaGetLastError());
+    normalize(stack, y, previous_inject, *weights.norm, eps, normalized_p, nullptr, stream);
     const NarrowRead read{.normalized = normalized_p,
                           .down       = down_w,
                           .inject     = inject_w,
@@ -527,6 +572,21 @@ void hyper_connection_read(const Tensor& stack, const HyperConnectionWeights& we
     }
 }
 
+} // namespace
+
+void hyper_connection_read(const Tensor& stack, const HyperConnectionWeights& weights, float eps,
+                           WorkspaceArena& workspace, Tensor& mixed, Tensor* inject_weights,
+                           cudaStream_t stream) {
+    read(stack, nullptr, nullptr, weights, eps, workspace, mixed, inject_weights, stream);
+}
+
+void hyper_connection_write_read(Tensor& stack, const Tensor& y, const Tensor& previous_inject,
+                                 const HyperConnectionWeights& weights, float eps,
+                                 WorkspaceArena& workspace, Tensor& mixed, Tensor* inject_weights,
+                                 cudaStream_t stream) {
+    read(stack, &y, &previous_inject, weights, eps, workspace, mixed, inject_weights, stream);
+}
+
 void hyper_connection_write(Tensor& stack, const Tensor& y, const Tensor& inject_weights,
                             cudaStream_t stream) {
     require(stack.dtype == DType::FP32 && stack.is_contiguous() && stack.data != nullptr &&
@@ -534,13 +594,7 @@ void hyper_connection_write(Tensor& stack, const Tensor& y, const Tensor& inject
             "stack must be contiguous FP32 [2560, 4, tokens]");
     const std::int32_t tokens = stack.ne[2];
     require(tokens > 0, "tokens must be positive");
-    require((y.dtype == DType::BF16 || y.dtype == DType::FP32) && y.is_contiguous() &&
-                y.data != nullptr && y.ne[0] == kHidden && y.ne[1] == tokens,
-            "y must be contiguous BF16 or FP32 [2560, tokens]");
-    require(inject_weights.dtype == DType::FP32 && inject_weights.is_contiguous() &&
-                inject_weights.data != nullptr && inject_weights.ne[0] == kStreams &&
-                inject_weights.ne[1] == tokens,
-            "inject weights must be contiguous FP32 [4, tokens]");
+    require_write_inputs(y, inject_weights, tokens);
     const std::int64_t elements = static_cast<std::int64_t>(kWidth) * tokens;
     const auto blocks = static_cast<unsigned>(div_up(elements, std::int64_t{256}));
     if (y.dtype == DType::FP32) {
