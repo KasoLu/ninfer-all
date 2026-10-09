@@ -1,0 +1,71 @@
+# syntax=docker/dockerfile:1
+#
+# Baseline runtime-only image for the 4090 workstation: packages the prebuilt
+# binaries from build/ (compiled with Dockerfile.toolchain / ninfer-local-build,
+# i.e. nvidia/cuda:13.1.2 on ubuntu 24.04) into a slim CUDA 13.1 runtime
+# image. Nothing is compiled here. Carries the pre-existing KV modes only
+# (bf16 / int8 / fp8 / rk8v4 / ...) — no rk6v4-e8 or new test tooling.
+#
+# Builds with the paired ignore file Dockerfile.runtime.dockerignore, which
+# admits build/apps/ even though the main .dockerignore hides the whole build
+# tree (the release Dockerfile compiles in-container and never needs it).
+# If your Docker is too old for per-Dockerfile ignore files, stage instead:
+# copy this Dockerfile + build/apps into a scratch directory and build that
+# directory as the context.
+#
+# Build (from the repository root, on the 4090 host):
+#   docker build -f Dockerfile.runtime -t ninfer-runtime:base .
+#
+# Run examples:
+#   docker run --rm --gpus all -p 1234:1234 -v <models>:/models \
+#     ninfer-runtime:base \
+#     ninfer-serve --model /models/qwen3_6_27b.ninfer --kv-dtype bf16
+#
+#   docker run --rm --gpus all -v <models>:/models -v <prompts>:/prompts \
+#     ninfer-runtime:base \
+#     ninfer --model /models/qwen3_6_27b.ninfer --kv-dtype rk8v4 \
+#            --prompt /prompts/q.txt --greedy --max-context 4096
+#
+#   docker run --rm --gpus all -it --entrypoint bash ninfer-runtime:base
+#     # then: ninfer / ninfer-serve / ninfer-perplexity are on PATH
+
+FROM nvidia/cuda:13.1.2-runtime-ubuntu24.04
+
+# Container time zone: without one, glibc local time is UTC and spdlog log
+# timestamps read UTC. Pin the workstation zone so logs read local time;
+# override per build with --build-arg TZ=... if the box moves zones.
+ARG TZ=Asia/Shanghai
+ENV TZ=${TZ}
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        libavcodec60 \
+        libavformat60 \
+        libavutil58 \
+        libcurl4t64 \
+        libswscale7 \
+    && rm -rf /var/lib/apt/lists/*
+
+# The CUDA runtime image ships forward-compatibility libraries in
+# /usr/local/cuda*/compat (a newer libcuda.so than the host driver). Forward
+# compatibility is supported only on datacenter GPUs; on any GeForce card the
+# loader picks these up and every CUDA call fails at startup with
+#   cudaErrorCompatNotSupportedOnDevice: forward compatibility was attempted
+#   on non supported HW
+# Removing them lets the container use the host driver through ordinary CUDA
+# minor-version compatibility, which is what an RTX 4090 needs.
+RUN rm -rf /usr/local/cuda-13.1/compat /usr/local/cuda-13/compat /usr/local/cuda/compat
+
+# Prebuilt products (statically linked against the ninfer_*.a libraries;
+# only the CUDA runtime and the ffmpeg/curl shared libs above are needed).
+COPY build/apps/ninfer            /usr/local/bin/ninfer
+COPY build/apps/ninfer-serve      /usr/local/bin/ninfer-serve
+COPY build/apps/ninfer-perplexity /usr/local/bin/ninfer-perplexity
+
+WORKDIR /workspace
+EXPOSE 1234
+STOPSIGNAL SIGTERM
+
+CMD ["ninfer-serve", "--help"]

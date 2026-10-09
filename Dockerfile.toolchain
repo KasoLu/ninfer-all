@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1
+#
+# Development toolchain image for the 4090 workstation (sm_89, RTX 4090).
+# Built once:  docker build -f Dockerfile.toolchain -t ninfer-4090-devel:0903 .
+#
+# The container created from this image is long-lived (sleep infinity) and the
+# repository is bind-mounted at /ninfer/ (matching WORKDIR below); the
+# build tree lives in <repo>/build so source and build cache share one tree.
+# All day-to-day work happens inside `docker exec -it <name> bash`.
+#
+# NOTE: the devel image doubles as the run-time environment here. On GeForce
+# hosts the CUDA forward-compatibility libraries in /usr/local/cuda*/compat
+# must be stripped, or CUDA initialization fails at container startup with
+# cudaErrorCompatNotSupportedOnDevice (same reason as in the runtime stage of
+# the release Dockerfile).
+
+FROM nvidia/cuda:13.1.2-devel-ubuntu24.04
+
+# Container time zone: without one, glibc local time is UTC and spdlog log
+# timestamps read UTC. Pin the workstation zone so logs read local time;
+# override per build with --build-arg TZ=... if the box moves zones.
+ARG TZ=Asia/Shanghai
+ENV TZ=${TZ}
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        cmake \
+        git \
+        libavcodec-dev \
+        libavformat-dev \
+        libavutil-dev \
+        libcurl4-openssl-dev \
+        libswscale-dev \
+        ninja-build \
+        pkg-config \
+        python3 \
+        python3-pip \
+        python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rm -rf /usr/local/cuda-13.1/compat /usr/local/cuda-13/compat /usr/local/cuda/compat
+
+WORKDIR /ninfer/

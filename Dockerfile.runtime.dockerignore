@@ -1,0 +1,22 @@
+# Per-Dockerfile ignore file for Dockerfile.runtime (BuildKit uses this
+# instead of .dockerignore when building with -f Dockerfile.runtime).
+#
+# The main .dockerignore excludes the whole build tree (the release
+# Dockerfile compiles in-container and never needs it), but the runtime
+# image is copy-only: it needs exactly the three prebuilt binaries in
+# build/apps. Keep the context tiny by excluding everything else.
+#
+# Note: dockerignore follows gitignore semantics, so the children of the
+# build tree are excluded individually and the binaries re-included.
+
+.git
+.cache
+build/*
+!build/apps
+build/apps/*
+!build/apps/ninfer
+!build/apps/ninfer-serve
+!build/apps/ninfer-perplexity
+
+**/__pycache__
+**/.venv
