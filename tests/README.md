@@ -240,6 +240,9 @@ and checks reordered and repeated GPU-decoded rows exactly against independently
 FP64 products rounded to BF16. `tests/convert/test_qwen4_exp_ngram.py` separately checks the
 quantizer against a scalar codebook oracle, source-shard boundaries, digest stability and
 invalid source metadata. It does not require the full 102 GB HF table.
+The CTest launcher probes CUDA through the native test binary before importing the conversion
+dependencies. A host without a usable GPU returns skip code 77 without requiring pytest or
+PyTorch; a host with a GPU runs the complete conversion and decoding check.
 
 `tests/convert/test_block_fp8.py` checks HF 128×128 E4M3FN expert matrices against an
 independent FP64 codebook/block-product oracle with BF16 or FP32 scales, partial reads and

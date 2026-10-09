@@ -11,7 +11,7 @@ ninfer_add_test(ninfer_qwen4_exp_ngram_component_test
   LIBRARIES ninfer_model_loading ninfer_ops)
 
 add_test(NAME ninfer_qwen4_exp_ngram_writer_interop_test
-  COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/../../convert/test_qwen4_exp_ngram.py"
+  COMMAND ${Python3_EXECUTABLE} -B "${CMAKE_CURRENT_LIST_DIR}/ngram_writer_interop.py"
     $<TARGET_FILE:ninfer_tests>)
 set_tests_properties(ninfer_qwen4_exp_ngram_writer_interop_test PROPERTIES SKIP_RETURN_CODE 77)
 
