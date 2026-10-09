@@ -41,6 +41,25 @@ Two things it refuses rather than lets you get wrong:
 line and needs changing for `ninfer_bench`, which prints CSV. A run where any sample produced no
 number exits 1, because a comparison with a hole in it is not a comparison.
 
+## Needle probe baker (`make_needle_probes.py`)
+
+Deterministic haystack probes for the retrieval gates (RK6V4E8.md section 7.3). Stdlib
+only, no network, no tokenizer: token counts are char-based estimates kept under the
+context limit by a 10% safety factor, and needle depths are fractions of the haystack,
+so the gate semantics hold regardless of the exact tokenization.
+
+```bash
+python3 tools/bench/make_needle_probes.py --out /tmp/needles                  # ~260K single-needle haystack
+python3 tools/bench/make_needle_probes.py --out /tmp/needles --single-tokens 200000
+python3 tools/bench/make_needle_probes.py --out /tmp/smoke --scale 0.01       # smoke test
+```
+
+Writes `needle_single.json`, `needle_five.json`, `needle_code.json` (OpenAI messages
+files for the `ninfer` CLI `--messages`) plus `expected_answers.json` with the
+passphrases, canary values, and generation metadata used for mechanical grading.
+[`run_needle_gate.sh`](../run_needle_gate.sh) drives the full gate: ctest round-trip
+gate, probe generation, one greedy `ninfer` run per kv-dtype and probe, and the
+substring/order grading.
 ## External Serve TTFT
 
 [`ttft/README.md`](ttft/README.md) defines the black-box latency benchmark. The measurement runner

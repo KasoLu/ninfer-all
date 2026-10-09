@@ -24,6 +24,8 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
 | Watch a resident server: dashboard, and restart on a wedge | [`monitor/`](monitor/README.md) |
 | Check long-context recall, cold prefill against a cached prefix | [`longctx_recall_probe.py`](longctx_recall_probe.py) |
+| Long-context PPL depth matrix on one oversized file (bf16 @64K, rk8v4/rk6v4-e8 @128K/200K) | [`run_long_context_ppl.sh`](run_long_context_ppl.sh) |
+| Needle retrieval gates (single-needle + code-detail at the 200K context tier) | [`run_needle_gate.sh`](run_needle_gate.sh), probes from [`bench/make_needle_probes.py`](bench/make_needle_probes.py) |
 | Exercise a resident HTTP server | [`smoke/serve_contract.py`](smoke/serve_contract.py) |
 | Exercise thinking preservation through a managed server | [`smoke/serve_thinking_preservation.py`](smoke/serve_thinking_preservation.py) |
 | Measure the physical HBM read/copy ceiling | [`hbm_bandwidth_probe.cu`](hbm_bandwidth_probe.cu); [build command](#standalone-hbm-probe) |
