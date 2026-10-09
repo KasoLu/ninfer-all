@@ -134,6 +134,12 @@ __device__ __forceinline__ void decode_key(const KvPlanes& planes, const std::in
             static_cast<const std::uint8_t*>(planes.k) + plane_offset<64>(table, head, p, d / 4);
         codes_to_half(kv_cache_e8_root_unpack_i8x16(load_vec<std::uint32_t>(bytes)),
                       scale_at(planes.k_scale, plane_offset<4>(table, head, p, d / 64)), out);
+    } else if constexpr (Storage == KvCacheStorage::RotatedInt6KeyInt4ValueE8) {
+        const auto* bytes =
+            static_cast<const std::uint8_t*>(planes.k) + plane_offset<192>(table, head, p,
+                                                                          (d * 3) / 4);
+        codes_to_half(kv_cache_i6_unpack_i8x16(bytes),
+                      scale_at(planes.k_scale, plane_offset<4>(table, head, p, d / 64)), out);
     } else if constexpr (Storage == KvCacheStorage::Fp8E4M3Row256 ||
                          Storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         const auto* codes =
@@ -167,7 +173,8 @@ __device__ __forceinline__ void decode_value(const KvPlanes& planes, const std::
     } else if constexpr (Storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
                          Storage == KvCacheStorage::RotatedLloyd4KeyInt4Value ||
                          Storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8 ||
-                         Storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
+                         Storage == KvCacheStorage::RotatedE8RootKeyInt4Value ||
+                         Storage == KvCacheStorage::RotatedInt6KeyInt4ValueE8) {
         const auto* bytes =
             static_cast<const std::uint8_t*>(planes.v) + plane_offset<128>(table, head, p, d / 2);
         codes_to_half(kv_cache_int4_unpack_i8x16(load_vec<uint2>(bytes)),
@@ -507,6 +514,7 @@ void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, con
         NINFER_SPARSE_ATTENTION_CASE(RotatedLloyd4KeyInt4Value)
         NINFER_SPARSE_ATTENTION_CASE(RotatedInt4KeyInt4ValueE8)
         NINFER_SPARSE_ATTENTION_CASE(RotatedE8RootKeyInt4Value)
+        NINFER_SPARSE_ATTENTION_CASE(RotatedInt6KeyInt4ValueE8)
 #undef NINFER_SPARSE_ATTENTION_CASE
     }
     require(false, "unsupported cache storage");

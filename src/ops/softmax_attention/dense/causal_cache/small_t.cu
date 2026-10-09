@@ -35,6 +35,9 @@ std::string small_t_i8_route_key(std::int32_t q_heads, KvCacheStorage storage,
     case KvCacheStorage::RotatedInt4KeyInt4ValueE8:
         coding = "rk4v4-e8";
         break;
+    case KvCacheStorage::RotatedInt6KeyInt4ValueE8:
+        coding = "rk6v4-e8";
+        break;
     case KvCacheStorage::RotatedE8RootKeyInt4Value:
         coding = "rk2v4-e8";
         break;

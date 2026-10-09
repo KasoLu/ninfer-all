@@ -118,6 +118,9 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "rk4v4") { return KvCacheStorage::RotatedLloyd4KeyInt4Value; }
     // rk4v4-e8: rotated E8-snapped int4 keys with the rk8v4 value plane. Opt-in.
     if (text == "rk4v4-e8") { return KvCacheStorage::RotatedInt4KeyInt4ValueE8; }
+    // rk6v4-e8: rotated E8-snapped 6-bit keys (four per three bytes) with the rk8v4 value plane.
+    // Opt-in.
+    if (text == "rk6v4-e8") { return KvCacheStorage::RotatedInt6KeyInt4ValueE8; }
     // rk2v4-e8: rotated keys as E8 root codes, two bytes per eight dimensions. Opt-in.
     if (text == "rk2v4-e8") { return KvCacheStorage::RotatedE8RootKeyInt4Value; }
     if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
@@ -191,7 +194,7 @@ std::string usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); alias --vram-headroom-mib\n"
            "  --kv-dtype T                  bf16 (default), int8, fp8, rk8v4, rk4v4,\n"
-           "                                rk4v4-e8, rk2v4-e8, nvfp4 or k8v4\n"
+           "                                rk4v4-e8, rk6v4-e8, rk2v4-e8, nvfp4 or k8v4\n"
            "\n"
            "SPECULATIVE DECODING (off by default)\n"
            "  --spec mtp|dflash|dflash2     speculative decoding backend\n"

@@ -253,7 +253,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--ngram-ram-mib N` | `disk`: budget for cached rows and their index (`0` disables); `ram-hot`: budget for the profile's resident rows and index | `0` for disk; `4096` for ram-hot |
 | `--ngram-lock` | `ram`, `ram-hot`: lock the resident rows in physical memory (`mlock`, `VirtualLock`) | off |
 | `--no-ngram-table` | Qwen3.8-Flash-Next: run without the n-gram table, a non-standard experimental mode (the Q2_0 release's WikiText-2 perplexity rises from 2.66 to 5.01) | off |
-| `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk2v4-e8\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys and `rk2v4-e8` opt-in E8 root-code keys; all nine are accepted on every build target (see [Context and memory](#context-and-memory)); for Qwen3.8-Flash-Next it is the storage of the sparse-attention layers' KV | `bf16` |
+| `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk6v4-e8\|rk2v4-e8\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys, `rk6v4-e8` opt-in E8-lattice 6-bit keys and `rk2v4-e8` opt-in E8 root-code keys; all ten are accepted on every build target (see [Context and memory](#context-and-memory)); for Qwen3.8-Flash-Next it is the storage of the sparse-attention layers' KV | `bf16` |
 | `--spec mtp\|dflash\|dflash2` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)) | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--draft-min-p P` | Flash-Next MTP only: verify through the first draft at or below this absolute probability; the full draft chain still runs; see [MTP](qwen3-8-flash-next.md#mtp-speculative-decoding) | `0` (off) |
@@ -340,8 +340,8 @@ The registered model IDs have a native context limit of 262,144 tokens. `--max-c
 to four times that, 1,048,576 tokens, with plain RoPE or YaRN (`--rope-yarn`) past the native
 window. What fits depends on the card, the artifact, the media workload, the output budget and the
 KV format. The artifact describes its model configuration and weight representations;
-`--kv-dtype` independently selects runtime KV storage, BF16 by default. All nine formats — `bf16`,
-`int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`, `k8v4`, `nvfp4` — are accepted on every
+`--kv-dtype` independently selects runtime KV storage, BF16 by default. All ten formats — `bf16`,
+`int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk6v4-e8`, `rk2v4-e8`, `k8v4`, `nvfp4` — are accepted on every
 build target: the Blackwell-only `mma.sync...kind::f8f6f4` restriction applies to FP8/NVFP4
 *weights and activations*, not to KV storage. Measured size, decode speed and perplexity of seven of
 them on an RTX 3090 are in [`docs/config-calculator.html`](config-calculator.html).
@@ -354,9 +354,13 @@ indices: 31% smaller than `rk8v4`, within 3% of `nvfp4`'s size, better perplexit
 (+0.21% against INT8) and `rk8v4`'s decode speed, so it is the choice when context is the limit.
 `rk4v4-e8` has `rk4v4`'s size but snaps each octet of a scaled G64 key group to the nearest E8
 lattice point before the codes are clamped to [-8, 7]; the coset bit is not stored, so per-value
-error is no better than plain INT4. `rk2v4-e8` stores each 8-dimension key block in two bytes, the
-nearest of E8's 240 roots and a byte holding a log-radius and a residual axis: 216 bytes per token
-and KV head against 280 for `rk4v4-e8` and 408 for `rk8v4`, the one format that holds 1,048,576
+error is no better than plain INT4. `rk6v4-e8` stores each E8-snapped octet of a scaled G64 key
+group in two 6-bit codes, three bytes per four codes: 192 bytes of key codes per token and KV
+head with rk8v4's value plane, 344 bytes in total against 280 for `rk4v4-e8` and 408 for `rk8v4`.
+It trades the E8 lattice's 8-bit-per-coordinate margin for a sixth of a byte of context per key
+coordinate. `rk2v4-e8` stores each 8-dimension key block in two bytes, the nearest of E8's 240
+roots and a byte holding a log-radius and a residual axis: 216 bytes per token and KV head
+against 280 for `rk4v4-e8` and 408 for `rk8v4`, the one format that holds 1,048,576
 tokens beside Ternary Bonsai 2 on a 24 GB card, at a quality cost (quick-corpus perplexity 5.631 to
 5.820 on Bonsai 2, and fewer accepted DFlash2 drafts). `fp8` and `k8v4` are each beaten by `rk8v4`
 on size, speed and quality together, so neither has a niche. The prepared prompt must fit

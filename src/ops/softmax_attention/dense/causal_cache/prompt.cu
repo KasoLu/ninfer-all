@@ -188,6 +188,10 @@ void causal_attention_prompt_attention_launch_for(const Tensor& q, const Tensor&
             launch_i8.template operator()<true, KvKeyCoding::Int4E8, true>();
         } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
             launch_i8.template operator()<true, KvKeyCoding::Int4E8, false>();
+        } else if (cache.storage == KvCacheStorage::RotatedInt6KeyInt4ValueE8 && pv_f16) {
+            launch_i8.template operator()<true, KvKeyCoding::K6E8, true>();
+        } else if (cache.storage == KvCacheStorage::RotatedInt6KeyInt4ValueE8) {
+            launch_i8.template operator()<true, KvKeyCoding::K6E8, false>();
         } else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
             launch_i8.template operator()<true, KvKeyCoding::RootE8, false>();
         } else if (cache_v.dtype == DType::U8 && pv_f16) {

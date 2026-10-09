@@ -40,7 +40,7 @@ const double kRtx5090DramGBs                = bench::device_specs().dram_spec_gb
 enum class Mode : std::uint8_t { Full, Prefix, All };
 enum class FullGeometryChoice : std::uint8_t { Kv4, Kv2, All };
 enum class KvChoice : std::uint8_t {
-    Bf16, Int8, Fp8, Rk8V4, Rk4V4, Rk4V4E8, Rk2V4E8, Nvfp4, K8V4, All
+    Bf16, Int8, Fp8, Rk8V4, Rk4V4, Rk4V4E8, Rk6V4E8, Rk2V4E8, Nvfp4, K8V4, All
 };
 enum class LayoutChoice : std::uint8_t { Paged, Cyclic, All };
 enum class Execution : std::uint8_t { Eager, Graph, Both };
@@ -102,7 +102,7 @@ struct Result {
                  "error: %s\n"
                  "usage: ninfer_kv_cache_append_bench [--mode full|prefix|all] "
                  "[--full-geometry d256-kv4|d256-kv2|all] "
-                 "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4|all] "
+                 "[--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk6v4-e8|rk2v4-e8|nvfp4|k8v4|all] "
                  "[--layout paged|cyclic|all] [--tokens T,...] [--counts C,...] "
                  "[--cyclic-capacity 2048|4096] [--batch B] "
                  "[--context L] [--execution eager|graph|both] [--cache cold|warm|both] "
@@ -183,6 +183,8 @@ Options parse_options(int argc, char** argv) {
                 options.kv = KvChoice::Rk4V4;
             else if (value == "rk4v4-e8")
                 options.kv = KvChoice::Rk4V4E8;
+            else if (value == "rk6v4-e8")
+                options.kv = KvChoice::Rk6V4E8;
             else if (value == "rk2v4-e8")
                 options.kv = KvChoice::Rk2V4E8;
             else if (value == "nvfp4")
@@ -192,7 +194,7 @@ Options parse_options(int argc, char** argv) {
             else if (value == "all")
                 options.kv = KvChoice::All;
             else
-                usage("--kv-dtype expects bf16, int8, fp8, rk8v4, rk4v4, rk4v4-e8, rk2v4-e8, nvfp4, k8v4, or all");
+                usage("--kv-dtype expects bf16, int8, fp8, rk8v4, rk4v4, rk4v4-e8, rk6v4-e8, rk2v4-e8, nvfp4, k8v4, or all");
         } else if (argument == "--layout") {
             const std::string_view value(next("--layout requires a value"));
             if (value == "paged")
@@ -542,6 +544,8 @@ const char* storage_name(KvCacheStorage storage) {
         return "rk4v4";
     case KvCacheStorage::RotatedInt4KeyInt4ValueE8:
         return "rk4v4-e8";
+    case KvCacheStorage::RotatedInt6KeyInt4ValueE8:
+        return "rk6v4-e8";
     case KvCacheStorage::RotatedE8RootKeyInt4Value:
         return "rk2v4-e8";
     case KvCacheStorage::Nvfp4Group16:
@@ -688,6 +692,7 @@ std::vector<KvCacheStorage> selected_storages(KvChoice choice) {
     if (choice == KvChoice::Rk8V4) return {KvCacheStorage::RotatedInt8KeyInt4ValueGroup64};
     if (choice == KvChoice::Rk4V4) return {KvCacheStorage::RotatedLloyd4KeyInt4Value};
     if (choice == KvChoice::Rk4V4E8) return {KvCacheStorage::RotatedInt4KeyInt4ValueE8};
+    if (choice == KvChoice::Rk6V4E8) return {KvCacheStorage::RotatedInt6KeyInt4ValueE8};
     if (choice == KvChoice::Rk2V4E8) return {KvCacheStorage::RotatedE8RootKeyInt4Value};
     if (choice == KvChoice::Nvfp4) return {KvCacheStorage::Nvfp4Group16};
     if (choice == KvChoice::K8V4) return {KvCacheStorage::Fp8KeyNvfp4Value};
@@ -697,6 +702,7 @@ std::vector<KvCacheStorage> selected_storages(KvChoice choice) {
             KvCacheStorage::RotatedInt8KeyInt4ValueGroup64,
             KvCacheStorage::RotatedLloyd4KeyInt4Value,
             KvCacheStorage::RotatedInt4KeyInt4ValueE8,
+            KvCacheStorage::RotatedInt6KeyInt4ValueE8,
             KvCacheStorage::RotatedE8RootKeyInt4Value,
             KvCacheStorage::Nvfp4Group16,
             KvCacheStorage::Fp8KeyNvfp4Value};

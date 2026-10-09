@@ -63,6 +63,9 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     if (value == "rk4v4") { return KvCacheStorage::RotatedLloyd4KeyInt4Value; }
     // rk4v4-e8: rotated E8-snapped int4 keys with the rk8v4 value plane. Opt-in.
     if (value == "rk4v4-e8") { return KvCacheStorage::RotatedInt4KeyInt4ValueE8; }
+    // rk6v4-e8: rotated E8-snapped 6-bit keys (four per three bytes) with the rk8v4 value plane.
+    // Opt-in.
+    if (value == "rk6v4-e8") { return KvCacheStorage::RotatedInt6KeyInt4ValueE8; }
     // rk2v4-e8: rotated keys as E8 root codes, two bytes per eight dimensions. Opt-in.
     if (value == "rk2v4-e8") { return KvCacheStorage::RotatedE8RootKeyInt4Value; }
     if (value == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
@@ -204,7 +207,7 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); alias --vram-headroom-mib\n"
            "  --kv-dtype T                  KV storage: bf16 (default), int8, fp8, rk8v4,\n"
-           "                                rk4v4, rk4v4-e8, rk2v4-e8, nvfp4 or k8v4\n"
+           "                                rk4v4, rk4v4-e8, rk6v4-e8, rk2v4-e8, nvfp4 or k8v4\n"
            "\n"
            "CONTEXT CACHE\n"
            "  --no-prefix-reuse             disable compatible-prefix caching (on by\n"

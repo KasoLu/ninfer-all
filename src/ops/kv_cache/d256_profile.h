@@ -73,6 +73,7 @@ inline constexpr bool kv_cache_is_int8_family(ninfer::KvCacheStorage storage) {
            storage == ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
            storage == ninfer::KvCacheStorage::RotatedLloyd4KeyInt4Value ||
            storage == ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueE8 ||
+           storage == ninfer::KvCacheStorage::RotatedInt6KeyInt4ValueE8 ||
            storage == ninfer::KvCacheStorage::RotatedE8RootKeyInt4Value;
 }
 
@@ -106,6 +107,19 @@ inline constexpr D256KVCacheProfile d256_kv_cache_profile(ninfer::KvCacheStorage
         return {DType::U8,
                 DType::U8,
                 kD256KVCacheHeadDim / 4,
+                kD256KVCacheHeadDim / 2,
+                64,
+                DType::FP16,
+                4,
+                DType::FP16,
+                8};
+    case ninfer::KvCacheStorage::RotatedInt6KeyInt4ValueE8:
+        // Four 6-bit E8 key codes per three bytes: the key plane holds 256 * 3/4 = 192 code bytes
+        // per row under the G64 FP16 scale; the value plane is rk8v4's. Dispatch on the storage,
+        // as for rk4v4 and rk4v4-e8.
+        return {DType::U8,
+                DType::U8,
+                kD256KVCacheHeadDim * 3 / 4,
                 kD256KVCacheHeadDim / 2,
                 64,
                 DType::FP16,

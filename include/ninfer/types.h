@@ -70,6 +70,11 @@ enum class KvCacheStorage : std::uint8_t {
     // a residual axis (two bytes per block) over a group-64 scale, paired with the rk8v4 packed
     // int4 value plane. Opt-in through --kv-dtype rk2v4-e8.
     RotatedE8RootKeyInt4Value,
+    // rk6v4-e8: rotated keys snapped per 8-dimension block to the E8 lattice and stored as packed
+    // signed 6-bit codes (four per three bytes, 192 bytes per row) over a group-64 scale, paired
+    // with the rk8v4 packed int4 value plane. Opt-in through --kv-dtype rk6v4-e8. Appended last
+    // so the existing values keep their numbering.
+    RotatedInt6KeyInt4ValueE8,
 };
 
 enum class EnginePurpose : std::uint8_t {

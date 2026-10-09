@@ -69,7 +69,7 @@ std::vector<RouteCatalogEntry> build_catalog() {
     // Small-T attention launch tiers for 24 query heads over 4 KV heads, per KV coding and query
     // width: the tier list depends on how many 16-row tiles the width's query rows fill.
     constexpr int query_heads_per_kv_head = 24 / 4;
-    for (const char* coding : {"rk8v4", "rk4v4", "rk4v4-e8", "rk2v4-e8", "int8"}) {
+    for (const char* coding : {"rk8v4", "rk4v4", "rk4v4-e8", "rk6v4-e8", "rk2v4-e8", "int8"}) {
         for (int width = 1; width <= 8; ++width) {
             const int row_tiles = (width * query_heads_per_kv_head + 15) / 16;
             std::vector<std::string> tiers;

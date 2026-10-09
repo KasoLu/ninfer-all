@@ -36,6 +36,7 @@ constexpr KvCacheStorage kStorages[] = {
     KvCacheStorage::RotatedLloyd4KeyInt4Value,
     KvCacheStorage::RotatedInt4KeyInt4ValueE8,
     KvCacheStorage::RotatedE8RootKeyInt4Value,
+    KvCacheStorage::RotatedInt6KeyInt4ValueE8,
 };
 
 // The profile must be evaluable at compile time for every storage; this also proves each one has
@@ -54,6 +55,7 @@ static_assert(profile_is_constexpr<KvCacheStorage::Fp8KeyNvfp4Value>());
 static_assert(profile_is_constexpr<KvCacheStorage::RotatedLloyd4KeyInt4Value>());
 static_assert(profile_is_constexpr<KvCacheStorage::RotatedInt4KeyInt4ValueE8>());
 static_assert(profile_is_constexpr<KvCacheStorage::RotatedE8RootKeyInt4Value>());
+static_assert(profile_is_constexpr<KvCacheStorage::RotatedInt6KeyInt4ValueE8>());
 
 // This fork's defining invariant: the BF16 cache is symmetric. Upstream stores V as FP16, the two
 // are the same width, and every catch-up merge has tried to reintroduce that.
@@ -126,6 +128,31 @@ static_assert(d256_kv_cache_profile(KvCacheStorage::RotatedE8RootKeyInt4Value)
                   .value_scale_leading_extent == 8);
 static_assert(ninfer::ops::kv_cache_is_int8_family(KvCacheStorage::RotatedE8RootKeyInt4Value));
 
+// rk6v4-e8 keeps three i6 code bytes per eight key dimensions, three quarters of the head
+// dimension, under the same G64 key scales, with rk8v4's packed value plane: 192 + 128 + 8 + 16
+// = 336 bytes per token per head, between rk8v4's 400 and rk4v4-e8's 272.
+static_assert(std::is_same_v<KvKeyCodeT<KvCacheStorage::RotatedInt6KeyInt4ValueE8>, std::uint8_t>);
+static_assert(std::is_same_v<KvValueCodeT<KvCacheStorage::RotatedInt6KeyInt4ValueE8>, std::uint8_t>);
+static_assert(std::is_same_v<KvKeyScaleT<KvCacheStorage::RotatedInt6KeyInt4ValueE8>, __half>);
+static_assert(std::is_same_v<KvValueScaleT<KvCacheStorage::RotatedInt6KeyInt4ValueE8>, __half>);
+static_assert(d256_kv_cache_profile(KvCacheStorage::RotatedInt6KeyInt4ValueE8).key_leading_extent *
+                  4 ==
+              3 * ninfer::ops::kD256KVCacheHeadDim,
+              "rk6v4-e8 packs three key i6 bytes per eight dimensions");
+static_assert(d256_kv_cache_profile(KvCacheStorage::RotatedInt6KeyInt4ValueE8).scale_leading_extent == 4);
+static_assert(d256_kv_cache_profile(KvCacheStorage::RotatedInt6KeyInt4ValueE8)
+                  .value_scale_leading_extent == 8);
+static_assert(ninfer::ops::kv_cache_is_int8_family(KvCacheStorage::RotatedInt6KeyInt4ValueE8));
+static_assert(d256_kv_cache_profile(KvCacheStorage::RotatedInt6KeyInt4ValueE8).key_leading_extent +
+                  d256_kv_cache_profile(KvCacheStorage::RotatedInt6KeyInt4ValueE8)
+                      .value_leading_extent +
+                  2 * d256_kv_cache_profile(KvCacheStorage::RotatedInt6KeyInt4ValueE8)
+                      .scale_leading_extent +
+                  2 * d256_kv_cache_profile(KvCacheStorage::RotatedInt6KeyInt4ValueE8)
+                      .value_scale_leading_extent ==
+              344,
+              "rk6v4-e8 is 344 bytes per token per head (192 + 128 + 2*4 + 2*8)");
+
 // k8v4 pairs an FP8 key plane with an NVFP4 value plane, so its two scale planes differ in dtype.
 static_assert(std::is_same_v<KvKeyScaleT<KvCacheStorage::Fp8KeyNvfp4Value>, __half>);
 static_assert(std::is_same_v<KvValueScaleT<KvCacheStorage::Fp8KeyNvfp4Value>, std::uint8_t>);
@@ -143,6 +170,7 @@ static_assert(packed_extents_agree<KvCacheStorage::RotatedInt8KeyInt4ValueGroup6
 static_assert(packed_extents_agree<KvCacheStorage::RotatedLloyd4KeyInt4Value>());
 static_assert(packed_extents_agree<KvCacheStorage::RotatedInt4KeyInt4ValueE8>());
 static_assert(packed_extents_agree<KvCacheStorage::RotatedE8RootKeyInt4Value>());
+static_assert(packed_extents_agree<KvCacheStorage::RotatedInt6KeyInt4ValueE8>());
 
 } // namespace
 

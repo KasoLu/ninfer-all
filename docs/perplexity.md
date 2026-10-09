@@ -20,8 +20,8 @@ English reference text, English long-form text, Chinese reference text, and NInf
 
 The default evaluation uses a 4,096-token context and a 2,048-token stride. Use `--context` and
 `--stride` to change that protocol, or score one UTF-8 file with `--text FILE`. The available Main
-KV representations are the server's nine: `bf16`, `int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`,
-`rk2v4-e8`, `nvfp4`, and `k8v4`.
+KV representations are the server's ten: `bf16`, `int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`,
+`rk6v4-e8`, `rk2v4-e8`, `nvfp4`, and `k8v4`.
 
 Seven of them were measured on this corpus with Qwen3.8-27B on an RTX 3090; the results, alongside
 each format's size and decode speed, are in [`docs/config-calculator.html`](config-calculator.html).

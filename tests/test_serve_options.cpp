@@ -322,6 +322,11 @@ int main() {
                       "--kv-dtype rk2v4-e8 did not select rotated E8-root key storage");
     failures += check(kv_help.find("rk2v4-e8") != std::string::npos,
                       "serve help omits --kv-dtype rk2v4-e8");
+    const ServeOptions i6 = parse({"ninfer-serve", "model.ninfer", "--kv-dtype", "rk6v4-e8"});
+    failures += check(i6.kv_cache == ninfer::KvCacheStorage::RotatedInt6KeyInt4ValueE8,
+                      "--kv-dtype rk6v4-e8 did not select rotated K6/V4 E8 storage");
+    failures += check(kv_help.find("rk6v4-e8") != std::string::npos,
+                      "serve help omits --kv-dtype rk6v4-e8");
     const ServeOptions yarn = parse({"ninfer-serve", "model.ninfer", "--rope-yarn"});
     failures += check(yarn.rope_yarn && !defaults.rope_yarn, "--rope-yarn did not select YaRN");
     failures += check(defaults.rope_yarn_factor == 1.0F, "serving YaRN factor must default to 1");

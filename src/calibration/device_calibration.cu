@@ -965,6 +965,8 @@ ops::DeviceRouteProfile calibrate_device_routes(const CalibrationOptions& option
                             "rk4v4");
         calibrate_attention(profile, timer, options, KvCacheStorage::RotatedInt4KeyInt4ValueE8,
                             "rk4v4-e8");
+        calibrate_attention(profile, timer, options, KvCacheStorage::RotatedInt6KeyInt4ValueE8,
+                            "rk6v4-e8");
         calibrate_attention(profile, timer, options, KvCacheStorage::RotatedE8RootKeyInt4Value,
                             "rk2v4-e8");
         calibrate_attention(profile, timer, options, KvCacheStorage::Int8Group64, "int8");

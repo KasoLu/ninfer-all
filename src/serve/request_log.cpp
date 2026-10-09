@@ -145,6 +145,8 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
         return "rotated-lloyd4g64-v4g32";
     case ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueE8:
         return "rotated-k4e8g64-v4g32";
+    case ninfer::KvCacheStorage::RotatedInt6KeyInt4ValueE8:
+        return "rotated-k6e8g64-v4g32";
     case ninfer::KvCacheStorage::RotatedE8RootKeyInt4Value:
         return "rotated-k2e8g64-v4g32";
     case ninfer::KvCacheStorage::Nvfp4Group16:

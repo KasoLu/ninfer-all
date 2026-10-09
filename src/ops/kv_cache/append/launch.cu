@@ -94,6 +94,8 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
             issue.template operator()<true, KvKeyCoding::Lloyd4>();
         } else if (cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
             issue.template operator()<true, KvKeyCoding::Int4E8>();
+        } else if (cache.storage == KvCacheStorage::RotatedInt6KeyInt4ValueE8) {
+            issue.template operator()<true, KvKeyCoding::K6E8>();
         } else if (cache.storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
             issue.template operator()<true, KvKeyCoding::RootE8>();
         } else if (packed_values) {

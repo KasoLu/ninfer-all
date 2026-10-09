@@ -98,6 +98,16 @@ struct KVCacheAppendPrefixExecutionEnvelope {
  * the largest coordinate of u less its projection on the root, with its sign. The exact operation
  * order is ops/kv_cache/e8_root_codec.cuh's; decode yields eight int8 codes times s.
  *
+ * KvCacheStorage::RotatedInt6KeyInt4ValueE8 (rk6v4-e8) is selected by storage as well. Values are
+ * the rk8v4 packed coding. Keys take the same rotation and G64 group as INT8-G64, with
+ * scale_bits = FP16_RNE(a / 31) for the group's absmax a. Each block of eight consecutive rotated
+ * dimensions y = FP32(x) * inv is snapped to the nearest E8 lattice point exactly as rk4v4-e8
+ * (D8 and D8 + 1/2 by squared distance, D8 on ties); the stored key code is
+ * I6(clamp(RNE_even(point), -32, 31)), held as value & 0x3F. Four codes pack into one 24-bit word
+ * (three bytes), code 0 in the low six bits: a 16-dimension block is 12 bytes, a G64 group 48,
+ * and one (token, kv_head) row 192. The coset bit is not stored; decode yields sixteen int8 codes
+ * (code ^ 32) - 32 times s.
+ *
  * V uses represented BF16 source values directly as x under every profile, including rk8v4: values
  * are never rotated, so no inverse preparation is applied to the attention output. For every
  * quantized profile, K is a paired physical representation for causal Attention: its

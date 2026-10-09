@@ -11,6 +11,7 @@ int run_softmax_attention_nvfp4_tests();
 int run_softmax_attention_k8v4_tests();
 int run_softmax_attention_rk4v4_e8_tests();
 int run_softmax_attention_rk2v4_e8_tests();
+int run_softmax_attention_rk6v4_e8_tests();
 int run_softmax_attention_plain_and_packed_tests();
 int run_softmax_attention_context_tests();
 int run_softmax_attention_wide_tests();
@@ -69,9 +70,12 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--rk2v4-e8-only") {
         return run_guarded("rk2v4-e8", run_softmax_attention_rk2v4_e8_tests);
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--rk6v4-e8-only") {
+        return run_guarded("rk6v4-e8", run_softmax_attention_rk6v4_e8_tests);
+    }
     if (argc != 1) {
         std::cerr << "usage: ninfer_softmax_attention_test "
-                     "[--dflash2-only|--nvfp4-only|--k8v4-only|--rk4v4-e8-only|--rk2v4-e8-only|"
+                     "[--dflash2-only|--nvfp4-only|--k8v4-only|--rk4v4-e8-only|--rk6v4-e8-only|--rk2v4-e8-only|"
                      "--int8-prompt-only|--pack-gqa-only|--wide-only|--parallel-tiles-only]\n";
         return 2;
     }

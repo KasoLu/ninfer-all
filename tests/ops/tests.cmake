@@ -69,6 +69,8 @@ add_test(NAME ninfer_softmax_attention_rk4v4_e8_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --rk4v4-e8-only)
 add_test(NAME ninfer_softmax_attention_rk2v4_e8_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --rk2v4-e8-only)
+add_test(NAME ninfer_softmax_attention_rk6v4_e8_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --rk6v4-e8-only)
 
 # Upstream's DFlash2 verification sweep. ~460 s: six storage families (five upstream, plus this
 # fork's rk8v4) over every narrow width, batch and base offset, so it gets a timeout well clear of
@@ -86,6 +88,7 @@ set_tests_properties(
   ninfer_softmax_attention_k8v4_test
   ninfer_softmax_attention_rk4v4_e8_test
   ninfer_softmax_attention_rk2v4_e8_test
+  ninfer_softmax_attention_rk6v4_e8_test
   ninfer_softmax_attention_dflash2_test
   ninfer_softmax_attention_int8_prompt_test
   ninfer_softmax_attention_pack_gqa_test
@@ -141,6 +144,16 @@ ninfer_add_op_test(ninfer_sparse_moe_route_network_test
 ninfer_add_op_test(ninfer_e8_root_decode_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_e8_root_decode.cu"
   LIBRARIES ninfer_ops)
+
+# Production i6 pack/unpack round-trip gate: the production kv_cache_pack_i6_quad and
+# kv_cache_unpack_i6x16 must invert each other over every code value at every position of the
+# 16-dim block plus a randomized sweep (the 2026-09 4090-repo high-byte bug slipped past its own
+# cosine bench, which decoded with reference arithmetic).
+ninfer_add_op_test(ninfer_i6_roundtrip_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_i6_roundtrip.cu"
+  LIBRARIES ninfer_ops)
+
+set_tests_properties(ninfer_i6_roundtrip_test PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_op_test(ninfer_mtp_pack_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_pack.cpp"
