@@ -172,3 +172,19 @@
      单针 haystack 实际深度回到 ~162K token（含 10% safety），逼近 200K 容量档。
 - KV 质量未被此次首跑证伪也未被证实：四份日志的思考前缀都在正确复述题目
   （说明长 prompt 被完整读取），但答案判定要等修复后重跑。
+
+## master 合入 main（2026-03-03，合并提交 54138b41）
+
+- master 前进了 97 个提交：Gemma 4 模型家族（QAT GGUF 直载、assistant MTP、vision、
+  全 KV 格式 + host 层）、结构化输出性能（重叠 mask、自动投机）、Flash-Next
+  span/Q8_0/lookup 起草/自适应 MTP、引擎调度（decode rounds 与 prefill 成比例、
+  --host-cache-mib auto、/metrics 计数器、构建版本）、MSVC 构建恢复、CI 改进、
+  文档大清理。master 上**没有** rk6v4-e8（PR #14 是 Flash-Next offload，与此无关）。
+- 冲突仅 2 处且都是文本并集：docs/cli.md 的 --kv-dtype 行（我们的 10 格式清单 +
+  master 的 Gemma 4 注解，合并为 10 格式 + 注解）、tests/ops/tests.cmake 同位置
+  各自新增的测试块（i6_roundtrip 与 fixed_point，两段都保留）。
+- 验证（无 N 卡开发机，libcuda 桩 + LD_PRELOAD，sm_89 显式配置）：构建 609 单元
+  全绿；ctest 318 个测试 315 通过，3 个失败均为合并前已存在的环境问题
+  （chat_templates 缺 jinja2；peer_copy_order 与 expert_cache_visibility 自带
+  LD_PRELOAD 覆盖桩且需 GPU）。rk6v4-e8 门禁（i6_roundtrip/kv_cache_append）
+  在本机跳过，4090 上合并前已全绿，合并未触及 codec 文件。
