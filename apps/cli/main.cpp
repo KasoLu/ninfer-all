@@ -300,6 +300,18 @@ void print_generation_summary(const ninfer::GenerationResult& result,
         print_metric("ngram read per pass", pass.str());
         print_metric("ngram stalls", stall.str());
     }
+    const ninfer::ExpertResidencyStats& experts = stats.experts;
+    if (experts.routes != 0) {
+        std::ostringstream moved;
+        moved << std::fixed << std::setprecision(1) << double(experts.transferred_bytes) / 1048576.0
+              << " MiB, " << experts.admitted << " admitted";
+        print_metric("expert slots", std::to_string(experts.slots));
+        print_metric("expert hits", format_percent(experts.hits, experts.routes));
+        if (experts.cpu_routes != 0) {
+            print_metric("expert CPU routes", format_percent(experts.cpu_routes, experts.routes));
+        }
+        print_metric("expert transfers", moved.str());
+    }
 }
 
 } // namespace
@@ -312,6 +324,10 @@ int main(int argc, char** argv) {
         std::cerr << "error: " << error.what() << '\n';
         std::cerr << ninfer::cli::usage_text(argv[0]);
         return 1;
+    }
+    if (cli.version_requested) {
+        std::cout << "ninfer " << NINFER_VERSION << '+' << NINFER_BUILD_ID << '\n';
+        return 0;
     }
     if (cli.help_requested) {
         std::cout << ninfer::cli::usage_text(argv[0]);

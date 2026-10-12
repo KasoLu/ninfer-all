@@ -4,12 +4,12 @@
 `.ninfer` artifact. Build NInfer or pull the image, and download an artifact, as the
 [project README](../README.md) describes before following this guide.
 
-The examples use the Qwen3.8-27B NVFP4 artifact with INT8 KV storage.
+The examples use the official Qwen3.8-27B `groupwise-int` artifact with INT8 KV storage.
 
 ## Text input
 
 ```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/ninfer models/qwen3_8_27b.ninfer \
   --prompt "Summarize the difference between prefill and decode." \
   --max-context 32768 \
   --max-new 8192 \
@@ -27,7 +27,7 @@ written to stderr, so stdout can be redirected independently. FFmpeg's media-dec
 records prefixed `media |`: FFmpeg errors are warnings and everything milder is `debug`.
 
 ```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/ninfer models/qwen3_8_27b.ninfer \
   --prompt "Return one sentence." \
   --max-context 4096 \
   --max-new 64 \
@@ -75,7 +75,7 @@ For example, this allows at most 512 model-origin thinking tokens while retainin
 output capacity for the inserted suffix and the answer:
 
 ```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/ninfer models/qwen3_8_27b.ninfer \
   --prompt "Explain speculative decoding, then give a concise conclusion." \
   --max-context 4096 \
   --max-new 1024 \
@@ -92,7 +92,8 @@ GPU residency is frozen when the Engine starts:
 - no `--spec` omits MTP/DFlash/DFlash2 weights and state and the optimized proposal head;
 - `--spec mtp`, `--spec dflash` (35B-A3B), and `--spec dflash2` (Qwen3.8-27B) load only
   the selected speculative backend;
-- a speculative backend with the full proposal head omits the optimized proposal head;
+- a speculative backend loads the artifact's optimized proposal head when it stores one, unless
+  `--full-draft-head` keeps the drafts on the full output head and omits it;
 - Vision is disabled by default, omitting its weights and Vision-specific unified-workspace extent;
 - `--vision` loads the weights, expands the one Program workspace for Vision encode/handoff, and
   enables image/video input.
@@ -135,7 +136,7 @@ and an optional `tools` array.
 Run message files from the repository root when they contain repository-relative media paths:
 
 ```bash
-./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/ninfer models/qwen3_8_27b.ninfer \
   --messages examples/cli/messages/image_chart.json \
   --max-context 8192 \
   --max-new 128 \
@@ -167,9 +168,12 @@ long-decode, and long-context inputs.
 ## Speculative decoding
 
 Speculative decoding is disabled by default. Select MTP, the 35B-A3B DFlash or the Qwen3.8-27B
-DFlash2 backend with one to fifteen draft positions. Only one backend can be enabled per Engine, and
-`--lm-head-draft` selects the optimized proposal head and requires a selected backend. Both
-masked-draft backends may be combined with `--vision`:
+DFlash2 backend with one to fifteen draft positions. Only one backend can be enabled per Engine.
+Drafts go through the artifact's optimized proposal head when it stores one: a vocabulary shortlist
+(131,072 rows of the 27B's 248,320) that is cheaper to project at every draft step, for the memory
+of that matrix (0.3 GiB with the 27B GSQ-RCO IQ3_S artifact). `--lm-head-draft` requires the
+proposal head and `--full-draft-head` keeps the full output head; both need a selected backend.
+Both masked-draft backends may be combined with `--vision`:
 
 ```bash
 ./build/apps/ninfer models/qwen3_6_35b_a3b.ninfer \
@@ -199,6 +203,14 @@ penalties, and prefix reuse. An artifact without the companion weights reports a
 component when selected. Vision, MTP and DFlash follow the same rule: their weights are required
 only when that component is enabled at startup.
 
+A request that samples (temperature above zero) verifies MTP and DFlash drafts with coupled
+draws: the model draws each verified position with the request's seed and that position as the key,
+exactly as plain decoding does, and keeps a draft only while it equals that draw. Every emitted
+token is the model's own sample; the drafts decide only how many tokens one pass emits, not which.
+What can still separate a speculative answer from a plain one with the same seed is the
+floating-point effect of the verification width, as for greedy decoding. DFlash2 verifies its
+retained proposal distribution by rejection sampling.
+
 ### Choosing a draft count
 
 The draft count is a trade on what the output looks like. Each round verifies K+1 columns and runs
@@ -212,13 +224,14 @@ guessing right.
   MTP there, because the head already copies.
 - **DFlash2:** seven is the checkpoint recommendation and the best mean on this card. The best K
   still depends on the workload, so a deployment serving one kind of work should sweep its own.
-  `--lm-head-draft` is within noise of unset for DFlash2 at every count and can be left off.
+  The optimized proposal head is within noise of the full head for DFlash2 at every count, so
+  `--full-draft-head` can save its memory there.
 - **DFlash:** seven forms the measured block length eight; fifteen uses the maximum supported block
   length sixteen.
 
-The tables and sweeps are in [performance](performance.md#choosing-the-draft-count-rtx-3090-qwen38-27b).
-The published [performance results](performance.md) use MTP with three draft tokens and DFlash with
-seven, both with the optimized proposal head.
+The tables are in [performance](performance.md#mtp-draft-count-by-content); the
+[reference measurements](performance/reference-2026-09.md#draft-length) sweep one to fifteen drafts
+of both MTP and DFlash2 on four cards.
 
 ## Common options
 
@@ -236,15 +249,16 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
-| `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see [pipeline stages](maintainer/pipeline-parallel-plan.md)); on the Qwen3.5 family MTP, DFlash and DFlash2 run across the stages and Vision is refused; overrides `--device` | none |
+| `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see [pipeline stages](maintainer/pipeline-stages.md)); on the Qwen3.5 family MTP, DFlash, DFlash2 and resident or CPU Vision run across the stages (the Vision tower stays on the first device; `--vision-residency overlay` is refused); overrides `--device` | none |
 | `--stage-layers A,B,...` | layers per stage, in `--devices` order; omitted means a split chosen from each device's free memory | memory-balanced |
 | `--expert-residency device\|host\|disk` | Qwen3.8-Flash-Next: routed expert banks in GPU memory, in pinned host memory read across the bus, or left in the artifact's files and streamed into the device expert cache (see [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#run)) | `device` |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; `0` turns the host-mode cache off, and disk mode needs one | `auto` (what is free after startup) |
-| `--expert-dma-share F` | native host experts: fraction of distinct decode/verify cache misses copied to the GPU, `0..1`; values below `1` enable experimental CPU mixing; prefill uses the GPU | `1` |
-| `--expert-cpu-threads N` | native host experts: `1..256` CPU workers | logical thread count capped at 16 |
-| `--expert-cache-adaptive` | replace cold native experts between calls; changes the CPU/GPU arithmetic partition | off |
-| `--expert-profile PATH` | fill the native expert cache from counts for the same artifact and bank geometry | none |
-| `--expert-profile-out PATH` | record native expert counts after requests | none |
+| `--expert-misses staged\|mapped` | GGUF host experts: copy each missing expert into a device cache slot while the cached experts run (`staged`), or let the expert kernels read the missing ones across the bus (`mapped`) | `staged` |
+| `--expert-dma-share F` | host or disk experts: the GPU's share of a call's cache misses, `0..1`; below `1` the CPU computes the rest, an experimental mode; prefill always uses the GPU | `1` |
+| `--expert-cpu-threads N` | host experts with a CPU share: `1..256` CPU workers | automatic, at most 16 |
+| `--expert-cache-adaptive` | replace cold cached experts between calls; changes the CPU/GPU arithmetic partition | off |
+| `--expert-profile PATH` | fill the host expert cache from counts recorded for the same artifact and bank geometry | none |
+| `--expert-profile-out PATH` | record expert counts for this artifact after requests | none |
 | `--ngram-table PATH` | Qwen3.8-Flash-Next: the n-gram table artifact of a model published without its table | the model's own table |
 | `--ngram-residency disk\|ram\|ram-hot` | Qwen3.8-Flash-Next: where the n-gram rows come from: the table's file, 16 rows per token; all of the table in RAM; or the rows a hot-row profile ranks first in RAM and the rest from the file (see [the n-gram rows](qwen3-8-flash-next.md#the-n-gram-rows)) | `disk` |
 | `--ngram-io buffered\|direct\|mmap` | Qwen3.8-Flash-Next: how rows are read from the file: through the OS page cache, past it, or out of a mapping | `buffered` |
@@ -253,16 +267,17 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--ngram-ram-mib N` | `disk`: budget for cached rows and their index (`0` disables); `ram-hot`: budget for the profile's resident rows and index | `0` for disk; `4096` for ram-hot |
 | `--ngram-lock` | `ram`, `ram-hot`: lock the resident rows in physical memory (`mlock`, `VirtualLock`) | off |
 | `--no-ngram-table` | Qwen3.8-Flash-Next: run without the n-gram table, a non-standard experimental mode (the Q2_0 release's WikiText-2 perplexity rises from 2.66 to 5.01) | off |
-| `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk6v4-e8\|rk2v4-e8\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys, `rk6v4-e8` opt-in E8-lattice 6-bit keys and `rk2v4-e8` opt-in E8 root-code keys; all ten are accepted on every build target (see [Context and memory](#context-and-memory)); for Qwen3.8-Flash-Next it is the storage of the sparse-attention layers' KV | `bf16` |
-| `--spec mtp\|dflash\|dflash2` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)) | off |
-| `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
+| `--kv-dtype bf16\|int8\|fp8\|rk8v4\|rk4v4\|rk4v4-e8\|rk6v4-e8\|rk2v4-e8\|nvfp4\|k8v4` | KV-cache storage. `rk8v4` is opt-in RotorQuant, `rk4v4` opt-in Lloyd-Max 4-bit keys, `rk4v4-e8` opt-in E8-lattice INT4 keys, `rk6v4-e8` opt-in E8-lattice 6-bit keys and `rk2v4-e8` opt-in E8 root-code keys; all ten are accepted on every build target (see [Context and memory](#context-and-memory)); for Qwen3.8-Flash-Next it is the storage of the sparse-attention layers' KV; for Gemma 4 the sliding-window blocks' K and V, with the full-attention blocks' one value plane in an unrotated coding (see [Gemma 4](gemma4.md#kv-cache-formats)) | `bf16` |
+| `--spec mtp\|dflash\|dflash2` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)), Gemma 4 from one converted with its assistant (see [Gemma 4](gemma4.md#speculative-decoding-with-the-assistant)) | off |
+| `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2; `1..7` for Gemma 4's assistant | unset |
 | `--draft-min-p P` | Flash-Next MTP only: verify through the first draft at or below this absolute probability; the full draft chain still runs; see [MTP](qwen3-8-flash-next.md#mtp-speculative-decoding) | `0` (off) |
-| `--lm-head-draft` | optimized proposal head | off |
+| `--lm-head-draft` | require the optimized proposal head | used when the artifact stores it |
+| `--full-draft-head` | draft through the full output head even when the artifact stores a proposal head | off |
 | `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query, verification keeps full attention (see [serving](serving.md#mtp-attention-window)) | `0` (whole history) |
 | `--lookup-ngram N` | context-lookup drafting alongside `--spec`: the last `N` tokens are matched against the sequence so far and what followed is proposed; exact, since verification rejects a wrong guess | `0` (off) |
 | `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
 | `--ngram-min-match N` | shortest match a copy is drawn from, `4..64` | `12` |
-| `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
+| `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [quality trades](maintainer/quality-trade-experiments.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
 | `--lm-head-q4`, `--lm-head-q6` | store the output head as Q4 or Q6 while loading | off |
 | `--embedding-q4`, `--embedding-q6` | store the token embedding as Q4 or Q6 while loading | off |
@@ -271,9 +286,9 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--mlp-a8-decode` | integer-activation MLP gate_up at decode and verify widths | off |
 | `--no-prefill-a8` | return full prefill tiles to their A16 routes, which is how the integer routes are measured on a whole request | integer routes |
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
-| `--vision-residency resident\|overlay\|cpu` | `overlay` keeps the Vision tower host-pinned and borrows device memory per image from the evictable text weight tail (no resident Vision cost; needs CUDA VMM). `--vision-offload on\|off` is accepted as an alias for `overlay\|resident`. `cpu` encodes on CPU threads from host FP32 weights, with no device Vision memory and `--vision-max-merged` capped at 256 unless given | `resident` |
+| `--vision-residency resident\|overlay\|cpu` | `overlay` keeps the Vision tower host-pinned and borrows device memory per image from the evictable text weight tail (no resident Vision cost; needs CUDA VMM); for Gemma 4 the tower's blocks stay pinned and stream through a two-block device window. `--vision-offload on\|off` is accepted as an alias for `overlay\|resident`. `cpu` encodes on CPU threads from host FP32 weights, with no device Vision memory and `--vision-max-merged` capped at 256 unless given. Qwen3.8-Flash-Next keeps its tower resident | `resident` |
 | `--vision-cpu` | `--vision` with `--vision-residency cpu` | off |
-| `--vision-max-merged N` | merged-token budget of one media item; larger media downscales at preprocessing | 16384 |
+| `--vision-max-merged N` | merged-token budget of one media item; larger media downscales at preprocessing. Gemma 4: the most soft tokens an image or video frame may take, rounded down to its budgets 70, 140, 280, 560, 1120 (an image takes 280, 70 with `detail: low` and this bound with `detail: high`; a video frame 70) | 16384 |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--wddm-evictable-budget` | Windows builds with `-DNINFER_D3D12_RESIDENCY=ON`: budget against dedicated memory, holding the device arenas resident | off |
 | `--chat-template FILE` | use a local Jinja template | artifact template |
@@ -327,7 +342,7 @@ waiting thread sleep; the decode performance cost depends on the host. `yield` y
 while waiting.
 
 ```bash
-NINFER_CUDA_SYNC=blocking ./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer --prompt "Hello"
+NINFER_CUDA_SYNC=blocking ./build/apps/ninfer models/qwen3_8_27b.ninfer --prompt "Hello"
 ```
 
 The Engine-ready log reports the selected mode. Empty or unrecognized values, or failure to apply
@@ -344,7 +359,8 @@ KV format. The artifact describes its model configuration and weight representat
 `int8`, `fp8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk6v4-e8`, `rk2v4-e8`, `k8v4`, `nvfp4` — are accepted on every
 build target: the Blackwell-only `mma.sync...kind::f8f6f4` restriction applies to FP8/NVFP4
 *weights and activations*, not to KV storage. Measured size, decode speed and perplexity of seven of
-them on an RTX 3090 are in [`docs/config-calculator.html`](config-calculator.html).
+them on an RTX 3090 are in [performance](performance.md#kv-formats-on-qwen38-27b) and the
+[configuration calculator](config-calculator.html).
 
 `rk8v4` is the best all-round choice: rotated INT8 keys with a packed signed int4 value plane,
 about 23% smaller than INT8 for about 0.082% perplexity, and the flattest decode curve of any

@@ -363,6 +363,9 @@ int writer_fixture(const std::filesystem::path& path, const std::filesystem::pat
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--check-cuda") {
+            return ninfer::test::cuda_unavailable() ? 77 : 0;
+        }
         if (argc == 4 && std::string(argv[1]) == "--writer-fixture") {
             return writer_fixture(argv[2], argv[3]);
         }

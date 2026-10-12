@@ -21,6 +21,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -47,6 +48,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
+        Tensor sample_positions   = ordinary.sample_positions.slice(0, 0, batch_size);
         Tensor rope_positions     = ordinary.rope_positions.slice(0, 0, batch_size);
         Tensor kv_rows            = ordinary.text_kv_table_rows.slice(0, 0, batch_size);
         Tensor state_sources      = ordinary.state_source_slots.slice(0, 0, batch_size);
@@ -59,12 +61,16 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                                    state_destinations, envelope, hidden, logits);
         ops::scatter(hidden, state_destinations, state.continuation_hidden_store,
                      state.execution.device.stream);
+        // The structured lanes' masks, computed while the forward pass ran.
+        if (state.execution.io.structured != nullptr) {
+            state.execution.io.structured->wait(state.execution.device.stream);
+        }
         // Before sampling adds the round's tokens to the penalty counts.
         gather_logprobs(state.execution, logits.view({logits.ne[0], 1, batch_size}),
                         ordinary.sampling, nullptr);
         ops::sample(logits, sampled,
                     dimension(state.execution.parameters.model.resources().public_token_count),
-                    ordinary.sampling, cache_positions, ops::kSamplePurposeDecode,
+                    ordinary.sampling, sample_positions, ops::kSamplePurposeDecode,
                     state.execution.work, state.execution.device.stream);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
                                    sizeof(qwen3_5::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
@@ -177,8 +183,10 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
     if (request.grammar) {
         request.sampling_host.token_mask        = structured_round->device_mask(sequence.lane);
         request.sampling_host.token_mask_stride = structured_round->stride();
-        structured_round->fill(sequence.lane, *request.grammar, {}, device.stream);
+        structured_round->fill(sequence.lane, *request.grammar, device.stream);
     }
+    request.mask_cost = {};
+    request.next_mask.reset();
     request.speculative_stats = SpeculativeStats{
         .backend               = speculative_backend,
         .enabled               = speculative_backend != SpeculativeBackend::None,
@@ -431,6 +439,65 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
                                      {minimum_count, maximum_count});
 }
 
+std::uint32_t ProgramImpl::speculative_extent(const RequestControl& request) noexcept {
+    return request.grammar && !request.mask_cost.speculates()
+               ? 0U
+               : std::numeric_limits<std::uint32_t>::max();
+}
+
+StructuredReadiness ProgramImpl::structured_readiness(SequenceHandle handle) {
+    if (!structured_round || !valid_sequence(handle)) { return {}; }
+    const std::uint32_t lane = ContractAccess::lane(handle).value;
+    RequestControl& request  = requests[lane];
+    if (!request.grammar || request.mask_cost.speculates()) {
+        request.next_mask.reset();
+        return {};
+    }
+    // The grammar moves on only when the Engine commits tokens, which advances the ledger: a job
+    // started at another frontier is for another position.
+    const std::uint32_t frontier = active_sequence(lane).ledger_frontier;
+    if (request.next_mask && request.next_mask_frontier != frontier) { request.next_mask.reset(); }
+    if (!request.next_mask) {
+        request.next_mask = runtime::GrammarMaskJob::start(
+            *request.grammar, static_cast<std::size_t>(structured_round->stride()));
+        request.next_mask_frontier = frontier;
+        request.next_mask_started  = Clock::now();
+    }
+    if (!request.next_mask->ready()) {
+        const double waited =
+            std::chrono::duration<double>(Clock::now() - request.next_mask_started).count();
+        if (waited > runtime::kGrammarMaskBudgetSeconds) {
+            return {.ready   = false,
+                    .failure = "the grammar mask took over " +
+                               std::to_string(runtime::kGrammarMaskBudgetSeconds) + " s"};
+        }
+        return {.ready = false};
+    }
+    std::string problem = runtime::grammar_mask_problem(*request.next_mask);
+    if (!problem.empty()) { return {.ready = false, .failure = std::move(problem)}; }
+    return {};
+}
+
+std::shared_ptr<runtime::GrammarMaskJob>
+ProgramImpl::take_next_mask(RequestControl& request, const SequenceState& sequence,
+                            std::uint32_t extent) {
+    if (extent != 0 || !request.next_mask || !request.next_mask->ready() ||
+        request.next_mask_frontier != sequence.ledger_frontier) {
+        request.next_mask.reset();
+        return nullptr;
+    }
+    return std::exchange(request.next_mask, nullptr);
+}
+
+void ProgramImpl::observe_masks(std::span<const std::uint32_t> lanes) {
+    if (!structured_round) { return; }
+    structured_round->check();
+    for (const std::uint32_t lane : lanes) {
+        RequestControl& request = requests[lane];
+        if (request.grammar) { request.mask_cost.observe(structured_round->seconds(lane)); }
+    }
+}
+
 void ProgramImpl::validate_licensed_tokens(std::span<const TokenId> tokens) const {
     for (const TokenId token : tokens) {
         if (token < 0 || token >= dimension(parameters.model.resources().public_token_count)) {
@@ -492,13 +559,16 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         }
 
         bool logprobs = false;
+        if (structured_round) { structured_round->begin(); }
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence            = active_sequence(lanes[row]);
-            const RequestControl& request      = requests[lanes[row]];
+            RequestControl& request            = requests[lanes[row]];
             const std::uint32_t frontier       = sequence.execution_frontier;
             ordinary_host_ingress->tokens[row] = sequence.ledger.back();
             ordinary_host_ingress->cache_positions[row] =
                 checked_i32(frontier, "ordinary batch position");
+            ordinary_host_ingress->sample_positions[row] =
+                checked_i32(frontier + 1U, "ordinary batch sample position");
             ordinary_host_ingress->rope_positions[row] =
                 checked_i32(frontier, "ordinary batch RoPE position") + sequence.rope_delta;
             ordinary_host_ingress->text_kv_table_rows[row] =
@@ -508,11 +578,16 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
             if (request.grammar) {
-                structured_round->fill(sequence.lane, *request.grammar, {}, device.stream);
+                if (auto ready = take_next_mask(request, sequence, 0)) {
+                    structured_round->adopt(sequence.lane, std::move(ready));
+                } else {
+                    structured_round->start(sequence.lane, *request.grammar, {});
+                }
             }
             logprobs = logprobs || request.logprobs;
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
         }
+        if (structured_round) { structured_round->publish(); }
         arm_logprobs(logprobs);
 
         execution::OrdinaryBatchContext schedule_state{
@@ -537,6 +612,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         }
+        observe_masks(lanes);
         timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
@@ -678,7 +754,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         bool logprobs = false;
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             SequenceState& sequence           = active_sequence(lanes[row]);
-            const RequestControl& request     = requests[lanes[row]];
+            RequestControl& request           = requests[lanes[row]];
             const std::uint32_t frontier      = sequence.execution_frontier;
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
@@ -688,7 +764,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t extent        = std::min(
                 {row_copy ? static_cast<std::uint32_t>(match.tokens.size())
                           : sequence.mtp_draft_count,
-                 verify_window, max_by_budget, capacity - sequence.execution_frontier - 1});
+                 verify_window, max_by_budget, capacity - sequence.execution_frontier - 1,
+                 speculative_extent(request)});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
@@ -716,14 +793,18 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->sampling[row]                = request.sampling_host;
             logprobs = logprobs || request.logprobs;
             if (request.grammar) {
-                structured_round->fill(
-                    sequence.lane, *request.grammar,
-                    {mtp_host_ingress->current_drafts.data() + row * verify_window, extent},
-                    device.stream);
+                if (auto ready = take_next_mask(request, sequence, extent)) {
+                    structured_round->adopt(sequence.lane, std::move(ready));
+                } else {
+                    structured_round->start(
+                        sequence.lane, *request.grammar,
+                        {mtp_host_ingress->current_drafts.data() + row * verify_window, extent});
+                }
             }
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + draft_window));
         }
+        if (structured_round) { structured_round->publish(); }
 
         arm_logprobs(logprobs);
         qwen3_5::MtpDecodeState frame = io.mtp_decode->verification_view(verify_window);
@@ -750,6 +831,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         }
+        observe_masks(lanes);
         timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
@@ -921,7 +1003,8 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                            ? static_cast<std::uint32_t>(matches[row].tokens.size())
                                            : (drafter_runs ? draft_window : 0U);
         const std::uint32_t extent =
-            std::min({proposed, max_by_budget, capacity - sequence.execution_frontier - 1U});
+            std::min({proposed, max_by_budget, capacity - sequence.execution_frontier - 1U,
+                      speculative_extent(request)});
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
         maximum_target_tokens =
             std::max(maximum_target_tokens, sequence.execution_frontier + extent + 1U);
@@ -961,8 +1044,8 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 !matches[row].tokens.empty()
                     ? static_cast<std::uint32_t>(matches[row].tokens.size())
                     : (drafter_runs ? draft_window : 0U);
-            const std::uint32_t extent =
-                std::min({proposed, max_by_budget, capacity - frontier - 1U});
+            const std::uint32_t extent = std::min(
+                {proposed, max_by_budget, capacity - frontier - 1U, speculative_extent(request)});
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(frontier, "DFlash batch frontier");
@@ -993,11 +1076,19 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         arm_logprobs(logprobs);
 
         if (structured_round) {
-            structured_round->begin_dflash();
+            structured_round->begin();
             for (std::size_t row = 0; row < lanes.size(); ++row) {
-                structured_round->set_dflash_row(row, lanes[row],
-                                                 dflash_host_ingress->proposal_extents[row],
-                                                 requests[lanes[row]].grammar);
+                RequestControl& request     = requests[lanes[row]];
+                const std::uint32_t extent  = static_cast<std::uint32_t>(
+                    dflash_host_ingress->proposal_extents[row]);
+                auto ready = request.grammar
+                                 ? take_next_mask(request, active_sequence(lanes[row]), extent)
+                                 : nullptr;
+                // A lane whose mask was computed ahead hands it over; the round starts no job
+                // for it.
+                structured_round->set_dflash_row(row, lanes[row], extent,
+                                                 ready ? nullptr : request.grammar);
+                if (ready) { structured_round->adopt(lanes[row], std::move(ready)); }
             }
         }
         execution::DFlashBatchContext schedule_state{
@@ -1025,7 +1116,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         }
-        if (structured_round) { structured_round->check(); }
+        observe_masks(lanes);
         timing.end_wait();
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();

@@ -6,8 +6,11 @@
 namespace ninfer::models::qwen3_5::frontend {
 namespace {
 
-constexpr std::string_view kStart       = "<|im_start|>";
-constexpr std::string_view kEnd         = "<|im_end|>";
+constexpr std::string_view kQwenStart   = "<|im_start|>";
+constexpr std::string_view kQwenEnd     = "<|im_end|>";
+// Gemma 4's turns: <|turn>role\n ... <turn|>, the assistant's role named "model".
+constexpr std::string_view kGemmaStart  = "<|turn>";
+constexpr std::string_view kGemmaEnd    = "<turn|>";
 constexpr std::string_view kVisionStart = "<|vision_start|>";
 constexpr std::string_view kVisionEnd   = "<|vision_end|>";
 
@@ -55,12 +58,17 @@ PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
                                    std::span<const Modality> media) {
     PromptLayout result;
     const std::string_view source = output.text;
+    const bool gemma =
+        find_marker(output, kQwenStart, 0) == std::string::npos &&
+        find_marker(output, kGemmaStart, 0) != std::string::npos;
+    const std::string_view kStart = gemma ? kGemmaStart : kQwenStart;
+    const std::string_view kEnd   = gemma ? kGemmaEnd : kQwenEnd;
     for (auto pos = find_marker(output, kStart, 0); pos != std::string::npos;) {
         const auto header_end = source.find('\n', pos + kStart.size());
         if (header_end == std::string::npos) break;
         const auto role = source.substr(pos + kStart.size(), header_end - pos - kStart.size());
         ChatRole parsed;
-        if (role == "assistant")
+        if (role == "assistant" || (gemma && role == "model"))
             parsed = ChatRole::Assistant;
         else if (role == "user")
             parsed = ChatRole::User;
@@ -113,6 +121,29 @@ PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
         pos = next;
     }
 
+    // Gemma 4's template writes one <|image|> or <|video|> per media input, in input order; the
+    // processor adds the begin and end markers around the soft tokens it expands it into.
+    if (gemma) {
+        for (std::size_t pos = 0; pos < source.size();) {
+            const auto image = find_marker(output, "<|image|>", pos);
+            const auto video = find_marker(output, "<|video|>", pos);
+            const auto pad   = std::min(image, video);
+            if (pad == std::string::npos) break;
+            const auto modality = pad == image ? Modality::Image : Modality::Video;
+            constexpr std::size_t size = 9; // <|image|> and <|video|>
+            const auto index       = result.media_placeholders.size();
+            if (index >= media.size() || media[index] != modality) {
+                throw std::invalid_argument(
+                    "chat template media placeholders must match input count, type and order");
+            }
+            result.media_placeholders.push_back({{pad, pad + size}, modality, index});
+            pos = pad + size;
+        }
+        if (result.media_placeholders.size() != media.size()) {
+            throw std::invalid_argument("chat template omitted an input media placeholder");
+        }
+        return result;
+    }
     // Each media input contributes one complete Qwen placeholder in input order.
     for (std::size_t pos = 0; pos < source.size();) {
         const auto image = find_marker(output, "<|image_pad|>", pos);

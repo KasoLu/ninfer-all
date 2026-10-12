@@ -20,6 +20,10 @@ inline constexpr std::size_t kDefaultResponseStoreBytes   = 256ULL << 20;
 
 struct ServeOptions {
     bool help_requested = false;
+    bool version_requested = false;
+    // `<VERSION>+<build id>` of this binary, set by ninfer-serve from its build stamp (not a flag):
+    // GET /health, the X-NInfer-Version header, /props build_info and the server_start record.
+    std::string build_version;
     std::string artifact_path;
     std::filesystem::path chat_template_path;
     std::string host = "127.0.0.1";
@@ -45,6 +49,7 @@ struct ServeOptions {
     // callers before they were ever admitted.
     std::uint32_t pending_timeout_ms   = 600000;
     std::uint32_t prefill_chunk        = 1024;
+    std::uint32_t decode_rounds_per_prefill = 0;
     bool fast_prefill_kernel           = false;
     std::filesystem::path context_cost_presets;
     std::string device_profile = "auto";
@@ -123,6 +128,9 @@ struct ServeOptions {
     // --lenient-assistant-history: Responses input whose assistant content or reasoning follows
     // function_call Items joins that run's turn instead of failing with invalid_assistant_history.
     bool lenient_assistant_history = false;
+    // --lenient-image-detail: an OpenAI image detail other than auto, low or high is read as auto
+    // instead of failing with image_detail_not_supported.
+    bool lenient_image_detail = false;
     // Directory for /slots session files; empty disables slot save/restore.
     std::filesystem::path slot_save_path;
     // Spill an involuntarily evicted session back to the slot file it was last saved to or
@@ -191,7 +199,8 @@ struct ServeOptions {
     return RequestLimits{.default_max_tokens        = options.default_max_tokens,
                          .max_context               = static_cast<int>(options.max_context),
                          .assistant_prefill         = options.assistant_prefill,
-                         .lenient_assistant_history = options.lenient_assistant_history};
+                         .lenient_assistant_history = options.lenient_assistant_history,
+                         .lenient_image_detail      = options.lenient_image_detail};
 }
 
 ServeOptions parse_serve_options(int argc, char** argv);

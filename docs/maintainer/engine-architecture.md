@@ -383,12 +383,16 @@ FIFO head 暂时受 active incumbents 阻塞时，Scheduler 记录 protected hea
 Scheduler 保证：
 
 - staged prefill 按 lane 持有；prefill unit 每次 worker boundary 只推进一个 lane 的一个
-  chunk，lane 在其 staged prefill 完成、settle 或 cancel 时从集合中清除。默认情况下 staged
-  prefill 期间不进行 admission，因此同时最多一个 staged-prefill request；启用
+  chunk（剩余 prompt 最短的可运行 lane；被跳过 `kPrefillMaxSkip` 次的 lane 优先），lane 在其
+  staged prefill 完成、settle 或 cancel 时从集合中清除。默认情况下 staged prefill 期间不进行
+  admission，因此同时最多一个 staged-prefill request；启用
   `concurrent_prefill`（`--concurrent-prefill`）后，由于 prefill 不持有 resource transaction，
   admission 可以在其它 request prefill 期间进行（仍受 open global topology transition 与 decode
   连续性的门控），多个 request 可以同时处于 staged-prefill 状态；
-- 已有 decode work 不会被连续 prefill 饿死；
+- 已有 decode work 不会被连续 prefill 饿死：只要有 decode work，每个 prefill unit 之前先运行
+  `decode_rounds_per_prefill` 个 decode（或 control）unit（按该 unit 的 token 数相对一个 chunk
+  成比例，至少一个；`0` 为 `prefill_chunk / 64`，`1` 为严格交替），短 prompt 因此一轮之后即可
+  prefill；
 - decode round 包含所有且仅包含当前 decode-ready requests；
 - batch 使用精确 `B`，不以 inactive lane padding 到 `max_concurrency`。
 
@@ -580,7 +584,7 @@ live KV 与 State 的 lane；未启用时每个 prefill unit 只多一次 relaxe
   可承载页数的最小值。产物为许多 Use 只存一份的 auxiliary（输入列 gather、Hadamard 符号向量）只物化在
   rank 0；Model 为每个读取它的其他 rank 保留一份副本（`AuxiliaryReplicas`，两个模型族共用），Use 读取
   权重所在设备上的那一份，因此没有 P2P 的设备之间也不会跨卡访存。设计与限制见
-  [pipeline-parallel-plan.md](pipeline-parallel-plan.md)。
+  [pipeline-stages.md](pipeline-stages.md)。
 
 容量查询消费与执行同源的逐层参数和 Use。Allocation scope 同时用于布局计算与实际执行；
 顺序互斥的 scratch 取峰值，跨阶段仍活跃的数据计入完整存活期。Vision handoff 保留至 Text
@@ -681,12 +685,22 @@ commits forced thinking-control tokens through the matcher; the injected closure
 grammar in the reasoning phase. Framing and grammar state have identical rollback/commit ownership.
 
 Program reserves vocabulary bitsets in its planned persistent device arena and owns pinned host
-staging. Ordinary/prefill sampling uses the current mask. MTP supplies each current draft prefix
-to a forked matcher before launch. DFlash/DFlash2 must first generate device drafts: their graph
-captures D2H draft transfer, a CUDA host function that fills all reachable prefix masks, H2D mask
-transfer, then target verification. The host function calls no CUDA API; it captures exceptions
-for rethrow after stream synchronization and before any token can be published. All node addresses
-belong to Program and outlive graph replay.
+staging. Prefill sampling uses the mask installed with the request. An ordinary or MTP round
+starts each structured lane's mask job (a fork of its grammar; MTP supplies the round's draft
+prefixes, whose columns fill in parallel) on host threads before launch; a non-blocking upload
+stream collects the jobs in a host function, uploads their columns and records an event, and the
+round's graph waits on that event (an external event node) just before it samples, so the masks
+compute while the forward pass runs. DFlash/DFlash2 must first generate device drafts: their graph
+captures D2H draft transfer and a host function that starts the lanes' jobs from them, then target
+verification, then a host function that collects the jobs and the H2D mask transfer before the
+acceptance. Host functions call no CUDA API; they capture exceptions for rethrow after stream
+synchronization and before any token can be published. All node addresses belong to Program and
+outlive graph replay. A structured lane whose last masks took over 4 ms verifies no drafts (its
+extent is zero) until they are cheap again. Its next mask then computes ahead: the Engine asks
+`Program::structured_readiness` for every decode-ready lane before a round, which starts the
+lane's job at its committed ledger frontier and leaves the lane out of rounds until the job is
+ready; the round adopts the finished job instead of starting one. A job that fails, or runs over
+5 s, ends that request with an explicit error.
 
 Draft frames are compact at each round's actual proposal width, which may be narrower than the
 maximum ngram/copy window. D2H staging must preserve the fixed host-row pitch used by the grammar

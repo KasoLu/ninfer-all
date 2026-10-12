@@ -52,7 +52,7 @@ enum class KvCacheStorage : std::uint8_t {
     Fp8E4M3Row256,
     // RotorQuant rk8v4: rotated INT8 keys with a packed signed int4 value plane over a group-32
     // scale. Ported onto the kv_cache_append Op that owns KV quantization, and opt-in through
-    // --kv-dtype rk8v4. See docs/rtx-3090-windows.md.
+    // --kv-dtype rk8v4. See docs/cli.md, "Context and memory".
     RotatedInt8KeyInt4ValueGroup64,
     // NVFP4 e2m1, group-16 scale, both K and V planes packed two codes per byte.
     Nvfp4Group16,
@@ -106,6 +106,9 @@ struct KvCapacityPolicy {
 };
 
 enum class ProposalHead : std::uint8_t {
+    // The artifact's optimized proposal head when it stores one, the full output head otherwise;
+    // resolved when the model loads.
+    Auto,
     Full,
     Optimized,
 };
@@ -132,7 +135,8 @@ struct SpeculativeOptions {
     // Flash-Next MTP: truncate verification after the first draft whose absolute probability
     // is at or below this floor. Zero keeps the full window; drafting still runs the captured chain.
     float draft_min_p = 0;
-    ProposalHead proposal_head = ProposalHead::Full;
+    // An Engine's options() report the resolved head.
+    ProposalHead proposal_head = ProposalHead::Auto;
     // Context-lookup drafting: match this many trailing tokens against the sequence so far and
     // propose whatever followed the last time they appeared. 0 disables it. It costs no device
     // work, it is exact (verify rejects a wrong guess), and it is strongest exactly where a draft
@@ -331,6 +335,15 @@ struct ContextCacheOptions {
     // remainder, and rejects a plan whose state footprint exceeds half the budget.
     // `host_state_slots` and `host_kv_capacity_bytes` are ignored in that mode.
     std::optional<std::size_t> host_cache_budget_bytes;
+    // --host-cache-mib auto: host_cache_budget_bytes is sized at startup, once the weights are
+    // loaded, from the host memory still available (the smaller of the system's available memory
+    // and what the process's memory cgroup allows) less host_cache_reserve_bytes and, with Vision,
+    // the media caches; never above host_cache_max_bytes nor host_cache_percent of the machine's
+    // memory. For a machine that serves this one process: pinned pages cannot be reclaimed.
+    bool host_cache_auto                  = false;
+    std::size_t host_cache_reserve_bytes  = std::size_t{3} << 30;
+    std::optional<std::size_t> host_cache_max_bytes;
+    std::optional<std::uint32_t> host_cache_percent;
     // Bounded private/shared logical catalogs and per-continuation long-anchor count. An engaged
     // host-cache budget raises the anchor count within the state inventory it funds.
     std::optional<std::uint32_t> max_private_continuations;
@@ -481,11 +494,15 @@ enum class ExpertResidency : std::uint8_t {
     Disk,
 };
 
-// Native Flash-Next host experts, concurrency one. By default all misses execute on the GPU.
-// Shares below one enable experimental CPU mixing with different numerical results.
+// Flash-Next host and disk experts: how a decode or verification call gets the routed experts the
+// device cache lacks. By default every miss executes on the GPU; a DMA share below one lets the CPU
+// compute the rest, with different numerical results (native banks need concurrency one).
 struct HybridExpertOptions {
     float dma_share = 1; // 0..1 of distinct uncached experts per decode/verify call
     std::uint32_t cpu_threads = 0; // automatic, or 1..256
+    // GGUF banks: copy missing experts into device staging while the cached ones run (staged), or
+    // let the expert kernels read host experts across the bus (mapped; host experts only).
+    bool mapped_misses = false;
     bool adaptive_cache = false;
     std::filesystem::path routing_profile; // initial per-layer expert counts for this artifact
     std::filesystem::path record_profile; // write accumulated counts at request boundaries
@@ -599,6 +616,11 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Decode rounds that run before a prefill chunk while other requests generate, proportionally
+    // fewer (at least one) before a shorter prefill unit and more before a longer one. A decode
+    // round takes tens of milliseconds and a chunk hundreds, so strict alternation (1) leaves
+    // decoding streams a token per chunk; 0 is prefill_chunk / 64.
+    std::uint32_t decode_rounds_per_prefill = 0;
     // Prefill with the fast INT8-KV prompt-attention kernel and round prefill_chunk down to whole
     // prompt-attention waves. Off keeps the default kernel and the requested chunk.
     bool fast_prefill_kernel           = false;
@@ -817,12 +839,22 @@ enum class ImageResizePolicy : std::uint8_t {
     RejectOversized,
 };
 
+// How finely an image is seen (OpenAI's image detail). Low bounds it at the area of a 512 x 512
+// picture, 256 merged Vision tokens (or the server's own bound if that is smaller); Auto and High
+// use the server's bound (--vision-max-merged).
+enum class ImageDetail : std::uint8_t {
+    Auto,
+    Low,
+    High,
+};
+
 struct OwnedMedia {
     MediaKind kind = MediaKind::Image;
     std::vector<std::uint8_t> bytes;
     std::string media_type;
     std::string source_name;
     ImageResizePolicy image_resize_policy = ImageResizePolicy::Downsize;
+    ImageDetail image_detail              = ImageDetail::Auto;
 };
 
 struct ToolCall {
@@ -1628,6 +1660,19 @@ struct NgramTableStats {
     double stall_seconds = 0.0;
 };
 
+// Qwen3.8-Flash-Next's routed experts with host or disk residency, monotonic. A route is one
+// (token, expert) pair a pass took; a hit found its expert in a device slot. transferred_bytes
+// counts the expert bytes copied to the devices (misses and cache admissions); cpu_routes the
+// pairs computed by the CPU.
+struct ExpertResidencyStats {
+    std::uint64_t routes            = 0;
+    std::uint64_t hits              = 0;
+    std::uint64_t cpu_routes        = 0;
+    std::uint64_t admitted          = 0;
+    std::uint64_t transferred_bytes = 0;
+    std::uint32_t slots             = 0;
+};
+
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
@@ -1680,6 +1725,16 @@ struct RuntimeStats {
     std::uint32_t last_selected_frontier_tokens      = 0;
     // Aborted requests whose live state was published as a continuation endpoint.
     std::uint64_t salvaged_continuations = 0;
+    // Requests that left the queue without being admitted, and the time they had waited: the
+    // client gave up (cancelled) or the pending timeout fired (expired).
+    std::uint64_t waiting_cancelled_requests = 0;
+    std::uint64_t waiting_expired_requests   = 0;
+    double waiting_abandoned_seconds         = 0.0;
+    // Requests cancelled while their prompt prefilled, the prompt tokens they had computed, and
+    // how many of them the context cache salvaged so a retry resumes where they stopped.
+    std::uint64_t cancelled_prefills                = 0;
+    std::uint64_t cancelled_prefill_computed_tokens = 0;
+    std::uint64_t cancelled_prefills_salvaged       = 0;
 
     std::uint64_t state_moves     = 0;
     std::uint64_t state_forks     = 0;
@@ -1768,6 +1823,7 @@ struct RuntimeStats {
     // context cache instead of latching the Engine unavailable.
     std::uint64_t engine_recoveries = 0;
     NgramTableStats ngram_table;
+    ExpertResidencyStats experts;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {

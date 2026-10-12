@@ -136,11 +136,19 @@ public:
     // verification's width, a full prefill chunk (16 tokens with host or disk experts, which a
     // chunk would copy or read whole), a decode step and, with drafts, a draft and a commit.
     void warm_up();
+    // After warm_up: gives the host expert cache what each device still has free beyond
+    // `keep_free_bytes`, as more slots. No effect without a host expert cache.
+    void grow_expert_cache(std::uint64_t keep_free_bytes);
     [[nodiscard]] std::uint32_t position(std::uint32_t sequence) const;
 
-    // Runs `tokens` (at most prefill_chunk) at the sequence's next positions and leaves the logits
-    // of the last `logit_rows` of them in logits(), BF16 [vocab, logit_rows] on the head device.
-    // Work is queued on the device streams; logits() is ready on head_stream().
+    // Prompt tokens one forward() may take: prefill_chunk, or with layer-major spans (one stage,
+    // GGUF host experts) several chunks, which forward() runs layer by layer so that each layer's
+    // uncached experts cross the bus once for all of them.
+    [[nodiscard]] std::uint32_t prompt_step() const noexcept;
+    // Runs `tokens` (at most prompt_step(); beyond prefill_chunk not a media prompt's) at the
+    // sequence's next positions and leaves the logits of the last `logit_rows` of them in
+    // logits(), BF16 [vocab, logit_rows] on the head device. Work is queued on the device
+    // streams; logits() is ready on head_stream().
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows);
     // Hints the next known tokens' table rows from a copy of the sequence's hash context. Does
@@ -152,6 +160,8 @@ public:
     void decode(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens);
     // Copies the sequence's recurrent state into `out`, and back; both wait for the copies.
     void snapshot(std::uint32_t sequence, SequenceSnapshot& out);
+    // Device bytes one SequenceSnapshot's buffers take once its first snapshot sizes them.
+    [[nodiscard]] std::uint64_t snapshot_bytes() const;
     void restore(std::uint32_t sequence, const SequenceSnapshot& from);
     // Bytes of an image at `position`.
     [[nodiscard]] std::uint64_t image_bytes(std::uint32_t position) const;
@@ -178,13 +188,15 @@ public:
     // Whether the sequence's MTP state follows its tokens, which a media prompt breaks until the
     // sequence is reset; a sequence drafts only from a position past its first.
     [[nodiscard]] bool can_draft(std::uint32_t sequence) const;
-    // Drafts draft_tokens() tokens for each of `sequences` (distinct) from its next position: the
-    // MTP block runs its anchor (the token it sampled last and has not fed) and then its own
-    // drafts, greedily. `out` receives them sequence-major; returns once they are on the host.
-    // Optional `extents` receives one length per sequence, including the first draft at or below the
-    // probability floor. Drafting still executes the full captured chain.
+    // Drafts `steps` tokens (1..draft_tokens(); 0 means draft_tokens()) for each of `sequences`
+    // (distinct) from its next position: the MTP block runs its anchor (the token it sampled last
+    // and has not fed) and then its own drafts, greedily. `out` receives them sequence-major, each
+    // sequence's row draft_tokens() long; returns once they are on the host. Optional `extents`
+    // receives one length per sequence, up to the first draft at or below the probability floor.
+    // Drafting executes the whole chain of `steps`, captured once per step count.
     void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
-               std::span<std::int32_t> out, std::span<std::uint32_t> extents = {});
+               std::span<std::int32_t> out, std::span<std::uint32_t> extents = {},
+               std::uint32_t steps = 0);
     // Runs 2..draft_tokens() + 1 tokens of each sequence (its anchor, then its drafts) at its next
     // positions without committing them, and leaves the logits of every token in logits(), one
     // column per token, sequence after sequence. The sequences' positions and states stay where

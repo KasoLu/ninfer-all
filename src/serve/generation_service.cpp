@@ -196,6 +196,7 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
     }
     media.bytes               = std::move(source_bytes);
     media.image_resize_policy = part.image_resize_policy;
+    media.image_detail        = part.image_detail;
     return media;
 }
 
@@ -268,6 +269,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.max_pending_requests     = options.max_pending_requests;
     engine_options.pending_timeout_ms       = options.pending_timeout_ms;
     engine_options.prefill_chunk            = options.prefill_chunk;
+    engine_options.decode_rounds_per_prefill = options.decode_rounds_per_prefill;
     engine_options.fast_prefill_kernel      = options.fast_prefill_kernel;
     engine_options.kv_cache                 = options.kv_cache;
     engine_options.enable_vision            = options.enable_vision;
@@ -343,6 +345,12 @@ GenerationService::GenerationService(
     engine_options.diagnostic_observer   = std::move(diagnostic_observer);
     engine_options.slot_auto_save.listener = std::move(auto_save_listener);
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    // A request that says nothing about thinking gets its template's default. Qwen's templates
+    // think unless told not to; Gemma 4's chat template keeps thinking off unless enable_thinking
+    // asks for it, so without --no-thinking or a request flag a Gemma 4 server answers directly.
+    if (!options_.enable_thinking && engine_->load_summary().architecture == "Gemma4ForCausalLM") {
+        options_.enable_thinking = false;
+    }
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     count_capacity_ = std::make_shared<RequestCapacity>(

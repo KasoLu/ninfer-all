@@ -15,6 +15,7 @@
 #include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
+#include "runtime/engine/host_memory.h"
 
 #include <algorithm>
 #include <cmath>
@@ -33,6 +34,8 @@
 namespace ninfer::runtime {
 namespace {
 using Clock = std::chrono::steady_clock;
+
+constexpr std::uint32_t kMaximumDecodeRoundsPerPrefill = 4096;
 
 void validate_options(const EngineOptions& options) {
     if (options.artifact_path.empty()) {
@@ -84,6 +87,19 @@ void validate_options(const EngineOptions& options) {
     }
     if (options.max_pending_requests == 0 || options.pending_timeout_ms == 0) {
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
+    }
+    const ContextCacheOptions& cache = options.context_cache;
+    if (cache.host_cache_auto ? cache.host_cache_budget_bytes.has_value()
+                              : cache.host_cache_max_bytes || cache.host_cache_percent) {
+        throw std::invalid_argument(
+            "an automatic host cache takes no budget, and its cap and percent need it");
+    }
+    if (cache.host_cache_percent &&
+        (*cache.host_cache_percent == 0 || *cache.host_cache_percent > 100)) {
+        throw std::invalid_argument("host cache percent must be in [1,100]");
+    }
+    if (options.decode_rounds_per_prefill > kMaximumDecodeRoundsPerPrefill) {
+        throw std::invalid_argument("Engine decode_rounds_per_prefill must be in [0,4096]");
     }
     if (options.enable_vision && options.media_live_bytes == 0) {
         throw std::invalid_argument(
@@ -240,7 +256,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
     }
-
     ContextCacheOptions& cache = options.context_cache;
     if (options.speculative.ngram_archive_bytes != 0 &&
         options.speculative.ngram_draft_tokens == 0) {
@@ -287,9 +302,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         }
         // One pinned Host slab pool serves blocks and snapshots alike; its size is the only
         // capacity a deployment has to choose (docs/maintainer/hybrid-prefix-cache-spec.md §5.4).
-        cache.host_cache_budget_bytes =
-            cache.host_cache_budget_bytes.value_or(kDefaultHybridHostCacheBytes);
-        const bool host_tier             = *cache.host_cache_budget_bytes != 0;
+        // An automatic budget is sized once the weights are loaded, and holds a Host tier.
+        if (!cache.host_cache_auto) {
+            cache.host_cache_budget_bytes =
+                cache.host_cache_budget_bytes.value_or(kDefaultHybridHostCacheBytes);
+        }
+        const bool host_tier = cache.host_cache_auto || *cache.host_cache_budget_bytes != 0;
         HybridPrefixCacheOptions& hybrid = cache.hybrid;
         // One resident snapshot per request lane keeps every live conversation's latest
         // endpoint restorable without PCIe traffic; one more slot stages taps and endpoints while
@@ -338,7 +356,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
             (cache.max_shared_prefixes && *cache.max_shared_prefixes != 0) ||
             (cache.max_long_anchors_per_continuation &&
              *cache.max_long_anchors_per_continuation != 0) ||
-            cache.host_cache_budget_bytes) {
+            cache.host_cache_budget_bytes || cache.host_cache_auto) {
             throw std::invalid_argument("disabled context cache accepts only root-only capacities");
         }
         cache.device_state_slots                = 0;
@@ -612,6 +630,14 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     const auto retained_reader = std::make_shared<artifact::Reader>(options.artifact_path);
     const artifact::Reader& reader = *retained_reader;
     inspect.complete();
+    // An automatic draft head is the artifact's optimized proposal head when it stores one: it
+    // projects drafts onto a shortlist of the vocabulary instead of all of it.
+    if (options.speculative.proposal_head == ProposalHead::Auto) {
+        const bool stored = options.purpose == EnginePurpose::Generation &&
+                            options.speculative.backend != SpeculativeBackend::None &&
+                            reader.directory().component("text").proposal.has_value();
+        options.speculative.proposal_head = stored ? ProposalHead::Optimized : ProposalHead::Full;
+    }
     if (options.devices.size() > 1 && options.stage_layers.empty()) {
         const std::vector<std::size_t> free_now = free_bytes_by_rank(device);
         const std::vector<std::uint64_t> free_bytes(free_now.begin(), free_now.end());
@@ -632,6 +658,23 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             .suspendable     = options.suspend.enabled,
             .retained_reader = options.suspend.enabled ? retained_reader : nullptr});
     device.synchronize();
+    // An automatic Host budget is sized now that the weights are in place, from what the host
+    // still has; the media caches grow after startup, so they are reserved too.
+    if (options.context_cache.host_cache_auto) {
+        const std::uint64_t media_bytes =
+            options.enable_vision
+                ? std::uint64_t(options.media_cache_bytes) + options.media_live_bytes
+                : 0U;
+        options.context_cache = resolve_auto_host_cache_now(options.context_cache, media_bytes);
+        // The checkpoint catalog sizes its Host pools from a nonzero budget; a host with no memory
+        // to spare has none.
+        if (options.context_cache.mode == ContextCacheMode::Legacy &&
+            options.context_cache.host_cache_budget_bytes == 0U) {
+            options.context_cache.host_cache_budget_bytes.reset();
+            options.context_cache.host_state_slots       = 0;
+            options.context_cache.host_kv_capacity_bytes = 0;
+        }
+    }
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
     frontend.complete();

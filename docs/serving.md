@@ -9,13 +9,13 @@ artifacts as a [router](#several-models-router), one Engine per loaded model.
 See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_CUDA_SYNC` setting.
 
 ```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
+./build/apps/ninfer-serve models/qwen3_8_27b.ninfer \
   --host 127.0.0.1 \
   --port 8080 \
   --max-context 240000 \
   --kv-capacity 240000 \
   --max-concurrency 2 \
-  --kv-dtype int8 \
+  --kv-dtype rk4v4 \
   --device-state-slots 2 \
   --host-state-slots 8 \
   --host-kv-mib 8192 \
@@ -24,7 +24,8 @@ See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_C
   --preserve-thinking
 ```
 
-The command uses Qwen3.8-27B NVFP4. Each request has a 240,000-token logical ceiling. A shared
+The command uses the official Qwen3.8-27B `groupwise-int` artifact. Each request has a
+240,000-token logical ceiling. A shared
 240,000-token Main Text KV pool serves admitted requests; either request may use the full capacity
 when running alone, and two requests run concurrently when their complete reservations fit.
 
@@ -49,9 +50,9 @@ ledger.
 
 Other artifacts use the same command shape with their own path. For 35B-A3B DFlash, replace the MTP
 selection with `--spec dflash --draft-tokens 7 --lm-head-draft`. Qwen3.8-27B
-artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`, with
-`--lm-head-draft` optional. DFlash2 accepts draft counts 1..15 and supports the same sampling,
-concurrency, prefix reuse, and image/video request surfaces. It may remain combined with
+artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`. DFlash2
+accepts draft counts 1..15 and supports the same sampling, concurrency, prefix reuse, and
+image/video request surfaces. It may remain combined with
 `--vision`.
 
 When `--model-id` is omitted, the server advertises and accepts the artifact's `metadata.name`,
@@ -62,8 +63,9 @@ Vision is disabled by default: its weights and Vision-specific unified-workspace
 allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Add
 `--vision` when the server must accept image or video input. Speculative residency is likewise
 frozen by `--spec mtp|dflash|dflash2` and `--draft-tokens`; omitting `--spec` loads no speculative backend.
-`--lm-head-draft` additionally loads the optimized proposal head. DFlash on 35B-A3B and DFlash2 on Qwen3.8-27B can be combined
-with `--vision`; each accelerates generated-text decode after multimodal prefill, while Vision encode
+A selected backend also loads the artifact's optimized proposal head when it stores one
+(`--full-draft-head` keeps the full output head instead). DFlash on 35B-A3B and DFlash2 on
+Qwen3.8-27B can be combined with `--vision`; each accelerates generated-text decode after multimodal prefill, while Vision encode
 and prefill remain outside speculative acceleration. A later request cannot enable a capability
 omitted at startup. The artifact need only contain the Text backbone and the optional components
 selected for this process.
@@ -134,6 +136,23 @@ agree closely but not bit for bit. It reads the tower's weights in the official 
 formats as well as BF16, FP8 and NVFP4; a projection stored with a Hadamard rotation or an input
 gather is refused at load.
 
+Gemma 4 places its tower the same three ways with its own mechanics: `overlay` keeps the 27
+blocks' matrices in pinned host memory and streams them through a two-block device window during
+each encode (about 0.14 GiB of device memory instead of 1.07 GiB), and `cpu` runs an FP32 tower
+with AVX2/FMA kernels. Its budgets, layout and measurements are in [Gemma 4](gemma4.md#images-and-video).
+
+### Image detail
+
+OpenAI's image `detail` (Chat Completions `image_url.detail`, Responses `input_image.detail`) is
+accepted as `auto`, `high` or `low`. `auto` and `high` see the image at the resolution
+`--vision-max-merged` allows, which is NInfer's normal preprocessing. `low` bounds the image at the
+area of a 512 x 512 picture, 256 merged Vision tokens (or the server's bound when that is smaller),
+for a cheaper and coarser look. The same bytes at both details are prepared, cached and reused as
+two different images. Any other value is refused with `image_detail_not_supported`, or read as
+`auto` when the server runs with `--lenient-image-detail`. Gemma 4 maps the three to its budgets:
+`low` 70 soft tokens, `auto` the release's 280, `high` the `--vision-max-merged` bound (1120 by
+default).
+
 ## Several models (router)
 
 Started with `--models-dir` or `--models-preset` and no artifact path, the server is a router in
@@ -194,11 +213,27 @@ whose catalog is its one model.
 NInfer uses the vendored XGrammar v0.2.7 C++ compiler and token matcher to constrain final
 response content. This requires no model conversion or additional weights. Ordinary decoding,
 MTP, DFlash, and DFlash2 share the same target sampling contract, including CUDA Graphs,
-streaming, prefix reuse, and mixed constrained/unconstrained concurrent requests.
+streaming, prefix reuse, and mixed constrained/unconstrained concurrent requests. The
+`minLength`/`maxLength` of plain string values in a schema without `anyOf` are enforced beside
+the grammar, which keeps their token masks cached (a counted string otherwise costs tens of
+milliseconds per token with a large vocabulary).
+
+Every model computes a constrained request's masks on host threads while the GPU runs the step
+that needs them: the next token's mask, or in a speculative round one mask per draft position,
+filled in parallel. Speculation is automatic: a constrained request verifies drafts (MTP,
+DFlash/DFlash2, a context lookup) while its masks take at most 4 ms, which the verification
+hides, and decodes without drafts while they cost more, resuming once they are cheap again.
+A costly mask holds only its own request. Gemma 4 and Qwen3.8-Flash-Next run the decode step
+without it: the row keeps its logits and samples once the mask is ready, while the other requests
+go on. The Qwen3.5 family computes such a request's next mask after each of its tokens and leaves
+the request out of decode rounds until the mask is ready. A mask over 5 s fails its request with
+an explicit error, and so does a Gemma 4 or Flash-Next decoding request without a token for 120 s
+([Gemma 4](gemma4.md#structured-output)).
 
 It is opt-in: start the server with `--structured-output` (the CLI's `--json` and `--json-schema`
-enable it for their run). That reserves one grammar mask plane per draft position and lane, and a
-DFlash or DFlash2 round then carries a host grammar stage even when no request is constrained.
+enable it for their run). That reserves one grammar mask plane per draft position and lane; a
+DFlash or DFlash2 round then carries two host grammar stages, and another round waits on the
+masks' upload event before sampling, even when no request is constrained.
 Without it the server keeps the default path unchanged and refuses a constrained request with HTTP
 400 `response_format_not_supported`; with `--unconstrained-response-format` it generates such a
 request unconstrained instead, for clients that send a JSON format on every request and parse the
@@ -329,8 +364,9 @@ SSE content deltas are ordinary partial JSON bytes; concatenate them before pars
 guarantee format, not factual accuracy or semantic task success.
 
 Masks are applied before target top-k/top-p/min-p filtering at **every** speculative position,
-including correction and bonus tokens. Unconstrained draft distributions remain unchanged;
-accept/reject and residual sampling use the constrained target distribution. Per-request grammar
+including correction and bonus tokens. Drafts are proposed without the mask; every verification
+draw -- MTP and DFlash coupled draws, DFlash2 accept/reject and residual sampling -- uses the
+constrained target distribution. Per-request grammar
 state advances only with Engine output commit, and is never restored from a prompt/KV cache.
 DFlash/DFlash2 CUDA Graphs contain a host matcher node between draft generation and verification;
 this adds a CPU synchronization point and mask transfers per round. No speedup claim is implied.
@@ -365,7 +401,7 @@ up. A router instead unloads the failed model once its requests are gone and rep
 
 | Method and path | Behavior |
 |---|---|
-| `GET /health` | process health |
+| `GET /health` | process health and build version (see [Server version](#server-version)) |
 | `GET /v1/load` | serving capacity, current load, and monotonic token counters (see [Load](#load)) |
 | `GET /metrics` | Prometheus text with llama.cpp's `--metrics` series plus NInfer's (see [Metrics](#metrics)) |
 | `GET /stats` | the `/v1/load` snapshot plus the ingress peak and every Engine counter since startup (see [Stats](#stats)) |
@@ -430,7 +466,7 @@ read-only and fills only the llama.cpp fields NInfer can state truthfully:
    "params": {"n_predict": -1, "max_tokens": -1, "temperature": 1.0, "top_k": 20, "top_p": 0.95,
               "min_p": 0.0, "presence_penalty": 0.0, "frequency_penalty": 0.0, "seed": -1}},
  "total_slots": 1, "model_alias": "qwen3.8-27b", "model_path": "models/qwen3_8_27b.ninfer",
- "modalities": {"vision": false, "audio": false},
+ "modalities": {"vision": false, "audio": false}, "build_info": "ninfer 0.12.0-rtx3090+v0.12.0-rtx3090-57-ge1debb451",
  "endpoint_slots": true, "endpoint_props": true, "endpoint_metrics": true,
  "cors_proxy_enabled": false}
 ```
@@ -442,8 +478,21 @@ cap. The sampler is the loaded model's preset for the default thinking mode (thi
 `--no-thinking`) under the process sampling flags and `--greedy`; request fields still override it
 per request. `seed` is `--seed`, or `-1` when requests draw a fresh random seed. `model_alias` is the
 public model id and `model_path` the artifact path the server was started with.
-`cors_proxy_enabled` reports `--webui-mcp-proxy` (see [WebUI](#webui)). There is no `build_info`,
-`chat_template`, or writable `POST /props`.
+`cors_proxy_enabled` reports `--webui-mcp-proxy` (see [WebUI](#webui)). `build_info` is
+`ninfer <version>` (see [Server version](#server-version)). There is no `chat_template` or writable
+`POST /props`.
+
+### Server version
+
+The running build is reported from one string, `<VERSION>+<build id>`: `ninfer-serve --version`
+and `ninfer --version` print it and exit without loading a model; `GET /health` returns it as
+`{"status": "ok", "version": "0.12.0-rtx3090+v0.12.0-rtx3090-57-ge1debb451"}`; every response,
+the `503` during model load and `401` failures included, carries it in an `X-NInfer-Version`
+header; and the startup log, the `server_start` record and `/props` `build_info` include it.
+`VERSION` is the repository's file of that name. The build id is `git describe --always --tags` of
+the compiled tree with `-dirty` when its product sources differ from `HEAD`, or the
+`NINFER_BUILD_ID` environment variable of the build when it is set, as on rented build hosts that
+compile a snapshot without git metadata.
 
 ### Startup readiness
 
@@ -538,7 +587,8 @@ most requests admitted at once since startup, and the Engine's counters since st
 the request log's `throughput` record (see [Structured request log](#structured-request-log)):
 `tokens`, `throughput_tokens_per_second` averaged over the uptime, `scheduler`, `decode_batch`,
 `host_work` and the `context_cache` counters and gauges, and for Qwen3.8-Flash-Next the
-`ngram_table` reads (the block appears after the first row read). `queue` holds `depth`, the number of
+`ngram_table` reads (the block appears after the first row read) and, with host or disk experts,
+the `experts` counters. `queue` holds `depth`, the number of
 requests waiting for admission, and `entries`: the first 16 of them in submission order, each with
 its Engine `request_id`, `position` and `wait_seconds`, refreshed at least once a second while
 requests wait. It needs the API key like `/v1/load` and, like it, reads only published snapshots.
@@ -680,6 +730,19 @@ they advance during a long request rather than at its completion, and their rati
 | `ninfer:context_cache_exhausted_requests_total` | counter | requests failed because the context cache had no placement for them |
 | `ninfer:engine_recoveries_total` | counter | host-side worker failures the Engine survived instead of latching unavailable |
 | `ninfer:uptime_seconds` | gauge | seconds since the Engine became ready |
+| `ninfer:waiting_cancelled_requests_total` | counter | requests the client cancelled while they waited for admission (Qwen3.5 cores, as are the five series below) |
+| `ninfer:waiting_expired_requests_total` | counter | requests that reached `--pending-timeout-ms` before admission |
+| `ninfer:waiting_abandoned_seconds_total` | counter | time those cancelled and expired requests had waited |
+| `ninfer:cancelled_prefills_total` | counter | requests cancelled while their prompt prefilled |
+| `ninfer:cancelled_prefill_computed_tokens_total` | counter | prompt tokens those requests had computed |
+| `ninfer:cancelled_prefills_salvaged_total` | counter | cancelled prefills the context cache kept at the point they reached, so the retry resumes there |
+| `ninfer:context_selections_total{source}` | counter | admissions by the context-cache source they started from: `root` (a miss, prefilled from token zero), `private_endpoint`, `private_turn_closure`, `private_response_replay`, `private_long_anchor`, `shared_stable_prefix`; the hit rate is 1 - root / all |
+| `ninfer:context_pressure_events_total{event}` | counter | what pressure planning did to inactive owners: `private_owner_evicted`, `private_owner_degraded`, `shared_owner_evicted`, `shared_owner_degraded`, `checkpoint_dropped` |
+| `ninfer:context_pressure_searches_total{result}` | counter | pressure planning searches: `started`, `budget_exhausted`, `maximal_fallback` |
+| `ninfer:context_transfer_bytes_total{object,direction}` | counter | context-cache bytes moved between Device and Host: `object` `state`, `main_kv` or `backend_kv`, `direction` `d2h` or `h2d` |
+| `ninfer:context_transfer_seconds_total` | counter | time admissions waited for context-cache transfers |
+| `ninfer:context_historical_fork_hits_total` | counter | admissions that forked a historical checkpoint instead of the latest endpoint |
+| `ninfer:context_occupancy{pool}` | gauge | `device_state_slots`, `host_state_slots`, `device_main_kv_pages`, `device_backend_kv_pages`, `host_kv_bytes` in use |
 
 ### WebUI
 
@@ -750,7 +813,8 @@ The endpoint supports:
 - string content and ordered text/refusal parts; adjacent parts are preserved without inserted
   separators, and empty wire content remains an empty turn;
 - User `image_url` parts, tool-result `image_url` parts used by compatible clients, and the User
-  `video_url` extension using HTTP(S) or data URIs; image detail is omitted or `auto`;
+  `video_url` extension using HTTP(S) or data URIs; image `detail` `auto`, `high` or `low` (see
+  [image detail](#image-detail));
 - nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; zero performs prompt
   processing without generation; llama.cpp's `-1` ("no limit", the WebUI's default) and omitting
   both apply the [default output limit](#default-output-limit);
@@ -794,8 +858,7 @@ The endpoint supports:
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes JSON constrained output on a server without `--structured-output` (unless
 it runs with `--unconstrained-response-format`), nonzero `logit_bias`, audio/file input or audio
-output, `required` tool choice over several callable tools, explicit low/high image detail, web
-search, moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
+output, `required` tool choice over several callable tools, web search, moderation, low/high verbosity, stored Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
 The vLLM/llama.cpp constrained-decoding extensions (`grammar`, `structured_outputs`, `guided_json`,
 `guided_regex`, `guided_choice`, and `guided_grammar`) are rejected explicitly instead of being
@@ -1284,7 +1347,7 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `input_text` | message content part containing string `text` |
 | `output_text` | assistant-message replay part containing string `text` |
 | `refusal` | assistant-message replay part; its text enters assistant history |
-| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted or `auto`; requires server `--vision` |
+| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; `detail` `auto`, `high` or `low` (see [image detail](#image-detail)); requires server `--vision` |
 | `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
 | `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
@@ -1309,8 +1372,8 @@ An `input_text`, `input_image`, or tool-result part may carry
 boundaries; they affect reuse opportunities, not prompt identity or output semantics. String
 message status/phase metadata is accepted but has no Qwen prompt representation.
 
-`input_file`, `input_audio`, image `file_id`, non-`auto` image detail, reasoning metadata without raw
-reasoning text, partial tool Items, and other Item/content types are not supported. HTTP media URLs
+`input_file`, `input_audio`, image `file_id`, reasoning metadata without raw reasoning text,
+partial tool Items, and other Item/content types are not supported. HTTP media URLs
 stored in a response chain are fetched again when that chain is continued; use data URIs when the
 historical media bytes must be immutable.
 
@@ -1637,7 +1700,7 @@ a trained `softprompt_kv` or `direct_kv` graft carries cache state that NInfer w
 (both described below).
 
 ```bash
-ninfer-serve model.ninfer --graft v1=C:/grafts/v1_q38_nf4.bin --graft red=C:/grafts/red.bin
+ninfer-serve model.ninfer --graft v1=grafts/qwen38-27b/v1.bin --graft red=grafts/qwen38-27b/red.bin
 ```
 
 A request selects one with the top-level `"graft": "NAME"` field on OpenAI Chat Completions,
@@ -1734,21 +1797,23 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
 | `--recover-invariant-failures` | a broken internal invariant in the Engine worker fails the active and materializing requests and leaves the waiting ones queued, as recovery from out of memory does, instead of failing the Engine; eight consecutive recoveries without a completed unit still fail it | off |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
+| `--decode-rounds-per-prefill N` | Decode rounds that run before each prefill chunk while other requests generate, so a long prompt does not leave them one token per chunk; proportionally fewer, at least one, before a shorter prefill unit, so a short prompt gets in after one round; `1` alternates strictly, a larger value keeps streams responsive and makes the prompt finish later | `0` (`--prefill-chunk` / 64) |
 | `--fast-prefill-kernel` | prefill an `int8` or `rk*` KV cache with the fast prompt-attention kernel (FP16 PV accumulation per 64-key tile) and round `--prefill-chunk` down to whole attention waves; on Blackwell, prefill an `nvfp4` KV cache past 2048 visible keys with its fast kernel (QK on block-scaled FP4 Tensor Cores); a small perplexity cost (see [perplexity](perplexity.md)). Without the flag the [device profile](device-profiles.md)'s `attn_prompt_fast` decides, and the built-in profiles turn the kernel on where it measured faster | the device profile |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-colours on\|off` | `on` colours the console log's levels and gives every statistic of the operational lines a stable colour; `off` keeps the log plain; a redirected stderr is always plain | levels coloured on a console |
 | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | off |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
-| `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see [pipeline stages](maintainer/pipeline-parallel-plan.md)); on the Qwen3.5 family MTP, DFlash and DFlash2 run across the stages and Vision is refused; overrides `--device` | none |
+| `--devices A,B,...` | one pipeline stage per listed CUDA device (2 to 8, Linux; see [pipeline stages](maintainer/pipeline-stages.md)); on the Qwen3.5 family MTP, DFlash, DFlash2 and resident or CPU Vision run across the stages (the Vision tower stays on the first device; `--vision-residency overlay` is refused); overrides `--device` | none |
 | `--stage-layers A,B,...` | layers per stage, in `--devices` order; omitted means a split chosen from each device's free memory | memory-balanced |
 | `--expert-residency device\|host\|disk` | Qwen3.8-Flash-Next: routed expert banks in GPU memory, in pinned host memory read across the bus, or left in the artifact's files and streamed into the device expert cache (see [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#run)) | `device` |
 | `--expert-cache-mib N\|auto` | with host or disk experts, device memory for the most used experts; `0` turns the host-mode cache off, and disk mode needs one | `auto` (what is free after startup) |
-| `--expert-dma-share F` | native host experts: fraction of distinct decode/verify cache misses copied to the GPU, `0..1`; values below `1` enable experimental CPU mixing; prefill uses the GPU | `1` |
-| `--expert-cpu-threads N` | native host experts: `1..256` CPU workers | logical thread count capped at 16 |
-| `--expert-cache-adaptive` | replace cold native experts between calls; changes the CPU/GPU arithmetic partition | off |
-| `--expert-profile PATH` | fill the native expert cache from counts for the same artifact and bank geometry | none |
-| `--expert-profile-out PATH` | record native expert counts after requests | none |
+| `--expert-misses staged\|mapped` | GGUF host experts: copy each missing expert into a device cache slot while the cached experts run (`staged`), or let the expert kernels read the missing ones across the bus (`mapped`) | `staged` |
+| `--expert-dma-share F` | host or disk experts: the GPU's share of a call's cache misses, `0..1`; below `1` the CPU computes the rest, an experimental mode; prefill always uses the GPU | `1` |
+| `--expert-cpu-threads N` | host experts with a CPU share: `1..256` CPU workers | automatic, at most 16 |
+| `--expert-cache-adaptive` | replace cold cached experts between calls; changes the CPU/GPU arithmetic partition | off |
+| `--expert-profile PATH` | fill the host expert cache from counts recorded for the same artifact and bank geometry | none |
+| `--expert-profile-out PATH` | record expert counts for this artifact after requests | none |
 | `--ngram-table PATH` | Qwen3.8-Flash-Next: the n-gram table artifact of a model published without its table | the model's own table |
 | `--ngram-residency disk\|ram\|ram-hot` | Qwen3.8-Flash-Next: where the n-gram rows come from: the table's file, 16 rows per token; all of the table in RAM; or the rows a hot-row profile ranks first in RAM and the rest from the file (see [the n-gram rows](qwen3-8-flash-next.md#the-n-gram-rows)) | `disk` |
 | `--ngram-io buffered\|direct\|mmap` | Qwen3.8-Flash-Next: how rows are read from the file: through the OS page cache, past it, or out of a mapping | `buffered` |
@@ -1773,16 +1838,17 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--spec mtp\|dflash\|dflash2` | speculative backend; Qwen3.8-Flash-Next takes `mtp` from an artifact converted with its MTP block (see [MTP speculative decoding](qwen3-8-flash-next.md#mtp-speculative-decoding)) | off |
 | `--draft-tokens N` | `1..15` for MTP, DFlash and DFlash2 | unset |
 | `--draft-min-p P` | Flash-Next MTP only: verify through the first draft at or below this absolute probability; the full draft chain still runs; see [MTP](qwen3-8-flash-next.md#mtp-speculative-decoding) | `0` (off) |
-| `--lm-head-draft` | optimized proposal head | off |
-| `--adaptive-mtp` | MTP only: each round verifies 3..`--draft-tokens` drafts, the width favored by the drafts' measured survival and the measured round cost; see [Adaptive MTP](#adaptive-mtp) | off |
+| `--lm-head-draft` | require the optimized proposal head | used when the artifact stores it |
+| `--full-draft-head` | draft through the full output head even when the artifact stores a proposal head | off |
+| `--adaptive-mtp` | MTP only: each round verifies 3..`--draft-tokens` drafts (Qwen3.8-Flash-Next: 1..`--draft-tokens`, drafting only those), the width favored by the drafts' measured survival and the measured round cost; see [Adaptive MTP](#adaptive-mtp) | off |
 | `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query; verification keeps full attention; see [MTP attention window](#mtp-attention-window) | `0` (whole history) |
-| `--lookup-ngram N` | context-lookup drafting alongside `--spec`: the last `N` tokens are matched against the sequence so far and what followed is proposed; exact, since verification rejects a wrong guess | `0` (off) |
+| `--lookup-ngram N` | context-lookup drafting alongside `--spec` (Qwen3.8-Flash-Next: `--spec mtp`): the last `N` tokens are matched against the sequence so far and what followed is proposed; exact, since verification rejects a wrong guess | `0` (off) |
 | `--ngram-draft-tokens N` | copy drafting alongside `--spec`: up to `N` tokens (1..63; above 15 only at `--max-concurrency 1`) copied from earlier prompt, tool-result or output text that the last `--ngram-min-match` tokens match, verified by the target; `0` disables it; see [Ngram copy proposals](ngram.md) | `15` with `--spec`, else `0` |
 | `--ngram-min-match N` | shortest match a copy is drawn from, `4..64` | `12` |
 | `--ngram-archive-mib N` | RAM archive that keeps finished requests' copy sources for later requests naming the same `X-NInfer-Draft-Session` | `0` (off) |
 | `--ngram-session-mib N` | per-session share of that archive, 1 MiB up to the archive size | `128` |
 | `--ngram-native-sessions` | with the archive, also recognize the session identities Kilo, Codex and Claude send | off |
-| `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
+| `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [quality trades](maintainer/quality-trade-experiments.md)) | off |
 | `--no-prefill-cublas-projections` | with `--prefill-cublas`, keep the attention and GDN input projections off that route | projections on |
 | `--no-prefill-a8` | prefill every projection on the A16 routes instead of the integer-activation ones | integer routes |
 | `--mlp-a8-decode` | integer-activation MLP gate_up at decode and verify widths | off |
@@ -1798,12 +1864,13 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--unconstrained-response-format` | without `--structured-output`, generate a JSON or JSON Schema request unconstrained instead of refusing it | off |
 | `--assistant-prefill` | continue a Chat Completions request's trailing assistant message in place, as `/v1/messages` does | off |
 | `--lenient-assistant-history` | accept Responses input whose assistant message content or reasoning follows `function_call` Items in one run: it joins that run's assistant turn, as Messages flattens content blocks, and the template renders it before the calls. Without it such input fails with `invalid_assistant_history` rather than being silently reordered | off |
+| `--lenient-image-detail` | read an OpenAI image `detail` other than `auto`, `low` or `high` as `auto` instead of failing with `image_detail_not_supported`, for clients that send values NInfer does not know (see [image detail](#image-detail)) | off |
 | `--thinking-budget-message TEXT` | message a thinking-enabled request receives at its thinking budget instead of the built-in notice; the canonical `</think>` close is appended when missing | built-in |
 | `--default-reasoning-effort E` | effort for requests that name none: `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max` | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |
-| `--vision-residency resident\|overlay\|cpu` | `overlay` keeps the Vision tower in pinned host memory and encodes each image inside a window borrowed from the evict-ranked text weight tail, so `--vision` no longer reserves device memory and `--kv-capacity auto` resolves the no-vision capacity; requires `--vision` and CUDA virtual memory management. `--vision-offload on\|off` is accepted as an alias for `overlay\|resident`. `cpu` decodes the tower to host FP32 and encodes on CPU threads with no device Vision memory (see [Vision residency](#vision-residency)); it caps `--vision-max-merged` at 256 unless given | `resident` |
+| `--vision-residency resident\|overlay\|cpu` | `overlay` keeps the Vision tower in pinned host memory and encodes each image inside a window borrowed from the evict-ranked text weight tail, so `--vision` no longer reserves device memory and `--kv-capacity auto` resolves the no-vision capacity; requires `--vision` and CUDA virtual memory management; Gemma 4 keeps its tower's blocks pinned and streams them through a two-block device window instead. `--vision-offload on\|off` is accepted as an alias for `overlay\|resident`. `cpu` decodes the tower to host FP32 and encodes on CPU threads with no device Vision memory (see [Vision residency](#vision-residency)); it caps `--vision-max-merged` at 256 unless given. Qwen3.8-Flash-Next keeps its tower resident | `resident` |
 | `--vision-cpu` | `--vision` with `--vision-residency cpu` | off |
-| `--vision-max-merged N` | merged-token budget of one media item, `[64, 16384]`; larger images and video frame pairs are downscaled at preprocessing instead of being rejected, and the overlay window is sized for it | 16384 |
+| `--vision-max-merged N` | merged-token budget of one media item, `[64, 16384]`; larger images and video frame pairs are downscaled at preprocessing instead of being rejected, and the overlay window is sized for it. Gemma 4 (at least 70): the most soft tokens an image or video frame takes, rounded down to its budgets 70, 140, 280, 560, 1120; an image takes 280 (70 at `detail: low`, this bound at `detail: high`), a video frame 70 | 16384 |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--cuda-graph-allowance-mib N` | total CUDA Graph driver-state allowance in MiB, subtracted from the KV sizing budget | computed |
 | `--wddm-evictable-budget` | Windows builds with `-DNINFER_D3D12_RESIDENCY=ON`: budget against dedicated memory, holding the device arenas resident | off |
@@ -1818,7 +1885,10 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8` |
 | `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192` |
-| `--host-cache-mib N` | single pinned Host RAM ceiling for the whole retention tier in MiB. Hybrid mode: the slab pool KV blocks and state snapshots share, split at run time by eviction value; `0` keeps the cache on the Device only, and a nonzero budget below one snapshot is rejected. Default cache: the engine derives the Host StateImage slot count from the checkpoint inventory the capture path creates, spends the remaining state headroom on more long anchors per continuation when `--auto-long-anchors` is on, and gives Host KV the remainder. Replaces `--host-state-slots` and `--host-kv-mib`, which are rejected alongside it. | hybrid `8192`; otherwise unset (component flags used) |
+| `--host-cache-mib N\|auto` | single pinned Host RAM ceiling for the whole retention tier in MiB. Hybrid mode: the slab pool KV blocks and state snapshots share, split at run time by eviction value; `0` keeps the cache on the Device only, and a nonzero budget below one snapshot is rejected. Default cache: the engine derives the Host StateImage slot count from the checkpoint inventory the capture path creates, spends the remaining state headroom on more long anchors per continuation when `--auto-long-anchors` is on, and gives Host KV the remainder. `auto` sizes it once the weights are loaded (and, for Qwen3.8-Flash-Next, its experts pinned) from the host memory still available, the smaller of the system's available memory and what the process's memory cgroup allows, less `--host-cache-reserve-mib` and, with Vision, the media caches, and never above `--host-cache-max-mib` or `--host-cache-percent` of the machine's memory; for a machine that serves this one process, since pinned pages cannot be reclaimed. Replaces `--host-state-slots` and `--host-kv-mib`, which are rejected alongside it. Qwen3.8-Flash-Next and Gemma 4 keep their sequences' state images within this budget (or `--host-kv-mib`). | hybrid `8192`; otherwise unset (component flags used) |
+| `--host-cache-reserve-mib N` | with `--host-cache-mib auto`: host memory left free for what grows after startup (request buffers, the response store, graph instantiation) | `3072` |
+| `--host-cache-max-mib N` | with `--host-cache-mib auto`: the largest budget it may choose, for a host whose memory other processes share | none |
+| `--host-cache-percent N` | with `--host-cache-mib auto`: the largest budget as a percentage (1..100) of the machine's memory (physical, or the lower cgroup limit) | none |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 7)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation; with `--auto-long-anchors`, `--host-cache-mib` raises it within the state inventory it funds and never lowers it | `2`, `4` with `--auto-long-anchors` |
@@ -1961,7 +2031,7 @@ they do not infer request behavior from process-global counter deltas.
 
 | Event | Contents |
 |---|---|
-| `server_start` | artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities and switches, n-gram drafting options, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance and measured cost, CUDA/GPU environment, and redacted argv |
+| `server_start` | build version, artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities and switches, n-gram drafting options, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance and measured cost, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
@@ -2119,6 +2189,11 @@ summed, `read_latency_us` the `p50` and `p99` of a pass's read as the upper boun
 power-of-two histogram bucket, and `stalls` and `stall_seconds` the passes whose PLE layer waited
 for its rows after the layers before it and the device time it waited.
 
+With host- or disk-resident Flash-Next experts, `experts` reports the interval's routed
+(token, expert) pairs as `routes`, those served from a device slot as `hits`, the pairs the CPU
+computed as `cpu_routes`, the experts copied into device slots as `admitted`, the expert bytes
+copied to the devices as `transferred_bytes`, and the current number of device `slots`.
+
 The JSONL `throughput.host_work` object is the aggregation authority: the Engine worker counts each
 wall-time segment once, independent of batch size. `elapsed_seconds` contains the same five
 mutually exclusive Host phases and their `total`; `device_wait_seconds` is separate.
@@ -2172,8 +2247,9 @@ A request joins that batch only after its staged prefill finishes; when it compl
 cancelled, the next boundary rebuilds the batch without an empty row. A staged prefill holds
 admission back until it finishes. With `--concurrent-prefill` waiting requests are still admitted
 to free lanes while others prefill, so a new request's admission and prefill overlap the prefill
-and decode of the others (each prefill unit advances one chunk of the lowest staged lane per
-worker boundary).
+and decode of the others. Each prefill unit advances one chunk of the staged lane with the shortest
+remaining prompt, so a short or prefix-cached request is not held behind a long prompt for its
+whole prefill; a lane passed over eight times runs next, so a long prompt is not starved.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
 request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in
@@ -2190,14 +2266,18 @@ response the deployment allows rather than to a connection timeout: at C1 on an 
 6,500-token response occupies the engine for about 106 seconds. The 600,000 ms default admits a
 queued caller behind roughly ten such responses; lower it only to fail fast on purpose.
 
-One request owns the staged prefill at a time, and the executor alternates a single prefill chunk
-with a single decode round, so `--prefill-chunk` sets the worst-case pause every active stream sees
-while a new prompt is ingested. On an RTX 3090 ingesting a 4,900-token prompt behind four active
-streams, the largest inter-token gap measured 1,043 ms at chunk 1024, 515 ms at 512, and 312 ms at
-256, against an 82 ms median decode interval; the ingesting request's own prefill rate fell only
-from 1,135 to 1,130 to 1,110 tok/s. Prefill is not batched across requests at any chunk size, so a
-smaller chunk trades almost no ingestion throughput for a proportionally smaller stall. The shipped
-concurrent launcher uses 512.
+One request owns the staged prefill at a time, and before each prefill chunk the executor runs
+`--decode-rounds-per-prefill` decode rounds while other requests generate (by default the chunk
+over 64: 8 at chunk 512, 16 at 1024; proportionally fewer, at least one, before a shorter prefill
+unit such as a short prompt's), so `--prefill-chunk` sets the worst-case pause every active
+stream sees while a new prompt is ingested, and the decode rounds set how much of the GPU the
+streams keep meanwhile. With strict alternation (`1`) a stream got one token per chunk. The
+following measurements predate the decode rounds and used strict alternation: on an RTX 3090
+ingesting a 4,900-token prompt behind four active streams, the largest inter-token gap measured
+1,043 ms at chunk 1024, 515 ms at 512, and 312 ms at 256, against an 82 ms median decode interval;
+the ingesting request's own prefill rate fell only from 1,135 to 1,130 to 1,110 tok/s. Prefill is
+not batched across requests at any chunk size, so a smaller chunk trades almost no ingestion
+throughput for a proportionally smaller stall. The shipped concurrent launcher uses 512.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting

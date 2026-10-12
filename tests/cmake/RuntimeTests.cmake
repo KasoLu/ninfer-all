@@ -1,6 +1,9 @@
 ninfer_add_test(ninfer_admission_policy_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_admission_policy.cpp"
   LIBRARIES ninfer_runtime_support)
 
+ninfer_add_test(ninfer_host_memory_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_memory.cpp"
+  LIBRARIES ninfer_runtime_support)
+
 ninfer_add_test(ninfer_context_cost_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_context_cost.cpp"
   LIBRARIES ninfer_runtime_support ninfer::json)
 
@@ -12,6 +15,12 @@ ninfer_add_test(ninfer_slot_spill_guard_test
 
 ninfer_add_test(ninfer_resource_manager_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_resource_manager.cpp"
   LIBRARIES ninfer_runtime_support)
+# Bounds-checked containers: a slot read from the wrong catalogue (issue #39) aborts here instead of
+# reading past the end of a vector.
+if(NOT MSVC)
+  target_compile_definitions(ninfer_resource_manager_test PRIVATE
+    _GLIBCXX_ASSERTIONS _LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST)
+endif()
 
 ninfer_add_test(ninfer_kv_capacity_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_kv_capacity.cpp"
   LIBRARIES ninfer_runtime_support)

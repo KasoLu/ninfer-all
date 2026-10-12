@@ -188,6 +188,9 @@ cmp -s source.json ../{required}/source.json || exit 125
 set -Eeuo pipefail
 cd {shlex.quote(job)}
 trap 'rc=$?; date -u +%FT%TZ > {job}/finished; echo "$rc" > {job}/exit' EXIT
+# A job ended by stop-job (tmux sends SIGHUP) or a signal must not record success: jobs that
+# depend on it read this exit code.
+trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
 date -u +%FT%TZ > started
 cp {REMOTE}/source.json source.json
 {dependency}
@@ -409,6 +412,8 @@ def main():
         onstart.parent.mkdir(parents=True, exist_ok=True)
         onstart.write_text("#!/bin/bash\nset -eu\nmkdir -p /root/.ssh\nprintf '%s\\n' " +
                           shlex.quote(public) + " >> /root/.ssh/authorized_keys\n" +
+                          # Some hosts hand /root to another owner; sshd then refuses every key.
+                          "chown -R root:root /root/.ssh\nchown root:root /root\nchmod 755 /root\n" +
                           "chmod 700 /root/.ssh\nchmod 600 /root/.ssh/authorized_keys\n")
         result = vast("create", "instance", args.offer, "--image", args.image,
                       "--disk", args.disk, "--ssh", "--direct", "--cancel-unavail",

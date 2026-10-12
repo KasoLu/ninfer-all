@@ -95,11 +95,9 @@ compute-sanitizer --tool initcheck --error-exitcode 9 \
   build/tests/ninfer_tests ninfer_softmax_attention_test
 ```
 
-**Do not call the copy under `CUDA/v12.4/compute-sanitizer/` by absolute path.** Two copies are
-installed on a typical toolkit layout, and the 2024.1.0 one in v12.4 prints its banner and
-`ERROR SUMMARY: 0 errors`, exits 0, and **never executes the binary** — a clean report having
-checked nothing. `PATH` resolves `compute-sanitizer` to the v12.8 launcher, which is the working
-one, so the unqualified form above is safe.
+**Use the compute-sanitizer of the toolkit that built the binary.** With several toolkits installed,
+an older copy (2024.1.0, from CUDA 12.4) was seen to print its banner and `ERROR SUMMARY: 0 errors`,
+exit 0 and **never execute the binary** — a clean report having checked nothing.
 
 Two messages that look like failures and are not:
 
@@ -109,10 +107,10 @@ Two messages that look like failures and are not:
 - A single `-k 'regex:a|b'`-style argument disappearing in PowerShell: `|` is parsed as a pipeline
   before the tool sees it. One pattern per invocation.
 
-`ncu` needs one thing more: GPU performance counters are administrator-only by default on Windows
-and it fails with `ERR_NVGPUCTRPERM` otherwise. Run it from an elevated shell — that satisfies the
-permission per-run, with nothing persistent and no reboot.
-`scripts/sweeps/admin-profile.ps1` does this for the profiles the maintainer notes reference.
+`ncu` needs one thing more: access to the GPU performance counters, or it fails with
+`ERR_NVGPUCTRPERM`. On Windows they are administrator-only by default; an elevated shell satisfies
+that per run, with nothing persistent and no reboot (`scripts/sweeps/admin-profile.ps1` does it).
+Rented GPU containers usually deny the counters altogether; Nsight Systems still works there.
 
 The variable-width DFlash2 target-attention subset can be run with
 `./build/tests/ninfer_tests ninfer_softmax_attention_test --dflash2-only`. It covers D256/Q24/KV4 across all five
@@ -240,6 +238,9 @@ and checks reordered and repeated GPU-decoded rows exactly against independently
 FP64 products rounded to BF16. `tests/convert/test_qwen4_exp_ngram.py` separately checks the
 quantizer against a scalar codebook oracle, source-shard boundaries, digest stability and
 invalid source metadata. It does not require the full 102 GB HF table.
+The CTest launcher probes CUDA through the native test binary before importing the conversion
+dependencies. A host without a usable GPU returns skip code 77 without requiring pytest or
+PyTorch; a host with a GPU runs the complete conversion and decoding check.
 
 `tests/convert/test_block_fp8.py` checks HF 128×128 E4M3FN expert matrices against an
 independent FP64 codebook/block-product oracle with BF16 or FP32 scales, partial reads and

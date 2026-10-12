@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/context.h"
+#include "models/qwen3_5/program/structured_round.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
 
@@ -23,6 +24,8 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                  envelope, frame.target_hidden, frame.target_logits,
                                  frame.target_tokens);
     }
+    // The structured lanes' masks, computed while the verification ran.
+    if (execution.io.structured != nullptr) { execution.io.structured->wait(execution.device.stream); }
     // Before acceptance adds this round's tokens to the penalty counts.
     gather_logprobs(execution, frame.target_logits, frame.sampling, &frame.drafts);
     if (frame.proposal_q.data != nullptr) {
@@ -33,7 +36,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
             dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
             {false}, execution.work, execution.device.stream);
     } else {
-        ops::speculative_accept_greedy_drafts(
+        ops::speculative_accept_coupled_drafts(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
             frame.frontiers, frame.anchors, frame.licensed_tokens, frame.licensed_counts,
             frame.accepted_drafts,

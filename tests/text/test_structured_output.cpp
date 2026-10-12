@@ -1,5 +1,6 @@
 #include "text/structured_output.h"
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 using namespace ninfer;
@@ -75,6 +76,115 @@ int main() {
         bounded->accept(unicode);
         bounded->fill_masks(after, {});
         require((after[8] & 1U) != 0, "bounded string did not count Unicode code points");
+
+        // A root string's bounds leave the grammar like those inside an object; under anyOf they
+        // stay and compile to a chain of rules (one per count still allowed). Either way every
+        // length from minLength to maxLength closes, escapes and multi-byte scalars count once,
+        // and neither a shorter nor a longer string does.
+        const auto root_bounded = R"({"type":"string","minLength":2,"maxLength":40})";
+        const auto chained =
+            R"({"anyOf":[{"type":"string","minLength":2,"maxLength":40},{"type":"integer"}]})";
+        for (const char* schema : {root_bounded, chained}) {
+            const auto within = [&](const std::string& body) {
+                auto grammar = compiler.compile({StructuredOutputKind::JsonSchema, schema});
+                std::vector<TokenId> tokens{'"'};
+                for (unsigned char ch : body) { tokens.push_back(ch); }
+                tokens.push_back('"');
+                tokens.push_back(256);
+                try {
+                    grammar->accept(tokens);
+                    return true;
+                } catch (const std::logic_error&) { return false; }
+            };
+            require(!within("a"), "string under minLength accepted");
+            require(within("ab"), "string at minLength rejected");
+            require(within(std::string(40, 'x')), "string at maxLength rejected");
+            require(!within(std::string(41, 'x')), "string over maxLength accepted");
+            require(within(std::string(38, 'x') + "\\n\\u00e9"), "escapes do not count as one scalar");
+            require(!within(std::string(39, 'x') + "\\n\\u00e9"), "escaped scalars exceed maxLength");
+            require(within(std::string(37, 'x') + "é😀\\\""), "multi-byte scalars do not count once");
+        }
+        {
+            auto grammar = compiler.compile({StructuredOutputKind::JsonSchema, root_bounded});
+            grammar->accept(std::vector<TokenId>{'"', 'x'});
+            grammar->fill_masks(after, {});
+            require((after['"' / 32] & (1U << ('"' % 32))) == 0, "mask closes a root string under minLength");
+            grammar->accept(std::vector<TokenId>(39, 'x'));
+            grammar->fill_masks(after, {});
+            require((after['"' / 32] & (1U << ('"' % 32))) != 0, "mask cannot close a root string at maxLength");
+            require((after['x' / 32] & (1U << ('x' % 32))) == 0, "mask extends a root string past maxLength");
+        }
+
+        // Inside an object the bounds leave the grammar and the string constraint state enforces
+        // them: the same lengths close, and the masks at the bounds say so.
+        const auto object_bounded =
+            R"({"type":"object","properties":{"s":{"type":"string","minLength":2,"maxLength":40}},"required":["s"]})";
+        const auto in_object = [&](const std::string& body) {
+            auto grammar = compiler.compile({StructuredOutputKind::JsonSchema, object_bounded});
+            std::vector<TokenId> tokens;
+            for (unsigned char ch : "{\"s\":\"" + body + "\"}") { tokens.push_back(ch); }
+            tokens.push_back(256);
+            try {
+                grammar->accept(tokens);
+                return true;
+            } catch (const std::logic_error&) { return false; }
+        };
+        require(!in_object("a"), "object string under minLength accepted");
+        require(in_object("ab"), "object string at minLength rejected");
+        require(in_object(std::string(40, 'x')), "object string at maxLength rejected");
+        require(!in_object(std::string(41, 'x')), "object string over maxLength accepted");
+        require(in_object(std::string(38, 'x') + "\\n\\u00e9"), "object escapes do not count once");
+        require(!in_object(std::string(39, 'x') + "\\n\\u00e9"), "object escapes exceed maxLength");
+        require(in_object(std::string(37, 'x') + "é😀\\\""), "object multi-byte scalars do not count once");
+        {
+            auto grammar = compiler.compile({StructuredOutputKind::JsonSchema, object_bounded});
+            std::vector<TokenId> prefix;
+            for (unsigned char ch : std::string("{\"s\":\"x")) { prefix.push_back(ch); }
+            grammar->accept(prefix);
+            grammar->fill_masks(after, {});
+            require((after['"' / 32] & (1U << ('"' % 32))) == 0, "mask closes a string under minLength");
+            std::vector<TokenId> fill(39, 'x');
+            grammar->accept(fill);
+            grammar->fill_masks(after, {});
+            require((after['"' / 32] & (1U << ('"' % 32))) != 0, "mask cannot close a string at maxLength");
+            require((after['x' / 32] & (1U << ('x' % 32))) == 0, "mask extends a string past maxLength");
+            require((after['\\' / 32] & (1U << ('\\' % 32))) == 0, "mask starts an escape past maxLength");
+            // A draft column conditioned on drafts follows the same bound.
+            auto drafted = compiler.compile({StructuredOutputKind::JsonSchema, object_bounded});
+            drafted->accept(prefix);
+            std::vector<TokenId> drafts(38, 'x');
+            std::vector<std::uint32_t> columns(words * (drafts.size() + 1));
+            drafted->fill_masks(columns, drafts);
+            const auto last = std::span(columns).subspan(drafts.size() * words, words);
+            require((last['x' / 32] & (1U << ('x' % 32))) != 0, "draft column at 39 scalars cannot extend");
+            require((last['"' / 32] & (1U << ('"' % 32))) != 0, "draft column at 39 scalars cannot close");
+            // The columns, filled in parallel, equal the masks of the grammar after each draft
+            // prefix one at a time; after a rejected draft they are unrestricted.
+            for (const std::string draft : {std::string(45, 'x'), std::string("xx\"}") + std::string(3, 'x')}) {
+                auto parallel = compiler.compile({StructuredOutputKind::JsonSchema, object_bounded});
+                parallel->accept(prefix);
+                const std::vector<TokenId> ids(draft.begin(), draft.end());
+                std::vector<std::uint32_t> all(words * (ids.size() + 1));
+                parallel->fill_masks(all, ids);
+                bool reachable = true;
+                for (std::size_t j = 0; j <= ids.size(); ++j) {
+                    std::vector<std::uint32_t> single(words, ~std::uint32_t{0});
+                    if (reachable) {
+                        auto one = compiler.compile({StructuredOutputKind::JsonSchema, object_bounded});
+                        one->accept(prefix);
+                        try {
+                            one->accept(std::span(ids.data(), j));
+                            one->fill_masks(single, {});
+                        } catch (const std::logic_error&) {
+                            reachable = false;
+                            std::fill(single.begin(), single.end(), ~std::uint32_t{0});
+                        }
+                    }
+                    require(std::equal(single.begin(), single.end(), all.begin() + j * words),
+                            "a parallel draft column differs from its sequential mask");
+                }
+            }
+        }
 
         auto whitespace          = compiler.compile({StructuredOutputKind::JsonObject, {}});
         bool too_much_whitespace = false;

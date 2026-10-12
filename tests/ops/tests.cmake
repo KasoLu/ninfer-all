@@ -44,6 +44,10 @@ foreach(op IN LISTS ninfer_op_tests)
     LIBRARIES ninfer_ops)
 endforeach()
 
+ninfer_add_op_test(ninfer_gguf_moe_geglu_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_moe_geglu.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES ninfer_ops)
@@ -145,6 +149,10 @@ ninfer_add_op_test(ninfer_e8_root_decode_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_e8_root_decode.cu"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_fixed_point_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fixed_point.cu"
+  LIBRARIES ninfer_ops)
+
 # Production i6 pack/unpack round-trip gate: the production kv_cache_pack_i6_quad and
 # kv_cache_unpack_i6x16 must invert each other over every code value at every position of the
 # 16-dim block plus a randomized sweep (the 2026-09 4090-repo high-byte bug slipped past its own
@@ -154,7 +162,6 @@ ninfer_add_op_test(ninfer_i6_roundtrip_test
   LIBRARIES ninfer_ops)
 
 set_tests_properties(ninfer_i6_roundtrip_test PROPERTIES SKIP_RETURN_CODE 77)
-
 ninfer_add_op_test(ninfer_mtp_pack_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_pack.cpp"
   LIBRARIES ninfer_ops)
@@ -310,4 +317,7 @@ foreach(table IN ITEMS legacy unified)
 endforeach()
 ninfer_add_test(ninfer_moe_expert_cpu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_expert_cpu.cpp"
+  LIBRARIES ninfer_ops)
+ninfer_add_test(ninfer_gguf_expert_cpu_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_expert_cpu.cpp"
   LIBRARIES ninfer_ops)

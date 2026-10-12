@@ -66,7 +66,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>] [--fast-prefill-kernel]
-          [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
+          [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft|--full-draft-head]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
 ```
@@ -81,9 +81,9 @@ Example:
   -p 512,2048 -n 128 -pg '2048,128' -r 5 --warmup 1
 ```
 
-Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (K=1..15 for every backend);
-`--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
-enabled by default.
+Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (K=1..15 for every backend).
+Drafts use the optimized proposal head when the artifact stores one; `--lm-head-draft` requires it
+and `--full-draft-head` keeps the full output head. CUDA Graph decode is enabled by default.
 
 `--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
 and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with
@@ -315,10 +315,17 @@ cmake --build build --parallel --target ninfer_benches
   --qtype fp8 --policy a8 --n 16384 --k 5120 --t 1024
 ```
 
-Linear tuning measures every valid T through 128 and the two bulk anchors, 512 and 1024.
-[Linear tuning and performance reports](../docs/maintainer/linear-tuning.md) defines workload
-priorities, dispatch tradeoffs, and the final curve and metric tables. Respect each Op's extent
-alignment; these measurement targets do not limit supported T.
+Linear tuning measures every valid T through 128 and the two bulk anchors, 512 and 1024
+([Op development](../docs/maintainer/op-development.md)). Respect each Op's extent alignment; these
+measurement targets do not limit supported T. Where a boundary between schedules should sit is a
+separate question that `ninfer_linear_schedule_bench` answers: it times every candidate launch of a
+shape at the same column count, including candidates the shape table never selects, and names the
+one the table routes to:
+
+```bash
+./build/bench/ninfer_benches ninfer_linear_schedule_bench q4:131072x5120 --repeat 11 --spread
+./build/bench/ninfer_benches ninfer_linear_schedule_bench q8:2048x16384 --tokens 24,32,40,48 --only k32,mma
+```
 
 A continuous small-T sweep reuses one packed weight and one maximum-T activation/output
 allocation:
@@ -1127,8 +1134,8 @@ cmake --build build --parallel --target ninfer_benches
 ```
 
 The G2/G3/G4 benchmark uses physical rows 248320 and valid token domain 248077. G2 covers optional
-occurrence counts and batched sampling at `B=1,2,4,8`; G3 covers one-hot MTP windows (`K=1..5` in
-the default matrix; `--mtp-k` accepts up to 15).
+occurrence counts and batched sampling at `B=1,2,4,8`; G3 covers MTP windows under coupled
+verification (`K=1..5` in the default matrix; `--mtp-k` accepts up to 15).
 With no arguments it runs the G2/G3 greedy/stochastic matrix. G4 covers DFlash2 sparse-q acceptance
 with `K=1..15`, 16 proposal candidates, `P=0..K`, and `B=1..8`. `--drafts` defaults to the
 checkpoint recommendation of seven; the default extent is the selected K.
