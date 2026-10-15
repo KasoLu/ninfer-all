@@ -86,6 +86,7 @@ std::vector<std::int32_t> sampled_tokens(std::int32_t tokens) {
         return result;
     }
     std::vector<std::int32_t> result{0, 1, tokens / 2, tokens - 2, tokens - 1};
+    if (tokens > 8192) { result.insert(result.end(), {8191, 8192}); }
     std::sort(result.begin(), result.end());
     result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;
@@ -104,7 +105,10 @@ int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens, bool replay 
 
     Tensor x(device_activation.p, DType::BF16, {hidden, tokens});
     Tensor output(guarded_output.data(), fp32 ? DType::FP32 : DType::BF16, {rows, tokens});
-    DeviceArena workspace(256);
+    // The A16 routes hold no workspace except sm_70's wide route (ops/linear/sm70).
+    DeviceArena workspace(std::max<std::size_t>(
+        256, ops::linear_workspace_capacity_bytes(QType::BF16, rows, hidden,
+                                                  ops::LinearPolicy::A16Only, tokens, tokens)));
     ops::linear(x, weight.view(), output, ops::LinearPolicy::A16Only, workspace, nullptr);
     cuda_synchronize();
 
@@ -307,6 +311,12 @@ int run_general_bf16_linear() {
                 failures += run_bf16_linear_case(weight, tokens, false, true);
             }
         }
+    }
+    // A Qwen3.5 Vision item of 16,384 tokens projects 65,536 patches at once; sm_70's wide route
+    // takes such a call in passes of kWideColumns columns. Two passes, the second partial.
+    for (const auto& [n, k] : std::vector<std::pair<int, int>>{{4304, 1152}, {1152, 4304}}) {
+        DeviceWeight weight(make_patterned(n, k, 425U));
+        failures += run_bf16_linear_case(weight, 8192 + 263);
     }
     // A registered shape with an FP32 result takes the runtime-shape GEMM.
     DeviceWeight registered(make_patterned(256, 5120, 423U));

@@ -445,8 +445,11 @@ public:
           thinking_control_tokens(std::move(thinking_control_tokens_)),
           preserve_special(output.raw || output.preserve_special_tokens),
           split_reasoning(starts_in_reasoning && !output.raw),
-          // Copied, not moved: the body still asks whether the request declared tools.
-          tool_call_output(output.raw ? nullptr : tool_call_output_, output.tool_name_max_length) {
+          // Copied, not moved: the body still asks whether the request declared tools. Gemma's
+          // calls go through gemma_tools; the Qwen decoder would seed its own opener for a forced
+          // call.
+          tool_call_output(output.raw || gemma ? nullptr : tool_call_output_,
+                           output.tool_name_max_length) {
         if (thinking.budget && *thinking.budget == 0) {
             throw std::invalid_argument("thinking budget must be positive");
         }
@@ -462,7 +465,10 @@ public:
         // semantic tracker dormant unless a cap needs it, so the default unlimited path does not
         // decode every model token twice.
         semantic.in_reasoning = starts_in_reasoning && semantic.budget.has_value();
-        if (gemma && tool_call_output_ != nullptr) { gemma_tools.emplace(); }
+        if (gemma && tool_call_output_ != nullptr) {
+            // A forced call's opener, `<|tool_call>call:NAME{`, is already in the prompt.
+            gemma_tools.emplace(tool_call_output_->forced_tool_name);
+        }
     }
 
     // Gemma's dialect: channel markers open and close reasoning, tool-call markup stays in the
@@ -613,8 +619,11 @@ OutputSession::preview_model(std::span<const TokenId> tokens, std::uint32_t tota
             throw std::logic_error("prefix execution split exceeds the accepted token prefix");
         }
         if (impl_->grammar) {
-            impl_->preview_grammar = impl_->grammar->fork();
-            impl_->preview_grammar->accept(tokens.first(count));
+            // Installed only once it admits the round: a rejected round leaves no preview grammar
+            // for a later terminal preview to commit.
+            auto grammar = impl_->grammar->fork();
+            grammar->accept(tokens.first(count));
+            impl_->preview_grammar = std::move(grammar);
         }
         impl_->preview_ready = true;
         return runtime::OutputDecision{
@@ -800,8 +809,9 @@ runtime::OutputDecision OutputSession::preview_control(std::span<const TokenId> 
     impl_->preview_semantic.applied         = true;
     impl_->preview_semantic.injected_tokens = static_cast<std::uint32_t>(tokens.size());
     if (impl_->grammar) {
-        impl_->preview_grammar = impl_->grammar->fork();
-        impl_->preview_grammar->accept(tokens);
+        auto grammar = impl_->grammar->fork();
+        grammar->accept(tokens);
+        impl_->preview_grammar = std::move(grammar);
     }
     impl_->preview_ready = true;
     return runtime::OutputDecision{
@@ -825,6 +835,7 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     impl_->preview_semantic.control_pending = false;
     impl_->preview_output.clear();
     impl_->preview_logprobs.clear();
+    impl_->preview_grammar.reset();
     terminalize(impl_->preview_state, impl_->policy, impl_->preview_output, 0);
     release_logprobs(impl_->preview_state, impl_->preview_logprobs);
     impl_->preview_ready = true;

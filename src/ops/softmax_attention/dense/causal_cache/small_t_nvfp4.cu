@@ -5,6 +5,9 @@
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_nvfp4.cuh"
 #include "ops/kv_cache/plane_types.h"
+#if defined(NINFER_SM70)
+#    include "ops/softmax_attention/dense/causal_cache/small_t_sm70.cuh"
+#endif
 
 #include <cstdint>
 #include <stdexcept>
@@ -17,12 +20,24 @@ void launch_nvfp4_partial(const Tensor& q, CacheInput input, const Tensor& posit
                           PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                           std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
                           Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
+#if defined(NINFER_SM70)
+    // Volta's own kernel (small_t_sm70.cuh): the same grid, splits and partial outputs. The tiled
+    // kernel is Ampere's; a 70 build does not compile it.
+    launch_small_t_sm70_quantized<Geometry, TokenTile, MultiBatch, Masked, CacheInput, false,
+                                  false>(q, input, positions, scale, cache, invocation,
+                                         logical_capacity, splits, partial_acc, partial_m,
+                                         partial_l, stream);
+#else
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
     constexpr int Warps                = RowTiles == 3 ? 12 : 8;
     constexpr int KeyBlock             = 32;
     constexpr int MinBlocks            = RowTiles <= 2 ? 2 : 1;
-    constexpr std::size_t DynamicBytes = (RowTiles <= 2 ? 3u : 5u) * KeyBlock * kCausalHeadDim;
+    constexpr bool Compact =
+        RowTiles <= 2 || kCausalSmallTCompactKV<RowTiles, KeyBlock, 5 * KeyBlock * kCausalHeadDim>;
+    constexpr std::size_t DynamicBytes = (Compact ? 3u : 5u) * KeyBlock * kCausalHeadDim;
+    static_assert(kCausalSmallTQuantizedFixedBytes<RowTiles, KeyBlock> + DynamicBytes <=
+                  kMaxSharedBytesPerBlock);
     using KernelInput                  = CacheInput;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     const auto launch = [&]() {
@@ -62,6 +77,7 @@ void launch_nvfp4_partial(const Tensor& q, CacheInput input, const Tensor& posit
     };
 
     launch();
+#endif
 }
 
 template <typename Geometry, bool MultiBatch, bool Masked>

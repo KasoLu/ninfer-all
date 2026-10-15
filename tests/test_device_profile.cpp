@@ -121,6 +121,11 @@ void test_compiled_table_names_catalog_schedules() {
     const auto compiled = ninfer::runtime::parse_device_route_profiles(
         ninfer::runtime::compiled_device_route_profiles_json(), "compiled");
     for (const auto& entry : compiled) {
+#if defined(NINFER_SM75)
+        // No other part runs a Turing build, whose catalog lacks the 64-key small-T attention tier
+        // the newer parts' entries name; only Turing entries can be installed by it.
+        if (!entry.profile.hardware_class.ends_with("-sm75")) { continue; }
+#endif
         for (const auto& [key, bands] : entry.profile.routes) {
             const auto& catalog = ninfer::calibration::calibration_route_catalog();
             const auto found    = std::find_if(catalog.begin(), catalog.end(),
@@ -160,6 +165,7 @@ void test_builtin_parts() {
         {"NVIDIA RTX PRO 6000 Blackwell Workstation Edition", 12, 0, 188},
         {"NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition", 12, 0, 188},
         {"NVIDIA RTX PRO 6000 Blackwell Server Edition", 12, 0, 188},
+        {"Tesla V100-SXM2-16GB", 7, 0, 80},
     };
     for (const Part& part : parts) {
         const auto found = ninfer::runtime::find_device_route_profile(

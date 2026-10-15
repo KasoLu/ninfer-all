@@ -22,8 +22,14 @@ int run() {
     if (!artifact || !*artifact) { return 77; }
     static_assert(ninfer::models::qwen3_5::kMaximumVisionItemTokens == 16384);
     // The current Vision route fits below 827 MiB, including arena alignment and empty-scratch
-    // backing. The context growth check below protects the single-item lifetime bound.
+    // backing; an sm_70 build's wide projections stage FP16 activations and FP32 product planes
+    // (ops/linear/sm70) for 8,192 patches at a time and take 988 MiB for the 16K-token item. The
+    // context growth check below protects the single-item lifetime bound.
+#if defined(NINFER_SM70)
+    constexpr std::size_t kWorkspaceCeiling = 990ULL << 20;
+#else
     constexpr std::size_t kWorkspaceCeiling = 827ULL << 20;
+#endif
     try {
         int devices       = 0;
         const auto status = cudaGetDeviceCount(&devices);
@@ -64,7 +70,8 @@ int run() {
                                      std::to_string(at_item_limit) +
                                      " above=" + std::to_string(above_item_limit));
         }
-        std::cout << "Vision workspace remains bounded for long text context\n";
+        std::cout << "Vision workspace remains bounded for long text context: "
+                  << (at_item_limit >> 20) << " MiB\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

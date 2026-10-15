@@ -345,8 +345,14 @@ cublasHandle_t blas_handle() {
     if (device < 0 || device >= int(handles.size())) {
         throw std::invalid_argument("gguf: device ordinal out of range");
     }
+    // The first use can be inside a CUDA graph capture (a verify graph wide enough for the cuBLAS
+    // route); relaxed capture mode lets cublasCreate allocate without invalidating it.
     std::call_once(once[device], [&] {
-        if (cublasCreate(&handles[device]) != CUBLAS_STATUS_SUCCESS) {
+        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+        check(cudaThreadExchangeStreamCaptureMode(&mode), "capture mode");
+        const cublasStatus_t created = cublasCreate(&handles[device]);
+        check(cudaThreadExchangeStreamCaptureMode(&mode), "capture mode");
+        if (created != CUBLAS_STATUS_SUCCESS) {
             throw std::runtime_error("gguf: cublasCreate failed");
         }
     });
@@ -448,6 +454,13 @@ void launch_dequantize(const void* weight, std::int64_t row_bytes, int k,
     if (k <= 0 || k % (kSmallBlocks<type> ? ggml_cuda_type_traits<type>::qk : QK_K) != 0 ||
         rows <= 0) {
         throw std::invalid_argument("gguf dequantize: K must be whole blocks of the type");
+    }
+    // The slice decoders write whole 16-byte groups; this kernel stays for the rest.
+    if constexpr (kSliceDequantize<type>) {
+        if (out_row_stride % 8 == 0 && reinterpret_cast<std::uintptr_t>(out) % 16 == 0) {
+            slice_dequantize<type>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
+            return;
+        }
     }
     dequantize_rows_kernel<type, threads, dst_t>
         <<<dim3((k + QK_K - 1) / QK_K, rows, 1), threads, 0, stream>>>(
@@ -962,6 +975,13 @@ void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, 
 
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, float* out,
+                     std::int64_t out_row_stride, cudaStream_t stream) {
+    detail::dispatch_dequantize(type, weight, row_bytes, k, row_ids, rows, out, out_row_stride,
+                                stream);
+}
+
+void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
+                     const std::int32_t* row_ids, int rows, __half* out,
                      std::int64_t out_row_stride, cudaStream_t stream) {
     detail::dispatch_dequantize(type, weight, row_bytes, k, row_ids, rows, out, out_row_stride,
                                 stream);

@@ -11,6 +11,11 @@
 #     Windows box called the tree clean because Git Bash strips CR on read. Only real Linux bash
 #     saw it.
 #
+#   * scripts/check-host-compile.py on Windows -- the host code of every translation unit of the
+#     sm_70, sm_75, sm_80, sm_86, sm_89 and sm_120a configurations compiled by MSVC and by nvcc's
+#     MSVC front end, without device code. CI builds no Windows binary, and MSVC broke the Windows
+#     build three times (issues #44 and #62) on code that GCC accepts.
+#
 #   * tests/host/test_host_kv_clamp.cpp -- pins the pinned-host-KV-cache clamp arithmetic
 #     (src/core/host_kv_clamp.h) used by the Windows startup path in program_impl.h.
 #
@@ -18,10 +23,10 @@
 #
 #   * tests/test_docker_build_cache.sh -- the Dockerfile's incremental build cache.
 #
-#   * the CUDA build of every target for sm_86 and sm_120a in the Dockerfile's toolchain stage,
-#     then CTest. The toolchain stage is published as ghcr.io/<owner>/<repo>-toolchain once per
-#     change of its definition (.github/scripts/toolchain-image.sh); ccache carries over between
-#     runs; the binaries go to the image.
+#   * the CUDA build of every target for sm_75, sm_86 and sm_120a in the Dockerfile's toolchain
+#     stage, then CTest. The toolchain stage is published as ghcr.io/<owner>/<repo>-toolchain once
+#     per change of its definition (.github/scripts/toolchain-image.sh); ccache carries over
+#     between runs; the binaries go to the image.
 #
 # The last two run only when a file they build, test or ship from differs from the base: the
 # branch a pull request merges into, or on master the commit the published image was built from
@@ -48,7 +53,7 @@ jobs:
     outputs:
       changed: ${{ steps.compare.outputs.changed }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           # A pull request's merge commit and the branch head it merges into.
           fetch-depth: 2
@@ -57,10 +62,10 @@ jobs:
 
   calculator:
     name: Config calculator arithmetic
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
       # No dependencies and no build step: the test loads the page's own <script> into a vm
@@ -73,9 +78,9 @@ jobs:
 
   host-kv-clamp:
     name: Host KV clamp arithmetic
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Build and run tests/host/test_host_kv_clamp.cpp
         run: |
           g++ -std=c++20 -Wall -Wextra -Isrc tests/host/test_host_kv_clamp.cpp \
@@ -86,7 +91,7 @@ jobs:
     name: C++20 text and resource contracts (libc++)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install libc++
         run: sudo apt-get update && sudo apt-get install -y clang libc++-dev libc++abi-dev
       - name: Compile text sources and test copy-on-write state
@@ -102,11 +107,127 @@ jobs:
             tests/host/test_checkpoint_recovery_impact.cpp -o checkpoint_recovery_impact_test
           ./checkpoint_recovery_impact_test
 
+  windows-msvc:
+    name: Host code under MSVC (${{ matrix.build.label }}, part ${{ matrix.shard }}/3)
+    needs: build-inputs
+    if: needs.build-inputs.outputs.changed == 'true'
+    # Visual Studio 2022 (MSVC 14.44): CUDA 12.9 refuses Visual Studio 2026's MSVC 14.5x.
+    runs-on: windows-2022
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # A configuration's check takes 13-18 minutes on one 4-core runner; three runners take a
+        # third each.
+        shard: [1, 2, 3]
+        build:
+          # CUDA 13 dropped Volta, so sm_70 builds with 12.9.
+          - label: sm_70
+            archs: '70'
+            cuda: 12.9.1
+            installer: cuda_12.9.1_windows_network.exe
+            packages: nvcc cudart cublas_dev nvtx thrust cuda_profiler_api
+          # Their commands differ only in the architecture numbers, which check-host-compile.py
+          # compiles once; a definition or source of one of them alone is compiled for it.
+          - label: sm_75, sm_80, sm_86, sm_89
+            archs: '75 80 86 89'
+            cuda: 13.4.2
+            installer: cuda_13.4.2_windows_x86_64_network.exe
+            packages: nvcc crt nvvm cudart cublas_dev nvtx thrust cuda_profiler_api
+          - label: sm_120a
+            archs: '120a'
+            cuda: 13.4.2
+            installer: cuda_13.4.2_windows_x86_64_network.exe
+            packages: nvcc crt nvvm cudart cublas_dev nvtx thrust cuda_profiler_api
+    steps:
+      - uses: actions/checkout@v7
+      # The compiler, runtime, cuBLAS import library and the NVTX and CCCL headers: a configure and
+      # a host-only compile need nothing else.
+      - name: Install CUDA ${{ matrix.build.cuda }}
+        shell: pwsh
+        run: |
+          $version = '${{ matrix.build.cuda }}'
+          $short = ($version -split '\.')[0..1] -join '.'
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda.exe'
+          Invoke-WebRequest -Uri "https://developer.download.nvidia.com/compute/cuda/$version/network_installers/${{ matrix.build.installer }}" -OutFile $installer
+          $packages = '${{ matrix.build.packages }}'.Split(' ') | ForEach-Object { "${_}_$short" }
+          $process = Start-Process -FilePath $installer -ArgumentList (@('-s') + $packages) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "CUDA installer exited with $($process.ExitCode)" }
+          $cuda = "${env:ProgramFiles}\NVIDIA GPU Computing Toolkit\CUDA\v$short"
+          foreach ($file in 'bin\nvcc.exe', 'include\cuda_runtime.h', 'include\crt\host_config.h', 'lib\x64\cublas.lib') {
+            if (-not (Test-Path -LiteralPath (Join-Path $cuda $file))) { throw "the CUDA install lacks $file" }
+          }
+          "CUDA_PATH=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "$cuda\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      # Headers and import libraries are all a host-only compile reads: FFmpeg from BtbN's builds,
+      # laid out as the vcpkg triplet tree cmake/FindFFMPEG.cmake reads, zlib for the native PNG
+      # decoder from the runner's vcpkg, and libcurl from curl.se.
+      - name: FFmpeg, zlib and libcurl headers
+        shell: pwsh
+        run: |
+          $deps = Join-Path $env:RUNNER_TEMP 'deps'
+          $tree = Join-Path $deps 'installed\x64-windows'
+          New-Item -ItemType Directory -Force -Path $tree | Out-Null
+          Invoke-WebRequest -Uri 'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip' -OutFile "$deps\ffmpeg.zip"
+          Expand-Archive -Path "$deps\ffmpeg.zip" -DestinationPath $deps
+          $ffmpeg = Get-ChildItem -Path $deps -Directory -Filter 'ffmpeg-*' | Select-Object -First 1
+          Copy-Item -Recurse -Path "$($ffmpeg.FullName)\include", "$($ffmpeg.FullName)\lib" -Destination $tree
+          foreach ($lib in 'avformat', 'avcodec', 'avutil', 'swscale') {
+            if (-not (Test-Path -LiteralPath "$tree\lib\$lib.lib")) { New-Item -ItemType File -Path "$tree\lib\$lib.lib" | Out-Null }
+          }
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install --classic zlib:x64-windows
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg could not install zlib' }
+          $zlib = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+          Copy-Item -Path "$zlib\include\zlib.h", "$zlib\include\zconf.h" -Destination "$tree\include"
+          # Nothing links: the library only has to exist where src/media/CMakeLists.txt names it.
+          New-Item -ItemType File -Force -Path "$tree\lib\z.lib" | Out-Null
+          Invoke-WebRequest -Uri 'https://curl.se/windows/latest.cgi?p=win64-mingw.zip' -OutFile "$deps\curl.zip"
+          Expand-Archive -Path "$deps\curl.zip" -DestinationPath $deps
+          $curl = Get-ChildItem -Path $deps -Directory -Filter 'curl-*' | Select-Object -First 1
+          "VCPKG_ROOT=$deps" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "VCPKG_TARGET_TRIPLET=x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CURL_ROOT_DIR=$($curl.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      # vcvars64 writes its environment into its own cmd process only: carry it into the later steps.
+      - name: Visual Studio 2022 environment
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'no Visual Studio 2022 with the x64 toolset' }
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul 2>&1 && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$' -and $Matches[1] -notin 'VCPKG_ROOT', 'CUDA_PATH') {
+              "$($Matches[1])=$($Matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+          python -m pip install --quiet ninja
+      # The benchmarks too: the Windows release archive ships ninfer_bench.exe.
+      - name: Configure ${{ matrix.build.label }}
+        shell: pwsh
+        run: |
+          cl 2>&1 | Select-Object -First 1
+          nvcc --version | Select-Object -Last 2
+          $curl = $env:CURL_ROOT_DIR
+          foreach ($arch in '${{ matrix.build.archs }}'.Split(' ')) {
+            cmake -S . -B "build-$arch" -G Ninja -DCMAKE_BUILD_TYPE=Release `
+              "-DCMAKE_CUDA_ARCHITECTURES=$arch" "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH\bin\nvcc.exe" `
+              -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
+              -DCMAKE_CXX_USE_RESPONSE_FILE_FOR_INCLUDES=OFF -DCMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES=OFF `
+              -DBUILD_TESTING=ON -DNINFER_BUILD_APPS=ON -DNINFER_BUILD_BENCHMARKS=ON `
+              "-DCMAKE_PREFIX_PATH=$env:VCPKG_ROOT\installed\x64-windows" `
+              "-DCURL_INCLUDE_DIR=$curl\include" "-DCURL_LIBRARY=$curl\lib\libcurl.dll.a"
+            if ($LASTEXITCODE -ne 0) { throw "configure for sm_$arch failed ($LASTEXITCODE)" }
+          }
+      - name: Run scripts/check-host-compile.py
+        shell: pwsh
+        run: |
+          $builds = @('${{ matrix.build.archs }}'.Split(' ') | ForEach-Object { "build-$_" })
+          python -u scripts/check-host-compile.py $builds --shard ${{ matrix.shard }}/3 --jobs 4
+
   linux-scripts:
     name: Linux launcher and downloader guard
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       # The checkout must not normalize line endings, or the CRLF check tests nothing. Git's
       # default is to write out whatever .gitattributes says, which is exactly what a release
       # archive would carry, so this is the honest input.
@@ -129,8 +250,8 @@ jobs:
     name: Python suites (CPU)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
           # The wheels (CPU PyTorch is most of them) come from the cache; the key follows this file,
@@ -153,8 +274,8 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -185,7 +306,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: ['86', '120a']
+        arch: ['75', '86', '120a']
     steps:
       # The runner's disk (about 80 GB free) holds the toolchain, a build tree and ccache with room
       # to spare, so nothing is deleted to make space; the free space is logged.
@@ -194,8 +315,8 @@ jobs:
           # Outside the workspace, and without '..': actions/cache refuses such a path and saves nothing.
           echo "CCACHE_HOST_DIR=$RUNNER_TEMP/ccache" >> "$GITHUB_ENV"
           df -h /
-      - uses: actions/checkout@v5
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -207,7 +328,7 @@ jobs:
       - name: Toolchain image
         run: .github/scripts/toolchain-image.sh
       - name: Restore ccache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.CCACHE_HOST_DIR }}
           key: ccache-sm${{ matrix.arch }}-${{ github.sha }}
@@ -215,6 +336,7 @@ jobs:
       # A step timeout below the job's, so that a cold build which runs out of time still saves
       # its ccache and the next run continues from there.
       - name: Build every target
+        id: build
         timeout-minutes: 320
         env:
           GH_TOKEN: ${{ github.token }}
@@ -226,18 +348,17 @@ jobs:
             'ccache --zero-stats && scripts/build-native.sh configure && scripts/build-native.sh build && ccache --show-stats' \
             > build-ci.log 2>&1 &
           build=$!
-          context="build progress (sm_${{ matrix.arch }})"
-          .github/scripts/build-progress.sh "$build" build-ci.log "$context" &
+          .github/scripts/build-progress.sh watch "$build" build-ci.log "build progress (sm_${{ matrix.arch }})" &
           tail -n +1 -f build-ci.log --pid="$build" &
-          status=0
-          wait "$build" || status=$?
-          state=success; (( status == 0 )) || state=failure
-          gh api --silent -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state=$state \
-            -f context="$context" -f description="finished, exit $status" || true
-          exit "$status"
+          wait "$build"
+      - name: Report the build status
+        if: always() && steps.build.outcome != 'skipped'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/build-progress.sh finish "build progress (sm_${{ matrix.arch }})" "${{ steps.build.outcome }}"
       - name: Save ccache
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ env.CCACHE_HOST_DIR }}
           key: ccache-sm${{ matrix.arch }}-${{ github.sha }}
@@ -253,7 +374,7 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/src" -w /src ninfer-toolchain:ci \
             docker/stage-dist.sh build-ci ${{ matrix.arch }} dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-sm${{ matrix.arch }}
           path: dist/

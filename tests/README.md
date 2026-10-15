@@ -61,6 +61,14 @@ On a machine without a usable CUDA device -- no GPU, an old driver, or only the 
 skipped and the host tests still run. A test asks `tests/cuda_availability.h`; one that fails on its
 first CUDA call with the runtime's no-device message is skipped by CTest the same way.
 
+`scripts/check-host-compile.py BUILD_DIR...` compiles the host code of every translation unit of
+configured builds (`-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`) for syntax only, without device code: each
+`.cpp`, and each `.cu` through nvcc's host preprocessing, cudafe++ and the host compiler. A source
+whose command differs between the builds only in the architecture numbers is compiled once, and
+`--shard I/N` checks the I-th of N parts. CI runs it on Windows with MSVC for every architecture,
+since nothing else there compiles Windows code; one Linux configuration takes about 80 s on 28
+cores.
+
 Alternatively, `cmake --preset dev` enables products, tests and benchmarks together.
 After building, `ctest --preset dev` runs the same CTest suite. See
 [Build system](../docs/maintainer/build-system.md) for local interpreter presets.
@@ -252,10 +260,12 @@ that real-source check with the affected converter suite.
 Token log probabilities run through the public Engine on either family. The test checks that each
 record spells its token's text and that the drawn token tops its distribution under greedy
 decoding, that gathering them changes no generated token, that streaming, a stop string, three
-requests decoded as one batch and a JSON grammar's mask all reach the records, and that a request
+requests decoded as one batch and a JSON grammar's mask all reach the records, that schemas with an
+array, string or integer root constrain the answer from its first token, and that a request
 without them gathers none. `NINFER_LOGPROBS_ARTIFACT` names the artifact, and the test is skipped
-without it; `NINFER_LOGPROBS_NGRAM_TABLE` names a Qwen3.8-Flash-Next table artifact, and
-`NINFER_LOGPROBS_SPECULATIVE=mtp` or `dflash2` verifies the tokens in speculative rounds.
+without it; `NINFER_LOGPROBS_NGRAM_TABLE` names a Qwen3.8-Flash-Next table artifact,
+`NINFER_LOGPROBS_SPECULATIVE=mtp` or `dflash2` verifies the tokens in speculative rounds, and
+`NINFER_LOGPROBS_CONTEXT_CACHE=hybrid` admits every request through the hybrid prefix cache.
 `NINFER_LOGPROBS_DEVICES=0,1` selects a two-GPU layer pipeline:
 
 ```bash

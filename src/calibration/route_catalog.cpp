@@ -1,5 +1,9 @@
 #include "calibration/route_catalog.h"
 
+#include "ops/linear/common/route_table.h"
+#include "ops/softmax_attention/dense/causal_cache/launch.h"
+#include "ops/softmax_attention/dense/causal_cache/small_t_i8_launch.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -14,6 +18,11 @@ std::vector<RouteCatalogEntry> build_catalog() {
     const auto add = [&](std::string key, std::vector<std::string> candidates) {
         catalog.push_back({std::move(key), std::move(candidates)});
     };
+
+#if !defined(NINFER_SM70)
+    // An sm_70 build runs its own projection, decode-attention and single-row prompt routes
+    // (ops/linear/sm70, small_t_sm70.cuh, prompt_sm70.cu), which consult none of the projection and
+    // attention keys below; it calibrates the GDN prefill switch alone.
 
     // Ternary Bonsai 2 projections: the small-T kernel's row and column tiles per shape, and the
     // small-T kernel against the prefill GEMM per width.
@@ -49,20 +58,38 @@ std::vector<RouteCatalogEntry> build_catalog() {
     add("q4_linear_swiglu/34816x17408x5120",
         {"gemv_pair", "small_t_tiled", "split_half_pair_c40", "split_half_pair_c48",
          "split_half_pair_c128", "split_half_pair_c128_tail"});
-    for (const char* key : {"unified/q4_q5_attn_input", "unified/q4_q5_gdn_input",
-                            "unified/q5_linear_add/5120x6144", "unified/q5_linear_add/5120x17408",
-                            "unified/q4_linear_swiglu", "unified/q4_linear_add"}) {
-        add(key, {"unified"});
+    // A build that cannot select the unified table (ops/linear/common/route_table.h) has no switch
+    // onto it.
+    if (ops::detail::kUnifiedLinearRoutes) {
+        for (const char* key :
+             {"unified/q4_q5_attn_input", "unified/q4_q5_gdn_input",
+              "unified/q5_linear_add/5120x6144", "unified/q5_linear_add/5120x17408",
+              "unified/q4_linear_swiglu", "unified/q4_linear_add"}) {
+            add(key, {"unified"});
+        }
     }
+    // Q8 G32 K-split contractions (MTP heads, DFlash2 drafters, the official artifacts' heads):
+    // the four-K-warp form of each 8-column tile (ops/linear/q8/q8_ksplit_config.h).
+    for (const char* shape :
+         {"6144x5120", "14336x5120", "17408x5120", "34816x5120", "248320x5120", "5120x6144",
+          "5120x10240", "5120x17408", "5120x25600", "2048x4096", "2048x16384"}) {
+        add(std::string("q8_ksplit/") + shape, {"kw4"});
+    }
+
+#endif
 
     // The two-stage GDN prefill for 48 and 32 value heads.
     add("gdn_two_stage/h48", {"on"});
     add("gdn_two_stage/h32", {"on"});
 
-    // Prompt attention switches, measured on rk8v4.
+#if !defined(NINFER_SM70)
+    // Prompt attention switches, measured on rk8v4. A build without the standard INT8 prompt
+    // kernel (kCausalPromptI8Standard) has nothing to pack or to compare the fast one against.
     add("attn_pv_f16", {"on"});
-    add("attn_pack_gqa", {"on"});
-    add("attn_prompt_fast", {"on"});
+    if (ops::detail::kCausalPromptI8Standard) {
+        add("attn_pack_gqa", {"on"});
+        add("attn_prompt_fast", {"on"});
+    }
     // Parallel query tiles for single-row chunked small-T widths, measured on rk8v4.
     add("attn_parallel_tiles", {"on"});
 
@@ -82,11 +109,13 @@ std::vector<RouteCatalogEntry> build_catalog() {
             } else {
                 tiers = {"6x2x32",   "12x1x32", "12x1x64d", "24x1x32",  "6x2x32q",
                          "12x1x32q", "6x2x32e", "12x1x32e", "6x2x32qe", "12x1x32qe"};
+                if (!ops::detail::kSmallTI8KeyBlock64) { std::erase(tiers, "12x1x64d"); }
             }
             add(std::string("attn_i8_small/h24/") + coding + "/w" + std::to_string(width),
                 std::move(tiers));
         }
     }
+#endif
 
     std::sort(catalog.begin(), catalog.end(),
               [](const RouteCatalogEntry& a, const RouteCatalogEntry& b) { return a.key < b.key; });

@@ -88,6 +88,15 @@ std::vector<std::uint16_t> make_activation(std::int32_t rows, std::int32_t token
 // cannot say, since an exact A16 fallback would pass every bound in this file.
 int expect_route(const std::string& label, const WorkspaceArena& workspace,
                  std::size_t weight_bytes, std::int32_t tokens) {
+#if defined(NINFER_SM70)
+    // An sm_70 build takes its own route at every width (ops/linear/sm70): FP16 weight slabs into
+    // cuBLAS above the small-T widths, never the int8 materialisation. Only accuracy applies there.
+    (void)label;
+    (void)workspace;
+    (void)weight_bytes;
+    (void)tokens;
+    return 0;
+#else
     const bool engaged  = workspace.peak_used() >= weight_bytes;
     const bool expected = tokens >= ops::kCublasPrefillMinTokens;
     if (engaged == expected) { return 0; }
@@ -95,6 +104,7 @@ int expect_route(const std::string& label, const WorkspaceArena& workspace,
               << ", expected it to " << (expected ? "run" : "decline") << " (peak workspace "
               << workspace.peak_used() << " bytes, one weight " << weight_bytes << ")\n";
     return 1;
+#endif
 }
 
 float bf16_value(std::uint16_t bits) {
@@ -123,11 +133,12 @@ std::vector<float> token_column(const std::vector<std::uint16_t>& activation, st
 }
 
 // Tokens to check: the ends, the tokens either side of every tile edge the route can use at the
-// registered shapes (gate_up 1920, the split projections 5376, the down/out projections 13056),
-// and a deterministic scatter. Edges past `tokens` drop out.
+// registered shapes (gate_up 1920, the split projections 5376, the down/out projections 13056,
+// sm_70's column passes 8192), and a deterministic scatter. Edges past `tokens` drop out.
 std::vector<std::int32_t> sample_tokens(std::int32_t tokens, std::uint32_t seed) {
-    std::vector<std::int32_t> picks = {0,    1,     127,   128,   1919,  1920,  1921,  3839,
-                                       3840, 3841,  5375,  5376,  5377,  13055, 13056, 13057};
+    std::vector<std::int32_t> picks = {0,    1,    127,  128,  1919,  1920,  1921,  3839,  3840,
+                                       3841, 5375, 5376, 5377, 8191,  8192,  8193,  13055, 13056,
+                                       13057};
     picks.push_back(tokens - 1);
     for (std::uint32_t i = 0; i < 12; ++i) {
         picks.push_back(static_cast<std::int32_t>(qw::detail::mix64(seed + i * 7919U) %
@@ -424,6 +435,9 @@ int main() {
         // tokens to tile, so they get their own.
         failures += run_gate_up(4133);
         failures += run_down(13057, 6144);
+        // sm_70's wide route passes over more than 8,192 columns (a Vision item's patches): two
+        // passes, the second partial.
+        failures += run_gate_up(8192 + 263);
         for (const std::int32_t tokens : {128, 512, 1000, 5377}) {
             failures += run_gdn_input(tokens);
             failures += run_attn_input(tokens);
