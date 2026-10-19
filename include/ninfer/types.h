@@ -481,7 +481,7 @@ struct ModelSuspendOptions {
     bool auto_resume = true;
 };
 
-// Qwen3.8-Flash-Next (Qwen4ExpForCausalLM): where the routed experts' banks live.
+// Where supported MoE families keep routed expert banks (see each family guide).
 enum class ExpertResidency : std::uint8_t {
     // In the weight arena of each layer's stage device.
     Device,
@@ -569,11 +569,12 @@ struct EngineOptions {
     // Layers per stage, one count per entry of `devices`. Empty lets the engine choose from each
     // device's free memory.
     std::vector<std::uint32_t> stage_layers;
-    // Qwen3.8-Flash-Next only.
+    // Native Qwen MoE, Qwen3.8-Flash-Next and Gemma 4 MoE.
     ExpertResidency expert_residency = ExpertResidency::Device;
-    // Host-resident experts: device memory lent to the cache of the most used experts, split
-    // evenly over the devices. Empty takes what each device has free after startup less a margin;
-    // zero disables the cache.
+    // Host/disk experts: device memory lent to the persistent cache, split
+    // evenly over the devices. Automatic sizing follows each family's KV/workspace reservations.
+    // Zero disables the cache for native Qwen and Gemma, which retain bounded transient slots;
+    // Flash-Next disk residency requires a nonzero cache.
     std::optional<std::uint64_t> expert_cache_bytes;
     HybridExpertOptions hybrid_experts;
     // Qwen3.8-Flash-Next only.
@@ -616,7 +617,10 @@ struct EngineOptions {
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
-    std::uint32_t prefill_chunk        = 1024;
+    // Prompt tokens per prefill chunk; 0 is automatic: 1024, or 4096 for a native Qwen3.5-family MoE
+    // whose routed experts live in host memory or files (each chunk carries the whole expert bank
+    // across the bus once). Gemma 4 chooses its own chunk.
+    std::uint32_t prefill_chunk        = 0;
     // Decode rounds that run before a prefill chunk while other requests generate, proportionally
     // fewer (at least one) before a shorter prefill unit and more before a longer one. A decode
     // round takes tens of milliseconds and a chunk hundreds, so strict alternation (1) leaves
@@ -688,6 +692,11 @@ struct EngineOptions {
     // ($NINFER_DEVICE_PROFILES, else $XDG_CACHE_HOME or ~/.cache, /ninfer/device-profiles.json).
     std::string device_profile = "auto";
     std::filesystem::path device_profile_path;
+    // Lowest graphics clock, in MHz, the Engine's GPUs are held at while a generation or scoring
+    // call runs (core/gpu_clock_floor.h): a layer pipeline's stages otherwise wait at idle clocks.
+    // Zero leaves the clocks to the driver. Holding them needs administrator rights (root on
+    // Linux); without them the Engine reports it and runs at the driver's clocks.
+    std::uint32_t gpu_clock_floor_mhz = 0;
     // Prompt grafts a request may select by name through PromptOptions::graft. Each is loaded and
     // validated against the resident model at construction.
     std::vector<GraftSource> grafts;
@@ -1611,8 +1620,8 @@ struct MemorySummary {
     std::size_t host_kv_page_group_bytes = 0;
     // Engaged only when the single host RAM budget mode is active.
     std::size_t host_cache_budget_bytes = 0;
-    // Qwen3.8-Flash-Next host or disk experts: device memory lent to the expert cache, over every
-    // device.
+    // Host or disk routed experts: persistent device cache bytes, over every device. Native
+    // Qwen delivery windows are counted separately in workspace.
     std::size_t expert_cache_bytes = 0;
     // A pipeline over several devices: each device in stage order, the primary one (which the
     // single-device fields above describe) first. Empty on one device.
@@ -1663,7 +1672,7 @@ struct NgramTableStats {
     double stall_seconds = 0.0;
 };
 
-// Qwen3.8-Flash-Next's routed experts with host or disk residency, monotonic. A route is one
+// Routed experts with host or disk residency, monotonic. A route is one
 // (token, expert) pair a pass took; a hit found its expert in a device slot. transferred_bytes
 // counts the expert bytes copied to the devices (misses and cache admissions); cpu_routes the
 // pairs computed by the CPU.
@@ -1925,7 +1934,7 @@ struct LoadSummary {
     std::uint64_t artifact_bytes_read  = 0;
     std::uint64_t host_to_device_bytes = 0;
     std::uint64_t peak_staging_bytes   = 0;
-    std::uint64_t pinned_weight_bytes  = 0; // host-pinned weights (overlay vision tower)
+    std::uint64_t pinned_weight_bytes  = 0; // host-pinned model weights (experts or overlay vision tower)
     std::uint64_t overlay_window_bytes = 0; // device bytes one overlay vision window borrows
     std::size_t device_object_count    = 0;
     std::size_t host_object_count      = 0;

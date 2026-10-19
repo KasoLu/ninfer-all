@@ -63,11 +63,11 @@ and starts the one that matches the GPU. Every card by name, with what has run o
 | Architecture | Compute capability | Build | CUDA | In the image | Status |
 |---|---|---|---|---|---|
 | Blackwell: GeForce RTX 50, RTX PRO Blackwell | 12.0 | `120a` | 13.1 or newer | yes | measured; built-in device profiles |
-| Ada Lovelace | 8.9 | `89`, or the `86` build | 12.8 or newer | the `86` build | measured; built-in device profile |
-| Ampere | 8.6 | `86` (the default) | 12.8 or newer | yes | measured; the reference card |
-| Ampere, A100 class | 8.0 | `80` | 12.8 or newer | no | builds; not measured |
-| Turing | 7.5 | `75` | 12.8 or newer | yes | measured; built-in device profile |
-| Volta | 7.0 | `70` | 12.8 or 12.9 | no: [source build](docs/build-linux.md#tesla-v100-sm_70) | measured; built-in device profile |
+| Ada Lovelace | 8.9 | `89`, or the `86` build | 12.8 or newer | the `86` build | measured; built-in device profiles |
+| Ampere | 8.6 | `86` (the default) | 12.8 or newer | yes | measured (the reference card); built-in device profiles |
+| Ampere, A100 class | 8.0 | `80` | 12.8 or newer | no | built-in device profiles; not benchmarked |
+| Turing | 7.5 | `75` | 12.8 or newer | yes | measured; built-in device profiles |
+| Volta | 7.0 | `70` | 12.8 or 12.9 | no: [source build](docs/build-linux.md#tesla-v100-sm_70) | measured; built-in device profiles |
 | Hopper; data-center Blackwell; GB10; Pascal and older | | none | | | no build |
 
 </details>
@@ -90,13 +90,15 @@ and starts the one that matches the GPU. Every card by name, with what has run o
 <details>
 <summary><b>Device profiles and limits</b> — how a card gets its kernel routes</summary>
 
-- **Device profiles.** A profile picks the kernel route of every operation and width. A built-in
-  profile applies to the same GPU name, compute capability and SM count: the RTX 3090, 4090 and 5090,
-  the three RTX PRO 6000 Blackwell editions, the Tesla V100-SXM2-16GB and the TITAN RTX. Any other
-  card is calibrated once at first start, which took 82 to 107 seconds on the 8 to 12 GB cards, and
-  the result is stored for later starts; `ninfer-calibrate` measures again after a driver or clock
-  change ([device profiles](docs/device-profiles.md)). The `70` build runs its own routes, so the
-  V100 profile holds only the GDN prefill switch.
+- **Device profiles.** A profile picks the kernel route of every operation and width. The binary
+  carries profiles measured on 47 GPU models, from the Tesla V100 and RTX 2060 Super to the RTX PRO
+  6000 (the Profile column of [supported GPUs](docs/gpus.md#cards)); a built-in profile applies to
+  the same GPU name, compute capability and SM count. Any other card is calibrated once at first
+  start, which takes about half a minute to three and a half minutes, and the result is stored for
+  later starts; `ninfer-calibrate` measures again after a driver or clock change
+  ([device profiles](docs/device-profiles.md)). The `70` build runs its own
+  routes, so the V100 profiles hold only the GDN prefill switch and, for the 32 GB card, the Q8 MoE
+  prefill frontier.
 - **Architecture limits.** NVFP4 expert weights need a `120a` build. The Turing and Volta builds
   replace instructions their GPUs lack and reshape kernels to their shared memory
   ([Turing](docs/build-linux.md#turing-sm_75), [Tesla V100](docs/build-linux.md#tesla-v100-sm_70)).
@@ -227,8 +229,10 @@ Prefill of a 4,463-token prompt, in tok/s:
 
 - **Qwen3.5 family.** Dense and MoE (`Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`) with MTP,
   DFlash (35B-A3B) and DFlash2 (Qwen3.8-27B) drafters, Vision for images and video, and
-  `groupwise-int`, FP8, NVFP4 and ternary weights. NVFP4 expert banks prefill through W4A4 and need
-  a `120a` build.
+  `groupwise-int`, FP8, NVFP4 and ternary weights. Native MoE routed experts can stay in pinned
+  host memory or the artifact's files, brought into whole-layer GPU banks with an optional device
+  cache ([expert residency](docs/maintainer/qwen3_5-model.md#routed-expert-residency)). NVFP4
+  expert banks prefill through W4A4 and need a `120a` build.
 - **GGUF block formats.** Releases that pick a ggml type per tensor, such as ISTA-DASLab's GSQ-RCO,
   convert without requantization and multiply their blocks in place. The 3.5-bit Qwen3.8-27B IQ3_S
   release holds 10.95 GiB of weights instead of 15.9, scores WikiText-2 perplexity 7.071 (the
@@ -317,7 +321,8 @@ Prefill of a 4,463-token prompt, in tok/s:
   operation and width: built in for the cards in [supported GPUs](#supported-gpus), measured once
   at first start on any other ([device profiles](docs/device-profiles.md)).
 - **Pipeline stages.** `--devices 0,1,...` splits the layers over up to eight GPUs on Linux, each
-  stage owning its weights, KV and state ([pipeline stages](docs/maintainer/pipeline-stages.md)).
+  stage owning its weights, KV and state; the cards may differ where the build runs on each, such as
+  RTX 30 with RTX 40 cards on the `86` build ([pipeline stages](docs/maintainer/pipeline-stages.md)).
 - FP8 A8 and NVFP4 W4A4 tensor-core routes on every `120a` build, an FP4 tensor-core prompt kernel
   for an NVFP4 KV cache, and programmatic dependent launches on Blackwell.
 
@@ -327,14 +332,18 @@ Prefill of a 4,463-token prompt, in tok/s:
 
 `ghcr.io/iamwavecut/ninfer-all:latest` is built from the newest `master` commit that passes CI, on CUDA 13.4
 and Ubuntu 26.04, and is 1.6 GB compressed. It carries the `sm_75`, `sm_86` and `sm_120a` builds and starts
-the one that matches the GPU. It needs an NVIDIA driver of the CUDA 13 branch (580 or newer) and the
+the one that matches the GPUs. It needs an NVIDIA driver of the CUDA 13 branch (580 or newer) and the
 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
+`ghcr.io/iamwavecut/ninfer-all:multi` carries one build of all three architectures instead, for a
+layer pipeline (`--devices`) across cards of different architectures, where each card runs its own
+kernels; given such cards, `latest` runs the oldest card's build on all of them.
 
 <details>
 <summary><b>Commands, volumes and tags</b> — what the container runs</summary>
 
 - **Tags.** `latest`, `sha-<commit>` and the `VERSION`. A commit that changes only documentation or
-  tooling the image does not carry keeps the image before it.
+  tooling the image does not carry keeps the image before it. `multi` and `sha-<commit>-multi` are
+  the multi-architecture image, published apart from CI after each `master` push.
 - **Volumes.** `/models` holds artifacts, `/cache` the device profile measured on first start, and
   `/grafts/<model>/` optional [prompt grafts](docs/serving.md#prompt-grafts).
 - **Checked** on an RTX 3090 and an RTX 5090 with driver 580.159.03.
@@ -358,8 +367,9 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 \
 
 [compose.yaml](compose.yaml) wires the GPU, the port and the volumes for the same:
 `docker compose run --rm ninfer download qwen38-27b`, then `docker compose up -d`.
-`NINFER_IMAGE_ARCH=sm75|sm86|sm120a` overrides the GPU detection, and `docker build -t ninfer .`
-builds the image from source (`--build-arg ARCHS=86` for one architecture).
+`NINFER_IMAGE_ARCH=sm75|sm86|sm120a|multi` overrides the GPU detection, and `docker build -t ninfer .`
+builds the image from source (`--build-arg ARCHS=86` for one architecture,
+`--build-arg 'ARCHS=75;86;120a'` for the multi-architecture build).
 
 </details>
 
@@ -370,7 +380,9 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTUR
 cmake --build build --target ninfer-serve ninfer-calibrate
 ```
 
-`CMAKE_CUDA_ARCHITECTURES` takes one build from [supported GPUs](#supported-gpus).
+`CMAKE_CUDA_ARCHITECTURES` takes one build from [supported GPUs](#supported-gpus), or a list of them
+for a pipeline across cards of different architectures
+([several architectures](docs/build-linux.md#cards-of-several-architectures-in-one-pipeline)).
 
 <details>
 <summary><b>Toolchains and options</b> — CUDA versions per target, guides</summary>

@@ -11,6 +11,7 @@
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
 #include "core/host_kv_arena.h"
+#include "ops/common/device_tier.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/context_kv_materialize.h"
@@ -1044,23 +1045,26 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     // warp-level mma.sync schedules this family is written against, with the same 100 KiB of shared
     // memory per SM. The occupancy and split-k choices are still the sm_86 ones, so the card is
     // supported here in the sense of running correctly, not of being tuned for. 7.0 (Tesla V100)
-    // runs only a build for it, whose kernels emulate the Ampere warp primitives. 7.5 needs the
-    // Turing tier of a 75 build (NINFER_SM75), whose kernels avoid the sm_80 instructions and fit
+    // runs Volta's code, whose kernels emulate the Ampere warp primitives. 7.5 needs Turing's code
+    // (a build with 75 among its architectures), whose kernels avoid the sm_80 instructions and fit
     // its 64 KiB of shared memory.
-    const int capability = device.compute_capability();
-#if defined(NINFER_SM75)
-    constexpr bool kTuringBuild = true;
-#else
-    constexpr bool kTuringBuild = false;
-#endif
-    if (!(capability == 70 || capability == 80 || capability == 86 || capability == 89 ||
-          capability == 120 || (capability == 75 && kTuringBuild))) {
-        throw std::invalid_argument(
-            kTuringBuild
-                ? "Qwen3.5 family runtime requires compute capability 7.0, 7.5, 8.0, 8.6, 8.9 or "
-                  "12.0"
-                : "Qwen3.5 family runtime requires compute capability 7.0, 8.0, 8.6, 8.9 or 12.0 "
-                  "(7.5 needs a CMAKE_CUDA_ARCHITECTURES=75 build)");
+    // Every rank is checked: pipeline stages may mix capabilities (core/device.cu).
+    for (std::size_t rank = 0; rank < device.size(); ++rank) {
+        const RankContext& context = device.rank(rank);
+        const int capability       = context.compute_capability();
+        if (capability == 70 || capability == 80 || capability == 86 || capability == 89 ||
+            capability == 120 ||
+            (capability == 75 && ops::device_tier(context.device) == ops::DeviceTier::Turing)) {
+            continue;
+        }
+        std::string message =
+            "Qwen3.5 family runtime requires compute capability 7.0, 7.5, 8.0, 8.6, 8.9 or 12.0 "
+            "(7.5 needs a build with 75 among CMAKE_CUDA_ARCHITECTURES)";
+        if (device.model_parallel()) {
+            message += "; CUDA device " + std::to_string(context.device) + " has " +
+                       std::to_string(capability / 10) + "." + std::to_string(capability % 10);
+        }
+        throw std::invalid_argument(message);
     }
     if (options.speculative.ngram_draft_tokens != 0 &&
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&
@@ -1101,6 +1105,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->rope_yarn           = inputs.rope_yarn;
     impl->mtp_attention_window = inputs.mtp_attention_window;
     impl->features            = inputs.features;
+    impl->expert_cache_bytes  = inputs.expert_cache_bytes;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
     impl->structured_output   = inputs.structured_output;
@@ -1389,6 +1394,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .rope_yarn                  = planned_rope_yarn(parameters, options),
         .mtp_attention_window       = options.speculative.mtp_attention_window,
         .features                   = models::load_options(options),
+        .expert_cache_bytes         = options.expert_cache_bytes,
         .use_cuda_graph             = options.use_cuda_graph,
         .cuda_graph_allowance_bytes = options.cuda_graph_allowance_bytes,
         .causal_scoring             = options.purpose == EnginePurpose::CausalScoring,

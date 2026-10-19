@@ -166,26 +166,29 @@ std::string usage_text(const char* argv0) {
            "CONTEXT\n"
            "  --max-context N               context ceiling in tokens (default 2048)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
-           "                                (default 1024)\n"
+           "                                (default 1024; 4096 for native MoE experts\n"
+           "                                in host memory or files)\n"
            "  --max-new N                   cap on generated tokens (default 128)\n"
            "  --device N                    CUDA device index (default 0)\n"
            "  --devices A,B,...             one pipeline stage per listed GPU, each owning\n"
            "                                its layers' weights, KV cache and state, the\n"
            "                                first also the embedding, head and round state;\n"
-           "                                Linux only, and a repeated id (--devices 0,0)\n"
+           "                                the cards may differ where the build runs on\n"
+           "                                each, and a repeated id (--devices 0,0)\n"
            "                                exercises the path on one GPU\n"
            "  --stage-layers A,B,...        layers per stage (default: split by each GPU's\n"
            "                                free memory)\n"
-           "  --expert-residency device|host|disk  Qwen3.8-Flash-Next: expert banks in GPU\n"
-           "                                memory (default), in pinned host memory read\n"
-           "                                across the bus, or left in the artifact's files\n"
-           "                                and streamed into the device expert cache\n"
-           "  --expert-cache-mib N|auto     with host or disk experts: device memory for the\n"
-           "                                most used experts (default auto: what is free;\n"
-           "                                0 turns the host cache off; disk needs one)\n" +
+           "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
+           "                                host memory, or in artifact files\n"
+           "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen\n"
+           "                                and Gemma allow 0 (layer banks only).\n"
+           "                                Flash-Next disk requires a nonzero cache\n" +
            std::string(ninfer::product::kHybridExpertHelp) +
            std::string(ninfer::product::kNgramTableHelp) +
            "  --no-cuda-graph               decode without CUDA Graphs\n"
+           "  --gpu-clock-floor MHZ         hold the GPUs' graphics clock at MHZ or more while\n"
+           "                                a request runs, so pipeline stages do not wait at\n"
+           "                                idle clocks (needs administrator or root rights)\n"
            "\n"
            "KV CACHE\n"
            "  --kv-capacity N|auto          KV capacity in tokens (default --max-context);\n"
@@ -509,6 +512,11 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--gpu-clock-floor") {
+            options.gpu_clock_floor_mhz = parse_u32(value(arg), "gpu-clock-floor");
+            if (options.gpu_clock_floor_mhz == 0 || options.gpu_clock_floor_mhz > 5000) {
+                throw std::invalid_argument("--gpu-clock-floor must be in [1, 5000] MHz");
+            }
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {

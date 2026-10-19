@@ -44,7 +44,7 @@ foreach(op IN LISTS ninfer_op_tests)
     LIBRARIES ninfer_ops)
 endforeach()
 
-ninfer_add_op_test(ninfer_gguf_moe_geglu_test
+ninfer_add_op_test(ninfer_gguf_moe_geglu_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gguf_moe_geglu.cpp"
   LIBRARIES ninfer_ops)
 
@@ -73,6 +73,9 @@ add_test(NAME ninfer_softmax_attention_nvfp4_test
 add_test(NAME ninfer_softmax_attention_k8v4_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --k8v4-only)
 
+add_test(NAME ninfer_softmax_attention_quantized_depth_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --quantized-depth-only)
+
 add_test(NAME ninfer_softmax_attention_rk4v4_e8_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --rk4v4-e8-only)
 add_test(NAME ninfer_softmax_attention_rk2v4_e8_test
@@ -88,17 +91,21 @@ add_test(NAME ninfer_softmax_attention_dflash2_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --dflash2-only)
 add_test(NAME ninfer_softmax_attention_int8_prompt_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --int8-prompt-only)
+add_test(NAME ninfer_softmax_attention_fp8_prompt_test
+  COMMAND ninfer_tests ninfer_softmax_attention_test --fp8-prompt-only)
 add_test(NAME ninfer_softmax_attention_pack_gqa_test
   COMMAND ninfer_tests ninfer_softmax_attention_test --pack-gqa-only)
 
 set_tests_properties(
   ninfer_softmax_attention_nvfp4_test
   ninfer_softmax_attention_k8v4_test
+  ninfer_softmax_attention_quantized_depth_test
   ninfer_softmax_attention_rk4v4_e8_test
   ninfer_softmax_attention_rk2v4_e8_test
   ninfer_softmax_attention_rk6v4_e8_test
   ninfer_softmax_attention_dflash2_test
   ninfer_softmax_attention_int8_prompt_test
+  ninfer_softmax_attention_fp8_prompt_test
   ninfer_softmax_attention_pack_gqa_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
@@ -139,6 +146,13 @@ ninfer_add_op_test(ninfer_prepare_masked_block_test
 
 ninfer_add_op_test(ninfer_sparse_moe_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sparse_moe.cpp"
+  LIBRARIES ninfer_ops)
+add_test(NAME ninfer_sparse_moe_streaming_test
+  COMMAND ninfer_tests ninfer_sparse_moe_test --streaming)
+set_tests_properties(ninfer_sparse_moe_streaming_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_op_test(ninfer_sparse_moe_candidates_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_sparse_moe_candidates.cpp"
   LIBRARIES ninfer_ops)
 
 # The routing sort on its own, exhaustively. The Op test above covers SparseMoe end to end and
@@ -261,6 +275,10 @@ add_test(NAME ninfer_sparse_moe_wide_test
   COMMAND ninfer_tests ninfer_sparse_moe_test --wide-only)
 set_tests_properties(ninfer_sparse_moe_wide_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
+add_test(NAME ninfer_sparse_moe_candidates_op_test
+  COMMAND ninfer_tests ninfer_sparse_moe_test --candidates-only)
+set_tests_properties(ninfer_sparse_moe_candidates_op_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
 
 foreach(mode IN ITEMS ngram-only onehot-distribution mtp-onehot mtp-distribution ngram-negative-penalties wide-accept wide-distribution)
   string(REPLACE "-" "_" test_suffix "${mode}")
@@ -284,10 +302,11 @@ add_test(NAME ninfer_gdn_replay_fold_wide_test
 set_tests_properties(ninfer_gdn_replay_fold_wide_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600 RUN_SERIAL TRUE)
 
-# A Turing build has no selectable unified table (src/ops/linear/common/route_table.h), so its
-# route-table variants run the legacy table only.
+# A Turing card has no selectable unified table (src/ops/linear/common/route_table.h), so a build
+# for Turing alone runs the route-table variants on the legacy table only; in a build of several
+# architectures a Turing card runs its legacy table under either variant.
 set(ninfer_linear_route_tables legacy unified)
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "75")
+if(NINFER_ARCH_TURING AND NOT (NINFER_ARCH_VOLTA OR NINFER_ARCH_AMPERE OR NINFER_ARCH_BLACKWELL))
   set(ninfer_linear_route_tables legacy)
 endif()
 

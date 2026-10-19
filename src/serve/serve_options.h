@@ -48,7 +48,7 @@ struct ServeOptions {
     // at C1 on an RTX 3090, and a 6.5K-token one past 100 s; a 30 s deadline expired those
     // callers before they were ever admitted.
     std::uint32_t pending_timeout_ms   = 600000;
-    std::uint32_t prefill_chunk        = 1024;
+    std::uint32_t prefill_chunk        = 0; // 0: the Engine's automatic chunk
     std::uint32_t decode_rounds_per_prefill = 0;
     bool fast_prefill_kernel           = false;
     std::filesystem::path context_cost_presets;
@@ -81,6 +81,7 @@ struct ServeOptions {
     VisionResidency vision_residency       = VisionResidency::Resident;
     std::uint32_t vision_max_merged_tokens = 16384;
     bool use_cuda_graph     = true;
+    std::uint32_t gpu_clock_floor_mhz = 0;
     bool lm_head_q4         = false;
     bool lm_head_q6         = false;
     bool embedding_q4       = false;
@@ -160,7 +161,7 @@ struct ServeOptions {
     bool log_stats_panel   = false;
     bool enable_webui      = true;  // serve a WebUI compiled in with NINFER_WEBUI_DIR
     // --webui-mcp-proxy: relay the WebUI's MCP traffic at /cors-proxy. It reaches any http host it
-    // is given and carries no API key, so it stays off unless asked for by name.
+    // is given, so it stays off unless asked for by name.
     bool webui_mcp_proxy = false;
     bool structured_output = false; // accept JSON/JSON Schema constrained requests
     bool concurrent_prefill = false; // admit to free lanes while other requests prefill

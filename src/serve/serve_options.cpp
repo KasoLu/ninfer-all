@@ -95,7 +95,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                8192)\n"
            "  --max-concurrency N           requests decoded together, 1..8 (default 1)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
-           "                                (default 1024)\n"
+           "                                (default 1024; 4096 for native MoE experts\n"
+           "                                in host memory or files)\n"
            "  --decode-rounds-per-prefill N decode rounds after each prefill chunk while\n"
            "                                others generate (0: chunk / 64; 1 alternates)\n"
            "  --default-max-tokens N        output limit of a request that sets none\n"
@@ -106,23 +107,24 @@ std::string serve_usage_text(const char* argv0) {
            "                                metadata.name\n"
            "  --chat-template FILE          replace the artifact's chat template at startup\n"
            "  --device N                    CUDA device index (default 0)\n"
-           "  --devices A,B,...             one pipeline stage per listed device, 2..8\n"
-           "                                (Linux); excludes --device\n"
+           "  --devices A,B,...             one pipeline stage per listed device, 2..8;\n"
+           "                                excludes --device\n"
            "  --stage-layers A,B,...        layers per stage in --devices order (default:\n"
            "                                split by free memory)\n"
-           "  --expert-residency device|host|disk  Qwen3.8-Flash-Next: expert banks in GPU\n"
-           "                                memory (default), in pinned host memory read\n"
-           "                                across the bus, or left in the artifact's files\n"
-           "                                and streamed into the device expert cache\n"
-           "  --expert-cache-mib N|auto     with host or disk experts: device memory for the\n"
-           "                                most used experts (default auto: what is free;\n"
-           "                                0 turns the host cache off; disk needs one)\n" +
+           "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
+           "                                host memory, or in artifact files\n"
+           "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen\n"
+           "                                and Gemma allow 0 (layer banks only).\n"
+           "                                Flash-Next disk requires a nonzero cache\n" +
            std::string(ninfer::product::kHybridExpertHelp) +
            std::string(ninfer::product::kNgramTableHelp) +
            "  --no-cuda-graph               decode without CUDA Graphs (on by default)\n"
            "  --cuda-graph-allowance-mib N  CUDA Graph driver-state allowance taken from the\n"
            "                                KV sizing budget (default 0: computed per\n"
            "                                profile)\n"
+           "  --gpu-clock-floor MHZ         hold the GPUs' graphics clock at MHZ or more while\n"
+           "                                requests run, so pipeline stages do not wait at\n"
+           "                                idle clocks (needs administrator or root rights)\n"
            "  --device-profile auto|off|calibrate\n"
            "                                per-GPU route profile: auto uses the stored or\n"
            "                                built-in one and calibrates a device that has\n"
@@ -448,8 +450,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --no-webui                    do not serve a WebUI built in with\n"
            "                                NINFER_WEBUI_DIR on GET /\n"
            "  --webui-mcp-proxy             relay the WebUI's MCP traffic at /cors-proxy;\n"
-           "                                http targets only, reaches any host and carries\n"
-           "                                no API key, so only on a trusted bind\n"
+           "                                http targets only and reaches any host, so only\n"
+           "                                on a trusted bind\n"
            "  --max-request-mib N           request body limit, enforced before parsing\n"
            "                                (default 384)\n"
            "  --max-pending-requests N      requests waiting for admission (default 16)\n"
@@ -1189,6 +1191,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.use_cuda_graph = false;
             continue;
         }
+        if (arg == "--gpu-clock-floor") {
+            const std::uint64_t mhz =
+                parse_u64(require_value("--gpu-clock-floor"), "gpu-clock-floor");
+            if (mhz == 0 || mhz > 5000) {
+                throw std::invalid_argument("--gpu-clock-floor must be in [1, 5000] MHz");
+            }
+            options.gpu_clock_floor_mhz = static_cast<std::uint32_t>(mhz);
+            continue;
+        }
         if (arg == "--cuda-graph-allowance-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--cuda-graph-allowance-mib"), "cuda-graph-allowance-mib");
@@ -1656,8 +1667,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
     }
-    if (options.prefill_chunk == 0 || options.prefill_chunk % 128 != 0) {
-        throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
+    if (options.prefill_chunk % 128 != 0) {
+        throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
     if (options.unconstrained_response_format && options.structured_output) {
         throw std::invalid_argument(

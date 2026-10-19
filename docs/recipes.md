@@ -36,7 +36,8 @@ on 0.0.0.0:8080.
 | `--vision`, `--vision-residency`, `--vision-max-merged` | image and video input, where the tower lives (`overlay` borrows device memory per image), and the merged-token budget of one item |
 | `--max-concurrency` | requests admitted at once, 1 to 8 |
 | `--devices` | one pipeline stage per listed GPU (Linux) |
-| `--expert-residency`, `--ngram-table`, `--ngram-residency` | Qwen3.8-Flash-Next: where the experts and the n-gram rows live, and the table's file |
+| `--expert-residency`, `--expert-cache-mib` | native Qwen MoE, Gemma 4 and Qwen3.8-Flash-Next: where the routed experts live and their persistent device cache budget ([expert residency](cli.md#common-options)) |
+| `--ngram-table`, `--ngram-residency` | Qwen3.8-Flash-Next: where the n-gram rows live and the table's file |
 | `--disk-kv-path`, `--disk-kv-gib`, `--disk-kv-restore` | the disk tier of the context cache |
 
 ## Ternary Bonsai 2 27B
@@ -208,8 +209,8 @@ build (the image has one); `sm_86` and `sm_89` builds refuse the file. On an RTX
 ## Cards of 8 to 12 GB
 
 The windows the [small cards](performance/small-cards-2026-10.md) page measured: the server started
-with `--max-concurrency 1` and answered a request. None of these cards has a built-in device
-profile, so the first start calibrates (82 to 107 s there).
+with `--max-concurrency 1` and answered a request. These three cards carry built-in device profiles;
+another card of this size calibrates once at its first start, in one to three minutes.
 
 ```bash
 # 8 GB (RTX 3060 Ti): Ternary Bonsai 2 with 24,576 tokens of rk4v4 and no drafter. MTP does not fit.
